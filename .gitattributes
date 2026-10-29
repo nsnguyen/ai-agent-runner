@@ -1,0 +1,2 @@
+# Hooks must keep LF: with CRLF they fail bash -n and silently skip.
+.claude/temper/*.sh text eol=lf
