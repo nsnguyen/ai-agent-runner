@@ -69,7 +69,9 @@ fn start(root: &std::path::Path) -> Session {
     let client = json!({"name": "test", "version": "0"});
     let params = json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": client});
     s.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}));
-    assert!(s.reply(1)["result"]["capabilities"]["tools"].is_object());
+    let init = s.reply(1)["result"].clone();
+    assert!(init["capabilities"]["tools"].is_object());
+    assert_eq!(init["serverInfo"]["name"], json!("runner"));
     s.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     s
 }

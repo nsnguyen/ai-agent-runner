@@ -17,7 +17,8 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Deploys: previews only.
 
 ## Stack
-- Firecracker microVMs, driven through Firecracker's API socket. Everything else follows temper's defaults: Rust for the host service, CLI, and MCP server.
+- Firecracker microVMs, driven through Firecracker's API socket. Everything else follows temper's defaults: one Rust binary on the host, `runner`, that is both the CLI and the MCP server.
+- VM state is a directory per VM, not SQLite (docs/design.md). Disks are copied with GNU `cp --reflink=auto --sparse=always`.
 
 ## Commands
 - Build: `cargo build --release` (the binary is `target/release/runner`)
@@ -25,4 +26,6 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
 
 ## Sharp edges
+- On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
+- Old disk generations stay on disk until cleanup exists (design: Later).
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.

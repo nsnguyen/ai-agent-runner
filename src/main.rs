@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use runner::store::{Store, Vm};
+use runner::store::{BASE, Store, Vm};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -23,7 +23,7 @@ enum Cmd {
     Create {
         name: String,
         /// The VM whose current disk to fork.
-        #[arg(long, default_value = "base")]
+        #[arg(long, default_value = BASE)]
         from: String,
     },
     /// List VMs and their current disk generation.

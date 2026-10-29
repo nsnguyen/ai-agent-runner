@@ -2,12 +2,18 @@
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
-//   <root>/vms/<name>/lock           flock'd by the one run a VM allows at a time
+//   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The VM `create` forks unless told otherwise.
+pub const BASE: &str = "base";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -88,24 +94,36 @@ impl Store {
         self.make(name, &disk_of(&src, current(&src)?))
     }
 
-    // mkdir claims the name atomically; a failed make removes what it started.
+    // Built aside under a dot-name that list skips, then renamed into place, so
+    // a create killed partway never takes the name.
     fn make(&self, name: &str, disk: &Path) -> Result<Vm> {
         check_name(name)?;
         let vms = self.vms();
         fs::create_dir_all(&vms).map_err(at(&vms))?;
+        sweep_staging(&vms);
         let dir = vms.join(name);
-        match fs::create_dir(&dir) {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(Error::Exists(name.to_string()));
-            }
-            r => r.map_err(at(&dir))?,
+        if dir.exists() {
+            return Err(Error::Exists(name.to_string()));
         }
-        let made = fs::create_dir(dir.join("gens"))
-            .map_err(at(&dir))
-            .and_then(|()| clone(disk, &disk_of(&dir, 0)))
-            .and_then(|()| write_history(&dir, &[0]));
+        let staged = vms.join(format!(".new-{name}-{}", std::process::id()));
+        let made = fs::create_dir(&staged)
+            .and_then(|()| fs::create_dir(staged.join("gens")))
+            .map_err(at(&staged))
+            .and_then(|()| clone(disk, &disk_of(&staged, 0)))
+            .and_then(|()| write_history(&staged, &[0]))
+            // rename won't replace a directory with anything in it, so a
+            // create that raced this one keeps its VM.
+            .and_then(|()| {
+                fs::rename(&staged, &dir).map_err(|e| match e.kind() {
+                    io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists => {
+                        Error::Exists(name.to_string())
+                    }
+                    _ => at(&dir)(e),
+                })
+            })
+            .and_then(|()| sync_dir(&vms));
         if made.is_err() {
-            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_dir_all(&staged);
         }
         made?;
         read_vm(name, &dir)
@@ -127,9 +145,10 @@ impl Store {
             let Some(name) = name.to_str() else { continue };
             match self.get(name) {
                 Ok(vm) => out.push(vm),
-                // Half made, or not a VM's directory.
+                // Not a VM's directory: a staging one, or something else.
                 Err(Error::NoVm(_) | Error::BadName(_)) => {}
-                Err(e) => return Err(e),
+                // One broken VM shouldn't hide the rest.
+                Err(e) => eprintln!("runner: skipping {name}: {e}"),
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -235,13 +254,39 @@ fn current(dir: &Path) -> Result<u64> {
     gens.last().copied().ok_or_else(empty)
 }
 
-// Written aside and renamed, so a crash leaves either the old history or the new.
+// Written aside, synced and renamed, so even a host crash leaves either the old
+// history or the new.
 fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
     let tmp = dir.join("history.tmp");
     let text: String = gens.iter().map(|g| format!("{g}\n")).collect();
-    fs::write(&tmp, text).map_err(at(&tmp))?;
+    let mut f = File::create(&tmp).map_err(at(&tmp))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(at(&tmp))?;
     let path = dir.join("history");
-    fs::rename(&tmp, &path).map_err(at(&path))
+    fs::rename(&tmp, &path).map_err(at(&path))?;
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir).and_then(|d| d.sync_all()).map_err(at(dir))
+}
+
+// A staging directory whose creator is gone is what a killed create left.
+fn sweep_staging(vms: &Path) {
+    let Ok(entries) = fs::read_dir(vms) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(".new-")?.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok());
+        if pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 // Past every disk on hand, failed runs' included, so none is overwritten.
@@ -258,10 +303,20 @@ fn next_generation(dir: &Path) -> Result<u64> {
     Ok(last + 1)
 }
 
-// A reflink on XFS or btrfs takes constant time and no space until one side
-// writes. Other filesystems get a full copy.
+// GNU cp does the copying: a reflink on XFS or btrfs, which takes constant
+// time and no space until one side writes, else a copy that keeps the disk's
+// holes, so a sparse image stays small. Every generation is writable whatever
+// the source's mode, and synced before anything points at it.
 fn clone(from: &Path, to: &Path) -> Result<()> {
-    reflink_copy::reflink_or_copy(from, to)
-        .map(drop)
-        .map_err(at(from))
+    let out = Command::new("cp")
+        .args(["--reflink=auto", "--sparse=always", "--"])
+        .args([from, to])
+        .output()
+        .map_err(at(to))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(at(to)(io::Error::other(why)));
+    }
+    fs::set_permissions(to, fs::Permissions::from_mode(0o644)).map_err(at(to))?;
+    File::open(to).and_then(|f| f.sync_all()).map_err(at(to))
 }

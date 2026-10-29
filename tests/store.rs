@@ -107,11 +107,25 @@ fn one_run_at_a_time() {
 }
 
 #[test]
-fn a_lock_file_left_by_a_dead_run_does_not_block() {
+fn another_process_holds_the_lock_until_it_dies() {
     let (dir, store) = store();
     store.import("dev", &disk(dir.path(), b"v0")).unwrap();
-    // A run that crashed leaves the file, but the kernel already dropped its lock.
-    fs::write(dir.path().join("root/vms/dev/lock"), "").unwrap();
+    let lock = dir.path().join("root/vms/dev/lock");
+    // --no-fork: the process we kill is the one holding the lock.
+    let mut holder = std::process::Command::new("flock")
+        .arg("--no-fork")
+        .arg(&lock)
+        .args(["sleep", "60"])
+        .spawn()
+        .unwrap();
+    let held = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        matches!(store.begin_run("dev"), Err(Error::Busy(_)))
+    });
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(held, "the other process's lock was never seen");
+    // It died without unlocking; the kernel let go for it.
     store.begin_run("dev").unwrap();
 }
 
@@ -157,13 +171,45 @@ fn names_must_be_one_plain_path_part() {
 }
 
 #[test]
-fn a_half_made_vm_is_not_listed() {
+fn an_interrupted_create_does_not_take_the_name() {
+    let (dir, store) = store();
+    // What a create killed partway leaves: its staging directory, from a dead pid.
+    let staged = dir.path().join("root/vms/.new-dev-999999999");
+    fs::create_dir_all(staged.join("gens")).unwrap();
+    assert_eq!(store.list().unwrap(), vec![]);
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    assert!(!staged.exists(), "stale staging directory left behind");
+}
+
+#[test]
+fn a_broken_vm_does_not_hide_the_others() {
     let (dir, store) = store();
     store.import("base", &disk(dir.path(), b"v0")).unwrap();
-    // A create that died before writing history leaves a bare directory.
-    fs::create_dir_all(dir.path().join("root/vms/broken/gens")).unwrap();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    fs::write(dir.path().join("root/vms/dev/history"), "").unwrap();
     let names: Vec<String> = store.list().unwrap().into_iter().map(|v| v.name).collect();
     assert_eq!(names, ["base"]);
+}
+
+#[test]
+fn copies_keep_holes_and_are_writable() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (dir, store) = store();
+    let src = dir.path().join("sparse.ext4");
+    let f = fs::File::create(&src).unwrap();
+    f.set_len(64 << 20).unwrap();
+    drop(f);
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+    store.import("base", &src).unwrap();
+    let run = store.begin_run("base").unwrap();
+    let meta = fs::metadata(&run.disk).unwrap();
+    assert_eq!(meta.len(), 64 << 20);
+    assert!(
+        meta.blocks() * 512 < 1 << 20,
+        "64 MB of holes became {} bytes",
+        meta.blocks() * 512
+    );
+    fs::write(&run.disk, b"agent was here").unwrap();
 }
 
 mod props {
@@ -174,12 +220,20 @@ mod props {
     proptest! {
         // Anything accepted is safe to join onto the store's directory.
         #[test]
-        fn accepted_names_stay_inside_the_store(name in ".{0,40}") {
+        // Half the inputs look like names, so the accepted branch runs often.
+        fn accepted_names_stay_inside_the_store(
+            name in prop_oneof!["[a-z0-9-]{1,33}", "[a-zA-Z0-9./ -]{0,40}"]
+        ) {
             if check_name(&name).is_ok() {
                 let parts: Vec<_> = Path::new(&name).components().collect();
                 prop_assert_eq!(parts.len(), 1);
                 prop_assert!(matches!(parts[0], Component::Normal(_)));
             }
+        }
+
+        #[test]
+        fn plain_names_are_accepted(name in "[a-z0-9][a-z0-9-]{0,31}") {
+            prop_assert!(check_name(&name).is_ok());
         }
     }
 }

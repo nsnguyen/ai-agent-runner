@@ -1,9 +1,10 @@
 // The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
-use crate::store::{Store, Vm};
+use crate::store::{BASE, Store, Vm};
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{ServiceExt, schemars, tool, tool_router};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -30,9 +31,19 @@ pub struct VmList {
     vms: Vec<Vm>,
 }
 
+// Named here, or clients see the SDK's own name.
+#[tool_handler]
+impl ServerHandler for Tools {
+    fn get_info(&self) -> ServerConfig {
+        let tools = ServerCapabilities::builder().enable_tools().build();
+        let me = Implementation::new("runner", env!("CARGO_PKG_VERSION"));
+        ServerConfig::new(tools).with_server_info(me)
+    }
+}
+
 // Tool errors are strings, so a bad call becomes an error result the client
 // can read, not a broken session.
-#[tool_router(server_handler)]
+#[tool_router]
 impl Tools {
     #[tool(description = "List the VMs on this host and each one's current disk generation.")]
     fn list_vms(&self) -> Result<Json<VmList>, String> {
@@ -44,7 +55,7 @@ impl Tools {
         description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one)."
     )]
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
-        let from = args.from.as_deref().unwrap_or("base");
+        let from = args.from.as_deref().unwrap_or(BASE);
         self.store
             .fork(from, &args.name)
             .map(Json)
