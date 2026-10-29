@@ -20,9 +20,9 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Firecracker microVMs, driven through Firecracker's API socket. Everything else follows temper's defaults: Rust for the host service, CLI, and MCP server.
 
 ## Commands
-- Build: none yet
-- Test: none yet
-- Run locally: none yet
+- Build: `cargo build --release` (the binary is `target/release/runner`)
+- Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
+- Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
 
 ## Sharp edges
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
