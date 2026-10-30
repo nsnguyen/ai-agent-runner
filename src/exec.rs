@@ -1,7 +1,8 @@
 // The host's side of the guest protocol (src/proto.rs), under `runner exec`,
-// `runner shell`, MCP's exec and headless runs. Each command is one connection to the VM's
-// runner-guest, through Firecracker's vsock socket: write `CONNECT <port>`,
-// and Firecracker answers `OK <n>` once a listener in the guest takes it.
+// `runner shell`, MCP's exec and headless runs. Each command is one
+// connection to the VM's runner-guest, through Firecracker's vsock socket:
+// write `CONNECT <port>`, and Firecracker answers `OK <n>` once a listener in
+// the guest takes it.
 //
 // Firecracker ends a connection both ways once the host closes its side,
 // even only for writing, so the host only does that to hang up.
@@ -192,6 +193,50 @@ impl Drop for Cut {
     }
 }
 
+// A command under way on its connection, with its stdin fed and closed.
+struct Begun {
+    _cut: Cut,
+    writer: Writer,
+    /// The guest's frames, up to and including the first that isn't output.
+    frames: mpsc::Receiver<proto::Result<Option<FromGuest>>>,
+}
+
+// Sends `req`, then `stdin` and its close. Frames are read on their own
+// thread, so a deadline never lands partway through one, and stdin is fed on
+// its own thread too: a command that writes before it reads would otherwise
+// wait on this end forever.
+fn begin(conn: &UnixStream, req: &Request, stdin: &[u8]) -> Result<Begun> {
+    let cut = Cut(clone(conn)?);
+    let writer: Writer = Arc::new(Mutex::new(clone(conn)?));
+    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
+    let (tx, frames) = mpsc::channel();
+    let mut reader = clone(conn)?;
+    thread::spawn(move || {
+        loop {
+            let frame = proto::read_frame::<FromGuest>(&mut reader);
+            let output = matches!(frame, Ok(Some(FromGuest::Stdout(_) | FromGuest::Stderr(_))));
+            if tx.send(frame).is_err() || !output {
+                return;
+            }
+        }
+    });
+    let feeder = writer.clone();
+    let input = stdin.to_vec();
+    thread::spawn(move || {
+        for chunk in input.chunks(CHUNK) {
+            if send(&feeder, &ToGuest::Stdin(chunk.to_vec())).is_err() {
+                return;
+            }
+        }
+        let _ = send(&feeder, &ToGuest::CloseStdin);
+    });
+    Ok(Begun {
+        _cut: cut,
+        writer,
+        frames,
+    })
+}
+
 /// What a command did, as MCP's exec gives it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct Captured {
@@ -219,35 +264,11 @@ pub fn capture(
     timeout: Duration,
     cap: usize,
 ) -> Result<Captured> {
-    let _cut = Cut(clone(&conn)?);
-    let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
-    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
-    // Frames are read on their own thread, so the deadline never lands
-    // partway through one.
-    let (tx, rx) = mpsc::channel();
-    let mut reader = clone(&conn)?;
-    thread::spawn(move || {
-        loop {
-            let frame = proto::read_frame::<FromGuest>(&mut reader);
-            let output = matches!(frame, Ok(Some(FromGuest::Stdout(_) | FromGuest::Stderr(_))));
-            if tx.send(frame).is_err() || !output {
-                return;
-            }
-        }
-    });
-    // Fed on its own thread too: a command that writes before it reads
-    // would otherwise wait on this end forever.
-    let feeder = writer.clone();
-    let input = stdin.to_vec();
-    thread::spawn(move || {
-        for chunk in input.chunks(CHUNK) {
-            if send(&feeder, &ToGuest::Stdin(chunk.to_vec())).is_err() {
-                return;
-            }
-        }
-        let _ = send(&feeder, &ToGuest::CloseStdin);
-    });
-
+    let Begun {
+        _cut,
+        writer,
+        frames: rx,
+    } = begin(&conn, req, stdin)?;
     let (mut stdout, mut stderr) = (Kept::new(cap), Kept::new(cap));
     let mut deadline = Instant::now() + timeout.min(MAX_TIMEOUT);
     let mut timed_out = false;
@@ -313,31 +334,11 @@ pub fn stream(
     stop: impl Fn() -> bool,
     grace: Duration,
 ) -> Result<Streamed> {
-    let _cut = Cut(clone(&conn)?);
-    let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
-    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
-    let (tx, rx) = mpsc::channel();
-    let mut reader = clone(&conn)?;
-    thread::spawn(move || {
-        loop {
-            let frame = proto::read_frame::<FromGuest>(&mut reader);
-            let output = matches!(frame, Ok(Some(FromGuest::Stdout(_) | FromGuest::Stderr(_))));
-            if tx.send(frame).is_err() || !output {
-                return;
-            }
-        }
-    });
-    let feeder = writer.clone();
-    let input = stdin.to_vec();
-    thread::spawn(move || {
-        for chunk in input.chunks(CHUNK) {
-            if send(&feeder, &ToGuest::Stdin(chunk.to_vec())).is_err() {
-                return;
-            }
-        }
-        let _ = send(&feeder, &ToGuest::CloseStdin);
-    });
-
+    let Begun {
+        _cut,
+        writer,
+        frames: rx,
+    } = begin(&conn, req, stdin)?;
     let write = |to: &mut dyn Write, b: &[u8]| {
         to.write_all(b)
             .and_then(|()| to.flush())

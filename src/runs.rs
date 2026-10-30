@@ -20,8 +20,12 @@
 //
 // A run on a stopped VM boots it, which runs a new disk generation as every
 // boot does, and shuts it down at the end: a clean exit commits that
-// generation, and anything else rolls it back (Store::ask_rollback). A run on
-// a running VM joins it as it is, and commits or rolls back nothing.
+// generation, and anything else rolls it back. Rollback is the default: the
+// run asks boot for it once the guest is up (Store::ask_rollback) and takes
+// the ask back only when Claude Code has exited 0, so a VM shut down under
+// the run, by a host reboot, `runner stop` or the agent itself, rolls back
+// too. A run on a running VM joins it as it is, and commits or rolls back
+// nothing.
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
 use crate::proto::{Exit, Request};
@@ -34,7 +38,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -91,6 +95,8 @@ pub enum Error {
     NoPrompt,
     #[error("{vm} already has a run going, {run}: one run per VM; `runner cancel {run}` ends it")]
     Busy { vm: String, run: String },
+    #[error("{0} already has a run starting: one run per VM")]
+    Starting(String),
     #[error("{0} is shutting down: start the run once it's stopped")]
     Stopping(String),
     #[error("{0} stopped before the run could join it")]
@@ -164,7 +170,8 @@ pub struct AgentRun {
     /// What went wrong, if anything did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The end of Claude Code's stderr, once the run is over.
+    /// Untrusted: the end of what Claude Code wrote to stderr, once the run
+    /// is over.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
     /// The stream's size so far, in bytes.
@@ -249,9 +256,16 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
     let runs = store.runs(s.vm)?;
     fs::create_dir_all(&runs).map_err(io_err(format!("making {}", runs.display())))?;
     let Some(lock) = lock(&runs)? else {
-        let run = newest(&runs)?.map_or("a run".to_string(), |n| id(s.vm, n));
+        // Unless it's the newest, the run holding the lock is one starting.
+        let newest = match newest(&runs)? {
+            Some(n) => Some(load(store, s.vm, n)?),
+            None => None,
+        };
         let vm = s.vm.to_string();
-        return Err(Error::Busy { vm, run });
+        return Err(match newest {
+            Some(run) if run.state == State::Running => Error::Busy { vm, run: run.id },
+            _ => Error::Starting(vm),
+        });
     };
     let boots = match systemd::status(store, s.vm)?.state {
         VmState::Stopped => true,
@@ -323,10 +337,8 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
     let run_id = id(vm, n);
     let dir = store.runs(vm)?.join(n.to_string());
     let ask: Ask = read_json(&dir.join(ASK))?.ok_or_else(|| Error::NoRun(run_id.clone()))?;
-    let cancel = dir.join(CANCEL);
-    let cancelled = || cancel.exists();
     let mut from = None;
-    let ran = run_claude(store, vm, &dir, &ask, program, &cancelled, &mut from);
+    let ran = run_claude(store, vm, &run_id, &dir, &ask, program, &mut from);
     let mut end = End::default();
     match ran {
         Ok(Streamed { exit, stopped }) => {
@@ -347,19 +359,26 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         }
         // The generation the VM booted from stays current unless boot
         // committed the run's.
-        if let Some(from) = from {
-            let committed = store.get(vm)?.generation != from;
-            end.outcome = Some(if committed {
-                Outcome::Committed
-            } else {
-                Outcome::RolledBack
-            });
-            if clean && !committed {
-                end.error.get_or_insert(format!(
-                    "Claude Code exited 0, but {vm} didn't shut down cleanly, so its disk \
-                     was rolled back: `runner logs {vm}` says why"
-                ));
+        match from.map(|from| (from, store.get(vm))) {
+            Some((from, Ok(after))) => {
+                let committed = after.generation != from;
+                end.outcome = Some(if committed {
+                    Outcome::Committed
+                } else {
+                    Outcome::RolledBack
+                });
+                if clean && !committed {
+                    end.error.get_or_insert(format!(
+                        "Claude Code exited 0, but {vm} went down before the run ended, or \
+                         didn't shut down cleanly, so its disk was rolled back: `runner logs \
+                         {vm}` says which"
+                    ));
+                }
             }
+            Some((_, Err(e))) => {
+                end.error.get_or_insert(e.to_string());
+            }
+            None => {}
         }
     }
     end.ended = now();
@@ -371,22 +390,20 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
 fn run_claude(
     store: &Store,
     vm: &str,
+    run: &str,
     dir: &Path,
     ask: &Ask,
     program: &str,
-    cancelled: &dyn Fn() -> bool,
     from: &mut Option<u64>,
 ) -> Result<Streamed> {
-    if ask.boots {
-        systemd::start(store, vm)?;
-        *from = Some(store.get(vm)?.generation);
-    }
+    let cancel = dir.join(CANCEL);
+    let cancelled = || cancel.exists();
+    let stopped = Streamed {
+        exit: None,
+        stopped: true,
+    };
     if cancelled() {
-        let exit = None;
-        return Ok(Streamed {
-            exit,
-            stopped: true,
-        });
+        return Ok(stopped);
     }
     // A joined VM that has stopped since isn't started again: then the run
     // would have to shut it down, which nobody asked for.
@@ -394,7 +411,19 @@ fn run_claude(
     if !joinable {
         return Err(Error::Gone(vm.to_string()));
     }
+    if ask.boots {
+        systemd::start(store, vm)?;
+        *from = Some(store.get(vm)?.generation);
+    }
+    // A guest that answers means boot is past begin_run, which drops any
+    // ask from before it, and holds the VM until it has shut down.
     let conn = exec::reach(store, vm)?;
+    if ask.boots {
+        store.ask_rollback(vm, &format!("run {run}"))?;
+    }
+    if cancelled() {
+        return Ok(stopped);
+    }
     let mut argv = vec![program.to_string()];
     argv.extend(FLAGS.map(String::from));
     if let Some(session) = &ask.resume {
@@ -422,11 +451,13 @@ fn run_claude(
 
 // Shuts down a VM the run booted, as `runner stop` does, but by Ctrl-Alt-Del
 // straight to Firecracker: the stop of the unit host/install.sh installs
-// kills the VM (#51), which never commits. A run that didn't end cleanly asks
-// boot to roll back first. A guest still up after HALT_WAIT is stopped
-// through systemd, which kills it past its timeout, so nothing commits.
+// kills the VM (#51), which never commits. Only a clean run takes back its
+// ask to roll back first. A guest still up after HALT_WAIT is stopped through
+// systemd, which kills it past its timeout, so nothing commits.
 fn shut_down(store: &Store, vm: &str, run: &str, clean: bool) -> Result<()> {
-    if !clean {
+    if clean {
+        store.withdraw_rollback(vm)?;
+    } else {
         store.ask_rollback(vm, &format!("run {run}"))?;
     }
     let sock = store.api_socket(vm)?;
@@ -441,8 +472,14 @@ fn shut_down(store: &Store, vm: &str, run: &str, clean: bool) -> Result<()> {
     while store.held(vm)? {
         if Instant::now() > deadline && UnixStream::connect(&sock).is_ok() {
             systemd::stop(store, vm)?;
-            break;
+            return Ok(());
         }
+        std::thread::sleep(POLL);
+    }
+    // The unit `runner unit` writes still runs its ExecStop once boot has
+    // exited. Waited out, so a run right after this one finds the VM stopped.
+    let deadline = Instant::now() + HALT_WAIT;
+    while systemd::status(store, vm)?.state != VmState::Stopped && Instant::now() < deadline {
         std::thread::sleep(POLL);
     }
     Ok(())
@@ -494,7 +531,14 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
         State::Running => None,
         _ => tail(&dir.join(STDERR), STDERR_TAIL)?,
     };
-    let end = end.unwrap_or_default();
+    let mut end = end.unwrap_or_default();
+    if state == State::Lost {
+        let log = dir.join(LOG);
+        end.error = Some(format!(
+            "the process driving it died: {} may say why",
+            log.display()
+        ));
+    }
     let ended = (state != State::Running && state != State::Lost).then_some(end.ended);
     Ok(AgentRun {
         id: run_id,
@@ -524,8 +568,13 @@ fn held(runs: &Path, n: u64) -> Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         r => r.map_err(io_err(format!("opening {}", path.display())))?,
     };
-    let free = store::try_lock(&file).map_err(io_err(format!("locking {}", path.display())))?;
-    Ok(!free)
+    // Asked once: a lock just let go can look held for an instant
+    // (store::try_lock), and then the run looks to be going a moment longer.
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(e)) => Err(io_err(format!("locking {}", path.display()))(e)),
+    }
 }
 
 // The run lock, or None if a run holds it.
@@ -580,9 +629,10 @@ pub fn output(
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Events {
     pub run: AgentRun,
-    /// The run's stream-json events from the cursor on, in order. A line
-    /// that isn't JSON comes as a string, and one longer than 64 KiB as
-    /// {"runner_cut": true, "bytes": n} in its place.
+    /// Untrusted: the run's stream-json events from the cursor on, in order,
+    /// as Claude Code wrote them. A line that isn't JSON comes as a string,
+    /// and one longer than 64 KiB as {"runner_cut": true, "bytes": n} in its
+    /// place.
     pub events: Vec<Value>,
     /// Where the next read starts: pass it back as the cursor.
     pub cursor: u64,
@@ -641,7 +691,7 @@ fn event(line: &Line) -> Option<Value> {
 }
 
 /// Asks the run to stop, and returns it once it has ended, or as it stands
-/// if it's still going after a couple of minutes.
+/// if it's still going after two minutes.
 pub fn cancel(store: &Store, id: &str) -> Result<AgentRun> {
     let (vm, n) = parse_id(id)?;
     let run = load(store, &vm, n)?;
@@ -665,17 +715,19 @@ pub fn cancel(store: &Store, id: &str) -> Result<AgentRun> {
 /// over: what became of the disk, and what went wrong, if anything did.
 pub fn describe(run: &AgentRun) -> String {
     let state = match (run.state, run.exit_code, run.signal) {
-        // Nothing is known of the disk yet, or ever.
-        (state @ (State::Running | State::Lost), ..) => return state.to_string(),
+        (State::Running, ..) => return State::Running.to_string(),
+        // Nothing is known of the disk, nor ever will be.
+        (State::Lost, ..) => "lost".to_string(),
         (State::Exited, Some(code), _) => format!("exited {code}"),
         (State::Exited, None, Some(sig)) => format!("killed by signal {sig}"),
         (state, ..) => state.to_string(),
     };
-    let disk = match (run.outcome, run.boots) {
-        (Some(Outcome::Committed), _) => ", committed",
-        (Some(Outcome::RolledBack), _) => ", rolled back",
-        (None, false) => ", joined",
-        (None, true) => "",
+    let disk = match (run.outcome, run.boots, run.state) {
+        (_, _, State::Lost) => "",
+        (Some(Outcome::Committed), ..) => ", committed",
+        (Some(Outcome::RolledBack), ..) => ", rolled back",
+        (None, false, _) => ", joined",
+        (None, true, _) => "",
     };
     let error = run.error.as_deref().map(|e| {
         let lines: Vec<&str> = e.lines().collect();

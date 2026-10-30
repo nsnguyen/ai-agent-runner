@@ -350,6 +350,23 @@ fn a_non_zero_exit_rolls_back_what_the_run_booted() {
     assert!(vm.dir.path().join("vms/dev/gens/1.ext4").is_file());
 }
 
+// As `runner stop`, a host reboot, or the agent's own `sudo reboot` would.
+#[test]
+fn a_vm_shut_down_under_a_run_rolls_back() {
+    let vm = vm(false);
+    let boot = boot(&vm);
+    let id = vm.start("interrupted");
+    wait_for("claude to start", || vm.started());
+    let api = runner::firecracker::Api::new(vm.dir.path().join("vms/dev/api.sock"));
+    api.ctrl_alt_del().unwrap();
+    assert_eq!(boot.asked().as_deref(), Some("run dev.1"));
+
+    vm.go(0, 0);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 0, rolled back: "), "{row}");
+    assert_eq!(vm.generation(), 0);
+}
+
 #[test]
 fn cancel_ends_the_run_and_rolls_back_what_it_booted() {
     let vm = vm(false);
@@ -403,7 +420,16 @@ fn a_run_whose_driver_died_is_lost() {
     wait_for("claude to start", || vm.started());
     let pid = driver(vm.dir.path(), "1").expect("no process drives dev.1");
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
-    wait_for("dev.1 to be lost", || vm.row(&id).contains("  lost  "));
+    wait_for("dev.1 to be lost", || vm.row(&id).contains("  lost: "));
+    let log = vm.dir.path().join("vms/dev/runs/1/log");
+    let row = vm.row(&id);
+    assert!(
+        row.contains(&format!(
+            "the process driving it died: {} may say why",
+            log.display()
+        )),
+        "{row}"
+    );
     // Its lock went with it.
     vm.go(0, 0);
     assert_eq!(vm.start("next"), "dev.2");
@@ -467,7 +493,7 @@ fn driver(root: &Path, n: &str) -> Option<nix::unistd::Pid> {
         if read.is_err() {
             continue;
         }
-        let args: Vec<String> = cmdline.split(|&b| b == 0).map(|a| text(a)).collect();
+        let args: Vec<String> = cmdline.split(|&b| b == 0).map(text).collect();
         if args.windows(want.len()).any(|w| w == want) {
             return Some(nix::unistd::Pid::from_raw(pid));
         }
@@ -515,7 +541,8 @@ fn a_line_longer_than_the_cap_comes_alone_and_cut() {
 proptest! {
     // However the writes and reads interleave, reading on from each read's
     // `next` sees every byte once, in order, and only whole lines until the
-    // run has ended.
+    // run has ended. A cut line comes alone and is one line longer than the
+    // cap; its bytes are taken from what was written.
     #[test]
     fn reads_from_each_next_see_the_stream_whole(
         writes in prop::collection::vec(prop::collection::vec(prop_oneof![Just(b'\n'), Just(b'x')], 0..40), 0..20),
@@ -525,12 +552,19 @@ proptest! {
         let path = dir.path().join("stream");
         let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
         let (mut got, mut next, mut written) = (Vec::new(), 0, Vec::new());
-        let read = |next: &mut u64, got: &mut Vec<u8>, ended| loop {
-            let r = runs::lines(&path, *next, cap.max(64), ended).unwrap();
+        let read = |next: &mut u64, got: &mut Vec<u8>, written: &[u8], ended| loop {
+            let r = runs::lines(&path, *next, cap, ended).unwrap();
             for line in &r.lines {
                 match line {
                     Line::Whole(b) => got.extend(b),
-                    Line::Cut(_) => panic!("no line here is longer than the cap"),
+                    Line::Cut(n) => {
+                        let cut = &written[got.len()..got.len() + *n as usize];
+                        assert_eq!(r.lines.len(), 1);
+                        assert!(cut.len() > cap, "{cut:?} fits in {cap}");
+                        assert!(!cut[..cut.len() - 1].contains(&b'\n'));
+                        assert!(ended || cut.ends_with(b"\n"));
+                        got.extend(cut);
+                    }
                 }
             }
             if r.next == *next { return; }
@@ -539,11 +573,11 @@ proptest! {
         for w in &writes {
             file.write_all(w).unwrap();
             written.extend(w);
-            read(&mut next, &mut got, false);
+            read(&mut next, &mut got, &written, false);
             prop_assert!(got.is_empty() || got.ends_with(b"\n"));
             prop_assert!(written.starts_with(&got));
         }
-        read(&mut next, &mut got, true);
+        read(&mut next, &mut got, &written, true);
         prop_assert_eq!(got, written);
     }
 }

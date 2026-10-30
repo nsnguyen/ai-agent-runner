@@ -102,11 +102,11 @@ lands you in Claude Code running in dev, logged in with the host's token (docs/h
 runner run dev "Fix the failing test in app/ and commit it"
 ```
 
-prints the run's id, `dev.1`, at once, while Claude Code works on the prompt in dev as `claude -p`, with stream-json output and its permission prompts skipped: the VM is the sandbox. It runs in `/home/agent/work` unless `--dir` names another, which has to exist, and `--resume <session>` carries on an earlier session, by the `session_id` in that run's first event. The run doesn't need the connection that started it: close the laptop and it goes on.
+prints the run's id, `dev.1`, at once, while Claude Code works on the prompt in dev as `claude -p`, with stream-json output and its permission prompts skipped: the VM is the sandbox. It runs in `/home/agent/work` unless `--dir` names another, which has to exist, and `--resume <session>` carries on an earlier session, by the `session_id` in that run's first event: one that committed or joined, in the same `--dir`, since the session's record is on the VM's disk. The run doesn't need the connection that started it: close the laptop and it goes on.
 
 `runner output dev.1` prints the stream so far, an event per line, and `--follow` keeps printing until the run ends, then says on stderr how it did. `--from <bytes>` skips what an earlier read printed. `runner runs dev` lists dev's runs, newest first, and `runner cancel dev.1` stops one. A VM has one run at a time, so a second `runner run dev` is refused while one goes on.
 
-If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. If dev is running, the run joins it as it is, and nothing is committed or rolled back, so there's no undoing it until checkpoints work on running VMs (#22).
+If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run joins it as it is, and nothing is committed or rolled back, so there's no undoing it until checkpoints work on running VMs (#22).
 
 The stream is kept on the host, in `/var/lib/runner/vms/dev/runs/1/`, beside Claude Code's stderr, so it can be read with dev off, and goes when dev is deleted.
 

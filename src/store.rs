@@ -439,11 +439,14 @@ impl Store {
     }
 
     /// Whether something holds the VM now: a boot, or a command changing it.
+    /// Asked once: a lock that's just been let go can look held for an
+    /// instant (take_lock), so a caller that must know asks again.
     pub fn held(&self, name: &str) -> Result<bool> {
-        match take_lock(&self.existing(name)?, name) {
-            Ok(_lock) => Ok(false),
-            Err(Error::Busy(_)) => Ok(true),
-            Err(e) => Err(e),
+        let path = self.existing(name)?.join("lock");
+        match open_lock(&path, name)?.try_lock() {
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(e)) => Err(at(&path)(e)),
         }
     }
 
@@ -453,10 +456,15 @@ impl Store {
     }
 
     /// Asks the boot running the VM to roll back, not commit, however its
-    /// guest shuts down: how a run that failed ends. `by` names who asked,
-    /// for boot's note. The next boot drops an ask no boot took.
+    /// guest shuts down: what a run holds until it ends cleanly. `by` names
+    /// who asked, for boot's note. The next boot drops an ask no boot took.
     pub fn ask_rollback(&self, name: &str, by: &str) -> Result<()> {
         write_aside(&self.existing(name)?, ROLLBACK, &format!("{by}\n"))
+    }
+
+    /// Takes back an ask_rollback, so a clean shutdown commits again.
+    pub fn withdraw_rollback(&self, name: &str) -> Result<()> {
+        remove_if_there(&self.existing(name)?.join(ROLLBACK))
     }
 
     pub fn list(&self) -> Result<Vec<Vm>> {

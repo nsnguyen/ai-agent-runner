@@ -4,7 +4,7 @@
 //
 // Each boot is a run: it boots a fresh copy of the current disk, and only a
 // clean shutdown, Firecracker exiting 0, makes that copy current, unless a
-// headless run that failed asked for a rollback first (Store::ask_rollback).
+// headless run that hasn't ended cleanly asks to roll back (Store::ask_rollback).
 //
 // While the VM runs, boot hands its guest the credentials the VM may have
 // whenever runner-guest asks, which it does at each start (src/creds.rs).
@@ -195,7 +195,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     }
     drop(tap);
     let status = status?;
-    // A clean shutdown that a failed run asked for (src/runs.rs).
+    // A clean shutdown under a run that hadn't ended cleanly (src/runs.rs).
     if status.success()
         && let Some(by) = run.take_rollback()?
     {

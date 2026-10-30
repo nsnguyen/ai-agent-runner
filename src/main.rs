@@ -223,7 +223,8 @@ enum Cmd {
         follow: bool,
     },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
-    /// booted rolls back and shuts down. Returns once the run has ended.
+    /// booted rolls back and shuts down. Returns once the run has ended, or
+    /// after two minutes.
     Cancel { run: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,
