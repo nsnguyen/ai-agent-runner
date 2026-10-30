@@ -23,10 +23,10 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 
 | | What | Done when |
 |---|---|---|
-| M1 (this PR) | The VM store (import, create, fork, generations, undo), the CLI, and MCP over stdio. No VM boots. | Checks pass here, and local Claude Code lists VMs through `ssh kvm-host runner mcp` |
+| M1 (this PR) | The VM store (import, create, fork, generations, undo, delete), the CLI, and MCP over stdio. No VM boots. | Checks pass here, and local Claude Code lists VMs through `ssh kvm-host runner mcp` |
 | M2 | Boot: systemd unit, tap networking with NAT, `start`, `stop`, `logs`, the guest agent, `shell` | `runner shell dev` lands you in a VM |
 | M3 | Agent runs: `run` and `output`, credentials per boot, a result of exit code and changed paths | Local Claude Code runs Claude Code in a VM and reads what it did |
-| Later | Snapshots for sleep and wake, best-of-N forks, taking over a run, cleaning up old generations, more hosts | Each when it hurts |
+| Later | Snapshots for sleep and wake, best-of-N forks, taking over a run, cleaning up old generations of a VM that stays, more hosts | Each when it hurts |
 
 ## Guards
 

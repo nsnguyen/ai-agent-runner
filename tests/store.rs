@@ -277,3 +277,28 @@ fn delete_refuses_a_busy_vm_and_an_unknown_one() {
     assert!(matches!(store.delete("../etc"), Err(Error::BadName(_))));
     assert_eq!(store.get("base").unwrap(), vm("base", 0, 6));
 }
+
+#[test]
+fn a_create_sweeps_a_delete_that_died_but_not_a_live_one() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    let vms = dir.path().join("root/vms");
+    let dead = vms.join(".del-gone-1-4000000000");
+    let live = vms.join(format!(".del-live-1-{}", std::process::id()));
+    fs::create_dir(&dead).unwrap();
+    fs::create_dir(&live).unwrap();
+    store.fork("base", "dev").unwrap();
+    assert!(!dead.exists());
+    assert!(live.exists());
+    assert_eq!(store.list().unwrap().len(), 2);
+}
+
+#[test]
+fn deleting_twice_in_one_process_works() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    for _ in 0..2 {
+        store.fork("base", "dev").unwrap();
+        store.delete("dev").unwrap();
+    }
+}

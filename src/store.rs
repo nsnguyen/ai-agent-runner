@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The VM `create` forks unless told otherwise.
 pub const BASE: &str = "base";
@@ -195,13 +196,22 @@ impl Store {
         let _lock = take_lock(&dir, name)?;
         let vm = read_vm(name, &dir)?;
         // Renamed first, so the VM is gone at once and the name is free; a
-        // delete killed partway leaves a dot-directory that sweep_staging
-        // clears. The lock goes with the rename, still held until we return.
+        // delete killed partway leaves a dot-directory that the next create
+        // from a new process sweeps away. The lock goes with the rename, still held until we return.
         let vms = self.vms();
-        let doomed = vms.join(format!(".del-{name}-{}", std::process::id()));
+        // The nanos keep a leftover from colliding with the next delete of the
+        // same name in a long-lived `runner mcp`, whose pid never goes away.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let doomed = vms.join(format!(".del-{name}-{nanos}-{}", std::process::id()));
         fs::rename(&dir, &doomed).map_err(at(&dir))?;
         sync_dir(&vms)?;
-        fs::remove_dir_all(&doomed).map_err(at(&doomed))?;
+        // The VM is gone either way, so a failed removal is a warning, not a
+        // failure a caller would retry into "no such VM".
+        if let Err(e) = fs::remove_dir_all(&doomed) {
+            eprintln!("runner: {name} is deleted, but {}: {e}", doomed.display());
+        }
         Ok(vm)
     }
 }
@@ -233,7 +243,11 @@ fn take_lock(dir: &Path, name: &str) -> Result<File> {
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(at(&path))?;
+        .map_err(|e| match e.kind() {
+            // The VM was deleted between the caller's check and here.
+            io::ErrorKind::NotFound => Error::NoVm(name.to_string()),
+            _ => at(&path)(e),
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(Error::Busy(name.to_string())),
