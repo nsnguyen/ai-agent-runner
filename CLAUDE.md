@@ -24,6 +24,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Build: `cargo build --release` (the binary is `target/release/runner`)
 - Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
+- Boot tests, on the KVM host only: `cargo test --test kvm -- --ignored` (docs/host.md).
 
 ## Sharp edges
 - On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
