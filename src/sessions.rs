@@ -101,20 +101,16 @@ pub fn attach_argv(session: &str, create: bool) -> Vec<String> {
 /// none, and isn't started to look.
 pub fn list(store: &Store, vm: &str, user: &str) -> Result<Vec<Session>> {
     let args = ["list-sessions", "-F", LIST_FORMAT];
-    Ok(match tmux(store, vm, user, &args, 64 << 10)? {
-        Some(Ran::Ok(stdout)) => parse_list(&stdout),
-        _ => Vec::new(),
-    })
+    let listed = tmux(store, vm, user, &args, 64 << 10)?;
+    Ok(listed.map_or_else(Vec::new, |out| parse_list(&out)))
 }
 
 /// Ends the session and everything running in it.
 pub fn kill(store: &Store, vm: &str, user: &str, session: &str) -> Result<()> {
     check_name(session)?;
     let args = ["kill-session", "-t", &target(session)];
-    match tmux(store, vm, user, &args, 64 << 10)? {
-        Some(Ran::Ok(_)) => Ok(()),
-        _ => Err(no_session(vm, session)),
-    }
+    let killed = tmux(store, vm, user, &args, 64 << 10)?;
+    killed.map(drop).ok_or_else(|| no_session(vm, session))
 }
 
 /// The last `lines` of the session's active pane, reaching back into tmux's
@@ -128,10 +124,9 @@ pub fn read(store: &Store, vm: &str, user: &str, session: &str, lines: u32) -> R
     let pane = format!("{}:", target(session));
     let start = format!("-{lines}");
     let args = ["capture-pane", "-p", "-t", &pane, "-S", &start];
-    match tmux(store, vm, user, &args, CAPTURE_CAP)? {
-        Some(Ran::Ok(text)) => Ok(tail(&text, lines as usize, exec::OUTPUT_CAP)),
-        _ => Err(no_session(vm, session)),
-    }
+    let captured = tmux(store, vm, user, &args, CAPTURE_CAP)?;
+    let pane = captured.map(|text| tail(&text, lines as usize, exec::OUTPUT_CAP));
+    pane.ok_or_else(|| no_session(vm, session))
 }
 
 /// Sessions from `tmux list-sessions -F LIST_FORMAT`. A line that doesn't
@@ -188,16 +183,9 @@ pub fn tail(pane: &str, lines: usize, cap: usize) -> Pane {
     }
 }
 
-// How a tmux command that didn't fail went. tmux says "no server running" or
-// "error connecting" when the user has no sessions at all.
-enum Ran {
-    Ok(String),
-    NoServer,
-    NoSession,
-}
-
-// Runs tmux in a running VM; None if the VM isn't running.
-fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Result<Option<Ran>> {
+// Runs tmux in a running VM for its stdout. None if what it was asked about
+// isn't there: the session, the user's tmux server, or the running VM.
+fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Result<Option<String>> {
     let Some(conn) = exec::open_running(store, vm)? else {
         return Ok(None);
     };
@@ -213,11 +201,8 @@ fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Resul
     let why = match (got.exit_code, got.signal) {
         _ if got.timed_out => format!("{} didn't finish in {}s", args[0], TIMEOUT.as_secs()),
         (Some(0), _) if got.stdout_truncated => format!("{} printed over {cap} bytes", args[0]),
-        (Some(0), _) => return Ok(Some(Ran::Ok(got.stdout))),
-        _ if err.starts_with("no server running") || err.starts_with("error connecting") => {
-            return Ok(Some(Ran::NoServer));
-        }
-        _ if err.starts_with("can't find session") => return Ok(Some(Ran::NoSession)),
+        (Some(0), _) => return Ok(Some(got.stdout)),
+        _ if nothing_there(err) => return Ok(None),
         _ if !err.is_empty() => err.to_string(),
         (Some(code), _) => format!("{} exited {code}", args[0]),
         (None, sig) => format!("{} was killed by signal {}", args[0], sig.unwrap_or(0)),
@@ -226,6 +211,22 @@ fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Resul
         vm: vm.to_string(),
         why,
     })
+}
+
+/// Whether tmux's error says the session, or the user's whole server, isn't
+/// there. A server that's exiting as its last session ends says so in ways of
+/// its own: it's gone, or has no sessions left to find.
+pub fn nothing_there(stderr: &str) -> bool {
+    [
+        "no server running",
+        "error connecting",
+        "server exited unexpectedly",
+        "lost server",
+        "can't find session",
+        "no current target",
+    ]
+    .iter()
+    .any(|said| stderr.starts_with(said))
 }
 
 fn no_session(vm: &str, session: &str) -> Error {

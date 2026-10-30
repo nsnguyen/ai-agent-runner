@@ -6,12 +6,16 @@ mod common;
 
 use common::{FakeSystemd, FakeVsock, Guest, me, pty, text, wait_for};
 use proptest::prelude::*;
+use runner::exec;
+use runner::proto::{self, Request};
 use runner::sessions::{self, Session};
 use runner::store::Store;
 use std::fs;
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, Once};
+use std::time::Duration;
 use tempfile::TempDir;
 
 // A running VM named dev whose guest is up, as far as the runner can tell.
@@ -31,6 +35,7 @@ fn vm() -> Vm {
     let sd = FakeSystemd::new(dir.path());
     sd.set_state("active");
     let guest = Guest::spawn(&dir.path().join("guest.sock"));
+    keep_tmux_up(&guest);
     let vsock = FakeVsock::serve(&dir.path().join("vms/dev/vsock.sock"), &guest.sock);
     Vm {
         dir,
@@ -39,6 +44,30 @@ fn vm() -> Vm {
         _guest: guest,
         made: Mutex::new(Vec::new()),
     }
+}
+
+// tmux's server exits with its last session, and a client that reaches it
+// then fails. One session for the whole run keeps it up, so no test's start
+// races another's kill. It ends by itself. Straight to the guest, so the VM's
+// systemctl calls stay the test's own.
+fn keep_tmux_up(guest: &Guest) {
+    static KEPT: Once = Once::new();
+    KEPT.call_once(|| {
+        let mut conn = UnixStream::connect(&guest.sock).unwrap();
+        proto::hello(&mut conn).unwrap();
+        proto::check_hello(&mut conn).unwrap();
+        let name = format!("t{}-keep", std::process::id());
+        let argv = ["tmux", "new-session", "-d", "-s", &name, "sleep 120"];
+        let req = Request {
+            argv: argv.map(String::from).to_vec(),
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: None,
+        };
+        let made = exec::capture(conn, &req, b"", Duration::from_secs(10), 4096).unwrap();
+        assert_eq!(made.exit_code, Some(0), "{}", made.stderr);
+    });
 }
 
 // Sessions a failed test made don't outlive it.
@@ -377,4 +406,27 @@ fn a_tail_drops_the_blank_rows_under_the_cursor() {
     assert_eq!((got.text.as_str(), got.truncated), ("2\n3\n$\n", false));
     let got = sessions::tail("\n\n\n", 10, 1024);
     assert_eq!((got.text.as_str(), got.truncated), ("", false));
+}
+
+// What tmux 3.4 says when the session, or the user's whole server, isn't
+// there, including while the server exits as its last session ends.
+#[test]
+fn tmux_s_ways_of_saying_nothing_is_there() {
+    for gone in [
+        "no server running on /tmp/tmux-1000/default",
+        "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+        "server exited unexpectedly",
+        "lost server",
+        "can't find session: work",
+        "no current target",
+    ] {
+        assert!(sessions::nothing_there(gone), "{gone:?}");
+    }
+    for other in [
+        "",
+        "open terminal failed: not a terminal",
+        "unknown command: x",
+    ] {
+        assert!(!sessions::nothing_there(other), "{other:?}");
+    }
 }
