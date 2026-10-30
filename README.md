@@ -68,3 +68,39 @@ RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
 ```
 
 To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`.
+
+## Use it from the laptop
+
+On the laptop, `runner` is a short sh script that runs each command on the host over SSH: `runner shell dev` is `ssh -t runner@kvm-host runner shell dev`. Nothing else goes on the laptop.
+
+```sh
+git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
+client/install.sh runner@kvm-host
+```
+
+It installs `runner` to `~/.local/bin` and saves the host to `~/.config/runner/host`; `RUNNER_HOST` overrides that. The host is anything `ssh` takes, so an alias from `~/.ssh/config` works. Arguments reach the host as typed, spaces and quotes included, and the host's exit code comes back. It asks for a terminal only when stdin is one, so `runner list | grep dev` and `echo hi | runner exec dev -- cat` work. Rerun `client/install.sh` after a `git pull` to upgrade.
+
+### MCP clients
+
+`runner mcp` is `ssh -T -o BatchMode=yes runner@kvm-host runner mcp`: no terminal, so stdout carries only JSON-RPC, and no prompts, so the SSH key has to load without one (from the agent, or with no passphrase).
+
+Claude Code, in every project:
+
+```sh
+claude mcp add --scope user runner -- runner mcp
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`) and Cursor (`~/.cursor/mcp.json`) take the same entry. They don't get your shell's PATH or `RUNNER_HOST`, so give the absolute path, which `client/install.sh` prints, and keep the host in `~/.config/runner/host`:
+
+```json
+{
+  "mcpServers": {
+    "runner": {
+      "command": "/Users/you/.local/bin/runner",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Restart the app after editing its config.
