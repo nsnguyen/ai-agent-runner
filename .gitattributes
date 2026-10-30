@@ -2,3 +2,5 @@
 .claude/temper/*.sh text eol=lf
 # Shell scripts must keep LF too, or bash chokes on \r.
 images/**/*.sh text eol=lf
+# Laptop client scripts too.
+client/* text eol=lf
