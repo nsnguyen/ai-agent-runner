@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use runner::creds::Cred;
+use runner::doctor::{self, System};
 use runner::store::{BASE, Config, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
@@ -65,6 +67,18 @@ enum Cmd {
         #[arg(long, env = "USER")]
         user: String,
     },
+    /// Show or set which credentials a VM gets at boot: claude, github.
+    /// A VM gets claude until told otherwise.
+    Creds {
+        name: String,
+        /// Give it exactly these from the next boot on.
+        creds: Vec<Cred>,
+        /// Give it none from the next boot on.
+        #[arg(long, conflicts_with = "creds")]
+        none: bool,
+    },
+    /// Check this host can run VMs: one line per check, failing if any fails.
+    Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
     /// Run a VM until it shuts down: the unit's main process.
@@ -136,6 +150,29 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             let exe = std::env::current_exe()?;
             let root = std::path::absolute(root)?;
             print!("{}", systemd::render_unit(&exe, &root, &user)?);
+        }
+        Cmd::Creds { name, creds, none } => {
+            let got = if none || !creds.is_empty() {
+                store.set_creds(&name, &creds)?
+            } else {
+                store.creds(&name)?
+            };
+            let names: Vec<_> = got.iter().map(|c| c.name()).collect();
+            let list = if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(" ")
+            };
+            println!("{name}  creds {list}");
+        }
+        Cmd::Doctor => {
+            let report = doctor::check(&System, &store);
+            report.lines().for_each(|l| println!("{l}"));
+            return Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
         }
         Cmd::Mcp => return Ok(serve(store)),
         Cmd::Boot { name, firecracker } => runner::boot::boot(&store, &name, &firecracker)?,

@@ -1,6 +1,7 @@
 // The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
+use crate::doctor::{self, Report, System};
 use crate::store::{BASE, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -118,6 +119,13 @@ impl Tools {
             .delete(&name)
             .map(Json)
             .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Check this host can run VMs: KVM, the pinned Firecracker, reflink under the VM root, the guest kernel, the base VM, NAT, and the systemd unit. `ok` is false if any check fails; warnings don't fail."
+    )]
+    fn doctor(&self) -> Result<Json<Report>, String> {
+        Ok(Json(doctor::check(&System, &self.store)))
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]

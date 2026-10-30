@@ -102,6 +102,7 @@ fn lists_its_tools() {
         [
             "create_vm",
             "delete_vm",
+            "doctor",
             "list_vms",
             "start_vm",
             "stop_vm",
@@ -205,4 +206,32 @@ fn create_vm_takes_sizes() {
     assert_eq!((machine.cpus, machine.mem_mib), (4, 8192));
     let bad = s.call(3, "create_vm", json!({"name": "huge", "cpus": 64}));
     assert_eq!(bad["isError"], json!(true), "{bad}");
+}
+
+#[test]
+fn doctor_reports_every_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = start(dir.path());
+    let got = s.call(2, "doctor", json!({}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    let report = &got["structuredContent"];
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    let all = [
+        "kvm",
+        "firecracker",
+        "reflink",
+        "kernel",
+        "base",
+        "nat",
+        "unit",
+    ];
+    assert_eq!(names, all, "{report}");
+    // No base VM in an empty root, so at least that one fails.
+    assert_eq!(report["checks"][4]["status"], json!("fail"), "{report}");
+    assert_eq!(report["ok"], json!(false), "{report}");
 }
