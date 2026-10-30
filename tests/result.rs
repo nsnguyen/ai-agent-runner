@@ -22,10 +22,18 @@ fn says(text: &str) -> AgentSays {
 #[test]
 fn the_json_shape_is_pinned() {
     let changed = Changed::Measured(Changes {
-        paths: vec![Change {
-            path: "/home/agent/work/main.rs".to_string(),
-            change: Kind::Modified,
-        }],
+        paths: vec![
+            Change {
+                path: "/home/agent/work/main.rs".to_string(),
+                change: Kind::Modified,
+                contains: None,
+            },
+            Change {
+                path: "/home/agent/work/target".to_string(),
+                change: Kind::Added,
+                contains: Some(812),
+            },
+        ],
         more: 4,
     });
     let got = result(changed, says("Fixed the bug."));
@@ -36,7 +44,10 @@ fn the_json_shape_is_pinned() {
         "from_generation": 2,
         "generation": 3,
         "changed": {
-            "paths": [{"path": "/home/agent/work/main.rs", "change": "modified"}],
+            "paths": [
+                {"path": "/home/agent/work/main.rs", "change": "modified"},
+                {"path": "/home/agent/work/target", "change": "added", "contains": 812}
+            ],
             "more": 4
         },
         "agent_says": {"untrusted": true, "text": "Fixed the bug.", "truncated": false}
@@ -109,6 +120,22 @@ fn without_a_result_the_agent_says_its_last_message() {
 }
 
 #[test]
+fn a_subagent_does_not_speak_for_the_agent() {
+    let sub = r#"{"type":"assistant","parent_tool_use_id":"t2","message":{"content":[{"type":"text","text":"Subagent here."}]}}"#;
+    let got = AgentSays::from_stream(format!("{STREAM}{sub}\n").as_bytes()).unwrap();
+    assert_eq!(got, says("Done: I fixed main.rs."));
+}
+
+// A line too long to hold, like a huge tool result, is skipped, not read in.
+#[test]
+fn an_overlong_line_is_skipped() {
+    let huge = format!("{{\"type\":\"user\",\"x\":\"{}\"}}", "x".repeat(5 << 20));
+    let end = r#"{"type":"result","result":"Done."}"#;
+    let got = AgentSays::from_stream(format!("{huge}\n{end}\n").as_bytes()).unwrap();
+    assert_eq!(got, says("Done."));
+}
+
+#[test]
 fn an_empty_stream_says_nothing() {
     assert_eq!(
         AgentSays::from_stream(&b""[..]).unwrap(),
@@ -125,4 +152,28 @@ fn a_long_message_is_cut_on_a_character_boundary() {
     assert!(text.len() <= AgentSays::CAP && text.len() > AgentSays::CAP - 3);
     assert!(long.starts_with(text));
     assert_eq!(json["truncated"], true);
+}
+
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // A log is the agent's output, so any bytes at all.
+        #[test]
+        fn any_stream_reads_without_error(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            prop_assert!(AgentSays::from_stream(&bytes[..]).is_ok());
+        }
+
+        #[test]
+        fn the_text_kept_is_a_capped_prefix(text in ".{0,64}", copies in 0usize..1200) {
+            let long = text.repeat(copies);
+            let got = AgentSays::new(Some(long.clone()));
+            let kept = got.text().unwrap();
+            prop_assert!(kept.len() <= AgentSays::CAP);
+            prop_assert!(long.starts_with(kept));
+            let json = serde_json::to_value(&got).unwrap();
+            prop_assert_eq!(json["truncated"].as_bool(), Some(kept.len() < long.len()));
+        }
+    }
 }

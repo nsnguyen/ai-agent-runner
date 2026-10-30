@@ -5,7 +5,10 @@ use crate::changes::{self, Changes};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
+
+// Longer than any final message worth quoting; a huge tool result, say.
+const MAX_LINE: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunResult {
@@ -70,11 +73,7 @@ impl AgentSays {
         let mut text = text;
         let mut truncated = false;
         if let Some(t) = text.as_mut().filter(|t| t.len() > Self::CAP) {
-            let mut end = Self::CAP;
-            while !t.is_char_boundary(end) {
-                end -= 1;
-            }
-            t.truncate(end);
+            t.truncate(t.floor_char_boundary(Self::CAP));
             truncated = true;
         }
         AgentSays {
@@ -86,14 +85,28 @@ impl AgentSays {
 
     /// From a run's `claude -p --output-format stream-json` log: the final
     /// `result` event's text, or for a run cut off before one, its last
-    /// assistant message. Lines that aren't JSON, like a torn last line, are
-    /// skipped.
-    pub fn from_stream(stream: impl BufRead) -> io::Result<Self> {
+    /// assistant message. A subagent's messages, lines that aren't JSON, like a
+    /// torn last line, and lines too long to hold are skipped.
+    pub fn from_stream(mut stream: impl BufRead) -> io::Result<Self> {
         let (mut result, mut message) = (None, None);
-        for line in stream.split(b'\n') {
-            let Ok(event) = serde_json::from_slice::<Value>(&line?) else {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = (&mut stream).take(MAX_LINE).read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            if n as u64 == MAX_LINE && line.last() != Some(&b'\n') {
+                stream.skip_until(b'\n')?;
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
+            // A subagent's events name the tool call that started it.
+            if !event["parent_tool_use_id"].is_null() {
+                continue;
+            }
             match event["type"].as_str() {
                 Some("result") => result = event["result"].as_str().map(str::to_string),
                 Some("assistant") => {
