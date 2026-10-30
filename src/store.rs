@@ -5,6 +5,7 @@
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
+use crate::changes::{self, Changes};
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -163,11 +164,13 @@ impl Store {
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_lock(&dir, name)?;
+        let from = current(&dir)?;
         let generation = next_generation(&dir)?;
         let disk = disk_of(&dir, generation);
-        clone(&disk_of(&dir, current(&dir)?), &disk)?;
+        clone(&disk_of(&dir, from), &disk)?;
         let name = name.to_string();
         Ok(Run {
+            from,
             generation,
             disk,
             name,
@@ -218,6 +221,8 @@ impl Store {
 
 #[derive(Debug)]
 pub struct Run {
+    /// The generation this run's disk was cloned from.
+    pub from: u64,
     pub generation: u64,
     pub disk: PathBuf,
     name: String,
@@ -226,6 +231,13 @@ pub struct Run {
 }
 
 impl Run {
+    /// What the run changed: its disk against the generation it was cloned
+    /// from, read from the disks, at most `cap` paths. Measure before
+    /// `commit`, which takes the run.
+    pub fn changes(&self, cap: usize) -> changes::Result<Changes> {
+        changes::between(&disk_of(&self.dir, self.from), &self.disk, cap)
+    }
+
     pub fn commit(self) -> Result<Vm> {
         let mut gens = history(&self.dir)?;
         gens.push(self.generation);
