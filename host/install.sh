@@ -24,9 +24,16 @@ octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 # Up to /30: each VM takes a /30 of it.
 cidr="^$octet\.$octet\.$octet\.$octet/(30|[12]?[0-9])$"
 [[ $net =~ $cidr ]] || die "RUNNER_NET=$net isn't an a.b.c.d/n range of /30 or wider"
+# The runner refuses a range with host bits set, so every create would fail.
+IFS=./ read -r a b c d len <<<"$net"
+addr=$(((a << 24) | (b << 16) | (c << 8) | d))
+mask=$(((0xffffffff << (32 - len)) & 0xffffffff))
+((addr == (addr & mask))) || die "RUNNER_NET=$net has host bits set"
 
 missing=()
 command -v nft >/dev/null || missing+=(nftables)
+# The runner adds VMs' taps with it, by this path.
+[[ -x /usr/sbin/ip ]] || missing+=(iproute2)
 command -v curl >/dev/null || missing+=(curl)
 command -v pkaction >/dev/null || missing+=(polkit)
 if ((${#missing[@]})); then
@@ -36,7 +43,8 @@ if ((${#missing[@]})); then
     # Debian and Ubuntu ship the polkit daemon as polkitd.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]/#polkit/polkitd}"
   elif command -v dnf >/dev/null; then
-    dnf install -y -q "${missing[@]}"
+    # Fedora calls it iproute.
+    dnf install -y -q "${missing[@]/#iproute2/iproute}"
   else
     die "install ${missing[*]} first: there's no apt-get or dnf here"
   fi

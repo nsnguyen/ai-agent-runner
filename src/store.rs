@@ -227,16 +227,13 @@ impl Store {
         for entry in fs::read_dir(&vms).map_err(at(&vms))? {
             let entry = entry.map_err(at(&vms))?;
             let name = entry.file_name();
-            let dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            // Following symlinks, as finding a VM does.
+            let dir = entry.path().is_dir();
             if !dir || name.to_str().is_some_and(|n| n.starts_with(".del-")) {
                 continue;
             }
-            match read_slot(&entry.path()) {
-                Ok(slot) => taken.extend(slot),
-                // Gone since the listing: a create renamed or a delete.
-                Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            // A VM deleted since the listing reads as no slot.
+            taken.extend(read_slot(&entry.path())?);
         }
         Ok(taken)
     }

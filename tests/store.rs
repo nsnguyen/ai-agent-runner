@@ -470,6 +470,20 @@ fn a_slot_that_can_t_be_read_stops_a_create_rather_than_be_reused() {
 }
 
 #[test]
+fn a_vm_whose_directory_is_a_symlink_keeps_its_slot() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    let real = dir.path().join("dev-elsewhere");
+    let vm = dir.path().join("root/vms/dev");
+    fs::rename(&vm, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &vm).unwrap();
+    assert_eq!(slot(&store, "dev"), 1);
+    store.fork("base", "more").unwrap();
+    assert_eq!(slot(&store, "more"), 2);
+}
+
+#[test]
 fn a_vm_made_before_slots_existed_gets_one_when_asked() {
     let (dir, store) = store();
     store.import("base", &disk(dir.path(), b"rootfs")).unwrap();

@@ -91,8 +91,7 @@ impl fmt::Display for Subnet {
 pub struct Net {
     /// Unique among live VMs; picks everything below.
     pub slot: u32,
-    /// The tap device on the host: fc and its /30 in hex. Unique to the
-    /// address, so another root's VMs in another range never share it.
+    /// The tap device on the host: fc and its /30 in hex.
     pub tap: String,
     /// The host's end of the tap, and the guest's gateway.
     pub gateway: Ipv4Addr,
@@ -144,7 +143,8 @@ pub fn dns(resolv_confs: &[&Path]) -> Vec<Ipv4Addr> {
 
 /// A VM's tap on the host, with the gateway address on it, removed when
 /// dropped. `runner boot` holds one while Firecracker runs. Making one needs
-/// CAP_NET_ADMIN, which the VM's unit has and the CLI user doesn't.
+/// CAP_NET_ADMIN, which the VM's unit has and the CLI user doesn't;
+/// Firecracker can open it without, so boot should drop it before then.
 #[derive(Debug)]
 pub struct Tap {
     name: String,
