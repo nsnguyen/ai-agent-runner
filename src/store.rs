@@ -222,7 +222,7 @@ pub struct Run {
     pub disk: PathBuf,
     name: String,
     dir: PathBuf,
-    _lock: File,
+    _lock: Lock,
 }
 
 impl Run {
@@ -236,7 +236,18 @@ impl Run {
 
 // flock, not a pid file: the kernel drops it when the holder dies, so a
 // crashed run never wedges its VM.
-fn take_lock(dir: &Path, name: &str) -> Result<File> {
+#[derive(Debug)]
+struct Lock(File);
+
+// Unlocked by hand, not left to close: a child another thread is spawning
+// shares the open file until it execs, and keeps the flock that long.
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn take_lock(dir: &Path, name: &str) -> Result<Lock> {
     let path = dir.join("lock");
     let file = OpenOptions::new()
         .create(true)
@@ -249,7 +260,7 @@ fn take_lock(dir: &Path, name: &str) -> Result<File> {
             _ => at(&path)(e),
         })?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Lock(file)),
         Err(TryLockError::WouldBlock) => Err(Error::Busy(name.to_string())),
         Err(TryLockError::Error(e)) => Err(at(&path)(e)),
     }
