@@ -13,7 +13,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Not a cloud buyer. It never signs up for or rents hosts; it runs on machines I give it.
 
 ## Autonomy
-- Merging: I merge. <!-- Or: "Claude may merge when every check passes." If so, also add an empty .claude/temper/allow-merge, or temper's guard blocks the merge. -->
+- Merging: Claude may merge when every check passes. forge's review task merges the build PRs it approves, so issues that depend on each other build one after another. The boot tests can't run in the cloud, so those PRs merge without a VM booted; run `cargo test --test kvm -- --ignored` on the KVM host at each milestone.
 - Deploys: previews only.
 
 ## Stack
