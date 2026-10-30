@@ -6,9 +6,21 @@
 #   client/install.sh runner@kvm-host
 set -eu
 
+# With CDPATH set, cd prints where it went, which would land in $here.
+unset CDPATH
 here=$(cd "$(dirname "$0")" && pwd -P)
 bin="$HOME/.local/bin"
 conf="$HOME/.config/runner"
+
+# runner refuses these, so don't save one.
+if [ $# -gt 0 ]; then
+  case $1 in
+  '' | -*)
+    echo "install.sh: '$1' isn't a host: give it as ssh takes it, like runner@kvm-host" >&2
+    exit 2
+    ;;
+  esac
+fi
 
 mkdir -p "$bin"
 cp "$here/runner" "$bin/runner.new"
@@ -33,7 +45,7 @@ esac
 cat <<CONFIG
 
 Claude Code:
-  claude mcp add --scope user runner -- runner mcp
+  claude mcp add --scope user runner -- $bin/runner mcp
 
 Claude Desktop (~/Library/Application Support/Claude/claude_desktop_config.json)
 and Cursor (~/.cursor/mcp.json):

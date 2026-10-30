@@ -116,8 +116,24 @@ exit "${HOST_EXIT:-0}"
     }
 }
 
-// Runs `cmd` with a terminal on stdin.
-fn on_a_terminal(cmd: &mut Command) -> Output {
+// Runs `cmd` as typed at a terminal: stdin and stdout on one, stderr captured.
+fn at_a_terminal(cmd: &mut Command) -> Output {
+    let OpenptyResult {
+        master: _master,
+        slave,
+    } = openpty(None, None).unwrap();
+    let stdout = slave.try_clone().unwrap();
+    cmd.stdin(Stdio::from(slave))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap()
+}
+
+// Runs `cmd` typed at a terminal with its output piped: `runner list | grep dev`.
+fn piped_from_a_terminal(cmd: &mut Command) -> Output {
     let OpenptyResult {
         master: _master,
         slave,
@@ -129,14 +145,26 @@ fn on_a_terminal(cmd: &mut Command) -> Output {
 fn a_command_typed_at_a_terminal_gets_a_tty() {
     for shell in SHELLS {
         let laptop = Laptop::new();
-        let out = on_a_terminal(&mut laptop.runner(shell, &["shell", "dev"]));
+        let out = at_a_terminal(&mut laptop.runner(shell, &["shell", "dev"]));
         ok(&out);
+        // LogLevel=ERROR drops ssh's "Connection to … closed." after each one.
         assert_eq!(
             laptop.ssh_argv(),
-            ["-t", HOST, "runner shell dev"],
+            ["-t", "-o", "LogLevel=ERROR", HOST, "runner shell dev"],
             "{shell:?}"
         );
         assert_eq!(laptop.host_argv(), ["shell", "dev"], "{shell:?}");
+    }
+}
+
+#[test]
+fn output_piped_from_a_terminal_gets_no_tty() {
+    // A tty would end lines in CRLF and mix stderr into what's piped.
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = piped_from_a_terminal(&mut laptop.runner(shell, &["list"]));
+        ok(&out);
+        assert_eq!(laptop.ssh_argv(), [HOST, "runner list"], "{shell:?}");
     }
 }
 
@@ -181,14 +209,14 @@ fn a_piped_command_gets_no_tty_and_its_stdin_passes_through() {
 fn mcp_never_gets_a_tty_or_a_prompt_and_prints_nothing_itself() {
     for shell in SHELLS {
         let laptop = Laptop::new();
-        // A terminal on stdin still gets -T: stdout is for JSON-RPC alone.
-        let out = on_a_terminal(&mut laptop.runner(shell, &["mcp"]));
+        let mcp = ["-T", "-o", "BatchMode=yes", HOST, "runner mcp"];
+        // Even at a terminal: stdout is for JSON-RPC alone.
+        ok(&at_a_terminal(&mut laptop.runner(shell, &["mcp"])));
+        assert_eq!(laptop.ssh_argv(), mcp, "{shell:?}");
+
+        let out = laptop.runner(shell, &["mcp"]).output().unwrap();
         ok(&out);
-        assert_eq!(
-            laptop.ssh_argv(),
-            ["-T", "-o", "BatchMode=yes", HOST, "runner mcp"],
-            "{shell:?}"
-        );
+        assert_eq!(laptop.ssh_argv(), mcp, "{shell:?}");
         assert_eq!(laptop.host_argv(), ["mcp"], "{shell:?}");
         assert_eq!(text(&out.stdout), "");
     }
@@ -313,12 +341,15 @@ proptest! {
 fn install_puts_runner_in_local_bin_and_saves_the_host() {
     for shell in SHELLS {
         let home = tempfile::tempdir().unwrap();
+        // Run as typed in the checkout, with a CDPATH that makes cd print.
         let install = |args: &[&str]| {
             Command::new(shell[0])
                 .args(&shell[1..])
-                .arg(client("install.sh"))
+                .arg("client/install.sh")
                 .args(args)
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .env("HOME", home.path())
+                .env("CDPATH", ".:/nowhere")
                 .output()
                 .unwrap()
         };
@@ -334,12 +365,21 @@ fn install_puts_runner_in_local_bin_and_saves_the_host() {
         assert_eq!(mode & 0o777, 0o755);
         let host = home.path().join(".config/runner/host");
         assert_eq!(fs::read_to_string(&host).unwrap(), format!("{HOST}\n"));
-        // The desktop apps' configs need the absolute path, so it says it.
+        // The apps don't get the shell's PATH, so it gives the absolute path.
         let said = text(&out.stdout);
-        assert!(said.contains(installed.to_str().unwrap()), "{said}");
+        let path = installed.to_str().unwrap();
+        assert!(said.contains(&format!("runner -- {path} mcp")), "{said}");
+        assert!(said.contains(&format!(r#""command": "{path}""#)), "{said}");
 
         // A rerun to upgrade keeps the host.
         ok(&install(&[]));
         assert_eq!(fs::read_to_string(&host).unwrap(), format!("{HOST}\n"));
+
+        // runner would refuse these, so install doesn't save them.
+        for bad in ["", "-oProxyCommand=touch pwned"] {
+            let out = install(&[bad]);
+            assert_eq!(out.status.code(), Some(2), "{bad:?}");
+            assert_eq!(fs::read_to_string(&host).unwrap(), format!("{HOST}\n"));
+        }
     }
 }
