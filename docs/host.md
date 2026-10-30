@@ -5,7 +5,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 ## How it works
 
 - `runner start dev` is `systemctl start firecracker@dev`. The unit runs `runner boot dev`, which takes the VM's lock, copies its current disk into a new generation, starts Firecracker with `api.sock` in the VM's directory, and configures the kernel, that disk, the sizes and a vsock through the API. Then it starts the guest and tells systemd it's ready, so `start` returns once the guest has started.
-- Before Firecracker, boot adds the VM's tap (`fc` and its /30 in hex), and removes it once Firecracker exits. The guest's address, gateway and the host's DNS servers go in the kernel's `ip=` argument; `runner ip dev` prints the address. The unit gives boot CAP_NET_ADMIN for the tap, and boot clears it before running Firecracker.
+- Before Firecracker, boot adds the VM's tap (`fc` and its /30 in hex), and removes it once Firecracker exits, before it lets go of the VM. A boot killed first leaves the tap, and the VM's next boot replaces it. The guest's address, gateway and the host's DNS servers go in the kernel's `ip=` argument; `runner ip dev` prints the address. The unit gives boot CAP_NET_ADMIN for the tap, and boot clears it before running Firecracker.
 - The serial console is Firecracker's stdout, so it lands in the unit's journal: `runner logs dev`.
 - `runner stop dev` is `systemctl stop`. The unit's ExecStop, `runner halt dev`, sends Ctrl-Alt-Del and waits for boot to let go of the lock. After 30 seconds, systemd kills the VM.
 - A clean shutdown (Firecracker exits 0) commits the new generation. A kill, a crash or a guest panic doesn't: the previous generation stays current, and the new disk stays for a look.
@@ -39,9 +39,10 @@ The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own roo
 They need KVM, so they're `#[ignore]`d and skipped everywhere else:
 
 ```
-sudo -E RUNNER_TEST_DISK=rootfs.ext4 RUNNER_TEST_KERNEL=vmlinux cargo test --test kvm -- --ignored
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
+RUNNER_TEST_DISK=rootfs.ext4 RUNNER_TEST_KERNEL=vmlinux cargo test --test kvm -- --ignored
 ```
 
-As root, since `runner boot` makes the VM's tap. `cargo test --test boot -- --ignored`, also as root, checks Firecracker doesn't inherit boot's CAP_NET_ADMIN.
+The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
 
 The rootfs's init must take Ctrl-Alt-Del (systemd does) and print a login prompt on the serial console.

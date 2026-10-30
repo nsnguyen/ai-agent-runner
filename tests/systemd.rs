@@ -42,9 +42,11 @@ TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 # For boot to add and remove the VM's tap, and nothing else. Boot clears it
-# before running Firecracker, which doesn't need it.
+# before running Firecracker, which doesn't need it, and no setuid program
+# gets it back.
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
 ";
     assert_eq!(unit, want);
 }

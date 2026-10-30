@@ -62,8 +62,10 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     let net = store.net(name)?;
     let run = store.begin_run(name)?;
     // Made under the VM's lock, and dropped, which removes it, before the
-    // lock goes.
-    let _tap = match Tap::add_with(ip, &net) {
+    // lock goes: halt returns once the lock is free, and systemd may kill
+    // this process right after. commit and discard let go of the lock, so
+    // the tap is dropped by hand before either.
+    let tap = match Tap::add_with(ip, &net) {
         Ok(tap) => tap,
         Err(e) => {
             run.discard();
@@ -100,9 +102,9 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
             let cleared = libc::prctl(
                 libc::PR_CAP_AMBIENT,
                 libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                0,
-                0,
-                0,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
             );
             if cleared == 0 {
                 Ok(())
@@ -132,6 +134,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         let _ = remove_sockets(&[&api_sock, &vsock]);
+        drop(tap);
         run.discard();
         return Err(e);
     }
@@ -147,6 +150,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
 
     let status = child.wait().map_err(io_err("waiting for firecracker"));
     let _ = remove_sockets(&[&api_sock, &vsock]);
+    drop(tap);
     let status = status?;
     if status.success() {
         let vm = run.commit()?;

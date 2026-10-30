@@ -34,13 +34,20 @@ impl Host {
         fs::write(root.join("kernel/vmlinux"), b"kernel").unwrap();
         let fc = FakeFirecracker::new(&dir.path().join("fc"));
         // An `ip` that logs what it's asked and fails a step named in ip.fail.
+        // Removing the tap, it notes whether dev is still held, as it must
+        // be: a halt that saw it free could let systemd kill boot first.
         let (log, fail) = (dir.path().join("ip.log"), dir.path().join("ip.fail"));
+        let (lock, held) = (root.join("vms/dev/lock"), dir.path().join("held"));
         script(
             &dir.path().join("ip"),
             &format!(
-                "echo \"$*\" >> '{}'\n[ \"$1 $2\" = \"$(cat '{}' 2>/dev/null)\" ] && \
+                "echo \"$*\" >> '{}'\n\
+                 [ \"$1 $2\" = 'link del' ] && {{ flock -n '{}' true && echo free || echo held; }} > '{}'\n\
+                 [ \"$1 $2\" = \"$(cat '{}' 2>/dev/null)\" ] && \
                  {{ echo 'RTNETLINK answers: Operation not permitted' >&2; exit 2; }}\nexit 0\n",
                 log.display(),
+                lock.display(),
+                held.display(),
                 fail.display()
             ),
         );
@@ -77,6 +84,12 @@ impl Host {
             .env("FAKE_FC", &self.fc.dir)
             .env("FAKE_FC_VERSION", firecracker::VERSION)
             .env("NOTIFY_SOCKET", self.dir.path().join("notify"))
+    }
+
+    /// Whether dev was still held when its tap was removed.
+    fn held_at_tap_removal(&self) -> String {
+        let held = fs::read_to_string(self.dir.path().join("held"));
+        held.expect("the tap wasn't removed").trim().to_string()
     }
 
     /// What `ip` was asked to do, one line per call.
@@ -159,7 +172,7 @@ fn boot_calls(root: &Path, kernel: &Path, cpus: u32, mem: u32) -> Vec<(String, V
 }
 
 #[test]
-fn the_tap_is_up_before_firecracker_starts_and_gone_after() {
+fn the_tap_is_up_while_the_vm_runs_and_goes_before_the_vm_is_let_go() {
     let h = Host::new();
     let net = h.store.net("dev").unwrap();
     let boot = h.boot("dev");
@@ -177,6 +190,7 @@ fn the_tap_is_up_before_firecracker_starts_and_gone_after() {
     assert!(finish(boot).status.success());
     assert_eq!(h.ip_calls().last().unwrap(), &format!("link del dev {tap}"));
     assert_eq!(h.ip_calls().len(), 5);
+    assert_eq!(h.held_at_tap_removal(), "held");
 }
 
 #[test]
@@ -300,6 +314,7 @@ fn a_crash_keeps_the_old_generation_current() {
     assert_eq!(h.ready(), "READY=1");
     h.fc.exit_with(1);
     let out = finish(boot);
+    assert_eq!(h.held_at_tap_removal(), "held");
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
     assert!(err.contains("exit status: 1"), "{err}");
@@ -322,6 +337,7 @@ fn an_api_fault_stops_the_boot_and_drops_its_disk() {
         }
     });
     let out = finish(boot);
+    assert_eq!(h.held_at_tap_removal(), "held");
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
     assert!(err.contains("The kernel file cannot be opened"), "{err}");
@@ -345,6 +361,7 @@ fn firecracker_dying_before_its_api_is_up_is_reported() {
     h.fc.argv();
     h.fc.exit_with(1);
     let out = finish(boot);
+    assert_eq!(h.held_at_tap_removal(), "held");
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
     assert!(err.contains("before its API"), "{err}");

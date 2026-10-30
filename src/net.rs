@@ -9,6 +9,7 @@ use rmcp::schemars;
 use serde::Serialize;
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -183,7 +184,9 @@ impl Tap {
 impl Drop for Tap {
     fn drop(&mut self) {
         if let Err(e) = run(&self.ip, &["link", "del", "dev", &self.name]) {
-            eprintln!("runner: {e}");
+            // Not eprintln: under the unit, stderr is the journal stream
+            // Firecracker made non-blocking, and a failed write would panic.
+            let _ = writeln!(io::stderr(), "runner: {e}");
         }
     }
 }
