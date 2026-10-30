@@ -4,6 +4,7 @@ use runner::creds::Cred;
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::proto::{Exit, Request};
+use runner::runs::{self, AgentRun};
 use runner::sessions::{self, Session};
 use runner::store::{BASE, Checkpoint, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
@@ -186,6 +187,45 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// Start Claude Code on a prompt in a VM, headless and detached, and
+    /// print the run's id at once. A stopped VM is booted for the run and
+    /// shut down after it: exit 0 commits what it wrote to its disk, and
+    /// anything else rolls that back. A running VM is joined as it is. One
+    /// run per VM at a time.
+    Run {
+        name: String,
+        /// What to ask Claude Code. It reaches claude on its stdin.
+        #[arg(allow_hyphen_values = true)]
+        prompt: String,
+        /// Where Claude Code runs. It has to exist.
+        #[arg(short, long, default_value = claude::DIR)]
+        dir: String,
+        /// Carry on this Claude Code session: the session_id in an earlier
+        /// run's init event.
+        #[arg(long)]
+        resume: Option<String>,
+        /// The user Claude Code runs as.
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
+    },
+    /// List a VM's runs, newest first: id, when it started, how it stands,
+    /// and its prompt.
+    Runs { name: String },
+    /// Print a run's stream-json, an event per line: what's there now, or
+    /// with --follow, all of it as it comes.
+    Output {
+        run: String,
+        /// Start this many bytes in: what earlier reads printed.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// Keep printing until the run ends, then say how on stderr.
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
+    /// booted rolls back and shuts down. Returns once the run has ended, or
+    /// after two minutes.
+    Cancel { run: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
@@ -206,6 +246,15 @@ enum Cmd {
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
     Halt { name: String },
+    /// Drive a run to its end: what `runner run` starts.
+    #[command(hide = true)]
+    Drive {
+        name: String,
+        n: u64,
+        /// The program a run starts in the VM.
+        #[arg(long, env = "RUNNER_CLAUDE", default_value = "claude")]
+        claude: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -357,6 +406,37 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             };
             println!("{name}  creds {}", names(&got));
         }
+        Cmd::Run {
+            name,
+            prompt,
+            dir,
+            resume,
+            user,
+        } => {
+            let start = runs::Start {
+                vm: &name,
+                prompt: &prompt,
+                dir: &dir,
+                resume: resume.as_deref(),
+                user: &user,
+            };
+            let run = runs::start(&store, &std::env::current_exe()?, &start)?;
+            println!("{}", run.id);
+        }
+        Cmd::Runs { name } => {
+            let all = runs::list(&store, &name)?;
+            if all.is_empty() {
+                println!("no runs yet");
+            }
+            all.iter().for_each(|r| println!("{}", run_row(r)));
+        }
+        Cmd::Output { run, from, follow } => {
+            let run = runs::output(&store, &run, from, follow, &mut std::io::stdout().lock())?;
+            if follow {
+                eprintln!("runner: {} {}", run.id, runs::describe(&run));
+            }
+        }
+        Cmd::Cancel { run } => println!("{}", run_row(&runs::cancel(&store, &run)?)),
         Cmd::Doctor => {
             let report = doctor::check(&System, &store);
             report.lines().for_each(|l| println!("{l}"));
@@ -383,6 +463,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             ip,
         } => runner::boot::boot(&store, &name, &firecracker, &ip)?,
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
+        Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -521,6 +602,12 @@ fn row(c: &Checkpoint) -> String {
         "{mark} {}  {time}  {kind}  {} bytes{comment}",
         c.id, c.bytes
     )
+}
+
+// The prompt is quoted, so one with a newline in it still takes one line.
+fn run_row(r: &AgentRun) -> String {
+    let started = r.started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    format!("{}  {started}  {}  {:?}", r.id, runs::describe(r), r.prompt)
 }
 
 fn session_row(s: &Session) -> String {

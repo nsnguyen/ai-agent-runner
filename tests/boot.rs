@@ -684,3 +684,40 @@ fn a_stale_handoff_record_is_cleared_at_boot() {
     h.fc.exit_with(0);
     assert!(finish(boot).status.success());
 }
+
+#[test]
+fn a_run_s_rollback_ask_keeps_a_clean_shutdown_from_committing() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    h.store.ask_rollback("dev", "run dev.4").unwrap();
+
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert!(out.status.success(), "{notes}");
+    // The generation it booted from stays current, and the run's is kept
+    // for a look.
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    assert!(h.vm_dir("dev").join("gens/1.ext4").is_file());
+    assert!(notes.contains("run dev.4 asked to roll back"), "{notes}");
+    assert!(
+        !h.vm_dir("dev").join("rollback").exists(),
+        "the ask was kept"
+    );
+}
+
+#[test]
+fn a_rollback_ask_no_boot_took_is_dropped_at_the_next_boot() {
+    let h = Host::new();
+    h.store.ask_rollback("dev", "run dev.1").unwrap();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}

@@ -1,7 +1,8 @@
 // The host's side of the guest protocol (src/proto.rs), under `runner exec`,
-// `runner shell` and MCP's exec. Each command is one connection to the VM's
-// runner-guest, through Firecracker's vsock socket: write `CONNECT <port>`,
-// and Firecracker answers `OK <n>` once a listener in the guest takes it.
+// `runner shell`, MCP's exec and headless runs. Each command is one
+// connection to the VM's runner-guest, through Firecracker's vsock socket:
+// write `CONNECT <port>`, and Firecracker answers `OK <n>` once a listener in
+// the guest takes it.
 //
 // Firecracker ends a connection both ways once the host closes its side,
 // even only for writing, so the host only does that to hang up.
@@ -44,6 +45,8 @@ const STALLED: Duration = Duration::from_millis(100);
 // After a timeout's kill, how long to wait for the exit: the guest's grace
 // before its own SIGKILL, its drain of the last output, and slack.
 const KILL_WAIT: Duration = Duration::from_secs(10);
+// How often `stream` asks whether to stop.
+const POLL: Duration = Duration::from_millis(100);
 // Without a stop, an Instant past this would overflow.
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -92,7 +95,8 @@ pub fn open_running(store: &Store, name: &str) -> Result<Option<UnixStream>> {
     reach(store, name).map(Some)
 }
 
-fn reach(store: &Store, name: &str) -> Result<UnixStream> {
+/// Connects to the VM's runner-guest, waiting for one that's booting.
+pub fn reach(store: &Store, name: &str) -> Result<UnixStream> {
     let sock = store.vsock(name)?;
     connect(&sock, proto::PORT, GUEST_WAIT).map_err(|e| match e {
         proto::Error::Io(last) => Error::NoGuest {
@@ -189,6 +193,50 @@ impl Drop for Cut {
     }
 }
 
+// A command under way on its connection, with its stdin fed and closed.
+struct Begun {
+    _cut: Cut,
+    writer: Writer,
+    /// The guest's frames, up to and including the first that isn't output.
+    frames: mpsc::Receiver<proto::Result<Option<FromGuest>>>,
+}
+
+// Sends `req`, then `stdin` and its close. Frames are read on their own
+// thread, so a deadline never lands partway through one, and stdin is fed on
+// its own thread too: a command that writes before it reads would otherwise
+// wait on this end forever.
+fn begin(conn: &UnixStream, req: &Request, stdin: &[u8]) -> Result<Begun> {
+    let cut = Cut(clone(conn)?);
+    let writer: Writer = Arc::new(Mutex::new(clone(conn)?));
+    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
+    let (tx, frames) = mpsc::channel();
+    let mut reader = clone(conn)?;
+    thread::spawn(move || {
+        loop {
+            let frame = proto::read_frame::<FromGuest>(&mut reader);
+            let output = matches!(frame, Ok(Some(FromGuest::Stdout(_) | FromGuest::Stderr(_))));
+            if tx.send(frame).is_err() || !output {
+                return;
+            }
+        }
+    });
+    let feeder = writer.clone();
+    let input = stdin.to_vec();
+    thread::spawn(move || {
+        for chunk in input.chunks(CHUNK) {
+            if send(&feeder, &ToGuest::Stdin(chunk.to_vec())).is_err() {
+                return;
+            }
+        }
+        let _ = send(&feeder, &ToGuest::CloseStdin);
+    });
+    Ok(Begun {
+        _cut: cut,
+        writer,
+        frames,
+    })
+}
+
 /// What a command did, as MCP's exec gives it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct Captured {
@@ -216,35 +264,11 @@ pub fn capture(
     timeout: Duration,
     cap: usize,
 ) -> Result<Captured> {
-    let _cut = Cut(clone(&conn)?);
-    let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
-    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
-    // Frames are read on their own thread, so the deadline never lands
-    // partway through one.
-    let (tx, rx) = mpsc::channel();
-    let mut reader = clone(&conn)?;
-    thread::spawn(move || {
-        loop {
-            let frame = proto::read_frame::<FromGuest>(&mut reader);
-            let output = matches!(frame, Ok(Some(FromGuest::Stdout(_) | FromGuest::Stderr(_))));
-            if tx.send(frame).is_err() || !output {
-                return;
-            }
-        }
-    });
-    // Fed on its own thread too: a command that writes before it reads
-    // would otherwise wait on this end forever.
-    let feeder = writer.clone();
-    let input = stdin.to_vec();
-    thread::spawn(move || {
-        for chunk in input.chunks(CHUNK) {
-            if send(&feeder, &ToGuest::Stdin(chunk.to_vec())).is_err() {
-                return;
-            }
-        }
-        let _ = send(&feeder, &ToGuest::CloseStdin);
-    });
-
+    let Begun {
+        _cut,
+        writer,
+        frames: rx,
+    } = begin(&conn, req, stdin)?;
     let (mut stdout, mut stderr) = (Kept::new(cap), Kept::new(cap));
     let mut deadline = Instant::now() + timeout.min(MAX_TIMEOUT);
     let mut timed_out = false;
@@ -285,6 +309,88 @@ pub fn capture(
         stderr: stderr.text(),
         stderr_truncated: stderr.cut,
         timed_out,
+    })
+}
+
+/// How a command `stream` ran ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Streamed {
+    /// None if the exit never came back, after a stop that had to hang up.
+    pub exit: Option<Exit>,
+    /// True if `stop` said to stop it.
+    pub stopped: bool,
+}
+
+/// Runs `req` on `conn` to its end, with `stdin` as its input, then closed.
+/// Its stdout goes to `out` and its stderr to `err` as they come. `stop` is
+/// asked every tenth of a second; once it says yes, the command's process group
+/// gets SIGTERM, and SIGKILL `grace` later.
+pub fn stream(
+    conn: UnixStream,
+    req: &Request,
+    stdin: &[u8],
+    out: &mut impl Write,
+    err: &mut impl Write,
+    stop: impl Fn() -> bool,
+    grace: Duration,
+) -> Result<Streamed> {
+    let Begun {
+        _cut,
+        writer,
+        frames: rx,
+    } = begin(&conn, req, stdin)?;
+    let write = |to: &mut dyn Write, b: &[u8]| {
+        to.write_all(b)
+            .and_then(|()| to.flush())
+            .map_err(io_err("writing the command's output"))
+    };
+    // When SIGTERM went, then when SIGKILL did.
+    let (mut termed, mut killed): (Option<Instant>, Option<Instant>) = (None, None);
+    let mut asked = Instant::now();
+    let exit = loop {
+        match rx.recv_timeout(POLL) {
+            Ok(Ok(Some(FromGuest::Stdout(b)))) => write(out, &b)?,
+            Ok(Ok(Some(FromGuest::Stderr(b)))) => write(err, &b)?,
+            Ok(Ok(Some(FromGuest::Exit(exit)))) => break Some(exit),
+            Ok(Ok(Some(FromGuest::Error(why)))) => return Err(Error::Guest(why)),
+            // A hang-up for the kill ends the connection before the exit.
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) if termed.is_some() => {
+                break None;
+            }
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::HungUp);
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if termed.is_none() && asked.elapsed() >= POLL {
+            asked = Instant::now();
+            if stop() {
+                termed = Some(Instant::now());
+                let sigterm = ToGuest::Signal(libc::SIGTERM);
+                if !matches!(send_unless_stalled(&writer, &sigterm), Some(Ok(()))) {
+                    let _ = conn.shutdown(Shutdown::Both);
+                    break None;
+                }
+            }
+        }
+        match (termed, killed) {
+            (Some(t), None) if t.elapsed() > grace => {
+                if !kill(&writer, &conn) {
+                    break None;
+                }
+                killed = Some(Instant::now());
+            }
+            (_, Some(k)) if k.elapsed() > KILL_WAIT => {
+                let _ = conn.shutdown(Shutdown::Both);
+                break None;
+            }
+            _ => {}
+        }
+    };
+    Ok(Streamed {
+        exit,
+        stopped: termed.is_some(),
     })
 }
 

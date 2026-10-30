@@ -1,9 +1,11 @@
 // The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
+use crate::claude;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::proto::Request;
+use crate::runs::{self, AgentRun, Events};
 use crate::sessions::{self, Pane, Session};
 use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
@@ -109,6 +111,40 @@ pub struct ReadArgs {
     session: String,
     /// How many of the pane's last lines: 1 to 2000, default 100.
     lines: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RunAgentArgs {
+    /// The VM's name. A stopped VM is booted for the run and shut down after it.
+    name: String,
+    /// What to ask Claude Code.
+    prompt: String,
+    /// Where in the VM Claude Code runs; it has to exist. Defaults to /home/agent/work.
+    dir: Option<String>,
+    /// A Claude Code session to carry on: the session_id in an earlier run's init event.
+    resume: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RunArg {
+    /// The run's id, from run_agent or list_runs, like dev.1.
+    run: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RunOutputArgs {
+    /// The run's id, from run_agent or list_runs, like dev.1.
+    run: String,
+    /// Where to read from: 0, the default, or the cursor the last reply gave.
+    cursor: Option<u64>,
+    /// How long to wait for an event while there's nothing new: 45 seconds,
+    /// the default and the most.
+    wait_secs: Option<u64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RunList {
+    runs: Vec<AgentRun>,
 }
 
 // Named here, or clients see the SDK's own name.
@@ -294,6 +330,63 @@ impl Tools {
         let session = args.session.clone();
         blocking(move || sessions::kill(&store, &args.name, &user, &args.session)).await?;
         Ok(Json(Killed { killed: session }))
+    }
+
+    #[tool(
+        description = "Start Claude Code in a VM on a prompt, headless (`claude -p`, stream-json) and detached, and return the run at once; read it with run_output. A stopped VM is booted for the run and shut down after it: exit 0 commits what the run wrote to the disk, and anything else rolls it back. A running VM is joined as it is, with nothing committed or rolled back. One run per VM at a time. Claude Code runs as the agent user, with its permission prompts skipped: the VM is the sandbox."
+    )]
+    async fn run_agent(
+        &self,
+        Parameters(args): Parameters<RunAgentArgs>,
+    ) -> Result<Json<AgentRun>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        blocking(move || {
+            let exe = std::env::current_exe().map_err(|e| format!("finding runner: {e}"))?;
+            let start = runs::Start {
+                vm: &args.name,
+                prompt: &args.prompt,
+                dir: args.dir.as_deref().unwrap_or(claude::DIR),
+                resume: args.resume.as_deref(),
+                user: &user,
+            };
+            runs::start(&store, &exe, &start).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read a run's stream-json events from `cursor`: 0 at first, then the cursor each reply gives. The reply has the run too. While it goes on with nothing new to read, this waits up to 45 seconds for an event. A reply holds up to 64 KiB of events and says if there's `more`; an event bigger than that comes as {\"runner_cut\": true, \"bytes\": n}. The run is over once its state isn't running: read on until `more` is false."
+    )]
+    async fn run_output(
+        &self,
+        Parameters(args): Parameters<RunOutputArgs>,
+    ) -> Result<Json<Events>, String> {
+        let store = self.store.clone();
+        let cursor = args.cursor.unwrap_or(0);
+        let wait = args.wait_secs.map_or(runs::MAX_WAIT, Duration::from_secs);
+        blocking(move || runs::events(&store, &args.run, cursor, wait)).await
+    }
+
+    #[tool(
+        description = "Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run booted rolls back and shuts down. Returns the run once it has ended, or as it stands after two minutes. Fails for a run that's already over."
+    )]
+    async fn cancel_run(
+        &self,
+        Parameters(RunArg { run }): Parameters<RunArg>,
+    ) -> Result<Json<AgentRun>, String> {
+        let store = self.store.clone();
+        blocking(move || runs::cancel(&store, &run)).await
+    }
+
+    #[tool(
+        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and for a run that booted the VM, its outcome, committed or rolled_back."
+    )]
+    fn list_runs(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<RunList>, String> {
+        let runs = runs::list(&self.store, &name).map_err(|e| e.to_string())?;
+        Ok(Json(RunList { runs }))
     }
 
     #[tool(
