@@ -163,7 +163,8 @@ fn start_status_and_stop_through_systemd() {
     let sd = FakeSystemd::new(dir.path());
 
     let mut s = start_with_path(dir.path(), &sd.path());
-    let base = |state: &str| json!({"name": "base", "generation": 0, "bytes": 6, "state": state});
+    let address = Store::new(dir.path()).net("base").unwrap().address;
+    let base = |state: &str| json!({"name": "base", "generation": 0, "bytes": 6, "address": address, "state": state});
     let got = s.call(2, "vm_status", json!({"name": "base"}));
     assert_eq!(got["structuredContent"], base("stopped"), "{got}");
     let got = s.call(3, "start_vm", json!({"name": "base"}));

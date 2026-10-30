@@ -41,6 +41,10 @@ TimeoutStopSec=30
 # The serial console.
 StandardOutput=journal
 StandardError=journal
+# For boot to add and remove the VM's tap, and nothing else. Boot clears it
+# before running Firecracker, which doesn't need it.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 ";
     assert_eq!(unit, want);
 }

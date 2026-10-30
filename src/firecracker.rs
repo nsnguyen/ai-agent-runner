@@ -1,6 +1,7 @@
 // Firecracker, driven through its API socket: HTTP/1.1 over a Unix socket,
 // one request per connection. The calls and bodies are the ones in the
 // pinned release's src/firecracker/swagger/firecracker.yaml.
+use crate::net::Net;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -60,6 +61,10 @@ pub struct Guest<'a> {
     pub cpus: u32,
     pub mem_mib: u32,
     pub vsock: &'a Path,
+    /// The tap its eth0 is on, and its MAC.
+    pub net: &'a Net,
+    /// Its address, gateway and DNS, as the kernel's `ip=` argument.
+    pub ip_arg: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +79,8 @@ impl Api {
 
     /// Everything a guest needs before it can start.
     pub fn configure(&self, guest: &Guest) -> Result<()> {
-        let boot = json!({"kernel_image_path": guest.kernel, "boot_args": BOOT_ARGS});
+        let args = format!("{BOOT_ARGS} {}", guest.ip_arg);
+        let boot = json!({"kernel_image_path": guest.kernel, "boot_args": args});
         self.put("/boot-source", &boot)?;
         let rootfs = json!({
             "drive_id": "rootfs",
@@ -86,7 +92,13 @@ impl Api {
         let machine = json!({"vcpu_count": guest.cpus, "mem_size_mib": guest.mem_mib});
         self.put("/machine-config", &machine)?;
         let vsock = json!({"guest_cid": GUEST_CID, "uds_path": guest.vsock});
-        self.put("/vsock", &vsock)
+        self.put("/vsock", &vsock)?;
+        let eth0 = json!({
+            "iface_id": "eth0",
+            "host_dev_name": guest.net.tap,
+            "guest_mac": guest.net.mac,
+        });
+        self.put("/network-interfaces/eth0", &eth0)
     }
 
     pub fn start(&self) -> Result<()> {

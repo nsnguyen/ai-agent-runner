@@ -89,6 +89,8 @@ enum Cmd {
         name: String,
         #[arg(long, env = "RUNNER_FIRECRACKER", default_value = "firecracker")]
         firecracker: PathBuf,
+        #[arg(long, env = "RUNNER_IP", default_value = runner::host::IP)]
+        ip: PathBuf,
     },
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
@@ -178,7 +180,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             });
         }
         Cmd::Mcp => return Ok(serve(store)),
-        Cmd::Boot { name, firecracker } => runner::boot::boot(&store, &name, &firecracker)?,
+        Cmd::Boot {
+            name,
+            firecracker,
+            ip,
+        } => runner::boot::boot(&store, &name, &firecracker, &ip)?,
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
     }
     Ok(ExitCode::SUCCESS)
