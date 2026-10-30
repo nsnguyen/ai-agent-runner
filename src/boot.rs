@@ -122,7 +122,13 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
         .arg(&api_sock)
         .args(["--id", name])
         .stdin(run.hold()?)
-        .env_remove("NOTIFY_SOCKET");
+        .env_remove("NOTIFY_SOCKET")
+        // Nor does it get a credential: it's what a guest would break into
+        // first, and the host's may include ones this VM isn't given.
+        .env_remove("CREDENTIALS_DIRECTORY");
+    for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
+        fc.env_remove(var);
+    }
     // The unit gives this process CAP_NET_ADMIN for the tap. Firecracker
     // opens the tap without it, and a guest that broke into Firecracker
     // could use it to undo the host's NAT rules, so it doesn't inherit it.
@@ -163,7 +169,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     if let Err(e) = started {
         let _ = child.kill();
         let _ = child.wait();
-        offer.end();
+        drop(offer);
         let _ = remove_sockets(&sockets);
         drop(tap);
         run.discard();
@@ -180,7 +186,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     }
 
     let status = child.wait().map_err(io_err("waiting for firecracker"));
-    offer.end();
+    // Before the clear, so a handoff in flight can't note after it.
+    drop(offer);
     let _ = remove_sockets(&sockets);
     if let Err(e) = handed.clear() {
         note(format_args!("{e}"));
@@ -227,19 +234,24 @@ fn credentials(store: &Store, name: &str) -> Result<Keyring> {
 // Hands the guest its keyring each time it asks, for as long as the VM
 // runs, and notes which credentials went. Only the runner user can connect,
 // and it can read the credentials anyway; Firecracker connects for the guest.
+// Dropping it stops it and removes its socket, whichever way boot returns.
 struct Offer {
     sock: PathBuf,
     stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Offer {
     fn start(name: &str, sock: &Path, keyring: Keyring, handed: Handed) -> Result<Offer> {
         let what = || format!("offering credentials on {}", sock.display());
         let listener = UnixListener::bind(sock).map_err(io_err(what()))?;
+        let mut offer = Offer {
+            sock: sock.to_path_buf(),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
         fs::set_permissions(sock, Permissions::from_mode(0o600)).map_err(io_err(what()))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let stopped = offer.stop.clone();
         let name = name.to_string();
         let serve = move || {
             let creds = keyring.creds();
@@ -247,34 +259,41 @@ impl Offer {
                 if stopped.load(Ordering::SeqCst) {
                     return;
                 }
+                // Written, not yet read: the guest's own log says if it
+                // couldn't take them.
                 let sent = conn.and_then(|mut conn| {
                     conn.set_write_timeout(Some(HANDOFF_WAIT))?;
                     keyring.send(&mut conn)
                 });
                 let sent = sent.map_err(io_err("handing over credentials"));
                 match sent.and_then(|()| Ok(handed.record(&creds)?)) {
-                    Ok(()) => note(format_args!("{name}'s guest took {}", names(&creds))),
-                    Err(e) => note(format_args!("{name}'s guest: {e}")),
+                    Ok(()) => note(format_args!("handed {name}'s guest {}", names(&creds))),
+                    Err(e) => {
+                        note(format_args!("{name}'s guest: {e}"));
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
         };
         let thread = std::thread::Builder::new()
             .spawn(serve)
             .map_err(io_err("starting a thread"))?;
-        Ok(Offer {
-            sock: sock.to_path_buf(),
-            stop,
-            thread,
-        })
+        offer.thread = Some(thread);
+        Ok(offer)
     }
+}
 
+impl Drop for Offer {
     // Waits out a handoff in flight, so its note can't land after the boot
     // clears it. A connection of its own wakes the thread.
-    fn end(self) {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if UnixStream::connect(&self.sock).is_ok() {
-            let _ = self.thread.join();
+        if let Some(thread) = self.thread.take()
+            && UnixStream::connect(&self.sock).is_ok()
+        {
+            let _ = thread.join();
         }
+        let _ = fs::remove_file(&self.sock);
     }
 }
 

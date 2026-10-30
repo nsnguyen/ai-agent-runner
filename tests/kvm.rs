@@ -337,37 +337,43 @@ fn the_token_reaches_the_vm_s_memory_and_never_its_disk() {
     );
     assert!(!err.contains(&token), "boot's journal holds the token");
 
-    // Every disk the VM has, the one its run just committed included.
+    // Every disk the VM booted from, and its console, which the unit sends
+    // to the host's journal. The imported one never ran.
     let mut held = Vec::new();
     for entry in std::fs::read_dir(root.join("vms/dev/gens")).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "ext4") && holds(&path, token.as_bytes()) {
+        let ran = path.extension().is_some_and(|e| e == "ext4") && !path.ends_with("0.ext4");
+        if ran && holds(&path, &token) {
             held.push(path.display().to_string());
         }
     }
+    if holds(&console, &token) {
+        held.push(console.display().to_string());
+    }
     assert!(
         held.is_empty(),
-        "the token is on {held:?}; claude said {claude:?}"
+        "the token is in {held:?}; claude said {claude:?}"
     );
 }
 
-// Reads the whole file, holes included, a chunk at a time.
-fn holds(path: &Path, needle: &[u8]) -> bool {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).unwrap();
-    let mut buf = vec![0; 8 << 20];
-    let mut carry: Vec<u8> = Vec::new();
-    loop {
-        let n = file.read(&mut buf).unwrap();
-        if n == 0 {
-            return false;
-        }
-        carry.extend_from_slice(&buf[..n]);
-        if carry.windows(needle.len()).any(|w| w == needle) {
-            return true;
-        }
-        let keep = carry.len().saturating_sub(needle.len() - 1);
-        carry.drain(..keep);
+// GNU grep, which skips a sparse disk's holes and is far faster than a scan
+// here. -z splits records at NULs, so a disk of zeros isn't one huge line;
+// a token holds none. It goes in on stdin, not argv, where `ps` shows it.
+fn holds(path: &Path, token: &str) -> bool {
+    use std::io::Write;
+    let mut grep = Command::new("grep")
+        .args(["-F", "-a", "-z", "-q", "-f", "-", "--"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = grep.stdin.take().unwrap();
+    stdin.write_all(token.as_bytes()).unwrap();
+    drop(stdin);
+    match grep.wait().unwrap().code() {
+        Some(0) => true,
+        Some(1) => false,
+        code => panic!("grep {} exited {code:?}", path.display()),
     }
 }
 

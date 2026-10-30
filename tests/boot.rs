@@ -564,7 +564,7 @@ fn the_guest_is_handed_what_the_allowlist_names_each_time_it_asks() {
     let sock = h.vm_dir("dev").join(format!("vsock.sock_{}", creds::PORT));
     assert!(!sock.exists(), "credentials socket left behind");
     let said = format!("{}{}", text(&out.stdout), text(&out.stderr));
-    assert!(said.contains("dev's guest took claude"), "{said}");
+    assert!(said.contains("handed dev's guest claude"), "{said}");
     assert!(!said.contains(TOKEN), "a value in the journal: {said}");
 }
 
@@ -645,6 +645,31 @@ fn a_credential_the_host_lacks_is_named_and_the_vm_boots_anyway() {
             && err.contains("/etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"),
         "{err}"
     );
+}
+
+// Firecracker is what a guest would break into first, so it holds no
+// credential, even one the VM's allowlist leaves out.
+#[test]
+fn firecracker_gets_no_credentials() {
+    let h = Host::new();
+    let dir = h.dir.path().join("credentials");
+    fs::create_dir(&dir).unwrap();
+    let env = [
+        ("CREDENTIALS_DIRECTORY", dir.to_str().unwrap()),
+        ("CLAUDE_CODE_OAUTH_TOKEN", TOKEN),
+        ("ANTHROPIC_API_KEY", "sk-ant-api-fake"),
+        ("GH_TOKEN", "ghp-fake"),
+    ];
+    let boot = h.boot_with("dev", &env);
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    let seen = fs::read_to_string(h.fc.dir.join("env")).unwrap();
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+    for (var, _) in env {
+        let set = seen.lines().any(|l| l.starts_with(&format!("{var}=")));
+        assert!(!set, "firecracker has {var}");
+    }
 }
 
 // Left by a boot that was killed: its record goes before the guest can ask.

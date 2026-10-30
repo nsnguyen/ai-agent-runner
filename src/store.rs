@@ -7,7 +7,7 @@
 //   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
-//   <root>/vms/<name>/vsock.sock_10023  where its guest takes its credentials, while the VM runs
+//   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT), while it runs
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
