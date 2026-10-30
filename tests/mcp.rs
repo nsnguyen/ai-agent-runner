@@ -203,6 +203,6 @@ fn create_vm_takes_sizes() {
     assert_eq!(made["isError"], json!(false), "{made}");
     let machine = store.machine("big").unwrap();
     assert_eq!((machine.cpus, machine.mem_mib), (4, 8192));
-    let bad = s.call(3, "create_vm", json!({"name": "odd", "cpus": 3}));
+    let bad = s.call(3, "create_vm", json!({"name": "huge", "cpus": 64}));
     assert_eq!(bad["isError"], json!(true), "{bad}");
 }

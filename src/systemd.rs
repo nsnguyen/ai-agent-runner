@@ -170,9 +170,11 @@ Description=Firecracker microVM %i
 RequiresMountsFor={root}
 
 [Service]
-# Ready once the guest is started; until then the VM is booting.
+# Ready once the guest is started; until then the VM is booting. Booting
+# copies the disk, which takes minutes for a big one without reflink.
 Type=notify
 NotifyAccess=main
+TimeoutStartSec=600
 User={user}
 SupplementaryGroups=kvm
 Environment=RUNNER_ROOT={root}

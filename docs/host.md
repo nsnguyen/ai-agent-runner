@@ -8,6 +8,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 - The serial console is Firecracker's stdout, so it lands in the unit's journal: `runner logs dev`.
 - `runner stop dev` is `systemctl stop`. The unit's ExecStop, `runner halt dev`, sends Ctrl-Alt-Del and waits for boot to let go of the lock. After 30 seconds, systemd kills the VM.
 - A clean shutdown (Firecracker exits 0) commits the new generation. A kill, a crash or a guest panic doesn't: the previous generation stays current, and the new disk stays for a look.
+- Inside the guest, shut down with `reboot`, not `poweroff`. On x86 Firecracker has no power-off, so after `poweroff` the guest halts but Firecracker keeps running: the VM looks running until a stop kills it, and the run isn't committed.
 - `delete` and `undo` refuse a running VM, because boot holds its lock.
 - VMs get 2 vCPUs and 2 GiB unless `runner create --cpus --mem` says otherwise, and the host's kernel at `<root>/kernel/vmlinux` unless `--kernel` names one. A fork keeps its parent's.
 
@@ -28,6 +29,8 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 4. That user in the `kvm` and `systemd-journal` groups, and allowed to start and stop `firecracker@*` units: a polkit rule, which #14 adds.
 
 Then: `runner import base rootfs.ext4 && runner create dev && runner start dev && runner logs dev`.
+
+The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own root, but systemd boots the one in the unit's.
 
 ## Boot tests
 

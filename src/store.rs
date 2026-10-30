@@ -85,11 +85,9 @@ impl Config {
     fn check(&self) -> Result<()> {
         let bad = |why: String| Err(Error::BadConfig(why));
         if let Some(n) = self.cpus
-            && !(n == 1 || (n % 2 == 0 && (2..=32).contains(&n)))
+            && !(1..=32).contains(&n)
         {
-            return bad(format!(
-                "a VM takes 1 or an even number of vCPUs, up to 32, not {n}"
-            ));
+            return bad(format!("a VM takes 1 to 32 vCPUs, not {n}"));
         }
         if let Some(mib) = self.mem_mib
             && mib < 128
@@ -364,6 +362,11 @@ pub struct Run {
 
 impl Run {
     pub fn commit(self) -> Result<Vm> {
+        // Firecracker leaves the guest's writes in the page cache, and history
+        // mustn't point at a disk a power cut could tear.
+        File::open(&self.disk)
+            .and_then(|f| f.sync_all())
+            .map_err(at(&self.disk))?;
         let mut gens = history(&self.dir)?;
         gens.push(self.generation);
         write_history(&self.dir, &gens)?;
@@ -376,6 +379,12 @@ impl Run {
         if let Err(e) = fs::remove_file(&self.disk) {
             eprintln!("runner: couldn't remove {}: {e}", self.disk.display());
         }
+    }
+
+    /// The run's lock again, for the process that runs the VM to hold too:
+    /// the VM stays held until both have exited.
+    pub fn hold(&self) -> Result<File> {
+        self._lock.try_clone().map_err(at(&self.dir.join("lock")))
     }
 
     pub fn api_socket(&self) -> PathBuf {

@@ -97,6 +97,10 @@ fn start_logs_and_stop_under_systemd() {
             env_path("RUNNER_TEST_DISK").to_str().unwrap(),
         ],
     ));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
 
     let started = runner(&root, &["start", &name]);
     let status = ok(runner(&root, &["status", &name]));
@@ -113,5 +117,17 @@ fn start_logs_and_stop_under_systemd() {
     assert!(status.ends_with("  stopped\n"), "{status}");
     // Stopped cleanly, so the run was committed.
     assert!(status.contains("  gen 1  "), "{status}\n{}", logs());
-    ok(runner(&root, &["delete", &name]));
+}
+
+// A failed test still leaves the host's VMs as it found them.
+struct Cleanup {
+    root: PathBuf,
+    name: String,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        runner(&self.root, &["stop", &self.name]);
+        runner(&self.root, &["delete", &self.name]);
+    }
 }

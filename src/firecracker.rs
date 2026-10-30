@@ -14,9 +14,11 @@ pub const VERSION: &str = include_str!("../host/firecracker-version").trim_ascii
 
 /// The guest's kernel command line; Firecracker adds the root disk to it.
 /// The console is on serial, so it lands in the unit's journal. The i8042
-/// flags skip slow probing but keep the keyboard that carries Ctrl-Alt-Del.
-/// There's no `panic=`: a panicked guest hangs instead of rebooting, so
-/// Firecracker never exits 0 for it and its run isn't committed.
+/// flags skip slow probing but keep the keyboard that carries Ctrl-Alt-Del,
+/// and `reboot=k` resets through it, which is how Firecracker learns the
+/// guest is done. There's no `panic=`: a panicked guest hangs instead of
+/// rebooting, so unless the guest sets kernel.panic itself, Firecracker
+/// doesn't exit 0 for it and its run isn't committed.
 pub const BOOT_ARGS: &str =
     "console=ttyS0 reboot=k pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd";
 

@@ -265,11 +265,7 @@ fn sizes_firecracker_would_refuse_are_refused_at_create() {
             ..Config::default()
         },
         Config {
-            cpus: Some(3),
-            ..Config::default()
-        },
-        Config {
-            cpus: Some(34),
+            cpus: Some(33),
             ..Config::default()
         },
         Config {
@@ -293,7 +289,8 @@ fn sizes_firecracker_would_refuse_are_refused_at_create() {
         );
     }
     assert!(matches!(store.get("x"), Err(Error::NoVm(_))));
-    for cpus in [1, 2, 4, 32] {
+    // Odd counts are fine: only SMT, which runner never turns on, needs even ones.
+    for cpus in [1, 2, 3, 32] {
         let config = Config {
             cpus: Some(cpus),
             ..Config::default()

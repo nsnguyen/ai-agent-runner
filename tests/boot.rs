@@ -230,6 +230,13 @@ fn an_api_fault_stops_the_boot_and_drops_its_disk() {
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
     assert!(err.contains("The kernel file cannot be opened"), "{err}");
+    h.notify
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        h.notify.recv(&mut [0; 64]).is_err(),
+        "READY for a failed boot"
+    );
     // The guest never ran, so its copy of the disk is gone.
     assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
     assert_eq!(h.store.get("dev").unwrap().generation, 0);
@@ -336,4 +343,53 @@ fn ready_waits_for_the_guest_to_start() {
     assert_eq!(h.ready(), "READY=1");
     h.fc.exit_with(0);
     assert!(finish(boot).status.success());
+}
+
+#[test]
+fn firecracker_holds_the_vm_even_if_boot_dies() {
+    let h = Host::new();
+    let mut boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    // What a `runner boot` killed outside systemd leaves: a guest still running.
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+    assert!(matches!(h.store.delete("dev"), Err(Error::Busy(_))));
+    assert!(matches!(h.store.undo("dev"), Err(Error::Busy(_))));
+    h.fc.exit_with(0);
+    // Once it's gone the VM is free, with nobody left to commit the run.
+    wait_for("firecracker to let go", || {
+        !matches!(h.store.undo("dev"), Err(Error::Busy(_)))
+    });
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+}
+
+#[test]
+fn halt_waits_even_when_ctrl_alt_del_fails() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let fault = json!({"fault_message": "The keyboard buffer is full"}).to_string();
+    let _api = h.serve("dev", move |req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            (400, Some(fault.clone()))
+        } else {
+            (204, None)
+        }
+    });
+    assert_eq!(h.ready(), "READY=1");
+    let mut halt = h
+        .runner(&["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Still waiting: the guest may be shutting down anyway, and the unit's
+    // stop timeout is what ends the wait.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(halt.try_wait().unwrap().is_none(), "halt gave up at once");
+    h.fc.exit_with(0);
+    let out = halt.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("The keyboard buffer is full"));
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
 }

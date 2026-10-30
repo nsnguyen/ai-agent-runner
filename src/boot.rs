@@ -7,10 +7,10 @@
 use crate::firecracker::{self, Api, Guest};
 use crate::store::{self, Store};
 use crate::systemd;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 // Firecracker binds its socket within milliseconds.
@@ -62,11 +62,14 @@ pub fn boot(store: &Store, name: &str, bin: &Path) -> Result<()> {
     let vsock = run.vsock();
     // Firecracker binds both, and won't over a file a crashed one left.
     remove_sockets(&[&api_sock, &vsock])?;
+    // Firecracker's stdin is the lock, so the VM stays held while the guest
+    // runs even if this process dies. It reads stdin only from a tty or a
+    // fifo, so it never touches the file.
     let mut child = Command::new(bin)
         .arg("--api-sock")
         .arg(&api_sock)
         .args(["--id", name])
-        .stdin(Stdio::null())
+        .stdin(run.hold()?)
         .env_remove("NOTIFY_SOCKET")
         .spawn()
         .map_err(io_err(format!("running {}", bin.display())))?;
@@ -89,11 +92,14 @@ pub fn boot(store: &Store, name: &str, bin: &Path) -> Result<()> {
         run.discard();
         return Err(e);
     }
-    eprintln!("runner: {name} is running generation {}", run.generation);
+    note(format_args!(
+        "{name} is running generation {}",
+        run.generation
+    ));
     // Without systemd there's no one to tell, and with it a failure here
     // shows up as a start that times out.
     if let Err(e) = systemd::notify_ready() {
-        eprintln!("runner: couldn't tell systemd {name} is up: {e}");
+        note(format_args!("couldn't tell systemd {name} is up: {e}"));
     }
 
     let status = child.wait().map_err(io_err("waiting for firecracker"));
@@ -101,10 +107,10 @@ pub fn boot(store: &Store, name: &str, bin: &Path) -> Result<()> {
     let status = status?;
     if status.success() {
         let vm = run.commit()?;
-        eprintln!(
-            "runner: {name} shut down cleanly; generation {} is current",
+        note(format_args!(
+            "{name} shut down cleanly; generation {} is current",
             vm.generation
-        );
+        ));
         return Ok(());
     }
     Err(Error::Crashed {
@@ -120,13 +126,22 @@ pub fn boot(store: &Store, name: &str, bin: &Path) -> Result<()> {
 pub fn halt(store: &Store, name: &str) -> Result<()> {
     let sock = store.api_socket(name)?;
     match Api::new(&sock).ctrl_alt_del() {
-        Ok(()) => eprintln!("runner: sent Ctrl-Alt-Del to {name}"),
+        Ok(()) => note(format_args!("sent Ctrl-Alt-Del to {name}")),
         // Firecracker is gone already; boot may still be committing.
         Err(firecracker::Error::NotListening(_)) => {}
-        Err(e) => return Err(e.into()),
+        // The guest may be on its way down anyway, so the wait goes on, and
+        // the stop timeout ends it if not.
+        Err(e) => note(format_args!("{e}")),
     }
     store.wait_idle(name)?;
     Ok(())
+}
+
+// Firecracker makes its stdout non-blocking, and under the unit that's the
+// same journal stream as stderr, where eprintln! would panic on EAGAIN. A
+// note lost to a stalled journal is better than a boot that dies mid-commit.
+fn note(msg: std::fmt::Arguments) {
+    let _ = writeln!(io::stderr(), "runner: {msg}");
 }
 
 fn wait_for_api(child: &mut Child, sock: &Path) -> Result<()> {

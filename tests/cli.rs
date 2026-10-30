@@ -204,7 +204,7 @@ fn create_stores_sizes_and_a_fork_keeps_them() {
     assert!(!vms.join("dev/config.json").exists());
 
     for (args, want) in [
-        (&["create", "x", "--cpus", "3"][..], "1 or an even number"),
+        (&["create", "x", "--cpus", "33"][..], "1 to 32 vCPUs"),
         (&["create", "x", "--mem", "lots"], "isn't a memory size"),
         (
             &["create", "x", "--kernel", "/no/such/vmlinux"],
