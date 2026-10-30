@@ -1,0 +1,51 @@
+#!/bin/sh
+# runner on the laptop: every command runs on the KVM host over SSH
+# (docs/design.md). The host is anything ssh takes, like runner@kvm-host or an
+# alias in ~/.ssh/config: RUNNER_HOST, else the first line of
+# ~/.config/runner/host. POSIX sh only, since macOS's /bin/sh runs it.
+
+host=${RUNNER_HOST-}
+if [ -z "$host" ] && [ -r "$HOME/.config/runner/host" ]; then
+  read -r host <"$HOME/.config/runner/host"
+fi
+case $host in
+'' | -*)
+  echo "runner: no host. Set RUNNER_HOST, or put it in ~/.config/runner/host (client/install.sh <host> does)." >&2
+  exit 2
+  ;;
+esac
+
+# ssh hands the remote shell one string, so each argument is quoted for it:
+# bare when it's only safe characters, else in single quotes, with ' as '\''.
+q="'"
+cmd=runner
+for arg; do
+  case $arg in
+  '' | *[![:alnum:]@%+=:,./_-]*)
+    quoted=
+    while :; do
+      case $arg in
+      *"$q"*)
+        head=${arg%%"$q"*}
+        arg=${arg#*"$q"}
+        quoted=$quoted$head$q\\$q$q
+        ;;
+      *) break ;;
+      esac
+    done
+    arg=$q$quoted$arg$q
+    ;;
+  esac
+  cmd="$cmd $arg"
+done
+
+if [ "${1-}" = mcp ]; then
+  # No terminal, so stdout carries only JSON-RPC, and no prompt to hang the client.
+  exec ssh -T -o BatchMode=yes "$host" "$cmd"
+elif [ -t 0 ] && [ -t 1 ]; then
+  # A tty only when typed at one: piped output would get CRLF and stderr mixed in.
+  # LogLevel=ERROR drops ssh's "Connection to … closed." after every command.
+  exec ssh -t -o LogLevel=ERROR "$host" "$cmd"
+else
+  exec ssh "$host" "$cmd"
+fi
