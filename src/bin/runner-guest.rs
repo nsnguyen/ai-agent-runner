@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     let served = match args.unix {
         Some(path) => UnixListener::bind(path).map(|l| guest::serve(l.incoming())),
         None => VsockListener::bind_with_cid_port(VMADDR_CID_ANY, proto::PORT)
-            .map(|l| guest::serve(l.incoming())),
+            .map(|l| guest::serve(std::iter::repeat_with(|| guest::accept_vsock(&l)))),
     };
     match served {
         Ok(()) => ExitCode::SUCCESS,

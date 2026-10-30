@@ -3,33 +3,41 @@
 // as any user, for the host (src/proto.rs has the protocol).
 //
 // Each connection has a thread that waits for the command, one per output
-// stream that forwards it, and one that applies the host's frames.
+// stream that forwards it, one that applies the host's frames, and one that
+// writes stdin.
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::fcntl::OFlag;
+use nix::poll::{PollFd, PollFlags, poll};
 use nix::pty;
-use nix::sys::stat::Mode;
+use nix::sys::socket::{SockFlag, accept4};
+use nix::sys::stat::{Mode, fchmod};
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
-use nix::unistd::{Pid, User, geteuid, getgrouplist};
+use nix::unistd::{Gid, Pid, Uid, User, fchown, geteuid, getgrouplist};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Commands start with this PATH, as under systemd.
 pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-/// After the command exits, its output is done once it closes or goes quiet
-/// this long, so a background process left holding it can't keep the
-/// request open.
+// After the command exits, its output is done once it closes, goes quiet for
+// QUIET ms, or DRAIN has passed, so a background process left holding it
+// can't keep the request open.
 const QUIET: u16 = 100;
+const DRAIN: Duration = Duration::from_secs(1);
+// Stdin queued for a command that isn't reading it. Past this, the host's
+// frames wait, but its hang-up still lands.
+const MAX_QUEUED: usize = 1 << 20;
 
 /// A connection from the host: vsock in a VM, a Unix socket in tests.
 pub trait Conn: Read + Write + AsFd + Send + Sized + 'static {
@@ -56,17 +64,22 @@ impl Conn for vsock::VsockStream {
     }
 }
 
+/// Accepts with close-on-exec set at once. The vsock crate sets it after
+/// accepting, when a command starting on another thread could inherit the
+/// connection.
+pub fn accept_vsock(listener: &vsock::VsockListener) -> io::Result<vsock::VsockStream> {
+    let fd = accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC)?;
+    // SAFETY: accept4 just made this fd, and nothing else owns it.
+    Ok(unsafe { vsock::VsockStream::from_raw_fd(fd) })
+}
+
 /// Serves each connection on its own thread, for as long as they come.
 pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>) {
     for conn in conns {
-        match conn {
-            Ok(conn) => {
-                thread::spawn(move || handle(conn));
-            }
-            Err(e) => {
-                eprintln!("runner-guest: accept: {e}");
-                thread::sleep(Duration::from_millis(100));
-            }
+        let served = conn.and_then(|conn| thread::Builder::new().spawn(move || handle(conn)));
+        if let Err(e) = served {
+            eprintln!("runner-guest: accept: {e}");
+            thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -97,6 +110,7 @@ fn session<C: Conn>(conn: &mut C) -> proto::Result<()> {
     };
     let input = {
         let group = group.clone();
+        let stdin = Feed::new(stdin);
         thread::spawn(move || take_input(host, stdin, pty, &group))
     };
     // The scope joins the pumps, so all output is sent before the exit.
@@ -169,7 +183,8 @@ fn start(req: &Request) -> Result<Running, String> {
             .filter(|home| home.is_dir())
             .unwrap_or_else(|| "/".into()),
     };
-    cmd.current_dir(cwd);
+    // Entered in the child as the user, so root's access doesn't leak.
+    let dir = CString::new(cwd.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let ids = match &user {
         Some(u) if u.uid != geteuid() => Some(Ids::of(u)?),
         _ => None,
@@ -178,6 +193,9 @@ fn start(req: &Request) -> Result<Running, String> {
     let master = match req.tty {
         Some(size) => {
             let (master, slave) = open_pty(size).map_err(|e| format!("opening a pty: {e}"))?;
+            if let Some(ids) = &ids {
+                hand_over(&slave, ids).map_err(|e| format!("handing over the pty: {e}"))?;
+            }
             let dup = |fd: &OwnedFd| fd.try_clone().map_err(|e| e.to_string());
             cmd.stdin(dup(&slave)?).stdout(dup(&slave)?).stderr(slave);
             let dup = |f: &File| f.try_clone().map_err(|e| e.to_string());
@@ -194,14 +212,15 @@ fn start(req: &Request) -> Result<Running, String> {
     };
     let tty = master.is_some();
     // SAFETY: in_child makes only async-signal-safe calls.
-    unsafe { cmd.pre_exec(move || in_child(tty, ids.as_ref())) };
+    unsafe { cmd.pre_exec(move || in_child(tty, ids.as_ref(), &dir)) };
     let spawned = cmd.spawn();
     // Drops the slave ends it holds, so the PTY closes when the command does.
     drop(cmd);
-    let mut child = spawned.map_err(|e| format!("couldn't run {program}: {e}"))?;
+    let in_dir = cwd.display();
+    let mut child = spawned.map_err(|e| format!("couldn't run {program} in {in_dir}: {e}"))?;
     let group = Arc::new(Group {
         pgid: child.id() as libc::pid_t,
-        exited: Mutex::new(false),
+        exited: Mutex::new(None),
     });
 
     let (stdin, pty, outputs) = match master {
@@ -221,10 +240,6 @@ fn start(req: &Request) -> Result<Running, String> {
             (stdin, None, outputs)
         }
     };
-    // Blocking writes would still work, only without noticing a hang-up.
-    if let Err(e) = nonblocking(&stdin) {
-        eprintln!("runner-guest: stdin: {e}");
-    }
     Ok(Running {
         child,
         group,
@@ -256,12 +271,12 @@ impl Ids {
 }
 
 // Runs in the child between fork and exec, so it makes raw syscalls only.
-fn in_child(tty: bool, ids: Option<&Ids>) -> io::Result<()> {
+fn in_child(tty: bool, ids: Option<&Ids>, dir: &CString) -> io::Result<()> {
     let check = |r: libc::c_int| match r {
         -1 => Err(io::Error::last_os_error()),
         _ => Ok(()),
     };
-    // SAFETY: plain syscalls; groups outlives the call.
+    // SAFETY: plain syscalls; groups and dir outlive the call.
     unsafe {
         if tty {
             // A new session, with the PTY on stdin as its controlling terminal.
@@ -273,6 +288,7 @@ fn in_child(tty: bool, ids: Option<&Ids>) -> io::Result<()> {
             check(libc::setgid(ids.gid))?;
             check(libc::setuid(ids.uid))?;
         }
+        check(libc::chdir(dir.as_ptr()))?;
     }
     Ok(())
 }
@@ -290,6 +306,17 @@ fn open_pty(size: WinSize) -> nix::Result<(File, OwnedFd)> {
     Ok((master, slave))
 }
 
+// Gives the PTY to the user it runs as, group tty, as sshd does: programs
+// that reopen it by name need to.
+fn hand_over(slave: &OwnedFd, ids: &Ids) -> nix::Result<()> {
+    let (gid, mode) = match nix::unistd::Group::from_name("tty")? {
+        Some(tty) => (tty.gid, 0o620),
+        None => (Gid::from_raw(ids.gid), 0o600),
+    };
+    fchown(slave, Some(Uid::from_raw(ids.uid)), Some(gid))?;
+    fchmod(slave, Mode::from_bits_truncate(mode))
+}
+
 // The kernel signals SIGWINCH to the PTY's foreground process group.
 fn resize(pty: &File, size: WinSize) -> nix::Result<()> {
     let ws = libc::winsize {
@@ -302,28 +329,23 @@ fn resize(pty: &File, size: WinSize) -> nix::Result<()> {
     Errno::result(unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &ws) }).map(drop)
 }
 
-fn nonblocking(file: &File) -> nix::Result<()> {
-    let flags = OFlag::from_bits_retain(fcntl(file, FcntlArg::F_GETFL)?);
-    fcntl(file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(drop)
-}
-
 // The command's process group. Signals reach the whole group until the
 // command is reaped, and never after, so a reused pid can't get one.
 struct Group {
     pgid: libc::pid_t,
-    exited: Mutex<bool>,
+    exited: Mutex<Option<Instant>>,
 }
 
 impl Group {
     fn signal(&self, sig: i32) {
         let exited = self.exited.lock().unwrap();
-        if !*exited {
+        if exited.is_none() {
             // SAFETY: kill takes no pointers. A bad signal number is EINVAL.
             unsafe { libc::kill(-self.pgid, sig) };
         }
     }
 
-    fn has_exited(&self) -> bool {
+    fn exited(&self) -> Option<Instant> {
         *self.exited.lock().unwrap()
     }
 }
@@ -337,7 +359,7 @@ fn reap(child: &mut Child, group: &Group) -> io::Result<ExitStatus> {
             r => break r,
         }
     };
-    *group.exited.lock().unwrap() = true;
+    *group.exited.lock().unwrap() = Some(Instant::now());
     waited?;
     child.wait()
 }
@@ -349,10 +371,13 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
     loop {
         // Checked before the wait, so the last wait starts after the exit and
         // still catches output on its way through the PTY.
-        let exited = group.has_exited();
+        let exited = group.exited();
+        if exited.is_some_and(|at| at.elapsed() > DRAIN) {
+            return;
+        }
         let mut fds = [PollFd::new(src.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, QUIET) {
-            Ok(0) if exited => return,
+            Ok(0) if exited.is_some() => return,
             Ok(0) | Err(Errno::EINTR) => continue,
             Ok(_) => {}
             Err(e) => return eprintln!("runner-guest: output: {e}"),
@@ -364,11 +389,7 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
                     return;
                 }
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             // A PTY whose command has gone reads EIO.
             Err(_) => return,
         }
@@ -377,22 +398,13 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
 
 // Applies the host's frames until it hangs up, which hangs up the command,
 // as closing a terminal does.
-fn take_input<C: Conn>(mut host: C, stdin: File, pty: Option<File>, group: &Group) {
-    let mut stdin = Some(stdin);
-    loop {
+fn take_input<C: Conn>(mut host: C, mut stdin: Feed, pty: Option<File>, group: &Group) {
+    while stdin.wait_for_room(host.as_fd()) {
         match proto::read_frame::<ToGuest>(&mut host) {
-            Ok(Some(ToGuest::Stdin(data))) => {
-                let Some(file) = &mut stdin else { continue };
-                match feed(file, &data, host.as_fd()) {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    // The command closed its stdin.
-                    Err(_) => stdin = None,
-                }
-            }
+            Ok(Some(ToGuest::Stdin(data))) => stdin.push(data),
             Ok(Some(ToGuest::CloseStdin)) => {
                 if pty.is_none() {
-                    stdin = None;
+                    stdin.close();
                 }
             }
             Ok(Some(ToGuest::Resize(size))) => {
@@ -411,30 +423,58 @@ fn take_input<C: Conn>(mut host: C, stdin: File, pty: Option<File>, group: &Grou
     group.signal(libc::SIGHUP);
 }
 
-// Writes all of data to the command's stdin. A command that stops reading
-// holds up the host's later frames, but not its hang-up: false means the
-// host hung up first.
-fn feed(stdin: &mut File, mut data: &[u8], host: BorrowedFd) -> io::Result<bool> {
-    while !data.is_empty() {
-        match stdin.write(data) {
-            Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut fds = [
-                    PollFd::new(stdin.as_fd(), PollFlags::POLLOUT),
-                    PollFd::new(host, PollFlags::from_bits_retain(libc::POLLRDHUP)),
-                ];
-                match poll(&mut fds, PollTimeout::NONE) {
-                    Ok(_) | Err(Errno::EINTR) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                // nix doesn't know RDHUP's bit, so it reads as None, not true.
-                if fds[1].any() != Some(false) {
-                    return Ok(false);
-                }
+// The command's stdin, written from a queue on its own thread, so the host's
+// signals and resizes don't wait behind input the command hasn't read.
+struct Feed {
+    tx: Option<mpsc::Sender<Vec<u8>>>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Feed {
+    fn new(mut stdin: File) -> Feed {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let left = queued.clone();
+        // Not joined: it can wait on a command that never reads until the
+        // command exits. Dropping the sender closes stdin once the queue is
+        // written.
+        thread::spawn(move || {
+            let mut open = true;
+            for chunk in rx {
+                // A command that closed its stdin takes no more.
+                open = open && stdin.write_all(&chunk).is_ok();
+                left.fetch_sub(chunk.len(), Ordering::Relaxed);
             }
-            Err(e) => return Err(e),
+        });
+        Feed {
+            tx: Some(tx),
+            queued,
         }
     }
-    Ok(true)
+
+    fn push(&self, data: Vec<u8>) {
+        if let Some(tx) = &self.tx {
+            self.queued.fetch_add(data.len(), Ordering::Relaxed);
+            let _ = tx.send(data);
+        }
+    }
+
+    fn close(&mut self) {
+        self.tx = None;
+    }
+
+    // Past the cap, waits for the command to read, but not past a hang-up:
+    // false means the host hung up.
+    fn wait_for_room(&self, host: BorrowedFd) -> bool {
+        // nix doesn't know RDHUP's bit, so it reads as None, not true.
+        let rdhup = PollFlags::from_bits_retain(libc::POLLRDHUP);
+        while self.queued.load(Ordering::Relaxed) > MAX_QUEUED {
+            let mut fds = [PollFd::new(host, rdhup)];
+            let _ = poll(&mut fds, QUIET);
+            if fds[0].any() != Some(false) {
+                return false;
+            }
+        }
+        true
+    }
 }

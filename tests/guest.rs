@@ -29,9 +29,10 @@ fn guest() -> Guest {
         .env("GUEST_ONLY", "leaked")
         .spawn()
         .unwrap();
+    // bind makes the file before listen, so wait for a connect to work.
     let start = Instant::now();
-    while !sock.exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "no socket");
+    while UnixStream::connect(&sock).is_err() {
+        assert!(start.elapsed() < Duration::from_secs(10), "not listening");
         std::thread::sleep(Duration::from_millis(10));
     }
     Guest { child, sock, dir }
@@ -207,10 +208,13 @@ fn the_host_can_signal_the_command() {
 #[test]
 fn a_signal_reaches_the_command_s_children() {
     let g = guest();
-    let mut s = g.start(sh("sleep 30 & echo ready; wait"));
-    s.wait_for_stdout("ready");
+    let file = g.dir.path().join("pid");
+    let script = format!("sleep 30 & echo $! >{}; echo ready; wait", file.display());
+    let mut s = g.start(sh(&script));
+    let child = pid_of(&mut s, &file);
     s.send(&ToGuest::Signal(9));
     assert_eq!(s.exit(), Exit::Signal(9));
+    assert!(gone_soon(child), "{child} still running");
 }
 
 #[test]
@@ -246,6 +250,16 @@ fn exit_doesn_t_wait_for_a_background_process() {
 }
 
 #[test]
+fn exit_doesn_t_wait_for_a_chatty_background_process() {
+    let g = guest();
+    let start = Instant::now();
+    let mut s = g.start(sh("(while :; do echo x; sleep 0.05; done) & echo started"));
+    assert_eq!(s.exit(), Exit::Code(0));
+    assert!(text(&s.stdout).starts_with("started\n"));
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
 fn a_command_that_can_t_start_is_an_error() {
     let g = guest();
     let mut s = g.start(cmd(&["no-such-command"]));
@@ -268,12 +282,19 @@ fn an_unknown_user_is_an_error() {
     );
 }
 
-// Switching users needs root, which the agent has in a VM. Skipped, and
-// says so, anywhere else.
+// Switching users needs root, which the agent has in a VM. Tests that do
+// are skipped, and say so, anywhere else.
+fn root() -> bool {
+    let root = nix::unistd::geteuid().is_root();
+    if !root {
+        eprintln!("skipped: needs root");
+    }
+    root
+}
+
 #[test]
 fn runs_as_the_named_user_in_their_home() {
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("skipped: needs root");
+    if !root() {
         return;
     }
     let g = guest();
@@ -365,7 +386,18 @@ fn a_hang_up_hangs_up_the_command() {
     assert!(gone_soon(pid), "{pid} still running");
 }
 
-// More stdin than the pipe holds, for a command that never reads it.
+// Stdin the command never reads, more than a pipe holds.
+#[test]
+fn a_signal_lands_while_stdin_is_backed_up() {
+    let g = guest();
+    let mut s = g.start(cmd(&["sleep", "30"]));
+    s.send(&ToGuest::Stdin(vec![b'x'; 300_000]));
+    s.send(&ToGuest::Signal(15));
+    assert_eq!(s.exit(), Exit::Signal(15));
+}
+
+// Past what the agent queues, it stops reading frames, but still hears
+// the host hang up.
 #[test]
 fn a_hang_up_lands_while_stdin_is_backed_up() {
     let g = guest();
@@ -375,10 +407,59 @@ fn a_hang_up_lands_while_stdin_is_backed_up() {
         file.display()
     )));
     let pid = pid_of(&mut s, &file);
-    s.send(&ToGuest::Stdin(vec![b'x'; 100_000]));
-    s.send(&ToGuest::Signal(15));
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!gone(pid), "the signal jumped the backed-up stdin");
+    let mut conn = s.conn.try_clone().unwrap();
+    let flood = std::thread::spawn(move || {
+        for _ in 0..64 {
+            let chunk = ToGuest::Stdin(vec![b'x'; 64 * 1024]);
+            if proto::write_frame(&mut conn, &chunk).is_err() {
+                return;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!gone(pid), "{pid} died before the hang-up");
+    s.conn.shutdown(std::net::Shutdown::Both).unwrap();
     drop(s);
+    flood.join().unwrap();
     assert!(gone_soon(pid), "{pid} still running");
+}
+
+// Programs that reopen the terminal by name, like ssh-agent's pinentry.
+#[test]
+fn a_pty_belongs_to_the_user_it_runs_as() {
+    if !root() {
+        return;
+    }
+    let g = guest();
+    let req = Request {
+        user: Some("nobody".into()),
+        ..with_tty(
+            sh(r#"exec 3<>"$(tty)" && stat -c '%U %a' "$(tty)""#),
+            24,
+            80,
+        )
+    };
+    assert_eq!(g.run(req, &[]).0, "nobody 620\r\n");
+}
+
+// The directory is entered as the user, not as root.
+#[test]
+fn a_directory_the_user_can_t_enter_is_an_error() {
+    if !root() {
+        return;
+    }
+    let g = guest();
+    let private = g.dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    let mode = std::os::unix::fs::PermissionsExt::from_mode(0o700);
+    std::fs::set_permissions(&private, mode).unwrap();
+    let mut s = g.start(Request {
+        user: Some("nobody".into()),
+        cwd: Some(private.to_str().unwrap().into()),
+        ..cmd(&["pwd"])
+    });
+    match s.next_end() {
+        FromGuest::Error(e) => assert!(e.contains("Permission denied"), "{e}"),
+        other => panic!("wanted an error, got {other:?}"),
+    }
 }

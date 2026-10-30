@@ -7,6 +7,10 @@
 //   host         Request, then any ToGuest frames
 //   guest        FromGuest frames, ending with Exit or Error
 //
+// The host keeps its side open until Exit. Closing it, even only for
+// writing, hangs up the command (SIGHUP to its process group), as closing a
+// terminal does. CloseStdin is how stdin ends.
+//
 // After the hello, every message is a frame: a u32 big-endian length, then
 // that many bytes of postcard. A peer whose hello doesn't match is refused
 // before any frame, so a host and guest built apart say so instead of
@@ -16,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-/// The guest agent's vsock port: 22, ssh's port, in place of sshd.
+/// The guest agent's vsock port. 10022 echoes ssh's 22, since it replaces sshd.
 pub const PORT: u32 = 10022;
 pub const VERSION: u32 = 1;
 /// Starts every hello, so a wrong port or a stray peer fails fast.
@@ -84,7 +88,7 @@ pub enum FromGuest {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(Exit),
-    /// The command couldn't start, and why.
+    /// Why the command couldn't start, or couldn't be waited for.
     Error(String),
 }
 
