@@ -10,7 +10,9 @@ const UNIT: &str = "etc/systemd/system/runner-guest.service";
 const WANTS: &str = "etc/systemd/system/multi-user.target.wants/runner-guest.service";
 
 fn script(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("images/base").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("images/base")
+        .join(name)
 }
 
 fn text(b: &[u8]) -> String {
@@ -26,7 +28,11 @@ fn clean_tree() -> TempDir {
     fs::create_dir_all(guest.parent().unwrap()).unwrap();
     fs::write(&guest, b"guest").unwrap();
     fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).unwrap();
-    symlink("/home/agent/.local/bin/claude", root.join("usr/local/bin/claude")).unwrap();
+    symlink(
+        "/home/agent/.local/bin/claude",
+        root.join("usr/local/bin/claude"),
+    )
+    .unwrap();
     fs::create_dir_all(root.join(WANTS).parent().unwrap()).unwrap();
     fs::write(root.join(UNIT), b"[Service]\n").unwrap();
     symlink("/etc/systemd/system/runner-guest.service", root.join(WANTS)).unwrap();
@@ -58,6 +64,11 @@ fn check(tree: &Path) -> Output {
         .unwrap()
 }
 
+fn passes(out: &Output) {
+    let all = text(&out.stdout) + &text(&out.stderr);
+    assert!(out.status.success(), "check failed:\n{all}");
+}
+
 fn fails_mentioning(out: &Output, what: &str) {
     let all = text(&out.stdout) + &text(&out.stderr);
     assert!(!out.status.success(), "check passed:\n{all}");
@@ -67,8 +78,7 @@ fn fails_mentioning(out: &Output, what: &str) {
 #[test]
 fn check_passes_a_clean_image() {
     let tree = clean_tree();
-    let out = check(tree.path());
-    assert!(out.status.success(), "{}{}", text(&out.stdout), text(&out.stderr));
+    passes(&check(tree.path()));
 }
 
 #[test]
@@ -105,8 +115,7 @@ fn check_fails_on_claude_state_in_roots_home() {
 fn check_allows_an_empty_claude_dir() {
     let tree = clean_tree();
     fs::create_dir_all(tree.path().join("root/.claude")).unwrap();
-    let out = check(tree.path());
-    assert!(out.status.success(), "{}{}", text(&out.stdout), text(&out.stderr));
+    passes(&check(tree.path()));
 }
 
 /// Boots the built image in Firecracker: run on the KVM host with
@@ -114,7 +123,7 @@ fn check_allows_an_empty_claude_dir() {
 /// firecracker on PATH, and RUNNER_GUEST_PORT.
 #[test]
 #[ignore = "boots a VM: needs /dev/kvm, firecracker and a built images/base/out"]
-fn base_boots_with_the_guest_agent_and_claude() {
+fn base_boots_and_runner_guest_accepts_on_vsock() {
     let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("images/base/out");
     let out = Command::new("bash")
         .arg(script("boot-test.sh"))
