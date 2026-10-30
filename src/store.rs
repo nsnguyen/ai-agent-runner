@@ -11,6 +11,8 @@
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
+//   <root>/vms/<name>/rollback       a run's ask that its boot not commit, naming the run
+//   <root>/vms/<name>/runs/          its headless runs: their streams and how each ended (runs.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
@@ -436,6 +438,27 @@ impl Store {
         file.lock().map_err(at(&path))
     }
 
+    /// Whether something holds the VM now: a boot, or a command changing it.
+    pub fn held(&self, name: &str) -> Result<bool> {
+        match take_lock(&self.existing(name)?, name) {
+            Ok(_lock) => Ok(false),
+            Err(Error::Busy(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Where the VM's headless runs keep their records (runs.rs).
+    pub fn runs(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.existing(name)?.join("runs"))
+    }
+
+    /// Asks the boot running the VM to roll back, not commit, however its
+    /// guest shuts down: how a run that failed ends. `by` names who asked,
+    /// for boot's note. The next boot drops an ask no boot took.
+    pub fn ask_rollback(&self, name: &str, by: &str) -> Result<()> {
+        write_aside(&self.existing(name)?, ROLLBACK, &format!("{by}\n"))
+    }
+
     pub fn list(&self) -> Result<Vec<Vm>> {
         let vms = self.vms();
         let entries = match fs::read_dir(&vms) {
@@ -464,6 +487,8 @@ impl Store {
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_lock(&dir, name)?;
+        // An ask for an earlier boot that never took it isn't this run's.
+        remove_if_there(&dir.join(ROLLBACK))?;
         let from = current(&dir)?;
         let generation = next_generation(&dir)?;
         let disk = disk_of(&dir, generation);
@@ -667,6 +692,18 @@ impl Run {
         }
     }
 
+    /// Who asked for this run to roll back (Store::ask_rollback), if anyone
+    /// did. Taking it clears the ask.
+    pub fn take_rollback(&self) -> Result<Option<String>> {
+        let path = self.dir.join(ROLLBACK);
+        let by = match fs::read_to_string(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r.map_err(at(&path))?,
+        };
+        remove_if_there(&path)?;
+        Ok(Some(by.trim().to_string()))
+    }
+
     /// The run's lock again, for the process that runs the VM to hold too:
     /// the VM stays held until both have exited.
     pub fn hold(&self) -> Result<File> {
@@ -698,6 +735,7 @@ impl Run {
 }
 
 const HANDED: &str = "handed";
+const ROLLBACK: &str = "rollback";
 
 /// A boot's note of which credentials its guest took, for `runner status`,
 /// which runs in another process. Names only.
@@ -713,11 +751,14 @@ impl Handed {
     }
 
     pub fn clear(&self) -> Result<()> {
-        let path = self.dir.join(HANDED);
-        match fs::remove_file(&path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(at(&path)(e)),
-            _ => Ok(()),
-        }
+        remove_if_there(&self.dir.join(HANDED))
+    }
+}
+
+fn remove_if_there(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(at(path)(e)),
+        _ => Ok(()),
     }
 }
 
@@ -811,17 +852,26 @@ fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> 
 fn take_lock(dir: &Path, name: &str) -> Result<File> {
     let path = dir.join("lock");
     let file = open_lock(&path, name)?;
-    // A process spawned by another thread holds a copy of every open fd from
-    // fork to exec, so a lock just let go can look held for that instant.
-    // Ask again for a moment before calling the VM busy.
+    if try_lock(&file).map_err(at(&path))? {
+        Ok(file)
+    } else {
+        Err(Error::Busy(name.to_string()))
+    }
+}
+
+/// Takes `file`'s flock unless something else holds it; false if it does.
+// A process spawned by another thread holds a copy of every open fd from
+// fork to exec, so a lock just let go can look held for that instant. Ask
+// again for a moment before calling it held.
+pub(crate) fn try_lock(file: &File) -> io::Result<bool> {
     for _ in 0..LOCK_TRIES {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(true),
             Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_RETRY),
-            Err(TryLockError::Error(e)) => return Err(at(&path)(e)),
+            Err(TryLockError::Error(e)) => return Err(e),
         }
     }
-    Err(Error::Busy(name.to_string()))
+    Ok(false)
 }
 
 const LOCK_TRIES: u32 = 20;
@@ -1002,7 +1052,7 @@ fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
 // Written aside, synced and renamed, so even a host crash leaves either the old
 // file or the new. The temp name is per process, since `set_creds` runs
 // without the VM's lock and two of them must not share one.
-fn write_aside(dir: &Path, name: &str, text: &str) -> Result<()> {
+pub(crate) fn write_aside(dir: &Path, name: &str, text: &str) -> Result<()> {
     let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
     let mut f = File::create(&tmp).map_err(at(&tmp))?;
     f.write_all(text.as_bytes())
