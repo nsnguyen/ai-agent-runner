@@ -77,7 +77,7 @@ fn main() -> ExitCode {
         Ok(vms) if vms.is_empty() => println!("no VMs yet"),
         Ok(vms) if listing => vms
             .iter()
-            .for_each(|vm| println!("{}  {} used", line(vm), vm.used)),
+            .for_each(|vm| println!("{}  {} bytes used", line(vm), vm.used)),
         Ok(vms) => vms.iter().for_each(|vm| println!("{}", line(vm))),
         Err(e) => {
             eprintln!("runner: {e}");
@@ -114,7 +114,12 @@ fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
             Ok(f) if f.generations.is_empty() => println!("{name}  nothing to free"),
             Ok(f) => {
                 let gens: Vec<String> = f.generations.iter().map(u64::to_string).collect();
-                println!("{name}  {verb} gen {}  {} bytes", gens.join(" "), f.bytes);
+                // Up to: blocks a reflink shares with a disk that stays aren't freed.
+                println!(
+                    "{name}  {verb} gen {}  up to {} bytes",
+                    gens.join(" "),
+                    f.bytes
+                );
             }
             Err(e) => {
                 eprintln!("runner: {e}");

@@ -8,8 +8,10 @@ use tempfile::TempDir;
 
 fn runner(root: &Path, args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_runner");
+    // RUNNER_KEEP from the shell running the tests would change gc's answers.
     Command::new(bin)
         .env("RUNNER_ROOT", root)
+        .env_remove("RUNNER_KEEP")
         .args(args)
         .output()
         .unwrap()
@@ -46,7 +48,7 @@ fn create_forks_base_and_list_shows_both() {
     let (base, dev) = (used(dir.path(), "base"), used(dir.path(), "dev"));
     assert_eq!(
         text(&out.stdout),
-        format!("base  gen 0  6 bytes  {base} used\ndev  gen 0  6 bytes  {dev} used\n")
+        format!("base  gen 0  6 bytes  {base} bytes used\ndev  gen 0  6 bytes  {dev} bytes used\n")
     );
 }
 
@@ -96,19 +98,19 @@ fn delete_removes_a_vm() {
     let base = used(dir.path(), "base");
     assert_eq!(
         text(&out.stdout),
-        format!("base  gen 0  6 bytes  {base} used\n")
+        format!("base  gen 0  6 bytes  {base} bytes used\n")
     );
     let out = runner(dir.path(), &["delete", "dev"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("no VM named dev"));
 }
 
-// dev at generation 3, every generation committed and still on disk.
+// dev at generation 6, every generation committed and still on disk.
 fn with_history() -> TempDir {
     let dir = with_base();
     let store = Store::new(dir.path()).keeping(usize::MAX);
     store.fork("base", "dev").unwrap();
-    for _ in 0..3 {
+    for _ in 0..6 {
         store.begin_run("dev").unwrap().commit().unwrap();
     }
     dir
@@ -118,8 +120,7 @@ fn with_history() -> TempDir {
 fn gc_dry_run_says_what_it_would_free_and_frees_nothing() {
     let dir = with_history();
     let gens = dir.path().join("vms/dev/gens");
-    let bytes: u64 = [0, 1]
-        .iter()
+    let bytes: u64 = (0..=4)
         .map(|g| {
             fs::metadata(gens.join(format!("{g}.ext4")))
                 .unwrap()
@@ -131,17 +132,18 @@ fn gc_dry_run_says_what_it_would_free_and_frees_nothing() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
-        format!("dev  would free gen 0 1  {bytes} bytes\n")
+        format!("dev  would free gen 0 1 2 3 4  up to {bytes} bytes\n")
     );
     assert!(gens.join("0.ext4").exists());
 
     let out = runner(dir.path(), &["gc", "dev", "--keep", "1"]);
     assert_eq!(
         text(&out.stdout),
-        format!("dev  freed gen 0 1  {bytes} bytes\n")
+        format!("dev  freed gen 0 1 2 3 4  up to {bytes} bytes\n")
     );
     assert!(!gens.join("0.ext4").exists());
-    assert!(!gens.join("1.ext4").exists());
+    assert!(!gens.join("4.ext4").exists());
+    assert!(gens.join("5.ext4").exists());
 }
 
 #[test]
@@ -149,9 +151,10 @@ fn gc_sweeps_every_vm_and_keeps_five_by_default() {
     let dir = with_history();
     let out = runner(dir.path(), &["gc"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(
-        text(&out.stdout),
-        "base  nothing to free\ndev  nothing to free\n"
+    let got = text(&out.stdout);
+    assert!(
+        got.starts_with("base  nothing to free\ndev  freed gen 0  up to "),
+        "{got}"
     );
     let out = Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", dir.path())
@@ -161,7 +164,7 @@ fn gc_sweeps_every_vm_and_keeps_five_by_default() {
         .unwrap();
     let got = text(&out.stdout);
     assert!(
-        got.starts_with("base  nothing to free\ndev  freed gen 0  "),
+        got.starts_with("base  nothing to free\ndev  freed gen 1 2 3  up to "),
         "{got}"
     );
 }
@@ -182,7 +185,7 @@ fn gc_reports_a_busy_vm_and_still_sweeps_the_rest() {
     drop(run);
     let out = runner(dir.path(), &["gc", "dev", "--keep", "0"]);
     assert!(
-        text(&out.stdout).starts_with("dev  freed gen 0 1 2 4  "),
+        text(&out.stdout).starts_with("dev  freed gen 0 1 2 3 4 5 7  up to "),
         "{}",
         text(&out.stdout)
     );
