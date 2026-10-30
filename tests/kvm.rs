@@ -10,7 +10,9 @@
 // the VM's tap: run them with sudo -E.
 // `start_logs_and_stop_under_systemd` needs `runner unit` installed and the
 // host's kernel in place; it uses the unit's root, RUNNER_ROOT or
-// /var/lib/runner.
+// /var/lib/runner. `exec_starts_the_vm_and_runs_in_the_guest` needs the same,
+// with the base image (images/base) as RUNNER_TEST_DISK, for its
+// runner-guest and agent user.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -174,6 +176,55 @@ fn start_logs_and_stop_under_systemd() {
     assert!(status.ends_with("  stopped\n"), "{status}");
     // Stopped cleanly, so the run was committed.
     assert!(status.contains("  gen 1  "), "{status}\n{}", logs());
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+fn exec_starts_the_vm_and_runs_in_the_guest() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("exec-test-{}", std::process::id());
+    ok(runner(
+        &root,
+        &[
+            "import",
+            &name,
+            env_path("RUNNER_TEST_DISK").to_str().unwrap(),
+        ],
+    ));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+
+    // Stopped, so exec boots it, then waits for its guest agent.
+    let uname = ok(runner(&root, &["exec", &name, "--", "uname", "-a"]));
+    let logs = ok(runner(&root, &["logs", &name]));
+    assert!(uname.starts_with("Linux "), "{uname}");
+    // The release the guest kernel printed on the console at boot.
+    let release = uname.split_whitespace().nth(2).unwrap();
+    assert!(
+        logs.contains(&format!("Linux version {release} ")),
+        "{uname}\n{logs}"
+    );
+    let who = ok(runner(
+        &root,
+        &["exec", &name, "--", "sh", "-c", "whoami; pwd"],
+    ));
+    assert_eq!(who, "agent\n/home/agent\n");
+    let mut piped = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", &root)
+        .args(["exec", &name, "--", "sh", "-c", "cat; exit 7"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Written, then closed, which ends cat.
+    let mut stdin = piped.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, b"over vsock").unwrap();
+    drop(stdin);
+    let out = piped.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "over vsock");
+    assert_eq!(out.status.code(), Some(7));
 }
 
 // A failed test still leaves the host's VMs as it found them.

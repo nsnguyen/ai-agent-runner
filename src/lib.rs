@@ -4,6 +4,7 @@ pub mod boot;
 pub mod changes;
 pub mod creds;
 pub mod doctor;
+pub mod exec;
 pub mod firecracker;
 pub mod guest;
 pub mod host;

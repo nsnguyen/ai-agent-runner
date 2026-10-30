@@ -10,6 +10,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 - `runner stop dev` is `systemctl stop`. The unit's ExecStop, `runner halt dev`, sends Ctrl-Alt-Del and waits for boot to let go of the lock. After 30 seconds, systemd kills the VM.
 - A clean shutdown (Firecracker exits 0) commits the new generation. A kill, a crash or a guest panic doesn't: the previous generation stays current, and the new disk stays for a look.
 - Inside the guest, shut down with `reboot`, not `poweroff`. On x86 Firecracker has no power-off, so after `poweroff` the guest halts but Firecracker keeps running: the VM looks running until a stop kills it, and the run isn't committed.
+- `runner shell dev` and `runner exec dev` reach the guest's runner-guest through the VM's `vsock.sock`: `CONNECT 10022`, then the protocol in `src/proto.rs`. A stopped VM is started first, and the runner retries for up to a minute while the guest boots. Its SIGTERM or SIGHUP hangs the command up, as closing its terminal does.
 - `delete` and `undo` refuse a running VM, because boot holds its lock.
 - VMs get 2 vCPUs and 2 GiB unless `runner create --cpus --mem` says otherwise, and the host's kernel at `<root>/kernel/vmlinux` unless `--kernel` names one. A fork keeps its parent's.
 

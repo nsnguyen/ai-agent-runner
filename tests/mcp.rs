@@ -2,7 +2,8 @@
 // through `ssh -T host runner mcp`.
 mod common;
 
-use common::FakeSystemd;
+use common::{FakeSystemd, FakeVsock, Guest, me};
+use runner::exec::OUTPUT_CAP;
 use runner::store::Store;
 use serde_json::{Value, json};
 use std::fs;
@@ -69,9 +70,13 @@ fn start(root: &std::path::Path) -> Session {
 }
 
 fn start_with_path(root: &std::path::Path, path: &str) -> Session {
+    start_with_env(root, &[("PATH", path)])
+}
+
+fn start_with_env(root: &std::path::Path, env: &[(&str, &str)]) -> Session {
     let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", root)
-        .env("PATH", path)
+        .envs(env.iter().copied())
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -114,6 +119,7 @@ fn lists_its_tools() {
             "create_vm",
             "delete_vm",
             "doctor",
+            "exec",
             "list_checkpoints",
             "list_vms",
             "restore_vm",
@@ -296,4 +302,118 @@ fn checkpoint_list_and_restore() {
     assert_eq!(bad["isError"], json!(true), "{bad}");
     let why = bad["content"][0]["text"].as_str().unwrap();
     assert!(why.contains("dev has no checkpoint 9"), "{why}");
+}
+
+// A VM named dev with a guest behind its vsock socket: runner-guest on a
+// Unix socket, run as the test's user.
+struct GuestVm {
+    dir: tempfile::TempDir,
+    sd: FakeSystemd,
+    _vsock: FakeVsock,
+    _guest: Guest,
+}
+
+fn guest_vm() -> GuestVm {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    Store::new(dir.path()).import("dev", &disk).unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    let guest = Guest::spawn(&dir.path().join("guest.sock"));
+    let vsock = FakeVsock::serve(&dir.path().join("vms/dev/vsock.sock"), &guest.sock);
+    GuestVm {
+        dir,
+        sd,
+        _vsock: vsock,
+        _guest: guest,
+    }
+}
+
+impl GuestVm {
+    fn serve(&self) -> Session {
+        let path = self.sd.path();
+        start_with_env(self.dir.path(), &[("PATH", &path), ("RUNNER_USER", &me())])
+    }
+}
+
+#[test]
+fn exec_runs_a_command_in_a_vm_it_starts_first() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let argv = ["sh", "-c", "echo out; echo err >&2; exit 3"];
+    let got = s.call(2, "exec", json!({"name": "dev", "argv": argv}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    let want = json!({
+        "exit_code": 3, "signal": null, "timed_out": false,
+        "stdout": "out\n", "stdout_truncated": false,
+        "stderr": "err\n", "stderr_truncated": false,
+    });
+    assert_eq!(got["structuredContent"], want);
+    assert!(
+        vm.sd
+            .calls()
+            .contains(&"systemctl start firecracker@dev.service".to_string()),
+        "{:?}",
+        vm.sd.calls()
+    );
+}
+
+#[test]
+fn exec_takes_stdin_and_caps_output() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let got = s.call(
+        2,
+        "exec",
+        json!({"name": "dev", "argv": ["cat"], "stdin": "héllo"}),
+    );
+    assert_eq!(got["structuredContent"]["stdout"], json!("héllo"), "{got}");
+    let script = format!("head -c {} /dev/zero | tr '\\0' a", OUTPUT_CAP + 1);
+    let got = s.call(
+        3,
+        "exec",
+        json!({"name": "dev", "argv": ["sh", "-c", script]}),
+    );
+    let out = &got["structuredContent"];
+    assert_eq!(out["stdout"].as_str().unwrap().len(), OUTPUT_CAP, "{got}");
+    assert_eq!(out["stdout_truncated"], json!(true));
+    assert_eq!(out["exit_code"], json!(0));
+}
+
+#[test]
+fn exec_kills_a_command_past_its_timeout() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let start = std::time::Instant::now();
+    let args = json!({"name": "dev", "argv": ["sleep", "30"], "timeout_secs": 1});
+    let got = s.call(2, "exec", args);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    let out = &got["structuredContent"];
+    assert_eq!(out["timed_out"], json!(true), "{got}");
+    assert_eq!(
+        (&out["exit_code"], &out["signal"]),
+        (&json!(null), &json!(9))
+    );
+}
+
+#[test]
+fn exec_errors_are_tool_errors() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let why = |got: &Value| got["content"][0]["text"].as_str().unwrap().to_string();
+    let got = s.call(2, "exec", json!({"name": "nope", "argv": ["true"]}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert_eq!(why(&got), "no VM named nope");
+    let got = s.call(3, "exec", json!({"name": "dev", "argv": []}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert!(why(&got).contains("argv"), "{got}");
+    // Neither of those started the VM.
+    assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
+    let got = s.call(
+        4,
+        "exec",
+        json!({"name": "dev", "argv": ["no-such-command"]}),
+    );
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert!(why(&got).contains("couldn't run no-such-command"), "{got}");
 }
