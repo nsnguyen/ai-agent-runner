@@ -3,8 +3,10 @@
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
+use crate::creds::{Cred, DEFAULT};
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -193,6 +195,44 @@ impl Store {
         read_vm(name, &dir)
     }
 
+    /// The credentials the VM gets at boot: what its allowlist names, or
+    /// `creds::DEFAULT` if it has none. Names only; no value is kept here.
+    pub fn creds(&self, name: &str) -> Result<Vec<Cred>> {
+        let path = self.existing(name)?.join("creds");
+        let text = match fs::read_to_string(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DEFAULT.to_vec()),
+            r => r.map_err(at(&path))?,
+        };
+        let bad = |e| at(&path)(io::Error::new(io::ErrorKind::InvalidData, e));
+        let mut creds = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.parse().map_err(bad))
+            .collect::<Result<Vec<Cred>>>()?;
+        creds.sort();
+        creds.dedup();
+        Ok(creds)
+    }
+
+    /// Sets the VM's allowlist to exactly `creds`. It takes effect at the
+    /// next boot, so a running VM doesn't block it.
+    pub fn set_creds(&self, name: &str, creds: &[Cred]) -> Result<Vec<Cred>> {
+        let dir = self.existing(name)?;
+        let mut creds = creds.to_vec();
+        creds.sort();
+        creds.dedup();
+        let text: String = creds.iter().map(|c| format!("{c}\n")).collect();
+        write_aside(&dir, "creds", &text).map_err(|e| match e {
+            // Deleted between the check and the write.
+            Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                Error::NoVm(name.to_string())
+            }
+            e => e,
+        })?;
+        Ok(creds)
+    }
+
     /// Removes a VM and all its disk generations. Forks of it are unaffected:
     /// each has a disk of its own.
     pub fn delete(&self, name: &str) -> Result<Vm> {
@@ -290,16 +330,21 @@ fn current(dir: &Path) -> Result<u64> {
     gens.last().copied().ok_or_else(empty)
 }
 
-// Written aside, synced and renamed, so even a host crash leaves either the old
-// history or the new.
 fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
-    let tmp = dir.join("history.tmp");
     let text: String = gens.iter().map(|g| format!("{g}\n")).collect();
+    write_aside(dir, "history", &text)
+}
+
+// Written aside, synced and renamed, so even a host crash leaves either the old
+// file or the new. The temp name is per process, since `set_creds` runs
+// without the VM's lock and two of them must not share one.
+fn write_aside(dir: &Path, name: &str, text: &str) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
     let mut f = File::create(&tmp).map_err(at(&tmp))?;
     f.write_all(text.as_bytes())
         .and_then(|()| f.sync_all())
         .map_err(at(&tmp))?;
-    let path = dir.join("history");
+    let path = dir.join(name);
     fs::rename(&tmp, &path).map_err(at(&path))?;
     sync_dir(dir)
 }
