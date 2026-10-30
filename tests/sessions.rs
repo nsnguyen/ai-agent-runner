@@ -346,10 +346,14 @@ fn attach_or_run_starts_the_program_once_and_then_reattaches() {
         cmd.extend(tmux.iter().map(String::as_str));
         vm.runner(&cmd)
     };
-    let said = format!("in {} with [--continue][fix it]", work.display());
+    // tmux reads a word ending in ; as the end of its command.
+    let said = format!(
+        "in {} with [--continue][fix it;][a\\;][;][--verbose]",
+        work.display()
+    );
 
     let t = pty(24, 200);
-    let mut first = t.spawn(open(&["--continue", "fix it"]));
+    let mut first = t.spawn(open(&["--continue", "fix it;", "a\\;", ";", "--verbose"]));
     t.wait_for(&said);
     vm.wait_for_row(&s, "sleep", "attached");
     vm.detach(&s);

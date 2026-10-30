@@ -78,11 +78,12 @@ pub fn open(vms: &impl Vms, c: &Claude, notes: &mut impl Write) -> Result<Exit> 
         vms.start(vm)?;
     }
     let found = running && vms.has_session(vm, &c.user, SESSION)?;
+    // Usually claude, though it could be a shell someone named claude.
     if found && c.argv.len() > 1 {
         let args = c.argv[1..].join(" ");
         note(
             notes,
-            &format!("claude is already running in {vm}, so this attaches to it without {args}"),
+            &format!("{vm} already has a claude session, so this attaches to it without {args}"),
         );
     }
     // The guest refuses a directory that isn't there, where tmux would start

@@ -331,7 +331,7 @@ fn claude_keeps_running_after_a_detach() {
     // Again, with arguments: the same claude, and a note that they're unused.
     let t = common::pty(24, 80);
     let mut again = t.spawn(on_a_terminal(&["claude", &name, "--", "--continue"]));
-    t.wait_for("claude is already running");
+    t.wait_for("already has a claude session");
     std::thread::sleep(Duration::from_secs(2));
     ok(runner(&root, &detach));
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());

@@ -224,14 +224,14 @@ fn a_running_claude_is_reattached_never_started_twice() {
 }
 
 #[test]
-fn arguments_for_a_claude_already_running_are_dropped_with_a_note() {
+fn arguments_for_a_session_already_there_are_dropped_with_a_note() {
     let mut fake = Fake::with("dev", true);
     fake.session = true;
     let (notes, got) = open(&fake, &ask("dev", &["--continue"]));
     got.unwrap();
     assert_eq!(
         notes,
-        "runner: claude is already running in dev, so this attaches to it without --continue\n"
+        "runner: dev already has a claude session, so this attaches to it without --continue\n"
     );
 }
 
@@ -251,29 +251,32 @@ fn from_is_noted_and_unused_when_the_vm_exists() {
 
 #[test]
 fn a_failed_step_stops_the_rest() {
-    for (fail, want) in [
-        ("exists", &["exists dev"][..]),
-        ("create", &["exists dev", "create dev from base"]),
+    let new = Fake::default;
+    let stopped = || Fake::with("dev", false);
+    let running = || Fake::with("dev", true);
+    let looked = ["exists dev", "running dev", "has_session dev agent claude"];
+    let cases: [(&str, fn() -> Fake, &[&str]); 6] = [
+        ("exists", new, &["exists dev"]),
+        ("create", new, &["exists dev", "create dev from base"]),
+        ("running", stopped, &["exists dev", "running dev"]),
         (
             "start",
-            &["exists dev", "create dev from base", "start dev"],
+            stopped,
+            &["exists dev", "running dev", "start dev"],
         ),
-    ] {
+        ("has_session", running, &looked),
+        ("attach", running, &[&looked[..], &["attach dev"]].concat()),
+    ];
+    for (fail, fake, want) in cases {
         let fake = Fake {
             fail: Some(fail),
-            ..Fake::default()
+            ..fake()
         };
         let (_, got) = open(&fake, &ask("dev", &[]));
         let err = got.unwrap_err().to_string();
         assert_eq!(err, format!("{fail} failed"));
         assert_eq!(fake.calls(), want, "{fail}");
     }
-    let fake = Fake {
-        fail: Some("has_session"),
-        ..Fake::with("dev", true)
-    };
-    open(&fake, &ask("dev", &[])).1.unwrap_err();
-    assert!(!fake.calls().contains(&"attach dev".to_string()));
 }
 
 // The real VMs, through the runner binary: without a terminal there's nothing
