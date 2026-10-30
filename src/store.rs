@@ -3,11 +3,13 @@
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/slots.lock                flock'd while a slot is picked
 //   <root>/subnet                    host config: the subnet slots carve up; 172.16.0.0/16 if absent
+use crate::creds::{Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use rmcp::schemars;
 use serde::Serialize;
@@ -77,6 +79,10 @@ pub struct Store {
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Store { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn vms(&self) -> PathBuf {
@@ -181,7 +187,7 @@ impl Store {
         let slot = (0..subnet.slots())
             .find(|s| !taken.contains(s))
             .ok_or(Error::NoSlot(subnet))?;
-        write_file(dir, "slot", &format!("{slot}\n"))?;
+        write_aside(dir, "slot", &format!("{slot}\n"))?;
         Ok(slot)
     }
 
@@ -272,6 +278,44 @@ impl Store {
         gens.pop();
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
+    }
+
+    /// The credentials the VM gets at boot: what its allowlist names, or
+    /// `creds::DEFAULT` if it has none. Names only; no value is kept here.
+    pub fn creds(&self, name: &str) -> Result<Vec<Cred>> {
+        let path = self.existing(name)?.join("creds");
+        let text = match fs::read_to_string(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DEFAULT.to_vec()),
+            r => r.map_err(at(&path))?,
+        };
+        let bad = |e| at(&path)(io::Error::new(io::ErrorKind::InvalidData, e));
+        let mut creds = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.parse().map_err(bad))
+            .collect::<Result<Vec<Cred>>>()?;
+        creds.sort();
+        creds.dedup();
+        Ok(creds)
+    }
+
+    /// Sets the VM's allowlist to exactly `creds`. It takes effect at the
+    /// next boot, so a running VM doesn't block it.
+    pub fn set_creds(&self, name: &str, creds: &[Cred]) -> Result<Vec<Cred>> {
+        let dir = self.existing(name)?;
+        let mut creds = creds.to_vec();
+        creds.sort();
+        creds.dedup();
+        let text: String = creds.iter().map(|c| format!("{c}\n")).collect();
+        write_aside(&dir, "creds", &text).map_err(|e| match e {
+            // Deleted between the check and the write.
+            Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                Error::NoVm(name.to_string())
+            }
+            e => e,
+        })?;
+        Ok(creds)
     }
 
     /// Removes a VM and all its disk generations. Forks of it are unaffected:
@@ -402,13 +446,14 @@ fn current(dir: &Path) -> Result<u64> {
 
 fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
     let text: String = gens.iter().map(|g| format!("{g}\n")).collect();
-    write_file(dir, "history", &text)
+    write_aside(dir, "history", &text)
 }
 
 // Written aside, synced and renamed, so even a host crash leaves either the old
-// file or the new.
-fn write_file(dir: &Path, name: &str, text: &str) -> Result<()> {
-    let tmp = dir.join(format!("{name}.tmp"));
+// file or the new. The temp name is per process, since `set_creds` runs
+// without the VM's lock and two of them must not share one.
+fn write_aside(dir: &Path, name: &str, text: &str) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
     let mut f = File::create(&tmp).map_err(at(&tmp))?;
     f.write_all(text.as_bytes())
         .and_then(|()| f.sync_all())

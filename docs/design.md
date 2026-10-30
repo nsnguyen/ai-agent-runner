@@ -35,6 +35,12 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 - Credentials come in per boot and never land on a VM's disk, so a forked disk holds no keys.
 - A run's result keeps what the runner measured apart from what the agent wrote, which is marked untrusted.
 
+## Credentials
+
+- The host holds `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`, and optionally `GH_TOKEN`. Each comes from a systemd credential of the same name (`LoadCredential=` in `firecracker@.service`), or else the environment, never from a file in the repo or a VM's directory.
+- Each VM has an allowlist of credential names in its directory: `claude` by default, `github` only when `runner creds <vm> claude github` adds it. A fork starts from the default. No MCP tool sets it.
+- After boot the host sends the allowed ones to `runner-guest` over vsock (`creds::Keyring`). The guest keeps them in memory, takes only those variables, and sets exactly them in each session's and run's environment (`Keyring::apply`), removing any other credential variable.
+
 ## Assumptions (correct these)
 
 - The host is a Linux machine of yours with KVM, on your tailnet, with XFS or btrfs under `/var/lib/runner`.

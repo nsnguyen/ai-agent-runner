@@ -1,4 +1,5 @@
 // The VM store on a temp directory: no KVM needed.
+use runner::creds::{Cred, DEFAULT};
 use runner::store::{Error, Store, Vm, check_name};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -301,6 +302,58 @@ fn deleting_twice_in_one_process_works() {
         store.fork("base", "dev").unwrap();
         store.delete("dev").unwrap();
     }
+}
+
+#[test]
+fn a_vm_gets_the_default_credentials_until_told_otherwise() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    assert_eq!(store.creds("base").unwrap(), DEFAULT);
+    let both = [Cred::Github, Cred::Claude, Cred::Github];
+    assert_eq!(
+        store.set_creds("base", &both).unwrap(),
+        vec![Cred::Claude, Cred::Github]
+    );
+    assert_eq!(
+        store.creds("base").unwrap(),
+        vec![Cred::Claude, Cred::Github]
+    );
+    assert_eq!(store.set_creds("base", &[]).unwrap(), vec![]);
+    assert_eq!(store.creds("base").unwrap(), vec![]);
+}
+
+// A fork is a new VM: it starts from the default, not from what its source was given.
+#[test]
+fn a_fork_does_not_inherit_credentials() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.set_creds("base", &[Cred::Github]).unwrap();
+    store.fork("base", "dev").unwrap();
+    assert_eq!(store.creds("dev").unwrap(), DEFAULT);
+}
+
+#[test]
+fn the_allowlist_holds_names_only() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store
+        .set_creds("base", &[Cred::Claude, Cred::Github])
+        .unwrap();
+    let file = dir.path().join("root/vms/base/creds");
+    assert_eq!(fs::read_to_string(file).unwrap(), "claude\ngithub\n");
+}
+
+#[test]
+fn credentials_need_a_vm_and_a_readable_allowlist() {
+    let (dir, store) = store();
+    assert!(matches!(store.creds("nope"), Err(Error::NoVm(_))));
+    assert!(matches!(
+        store.set_creds("nope", DEFAULT),
+        Err(Error::NoVm(_))
+    ));
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    fs::write(dir.path().join("root/vms/base/creds"), "claude\naws\n").unwrap();
+    assert!(matches!(store.creds("base"), Err(Error::Io { .. })));
 }
 
 fn slot(store: &Store, name: &str) -> u32 {
