@@ -470,3 +470,24 @@ fn generations_without_notes_still_list() {
     let listed = store.checkpoints("dev").unwrap();
     assert_eq!(summary(&listed), [(0, true, None, true)]);
 }
+
+#[test]
+fn a_note_left_without_its_disk_is_never_read_as_another() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("old")).unwrap();
+    // As a cleanup by hand that took the disk and missed its note.
+    fs::remove_file(gen_disk(dir.path(), "dev", 1)).unwrap();
+    assert!(matches!(
+        store.restore("dev", 1),
+        Err(Error::NoCheckpoint(_, 1))
+    ));
+    // A run that fails gets a number of its own, not the note's.
+    let run = store.begin_run("dev").unwrap();
+    assert_eq!(run.generation, 2);
+    drop(run);
+    assert_eq!(
+        summary(&store.checkpoints("dev").unwrap()),
+        [(0, true, Some("import"), true)]
+    );
+}

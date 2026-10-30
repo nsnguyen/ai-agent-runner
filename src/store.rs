@@ -258,7 +258,7 @@ impl Store {
         let _lock = take_lock(&dir, name)?;
         let mut gens = history(&dir)?;
         let frozen = read_note(&dir, id)?.is_some_and(|n| !n.auto);
-        if !gens.contains(&id) && !frozen {
+        if !(gens.contains(&id) || frozen) || !disk_of(&dir, id).is_file() {
             return Err(Error::NoCheckpoint(name.to_string(), id));
         }
         let generation = next_generation(&dir)?;
@@ -384,7 +384,7 @@ fn write_note(dir: &Path, generation: u64, note: &Note) -> Result<()> {
     write_aside(&path, &text)
 }
 
-// None for a generation made before notes were written, or a failed run's.
+// None for a generation made before notes were written, or most failed runs'.
 fn read_note(dir: &Path, generation: u64) -> Result<Option<Note>> {
     let path = note_of(dir, generation);
     let text = match fs::read(&path) {
@@ -477,20 +477,27 @@ fn sweep_staging(vms: &Path) {
     }
 }
 
-// Past every disk on hand, failed runs' included, so none is overwritten.
+// Past every disk and note on hand, failed runs' included, so none is
+// overwritten and no new disk is read with an old note.
 fn next_generation(dir: &Path) -> Result<u64> {
-    Ok(generations(dir)?.into_iter().max().unwrap_or(0) + 1)
+    let mut all = numbered(dir, ".ext4")?;
+    all.extend(numbered(dir, ".json")?);
+    Ok(all.into_iter().max().unwrap_or(0) + 1)
 }
 
 // Every disk on hand, in no order.
 fn generations(dir: &Path) -> Result<Vec<u64>> {
+    numbered(dir, ".ext4")
+}
+
+fn numbered(dir: &Path, suffix: &str) -> Result<Vec<u64>> {
     let gens = dir.join("gens");
     let mut out = Vec::new();
     for entry in fs::read_dir(&gens).map_err(at(&gens))? {
         let name = entry.map_err(at(&gens))?.file_name();
         let n = name
             .to_str()
-            .and_then(|s| s.strip_suffix(".ext4")?.parse::<u64>().ok());
+            .and_then(|s| s.strip_suffix(suffix)?.parse::<u64>().ok());
         out.extend(n);
     }
     Ok(out)
