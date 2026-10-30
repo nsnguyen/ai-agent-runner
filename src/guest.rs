@@ -7,7 +7,7 @@
 // writes stdin.
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use nix::errno::Errno;
-use nix::fcntl::OFlag;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::pty;
 use nix::sys::socket::{SockFlag, accept4};
@@ -23,7 +23,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +38,8 @@ const DRAIN: Duration = Duration::from_secs(1);
 // Stdin queued for a command that isn't reading it. Past this, the host's
 // frames wait, but its hang-up still lands.
 const MAX_QUEUED: usize = 1 << 20;
+// A command still running this long after the host hangs up is killed.
+const GRACE: Duration = Duration::from_secs(2);
 
 /// A connection from the host: vsock in a VM, a Unix socket in tests.
 pub trait Conn: Read + Write + AsFd + Send + Sized + 'static {
@@ -108,16 +110,28 @@ fn session<C: Conn>(conn: &mut C) -> proto::Result<()> {
         Ok(running) => running,
         Err(e) => return send(&out, FromGuest::Error(e)),
     };
-    let input = {
+    let input = Feed::new(stdin).and_then(|stdin| {
         let group = group.clone();
-        let stdin = Feed::new(stdin);
-        thread::spawn(move || take_input(host, stdin, pty, &group))
+        thread::Builder::new().spawn(move || take_input(host, stdin, pty, &group))
+    });
+    let input = match input {
+        Ok(input) => input,
+        Err(e) => {
+            group.signal(libc::SIGKILL);
+            let _ = reap(&mut child, &group);
+            return send(&out, FromGuest::Error(format!("starting a thread: {e}")));
+        }
     };
     // The scope joins the pumps, so all output is sent before the exit.
     let status = thread::scope(|s| {
         for (src, wrap) in outputs {
             let (out, group) = (&out, &*group);
-            s.spawn(move || pump(src, wrap, out, group));
+            let pumping =
+                thread::Builder::new().spawn_scoped(s, move || pump(src, wrap, out, group));
+            if let Err(e) = pumping {
+                eprintln!("runner-guest: starting a thread: {e}");
+                group.signal(libc::SIGKILL);
+            }
         }
         reap(&mut child, &group)
     });
@@ -317,6 +331,11 @@ fn hand_over(slave: &OwnedFd, ids: &Ids) -> nix::Result<()> {
     fchmod(slave, Mode::from_bits_truncate(mode))
 }
 
+fn nonblocking(file: &File) -> nix::Result<()> {
+    let flags = OFlag::from_bits_retain(fcntl(file, FcntlArg::F_GETFL)?);
+    fcntl(file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(drop)
+}
+
 // The kernel signals SIGWINCH to the PTY's foreground process group.
 fn resize(pty: &File, size: WinSize) -> nix::Result<()> {
     let ws = libc::winsize {
@@ -368,11 +387,14 @@ fn reap(child: &mut Child, group: &Group) -> io::Result<ExitStatus> {
 // command has exited and the stream has gone quiet.
 fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, group: &Group) {
     let mut buf = vec![0; 32 * 1024];
+    // Time spent sending after the exit, which DRAIN doesn't count, so a slow
+    // host doesn't cost the command its last output.
+    let mut sending = Duration::ZERO;
     loop {
         // Checked before the wait, so the last wait starts after the exit and
         // still catches output on its way through the PTY.
         let exited = group.exited();
-        if exited.is_some_and(|at| at.elapsed() > DRAIN) {
+        if exited.is_some_and(|at| at.elapsed().saturating_sub(sending) > DRAIN) {
             return;
         }
         let mut fds = [PollFd::new(src.as_fd(), PollFlags::POLLIN)];
@@ -385,11 +407,20 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
         match src.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
+                let start = Instant::now();
                 if send(out, wrap(buf[..n].to_vec())).is_err() {
                     return;
                 }
+                if let Some(at) = group.exited() {
+                    sending += start.elapsed().min(at.elapsed());
+                }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // The PTY is nonblocking for its stdin's sake.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
             // A PTY whose command has gone reads EIO.
             Err(_) => return,
         }
@@ -397,7 +428,7 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
 }
 
 // Applies the host's frames until it hangs up, which hangs up the command,
-// as closing a terminal does.
+// as closing a terminal does, and kills it if it ignores that.
 fn take_input<C: Conn>(mut host: C, mut stdin: Feed, pty: Option<File>, group: &Group) {
     while stdin.wait_for_room(host.as_fd()) {
         match proto::read_frame::<ToGuest>(&mut host) {
@@ -421,6 +452,13 @@ fn take_input<C: Conn>(mut host: C, mut stdin: Feed, pty: Option<File>, group: &
         }
     }
     group.signal(libc::SIGHUP);
+    let start = Instant::now();
+    while group.exited().is_none() {
+        if start.elapsed() > GRACE {
+            return group.signal(libc::SIGKILL);
+        }
+        thread::sleep(Duration::from_millis(QUIET.into()));
+    }
 }
 
 // The command's stdin, written from a queue on its own thread, so the host's
@@ -428,28 +466,31 @@ fn take_input<C: Conn>(mut host: C, mut stdin: Feed, pty: Option<File>, group: &
 struct Feed {
     tx: Option<mpsc::Sender<Vec<u8>>>,
     queued: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Feed {
-    fn new(mut stdin: File) -> Feed {
+    fn new(mut stdin: File) -> io::Result<Feed> {
+        nonblocking(&stdin)?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
-        let left = queued.clone();
-        // Not joined: it can wait on a command that never reads until the
-        // command exits. Dropping the sender closes stdin once the queue is
-        // written.
-        thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (left, stopped) = (queued.clone(), stop.clone());
+        // Closing the Feed closes stdin once the queue is written; dropping
+        // it drops the rest.
+        thread::Builder::new().spawn(move || {
             let mut open = true;
             for chunk in rx {
                 // A command that closed its stdin takes no more.
-                open = open && stdin.write_all(&chunk).is_ok();
+                open = open && write_until(&mut stdin, &chunk, &stopped);
                 left.fetch_sub(chunk.len(), Ordering::Relaxed);
             }
-        });
-        Feed {
+        })?;
+        Ok(Feed {
             tx: Some(tx),
             queued,
-        }
+            stop,
+        })
     }
 
     fn push(&self, data: Vec<u8>) {
@@ -477,4 +518,27 @@ impl Feed {
         }
         true
     }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+// Writes all of data unless the command closes its stdin or stop is set
+// first. It polls, so a command that never reads can't hold the thread.
+fn write_until(stdin: &mut File, mut data: &[u8], stop: &AtomicBool) -> bool {
+    while !data.is_empty() && !stop.load(Ordering::Relaxed) {
+        match stdin.write(data) {
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLOUT)];
+                let _ = poll(&mut fds, QUIET);
+            }
+            Err(_) => return false,
+        }
+    }
+    data.is_empty()
 }

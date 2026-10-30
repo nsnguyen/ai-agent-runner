@@ -31,7 +31,12 @@ fn guest() -> Guest {
         .unwrap();
     // bind makes the file before listen, so wait for a connect to work.
     let start = Instant::now();
-    while UnixStream::connect(&sock).is_err() {
+    let probe = |sock: &PathBuf| -> proto::Result<()> {
+        let mut conn = UnixStream::connect(sock)?;
+        proto::hello(&mut conn)?;
+        proto::check_hello(&mut conn)
+    };
+    while probe(&sock).is_err() {
         assert!(start.elapsed() < Duration::from_secs(10), "not listening");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -408,15 +413,21 @@ fn a_hang_up_lands_while_stdin_is_backed_up() {
     )));
     let pid = pid_of(&mut s, &file);
     let mut conn = s.conn.try_clone().unwrap();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = sent.clone();
     let flood = std::thread::spawn(move || {
         for _ in 0..64 {
             let chunk = ToGuest::Stdin(vec![b'x'; 64 * 1024]);
             if proto::write_frame(&mut conn, &chunk).is_err() {
                 return;
             }
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(500));
+    // 4 MiB offered; the agent takes about its 1 MiB cap plus buffers.
+    let taken = sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(taken < 48, "the agent took {taken} of 64 chunks");
     assert!(!gone(pid), "{pid} died before the hang-up");
     s.conn.shutdown(std::net::Shutdown::Both).unwrap();
     drop(s);
@@ -461,5 +472,53 @@ fn a_directory_the_user_can_t_enter_is_an_error() {
     match s.next_end() {
         FromGuest::Error(e) => assert!(e.contains("Permission denied"), "{e}"),
         other => panic!("wanted an error, got {other:?}"),
+    }
+}
+
+// The agent's 1s drain after exit counts only time spent waiting for the
+// command's output, not time waiting on a slow host.
+#[test]
+fn a_slow_host_still_gets_all_the_output() {
+    let g = guest();
+    let mut s = g.start(sh("yes | head -c 300000; echo END"));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(s.exit(), Exit::Code(0));
+    assert_eq!(s.stdout.len(), 300_004);
+    assert!(text(&s.stdout).ends_with("END\n"));
+}
+
+// A hang-up kills a command that ignores SIGHUP, after a grace period.
+#[test]
+fn a_hang_up_kills_a_command_that_ignores_it() {
+    let g = guest();
+    let file = g.dir.path().join("pid");
+    let script = format!(
+        "trap '' HUP; echo $$ >{}; echo ready; exec sleep 30",
+        file.display()
+    );
+    let mut s = g.start(sh(&script));
+    let pid = pid_of(&mut s, &file);
+    drop(s);
+    assert!(gone_soon(pid), "{pid} still running");
+}
+
+// A background process holding stdin unread doesn't keep the session's
+// threads alive after the exit.
+#[test]
+fn a_session_leaves_no_threads_behind() {
+    let g = guest();
+    let mut s = g.start(sh("exec 3<&0; sleep 30 <&3 & echo ready"));
+    s.wait_for_stdout("ready");
+    s.send(&ToGuest::Stdin(vec![b'x'; 200_000]));
+    assert_eq!(s.exit(), Exit::Code(0));
+    drop(s);
+    let tasks = format!("/proc/{}/task", g.child.id());
+    let start = Instant::now();
+    while std::fs::read_dir(&tasks).unwrap().count() > 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "threads left behind"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
