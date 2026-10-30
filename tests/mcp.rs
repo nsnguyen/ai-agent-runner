@@ -4,6 +4,8 @@ use runner::store::Store;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
 struct Session {
@@ -51,7 +53,15 @@ impl Drop for Session {
     }
 }
 
-fn start(root: &std::path::Path) -> Session {
+// A VM's allocated bytes, which the filesystem decides.
+fn used(root: &Path, vm: &str) -> u64 {
+    fs::read_dir(root.join("vms").join(vm).join("gens"))
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
+        .sum()
+}
+
+fn start(root: &Path) -> Session {
     let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", root)
         .arg("mcp")
@@ -102,11 +112,12 @@ fn create_then_list() {
     let mut s = start(dir.path());
     let made = s.call(2, "create_vm", json!({"name": "dev"}));
     assert_eq!(made["isError"], json!(false), "{made}");
-    let dev = json!({"name": "dev", "generation": 0, "bytes": 6});
+    let dev = json!({"name": "dev", "generation": 0, "bytes": 6, "used": used(dir.path(), "dev")});
     assert_eq!(made["structuredContent"], dev);
 
     let listed = s.call(3, "list_vms", json!({}));
-    let base = json!({"name": "base", "generation": 0, "bytes": 6});
+    let base =
+        json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base")});
     assert_eq!(listed["structuredContent"], json!({"vms": [base, dev]}));
 
     let gone = s.call(4, "delete_vm", json!({"name": "dev"}));
