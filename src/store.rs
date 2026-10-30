@@ -1,6 +1,7 @@
 // The filesystem is the database: each VM is a directory.
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
+//   <root>/vms/<name>/gens/<n>.comment  a checkpoint's comment; gc keeps these
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
@@ -9,13 +10,16 @@ use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The VM `create` forks unless told otherwise.
 pub const BASE: &str = "base";
+
+/// How many generations gc keeps besides the current one and the checkpoints.
+pub const KEEP: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -47,6 +51,19 @@ pub struct Vm {
     pub generation: u64,
     /// Size of that disk.
     pub bytes: u64,
+    /// Space all its generations take on the host: allocated blocks, not
+    /// apparent size. A block reflinked into several disks counts in each.
+    pub used: u64,
+}
+
+/// What gc deleted from one VM, or would on a dry run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freed {
+    pub name: String,
+    /// Oldest first.
+    pub generations: Vec<u64>,
+    /// Their allocated blocks.
+    pub bytes: u64,
 }
 
 // A name becomes a directory, so it has to be one plain path component.
@@ -63,11 +80,18 @@ pub fn check_name(name: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    keep: usize,
 }
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Store { root: root.into() }
+        let root = root.into();
+        Store { root, keep: KEEP }
+    }
+
+    /// Sets how many other generations gc keeps, at every commit and in `gc`.
+    pub fn keeping(self, keep: usize) -> Self {
+        Store { keep, ..self }
     }
 
     fn vms(&self) -> PathBuf {
@@ -172,6 +196,7 @@ impl Store {
             disk,
             name,
             dir,
+            keep: self.keep,
             _lock: lock,
         })
     }
@@ -187,6 +212,16 @@ impl Store {
         gens.pop();
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
+    }
+
+    /// Deletes the disk generations a VM no longer needs: all but the current
+    /// one, every checkpoint with a comment, and the newest few others. A run
+    /// holding the VM may be using any of them, so that's `Busy`, and a dry run
+    /// only says what would go.
+    pub fn gc(&self, name: &str, dry_run: bool) -> Result<Freed> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        collect(name, &dir, self.keep, dry_run)
     }
 
     /// Removes a VM and all its disk generations. Forks of it are unaffected:
@@ -222,16 +257,62 @@ pub struct Run {
     pub disk: PathBuf,
     name: String,
     dir: PathBuf,
+    keep: usize,
     _lock: Lock,
 }
 
 impl Run {
+    /// Makes this run's disk current, then collects the generations the store
+    /// doesn't keep. That gc runs under the run's lock, so it never races one.
     pub fn commit(self) -> Result<Vm> {
         let mut gens = history(&self.dir)?;
         gens.push(self.generation);
         write_history(&self.dir, &gens)?;
+        // The commit stands either way; the next one tries again.
+        if let Err(e) = collect(&self.name, &self.dir, self.keep, false) {
+            eprintln!("runner: {} is committed, but gc failed: {e}", self.name);
+        }
         read_vm(&self.name, &self.dir)
     }
+}
+
+// The caller holds the VM's lock. History is rewritten before any disk goes,
+// so a gc killed partway leaves only disks nothing points at, which the next
+// one deletes.
+fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> {
+    let mut gens = history(dir)?;
+    let current = current(dir)?;
+    let mut others: Vec<u64> = disks(dir)?
+        .into_iter()
+        .filter(|&g| g != current && !comment_of(dir, g).is_file())
+        .collect();
+    // Newest first, so the ones kept are the ones in front.
+    others.sort_unstable_by(|a, b| b.cmp(a));
+    let mut doomed = others.split_off(keep.min(others.len()));
+    doomed.reverse();
+    let mut bytes = 0;
+    for &g in &doomed {
+        let disk = disk_of(dir, g);
+        bytes += allocated(&fs::metadata(&disk).map_err(at(&disk))?);
+    }
+    if !dry_run && !doomed.is_empty() {
+        let before = gens.len();
+        gens.retain(|g| !doomed.contains(g));
+        if gens.len() != before {
+            write_history(dir, &gens)?;
+        }
+        for &g in &doomed {
+            let disk = disk_of(dir, g);
+            fs::remove_file(&disk).map_err(at(&disk))?;
+        }
+        sync_dir(&dir.join("gens"))?;
+    }
+    let name = name.to_string();
+    Ok(Freed {
+        name,
+        generations: doomed,
+        bytes,
+    })
 }
 
 // flock, not a pid file: the kernel drops it when the holder dies, so a
@@ -270,16 +351,31 @@ fn read_vm(name: &str, dir: &Path) -> Result<Vm> {
     let generation = current(dir)?;
     let disk = disk_of(dir, generation);
     let bytes = fs::metadata(&disk).map_err(at(&disk))?.len();
+    let gens = dir.join("gens");
+    let mut used = 0;
+    for entry in fs::read_dir(&gens).map_err(at(&gens))? {
+        used += allocated(&entry.and_then(|e| e.metadata()).map_err(at(&gens))?);
+    }
     let name = name.to_string();
     Ok(Vm {
         name,
         generation,
         bytes,
+        used,
     })
+}
+
+// st_blocks is in 512-byte units whatever the filesystem's block size.
+fn allocated(meta: &fs::Metadata) -> u64 {
+    meta.blocks() * 512
 }
 
 fn disk_of(dir: &Path, generation: u64) -> PathBuf {
     dir.join("gens").join(format!("{generation}.ext4"))
+}
+
+fn comment_of(dir: &Path, generation: u64) -> PathBuf {
+    dir.join("gens").join(format!("{generation}.comment"))
 }
 
 fn history(dir: &Path) -> Result<Vec<u64>> {
@@ -336,18 +432,23 @@ fn sweep_staging(vms: &Path) {
     }
 }
 
-// Past every disk on hand, failed runs' included, so none is overwritten.
-fn next_generation(dir: &Path) -> Result<u64> {
+// Every disk on hand, failed runs' included.
+fn disks(dir: &Path) -> Result<Vec<u64>> {
     let gens = dir.join("gens");
-    let mut last = 0;
+    let mut out = Vec::new();
     for entry in fs::read_dir(&gens).map_err(at(&gens))? {
         let name = entry.map_err(at(&gens))?.file_name();
         let n = name
             .to_str()
-            .and_then(|s| s.strip_suffix(".ext4")?.parse().ok());
-        last = last.max(n.unwrap_or(0));
+            .and_then(|s| s.strip_suffix(".ext4")?.parse::<u64>().ok());
+        out.extend(n);
     }
-    Ok(last + 1)
+    Ok(out)
+}
+
+// Past every disk on hand, so none is overwritten.
+fn next_generation(dir: &Path) -> Result<u64> {
+    Ok(disks(dir)?.into_iter().max().unwrap_or(0) + 1)
 }
 
 // GNU cp does the copying: a reflink on XFS or btrfs, which takes constant

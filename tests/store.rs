@@ -16,13 +16,19 @@ fn disk(dir: &Path, bytes: &[u8]) -> PathBuf {
     path
 }
 
-fn vm(name: &str, generation: u64, bytes: u64) -> Vm {
-    let name = name.to_string();
-    Vm {
-        name,
-        generation,
-        bytes,
+// What a test expects of a VM. Space used hangs on the filesystem's block
+// size, so it has tests of its own and these compare the rest.
+#[derive(Debug)]
+struct Shown(&'static str, u64, u64);
+
+impl PartialEq<Shown> for Vm {
+    fn eq(&self, s: &Shown) -> bool {
+        (self.name.as_str(), self.generation, self.bytes) == (s.0, s.1, s.2)
     }
+}
+
+fn vm(name: &'static str, generation: u64, bytes: u64) -> Shown {
+    Shown(name, generation, bytes)
 }
 
 #[test]
@@ -36,7 +42,7 @@ fn import_makes_a_vm_at_generation_zero() {
 #[test]
 fn list_is_empty_before_anything_exists() {
     let (_dir, store) = store();
-    assert_eq!(store.list().unwrap(), vec![]);
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]
@@ -176,7 +182,7 @@ fn an_interrupted_create_does_not_take_the_name() {
     // What a create killed partway leaves: its staging directory, from a dead pid.
     let staged = dir.path().join("root/vms/.new-dev-999999999");
     fs::create_dir_all(staged.join("gens")).unwrap();
-    assert_eq!(store.list().unwrap(), vec![]);
+    assert!(store.list().unwrap().is_empty());
     store.import("dev", &disk(dir.path(), b"v0")).unwrap();
     assert!(!staged.exists(), "stale staging directory left behind");
 }
@@ -301,4 +307,187 @@ fn deleting_twice_in_one_process_works() {
         store.fork("base", "dev").unwrap();
         store.delete("dev").unwrap();
     }
+}
+
+// gc: the current generation, commented checkpoints and the newest few others
+// stay; everything else on disk goes.
+
+// A store that keeps everything, for building up generations to collect.
+fn hoarder(dir: &TempDir) -> Store {
+    Store::new(dir.path().join("root")).keeping(usize::MAX)
+}
+
+// `dev` at generation `n`, with every generation from 0 committed.
+fn committed(dir: &TempDir, n: u64) -> Store {
+    let store = hoarder(dir);
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    for g in 1..=n {
+        let run = store.begin_run("dev").unwrap();
+        fs::write(&run.disk, format!("v{g}")).unwrap();
+        run.commit().unwrap();
+    }
+    store
+}
+
+// dev's disks, by generation.
+fn on_disk(dir: &Path) -> Vec<u64> {
+    let gens = dir.join("root/vms/dev/gens");
+    let mut out: Vec<u64> = fs::read_dir(gens)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".ext4")?.parse().ok()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn undo_all(store: &Store) -> Vec<u64> {
+    let mut seen = Vec::new();
+    while let Ok(vm) = store.undo("dev") {
+        seen.push(vm.generation);
+    }
+    seen
+}
+
+#[test]
+fn gc_keeps_the_current_generation_and_the_newest_others() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    let freed = store.gc("dev", false).unwrap();
+    assert_eq!(freed.name, "dev");
+    assert_eq!(freed.generations, [0, 1, 2, 3]);
+    assert_eq!(on_disk(dir.path()), [4, 5, 6]);
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 6, 2));
+    // History lost the deleted ones, so undo stops at the oldest disk left.
+    assert_eq!(undo_all(&store), [5, 4]);
+}
+
+#[test]
+fn gc_keeps_every_checkpoint_with_a_comment() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let gens = dir.path().join("root/vms/dev/gens");
+    fs::write(gens.join("1.comment"), "before the upgrade\n").unwrap();
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2, 3]);
+    assert_eq!(on_disk(dir.path()), [1, 4, 5, 6]);
+    assert!(gens.join("1.comment").is_file());
+    assert_eq!(undo_all(&store), [5, 4, 1]);
+}
+
+#[test]
+fn gc_keeps_five_others_unless_told() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 8);
+    let store = Store::new(dir.path().join("root"));
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 1, 2]);
+    assert_eq!(on_disk(dir.path()), [3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
+fn gc_counts_failed_runs_disks_as_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = committed(&dir, 1);
+    drop(store.begin_run("dev").unwrap());
+    drop(store.begin_run("dev").unwrap());
+    let store = Store::new(dir.path().join("root")).keeping(1);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2]);
+    assert_eq!(on_disk(dir.path()), [1, 3]);
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 1, 2));
+}
+
+#[test]
+fn gc_dry_run_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let history = dir.path().join("root/vms/dev/history");
+    let before = fs::read_to_string(&history).unwrap();
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    let would = store.gc("dev", true).unwrap();
+    assert_eq!(would.generations, [0, 1, 2, 3]);
+    assert!(would.bytes > 0);
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(fs::read_to_string(&history).unwrap(), before);
+    // The real thing frees just what the dry run said.
+    assert_eq!(store.gc("dev", false).unwrap(), would);
+}
+
+#[test]
+fn gc_counts_what_it_frees_in_allocated_blocks() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 3);
+    let gens = dir.path().join("root/vms/dev/gens");
+    let blocks = |g: u64| {
+        fs::metadata(gens.join(format!("{g}.ext4")))
+            .unwrap()
+            .blocks()
+            * 512
+    };
+    let want = blocks(0) + blocks(1);
+    let store = Store::new(dir.path().join("root")).keeping(1);
+    let freed = store.gc("dev", false).unwrap();
+    assert_eq!(freed.generations, [0, 1]);
+    assert_eq!(freed.bytes, want);
+}
+
+#[test]
+fn gc_leaves_alone_a_vm_a_run_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let hoard = committed(&dir, 6);
+    let run = hoard.begin_run("dev").unwrap();
+    fs::write(&run.disk, b"in progress").unwrap();
+    let store = Store::new(dir.path().join("root")).keeping(0);
+    assert!(matches!(store.gc("dev", false), Err(Error::Busy(n)) if n == "dev"));
+    assert!(matches!(store.gc("dev", true), Err(Error::Busy(_))));
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(fs::read(&run.disk).unwrap(), b"in progress");
+    run.commit().unwrap();
+    assert_eq!(
+        store.gc("dev", false).unwrap().generations,
+        [0, 1, 2, 3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn every_commit_collects_what_the_store_does_not_keep() {
+    let (dir, store) = store();
+    let store = store.keeping(2);
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    for _ in 0..5 {
+        store.begin_run("dev").unwrap().commit().unwrap();
+    }
+    assert_eq!(on_disk(dir.path()), [3, 4, 5]);
+}
+
+#[test]
+fn gc_refuses_an_unknown_vm() {
+    let (_dir, store) = store();
+    assert!(matches!(store.gc("nope", false), Err(Error::NoVm(n)) if n == "nope"));
+    assert!(matches!(store.gc("../etc", true), Err(Error::BadName(_))));
+}
+
+#[test]
+fn used_is_allocated_blocks_of_every_generation_not_apparent_size() {
+    use std::os::unix::fs::MetadataExt;
+    let (dir, store) = store();
+    let src = dir.path().join("sparse.ext4");
+    fs::File::create(&src).unwrap().set_len(64 << 20).unwrap();
+    store.import("base", &src).unwrap();
+    let run = store.begin_run("base").unwrap();
+    fs::write(&run.disk, vec![7u8; 1 << 20]).unwrap();
+    run.commit().unwrap();
+    let got = store.get("base").unwrap();
+    let gens = dir.path().join("root/vms/base/gens");
+    let want: u64 = fs::read_dir(gens)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
+        .sum();
+    assert_eq!(got.used, want);
+    assert!(got.used >= 1 << 20, "{}", got.used);
+    assert!(got.used < 4 << 20, "64 MB of holes counted: {}", got.used);
+    assert_eq!(store.list().unwrap()[0].used, want);
 }
