@@ -703,7 +703,10 @@ fn a_run_s_rollback_ask_keeps_a_clean_shutdown_from_committing() {
     assert_eq!(h.store.get("dev").unwrap().generation, 0);
     assert!(h.vm_dir("dev").join("gens/1.ext4").is_file());
     assert!(notes.contains("run dev.4 asked to roll back"), "{notes}");
-    assert!(!h.vm_dir("dev").join("rollback").exists(), "the ask was kept");
+    assert!(
+        !h.vm_dir("dev").join("rollback").exists(),
+        "the ask was kept"
+    );
 }
 
 #[test]

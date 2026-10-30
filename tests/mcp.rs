@@ -115,6 +115,7 @@ fn lists_its_tools() {
     assert_eq!(
         names,
         [
+            "cancel_run",
             "checkpoint_vm",
             "create_vm",
             "delete_vm",
@@ -122,10 +123,13 @@ fn lists_its_tools() {
             "exec",
             "kill_session",
             "list_checkpoints",
+            "list_runs",
             "list_sessions",
             "list_vms",
             "read_session",
             "restore_vm",
+            "run_agent",
+            "run_output",
             "start_vm",
             "stop_vm",
             "undo_vm",
