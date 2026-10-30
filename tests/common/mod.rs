@@ -142,8 +142,8 @@ fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     })
 }
 
-/// A `firecracker` that prints the version it's told to, records its argv,
-/// writes a line of "console", then exits with whatever number is written
+/// A `firecracker` that prints the version it's told to, records its argv
+/// and environment, writes a line of "console", then exits with whatever number is written
 /// to its `exit` fifo. The test serves its API socket.
 #[derive(Clone)]
 pub struct FakeFirecracker {
@@ -159,6 +159,7 @@ impl FakeFirecracker {
             &bin,
             r#"if [ "$1" = --version ]; then printf 'Firecracker %s\n\n' "$FAKE_FC_VERSION"; exit 0; fi
 grep '^CapAmb' /proc/$$/status > "$FAKE_FC/caps"
+env > "$FAKE_FC/env"
 printf '%s\n' "$@" > "$FAKE_FC/argv.tmp" && mv "$FAKE_FC/argv.tmp" "$FAKE_FC/argv"
 echo "fake console: Linux version 6.1"
 read -r code < "$FAKE_FC/exit"

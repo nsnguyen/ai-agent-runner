@@ -1,6 +1,13 @@
 // Credentials reach a VM's memory per boot and never its disk: the host finds
 // them, the guest holds them for its sessions (docs/design.md, Credentials).
 // Nothing here writes a value to a file or prints one.
+//
+// runner-guest asks for them each time it starts, before it takes a command:
+// it connects to the host on vsock PORT, which Firecracker passes on to
+// `vsock.sock_<PORT>` in the VM's directory, where `runner boot` hands it the
+// VM's keyring (`send`, then `receive` in the guest).
+use rmcp::schemars;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -9,8 +16,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 
+/// The host's vsock port runner-guest takes its credentials from.
+pub const PORT: u32 = 10023;
+
 /// A credential a VM's allowlist can name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum Cred {
     /// Claude Code's login: a `claude setup-token` token or an API key.
     Claude,
@@ -31,10 +42,12 @@ impl Cred {
         }
     }
 
-    // The variables it can arrive as, in the order the host looks; a VM gets
-    // only the first one found. The OAuth token comes first: an API key would
-    // win inside Claude Code and bill per token.
-    fn vars(self) -> &'static [&'static str] {
+    /// The variables it can arrive as, in the order the host looks; a VM gets
+    /// only the first one found. Each is also the name of the systemd
+    /// credential the host keeps it under.
+    // The OAuth token comes first: an API key would win inside Claude Code
+    // and bill per token.
+    pub fn vars(self) -> &'static [&'static str] {
         match self {
             Cred::Claude => &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
             Cred::Github => &["GH_TOKEN"],

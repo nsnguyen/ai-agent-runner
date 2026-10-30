@@ -10,6 +10,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 - `runner stop dev` is `systemctl stop`. The unit's ExecStop, `runner halt dev`, sends Ctrl-Alt-Del and waits for boot to let go of the lock. After 30 seconds, systemd kills the VM.
 - A clean shutdown (Firecracker exits 0) commits the new generation. A kill, a crash or a guest panic doesn't: the previous generation stays current, and the new disk stays for a look.
 - Inside the guest, shut down with `reboot`, not `poweroff`. On x86 Firecracker has no power-off, so after `poweroff` the guest halts but Firecracker keeps running: the VM looks running until a stop kills it, and the run isn't committed.
+- When runner-guest starts, before it takes a command, it asks the host for the VM's credentials on vsock port 10023. Firecracker passes that to `vsock.sock_10023`, where boot hands over the ones the VM's allowlist names (docs/design.md, Credentials).
 - `runner shell dev` and `runner exec dev` reach the guest's runner-guest through the VM's `vsock.sock`: `CONNECT 10022`, then the protocol in `src/proto.rs`. A stopped VM is started first, and the runner retries for up to a minute while the guest boots. Its SIGTERM or SIGHUP hangs the command up, as closing its terminal does.
 - `delete` and `undo` refuse a running VM, because boot holds its lock.
 - VMs get 2 vCPUs and 2 GiB unless `runner create --cpus --mem` says otherwise, and the host's kernel at `<root>/kernel/vmlinux` unless `--kernel` names one. A fork keeps its parent's.
@@ -30,6 +31,12 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
    ```
 4. That user in the `kvm` and `systemd-journal` groups, and allowed to start and stop `firecracker@*` units: a polkit rule, which #14 adds.
 5. NAT for the VMs' range, and `iproute2`. `host/install.sh` does both.
+6. Claude Code's token, for the VMs. Make it with `claude setup-token` on any machine with a browser, then on the host:
+   ```
+   sudo install -d -m 0700 /etc/credstore
+   sudo sh -c 'umask 077; cat > /etc/credstore/CLAUDE_CODE_OAUTH_TOKEN'   # paste it, then Enter and ^D
+   ```
+   The unit loads `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` from `/etc/credstore/` at each boot, and skips one that isn't there. That needs systemd 251 or later (Debian 12, Ubuntu 24.04); an older one loads nothing, and `runner logs` says the token is missing. An API key goes in `ANTHROPIC_API_KEY` the same way, and is used only without the token. A GitHub token in `GH_TOKEN` reaches only VMs given it with `runner creds <vm> claude github`. Each VM's guest gets its credentials from boot over vsock and keeps them in memory: `runner status dev` says which it took, and `runner logs dev` names any the host lacks. Only a runner-guest from this version on asks for them: rebuild `base` (images/base), then make VMs from it. A VM forked from an older base keeps its older guest, and gets none.
 
 Then: `runner import base rootfs.ext4 && runner create dev && runner start dev && runner logs dev`.
 

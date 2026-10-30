@@ -172,7 +172,9 @@ impl Tools {
         blocking(move || systemd::stop(&store, &name)).await
     }
 
-    #[tool(description = "Say whether a VM is stopped, booting, running or stopping.")]
+    #[tool(
+        description = "Say whether a VM is stopped, booting, running or stopping, and while it's up, which credentials its guest took, by name."
+    )]
     fn vm_status(
         &self,
         Parameters(NameArg { name }): Parameters<NameArg>,

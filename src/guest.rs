@@ -1,10 +1,13 @@
 // runner-guest: the agent inside each VM, so the guest needs no sshd and no
 // keys. It runs as root under systemd and runs one command per connection,
-// as any user, for the host (src/proto.rs has the protocol).
+// as any user, for the host (src/proto.rs has the protocol). Each command
+// gets exactly the credentials the host handed over at the agent's start
+// (src/creds.rs), which it holds in memory only.
 //
 // Each connection has a thread that waits for the command, one per output
 // stream that forwards it, one that applies the host's frames, and one that
 // writes stdin.
+use crate::creds::Keyring;
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -76,10 +79,13 @@ pub fn accept_vsock(listener: &vsock::VsockListener) -> io::Result<vsock::VsockS
     Ok(unsafe { vsock::VsockStream::from_raw_fd(fd) })
 }
 
-/// Serves each connection on its own thread, for as long as they come.
-pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>) {
+/// Serves each connection on its own thread, for as long as they come. Every
+/// command gets `keyring`'s credentials.
+pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>, keyring: Arc<Keyring>) {
     for conn in conns {
-        let served = conn.and_then(|conn| thread::Builder::new().spawn(move || handle(conn)));
+        let keyring = keyring.clone();
+        let served =
+            conn.and_then(|conn| thread::Builder::new().spawn(move || handle(conn, &keyring)));
         if let Err(e) = served {
             eprintln!("runner-guest: accept: {e}");
             thread::sleep(Duration::from_millis(100));
@@ -87,13 +93,13 @@ pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>) {
     }
 }
 
-fn handle<C: Conn>(mut conn: C) {
-    if let Err(e) = session(&mut conn) {
+fn handle<C: Conn>(mut conn: C, keyring: &Keyring) {
+    if let Err(e) = session(&mut conn, keyring) {
         eprintln!("runner-guest: {e}");
     }
 }
 
-fn session<C: Conn>(conn: &mut C) -> proto::Result<()> {
+fn session<C: Conn>(conn: &mut C, keyring: &Keyring) -> proto::Result<()> {
     proto::hello(conn)?;
     proto::check_hello(conn)?;
     let Some(req) = proto::read_frame::<Request>(conn)? else {
@@ -107,7 +113,7 @@ fn session<C: Conn>(conn: &mut C) -> proto::Result<()> {
         stdin,
         pty,
         outputs,
-    } = match start(&req) {
+    } = match start(&req, keyring) {
         Ok(running) => running,
         Err(e) => return send(&out, FromGuest::Error(e)),
     };
@@ -165,7 +171,7 @@ struct Running {
 // An output stream, and the frame its bytes go out in.
 type Output = (File, fn(Vec<u8>) -> FromGuest);
 
-fn start(req: &Request) -> Result<Running, String> {
+fn start(req: &Request, keyring: &Keyring) -> Result<Running, String> {
     let Some((program, args)) = req.argv.split_first() else {
         return Err("nothing to run: argv is empty".into());
     };
@@ -189,6 +195,9 @@ fn start(req: &Request) -> Result<Running, String> {
         cmd.env("TERM", "xterm-256color");
     }
     cmd.envs(req.env.iter().map(|(k, v)| (k, v)));
+    // Last, so the request can't add or change one. cmd's Debug output now
+    // holds their values: it's never printed.
+    keyring.apply(&mut cmd);
     let cwd = match &req.cwd {
         Some(cwd) if !Path::new(cwd).is_dir() => return Err(format!("no directory {cwd}")),
         Some(cwd) => PathBuf::from(cwd),

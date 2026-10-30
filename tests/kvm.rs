@@ -7,7 +7,10 @@
 // a login prompt on the serial console.
 // `boot_and_halt_by_hand` and `a_booted_vm_answers_at_its_address` need
 // Firecracker on PATH, RUNNER_TEST_KERNEL, and root (or CAP_NET_ADMIN) for
-// the VM's tap: run them with sudo -E.
+// the VM's tap: run them with sudo -E. So does
+// `the_token_reaches_the_vm_s_memory_and_never_its_disk`, with the base
+// image as RUNNER_TEST_DISK; a real token in CLAUDE_CODE_OAUTH_TOKEN lets
+// claude get further than a login error.
 // `start_logs_and_stop_under_systemd` needs `runner unit` installed and the
 // host's kernel in place; it uses the unit's root, RUNNER_ROOT or
 // /var/lib/runner. `exec_starts_the_vm_and_runs_in_the_guest` needs the same,
@@ -168,7 +171,8 @@ fn start_logs_and_stop_under_systemd() {
     let status = ok(runner(&root, &["status", &name]));
     let logs = || ok(runner(&root, &["logs", &name]));
     assert!(started.status.success(), "start: {:?}\n{}", started, logs());
-    assert!(status.ends_with("  running\n"), "{status}");
+    // Then the credentials its guest took, if it has runner-guest.
+    assert!(status.contains("  running"), "{status}");
     eventually("the kernel in the journal", || {
         logs().contains("Linux version")
     });
@@ -269,6 +273,108 @@ fn a_session_outlives_a_dropped_connection() {
     ok(runner(&root, &detach));
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     ok(runner(&root, &["kill", &name, "work"]));
+}
+
+// Booted by hand, so the token comes from this process's environment, the
+// way the unit's comes from /etc/credstore. Commands reach the guest through
+// the VM's vsock directly, since systemd doesn't know this VM is up.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, Firecracker, a kernel, the base image and root"]
+fn the_token_reaches_the_vm_s_memory_and_never_its_disk() {
+    use runner::proto::{PORT, Request};
+    let token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").unwrap_or_else(|_| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("sk-ant-oat01-runner-test-{}-{nanos}", std::process::id())
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let disk = env_path("RUNNER_TEST_DISK");
+    ok(runner(root, &["import", "dev", disk.to_str().unwrap()]));
+    std::fs::create_dir_all(root.join("kernel")).unwrap();
+    std::fs::copy(env_path("RUNNER_TEST_KERNEL"), root.join("kernel/vmlinux")).unwrap();
+
+    let console = root.join("console.log");
+    let boot = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", root)
+        .env("CLAUDE_CODE_OAUTH_TOKEN", &token)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("GH_TOKEN")
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .args(["boot", "dev"])
+        .stdout(std::fs::File::create(&console).unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let vsock = root.join("vms/dev/vsock.sock");
+    let run = |script: &str, timeout: u64| {
+        let conn = runner::exec::connect(&vsock, PORT, runner::exec::GUEST_WAIT).unwrap();
+        let req = Request {
+            argv: ["sh", "-c", script].map(String::from).to_vec(),
+            env: Vec::new(),
+            cwd: None,
+            user: Some(runner::exec::USER.to_string()),
+            tty: None,
+        };
+        let timeout = Duration::from_secs(timeout);
+        runner::exec::capture(conn, &req, b"", timeout, 1 << 20).unwrap()
+    };
+    let seen = run(r#"printf %s "$CLAUDE_CODE_OAUTH_TOKEN""#, 30);
+    // As a session would: Claude Code runs, and writes what it writes.
+    let claude = run("claude -p 'Reply with the word ok' </dev/null; sync", 300);
+    let handed = runner::store::Store::new(root).handed("dev").unwrap();
+    ok(runner(root, &["halt", "dev"]));
+    let out = boot.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(seen.stdout, token, "the guest didn't have the token");
+    assert_eq!(
+        handed,
+        Some(vec![runner::creds::Cred::Claude]),
+        "{claude:?}"
+    );
+    assert!(!err.contains(&token), "boot's journal holds the token");
+
+    // Every disk the VM booted from, and its console, which the unit sends
+    // to the host's journal. The imported one never ran.
+    let mut held = Vec::new();
+    for entry in std::fs::read_dir(root.join("vms/dev/gens")).unwrap() {
+        let path = entry.unwrap().path();
+        let ran = path.extension().is_some_and(|e| e == "ext4") && !path.ends_with("0.ext4");
+        if ran && holds(&path, &token) {
+            held.push(path.display().to_string());
+        }
+    }
+    if holds(&console, &token) {
+        held.push(console.display().to_string());
+    }
+    assert!(
+        held.is_empty(),
+        "the token is in {held:?}; claude said {claude:?}"
+    );
+}
+
+// GNU grep, which skips a sparse disk's holes and is far faster than a scan
+// here. -z splits records at NULs, so a disk of zeros isn't one huge line;
+// a token holds none. It goes in on stdin, not argv, where `ps` shows it.
+fn holds(path: &Path, token: &str) -> bool {
+    use std::io::Write;
+    let mut grep = Command::new("grep")
+        .args(["-F", "-a", "-z", "-q", "-f", "-", "--"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = grep.stdin.take().unwrap();
+    stdin.write_all(token.as_bytes()).unwrap();
+    drop(stdin);
+    match grep.wait().unwrap().code() {
+        Some(0) => true,
+        Some(1) => false,
+        code => panic!("grep {} exited {code:?}", path.display()),
+    }
 }
 
 // A failed test still leaves the host's VMs as it found them.

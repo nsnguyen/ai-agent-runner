@@ -317,13 +317,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             } else {
                 store.creds(&name)?
             };
-            let names: Vec<_> = got.iter().map(|c| c.name()).collect();
-            let list = if names.is_empty() {
-                "none".to_string()
-            } else {
-                names.join(" ")
-            };
-            println!("{name}  creds {list}");
+            println!("{name}  creds {}", names(&got));
         }
         Cmd::Doctor => {
             let report = doctor::check(&System, &store);
@@ -486,7 +480,20 @@ fn show(vm: &Vm) {
 }
 
 fn show_status(status: &VmStatus) {
-    println!("{}  {}", line(&status.vm), status.state);
+    let creds = status
+        .creds
+        .as_deref()
+        .map(|c| format!("  creds {}", names(c)));
+    let creds = creds.unwrap_or_default();
+    println!("{}  {}{creds}", line(&status.vm), status.state);
+}
+
+fn names(creds: &[Cred]) -> String {
+    if creds.is_empty() {
+        return "none".to_string();
+    }
+    let names: Vec<_> = creds.iter().map(|c| c.name()).collect();
+    names.join(" ")
 }
 
 fn serve(store: Store, user: String) -> ExitCode {

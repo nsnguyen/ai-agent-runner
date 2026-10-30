@@ -1,5 +1,6 @@
 // The unit file, the states systemd reports, and READY notifications: no
 // systemd needed.
+use runner::creds::Cred;
 use runner::systemd::{self, Error, State};
 use std::ffi::OsStr;
 use std::os::linux::net::SocketAddrExt;
@@ -33,6 +34,11 @@ TimeoutStartSec=600
 User=runner
 SupplementaryGroups=kvm
 Environment=RUNNER_ROOT=/var/lib/runner
+# The credentials a VM may get, each from /etc/credstore/<name> on the host.
+# One that isn't there is skipped. Boot hands a VM's to its guest.
+LoadCredential=CLAUDE_CODE_OAUTH_TOKEN
+LoadCredential=ANTHROPIC_API_KEY
+LoadCredential=GH_TOKEN
 ExecStart=/usr/local/bin/runner boot %i
 # Ctrl-Alt-Del, then wait for the guest to shut down. Past the timeout,
 # systemd kills the VM and its run isn't committed.
@@ -112,4 +118,23 @@ fn ready_reaches_a_path_socket_and_an_abstract_one() {
     systemd::notify(OsStr::new(&format!("@{name}")), "READY=1").unwrap();
     let n = sock.recv(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"READY=1");
+}
+
+// Both units, the one host/install.sh installs and `runner unit`'s, load
+// every variable a credential can arrive as, in the terse form: a missing
+// one is skipped rather than failing the boot.
+#[test]
+fn both_units_load_every_credential() {
+    let rendered = systemd::render_unit(
+        Path::new("/usr/local/bin/runner"),
+        Path::new("/var/lib/runner"),
+        "runner",
+    )
+    .unwrap();
+    for unit in [runner::host::UNIT, &rendered] {
+        for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
+            let line = format!("\nLoadCredential={var}\n");
+            assert!(unit.contains(&line), "no {line:?} in\n{unit}");
+        }
+    }
 }

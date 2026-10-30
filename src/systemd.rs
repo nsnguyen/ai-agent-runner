@@ -2,6 +2,7 @@
 // whose main process is `runner boot <vm>`. start, stop and status are
 // systemctl on it, logs is journalctl. systemctl's output is captured, never
 // inherited: under `runner mcp`, stdout is protocol.
+use crate::creds::Cred;
 use crate::store::{Store, Vm};
 use rmcp::schemars;
 use serde::Serialize;
@@ -85,6 +86,9 @@ pub struct VmStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<Ipv4Addr>,
     pub state: State,
+    /// The credentials its guest took this boot, by name; absent until it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creds: Option<Vec<Cred>>,
 }
 
 pub fn unit_name(vm: &str) -> String {
@@ -117,7 +121,16 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
     // A start or stop that worked shouldn't be reported as failed for want
     // of an address.
     let address = store.net(name).ok().map(|net| net.address);
-    Ok(VmStatus { vm, address, state })
+    let creds = match state {
+        State::Stopped => None,
+        _ => store.handed(name).ok().flatten(),
+    };
+    Ok(VmStatus {
+        vm,
+        address,
+        state,
+        creds,
+    })
 }
 
 /// The VM's journal: its serial console and the runner's own lines, on this
@@ -166,6 +179,11 @@ pub fn render_unit(runner: &Path, root: &Path, user: &str) -> Result<String> {
     let runner = plain_path(runner)?;
     let root = plain_path(root)?;
     check_user(user)?;
+    let load: String = Cred::ALL
+        .iter()
+        .flat_map(|c| c.vars())
+        .map(|var| format!("LoadCredential={var}\n"))
+        .collect();
     Ok(format!(
         "\
 # firecracker@.service, written by `runner unit`. Each instance is one VM:
@@ -185,7 +203,9 @@ TimeoutStartSec=600
 User={user}
 SupplementaryGroups=kvm
 Environment=RUNNER_ROOT={root}
-ExecStart={runner} boot %i
+# The credentials a VM may get, each from /etc/credstore/<name> on the host.
+# One that isn't there is skipped. Boot hands a VM's to its guest.
+{load}ExecStart={runner} boot %i
 # Ctrl-Alt-Del, then wait for the guest to shut down. Past the timeout,
 # systemd kills the VM and its run isn't committed.
 ExecStop={runner} halt %i
