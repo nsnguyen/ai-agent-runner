@@ -352,9 +352,9 @@ fn a_tty_puts_the_terminal_in_raw_mode_and_back() {
     // Raw, so ^C would go through as a byte; Enter is \r, as a terminal sends it.
     t.master.try_clone().unwrap().write_all(b"yes\r").unwrap();
     assert!(child.wait().unwrap().success(), "{}", t.seen());
-    let seen = t.seen();
-    assert!(seen.contains("30 100\r\n"), "{seen}");
-    assert!(seen.contains("got yes\r\n"), "{seen}");
+    // Read from the PTY on another thread, which may still be catching up.
+    t.wait_for("got yes\r\n");
+    assert!(t.seen().contains("30 100\r\n"), "{}", t.seen());
     assert!(same_modes(&t.modes(), &before), "terminal not restored");
 }
 
@@ -371,7 +371,7 @@ fn shell_on_a_terminal_gets_one_of_its_size() {
         .write_all(input.as_bytes())
         .unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(5), "{}", t.seen());
-    assert!(t.seen().contains("[30 100]"), "{}", t.seen());
+    t.wait_for("[30 100]");
     assert!(same_modes(&t.modes(), &before), "terminal not restored");
 }
 
@@ -388,9 +388,65 @@ fn sigterm_hangs_up_and_still_restores_the_terminal() {
     nix::sys::signal::kill(pid, nix::sys::signal::SIGTERM).unwrap();
     let status = child.wait().unwrap();
     assert!(start.elapsed() < Duration::from_secs(10));
-    // Not killed by the signal: it handled it, and failed.
-    assert_eq!(status.code(), Some(255), "{}", t.seen());
+    // Not killed by the signal: it handled it, and exits as if it had been.
+    assert_eq!(status.code(), Some(143), "{}", t.seen());
     assert!(same_modes(&t.modes(), &before), "terminal not restored");
+}
+
+// The guest stops reading once a command leaves 1 MiB of its input unread,
+// and then neither a signal nor a hang-up gets through to it. The runner
+// still gets out at once, as if killed by the signal.
+#[test]
+fn a_signal_gets_out_while_stdin_is_stalled() {
+    let vm = vm();
+    for (sig, code) in [(libc::SIGTERM, 143), (libc::SIGINT, 130)] {
+        let mut child = vm
+            .runner(&["exec", "dev", "--", "sleep", "5"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        std::thread::spawn(move || input.write_all(&vec![b'x'; 20 << 20]));
+        std::thread::sleep(Duration::from_millis(500));
+        let start = Instant::now();
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        let sig = nix::sys::signal::Signal::try_from(sig).unwrap();
+        nix::sys::signal::kill(pid, sig).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{sig}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{sig}: {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+// As a command writing into `| head` does locally: quietly, as if SIGPIPE
+// had killed it.
+#[test]
+fn exec_into_a_closed_pipe_exits_as_sigpipe() {
+    let vm = vm();
+    let mut child = vm
+        .runner(&["exec", "dev", "--", "yes"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut some = [0; 10];
+    child.stdout.take().unwrap().read_exact(&mut some).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(141));
+    assert_eq!(text(&out.stderr), "");
+}
+
+// A ^D after a partial line only sends the line, so the end takes two.
+#[test]
+fn a_tty_s_piped_input_ends_after_a_partial_line_too() {
+    let vm = vm();
+    let out = vm.run(&["exec", "dev", "--tty", "--", "cat"], b"abc");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(text(&out.stdout).contains("abc"), "{}", text(&out.stdout));
 }
 
 // The kernel sends SIGWINCH only to a terminal's foreground group, which the
@@ -407,7 +463,7 @@ fn a_resize_follows_the_terminal() {
     let pid = nix::unistd::Pid::from_raw(child.id() as i32);
     nix::sys::signal::kill(pid, nix::sys::signal::SIGWINCH).unwrap();
     assert!(child.wait().unwrap().success(), "{}", t.seen());
-    assert!(t.seen().contains("50 132\r\n"), "{}", t.seen());
+    t.wait_for("50 132\r\n");
 }
 
 #[test]
@@ -488,6 +544,9 @@ fn capture_keeps_the_first_cap_bytes_of_each_stream() {
     // Exactly the cap isn't cut.
     let got = capture(&vm, &["printf", "abc"], b"", LONG, 3);
     assert_eq!((got.stdout.as_str(), got.stdout_truncated), ("abc", false));
+    // A character the cap cuts in two goes, rather than ending in U+FFFD.
+    let got = capture(&vm, &["printf", "aé"], b"", LONG, 2);
+    assert_eq!((got.stdout.as_str(), got.stdout_truncated), ("a", true));
 }
 
 #[test]
@@ -520,9 +579,10 @@ fn a_timeout_returns_even_when_the_command_isn_t_reading_its_input() {
     let vm = vm();
     let input = vec![b'x'; 8 << 20];
     let start = Instant::now();
+    // It may live on in the guest, so it's short.
     let got = capture(
         &vm,
-        &["sleep", "30"],
+        &["sleep", "3"],
         &input,
         Duration::from_millis(500),
         100,
@@ -562,6 +622,20 @@ fn connect_gives_up_after_the_wait() {
     let got = exec::connect(&uds, proto::PORT, Duration::from_millis(300));
     assert!(got.is_err());
     assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+// A path too long for a socket won't get shorter.
+#[test]
+fn connect_fails_at_once_on_an_error_that_won_t_clear() {
+    let long = PathBuf::from(format!("/tmp/{}/vsock.sock", "x".repeat(200)));
+    let start = Instant::now();
+    let got = exec::connect(&long, proto::PORT, Duration::from_secs(10));
+    assert!(got.is_err());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 // Whatever answers isn't runner-guest, and waiting won't change that.

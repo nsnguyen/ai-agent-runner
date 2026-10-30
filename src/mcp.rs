@@ -78,7 +78,7 @@ pub struct ExecArgs {
     /// Text for the command's stdin, which then closes. Left out, stdin is
     /// closed from the start.
     stdin: Option<String>,
-    /// Seconds before the command is killed. Defaults to 120.
+    /// Seconds before the command is killed. Defaults to 120; at most 86400.
     timeout_secs: Option<u64>,
 }
 

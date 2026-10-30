@@ -16,7 +16,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, TryLockError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,9 @@ const HANDSHAKE: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_millis(100);
 // Stdin goes out in frames of this much, the guest's own read size.
 const CHUNK: usize = 32 * 1024;
+// A writer held this long is stalled behind stdin the command isn't reading,
+// not partway through a frame.
+const STALLED: Duration = Duration::from_millis(100);
 // After a timeout's kill, how long to wait for the exit: the guest's grace
 // before its own SIGKILL, its drain of the last output, and slack.
 const KILL_WAIT: Duration = Duration::from_secs(10);
@@ -51,10 +55,7 @@ pub enum Error {
     Store(#[from] crate::store::Error),
     #[error(transparent)]
     Proto(#[from] proto::Error),
-    #[error(
-        "runner-guest in {name} didn't answer within {}s ({last}): `runner logs {name}` says more",
-        GUEST_WAIT.as_secs()
-    )]
+    #[error("runner-guest in {name} didn't answer ({last}): `runner logs {name}` says more")]
     NoGuest { name: String, last: io::Error },
     /// Why the guest couldn't run the command.
     #[error("{0}")]
@@ -92,15 +93,27 @@ pub fn open(store: &Store, name: &str) -> Result<UnixStream> {
 /// Connects to `port` in the guest through Firecracker's vsock socket at
 /// `sock`, and checks the hello. A guest that has just booted takes a moment
 /// to listen, so it tries again until `wait` has passed; the error is the
-/// last try's. Something that answers but isn't runner-guest fails at once.
+/// last try's. An error that waiting won't clear, like something answering
+/// that isn't runner-guest, fails at once.
 pub fn connect(sock: &Path, port: u32, wait: Duration) -> proto::Result<UnixStream> {
     let deadline = Instant::now() + wait;
     loop {
         match try_connect(sock, port) {
-            Err(proto::Error::Io(_)) if Instant::now() < deadline => thread::sleep(RETRY),
+            Err(proto::Error::Io(e)) if passing(&e) && Instant::now() < deadline => {
+                thread::sleep(RETRY)
+            }
             done => return done,
         }
     }
+}
+
+// What a VM that's still booting, or a guest agent restarting, looks like.
+fn passing(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NotFound | ConnectionRefused | ConnectionReset | ConnectionAborted | WouldBlock | TimedOut
+    )
 }
 
 fn try_connect(sock: &Path, port: u32) -> proto::Result<UnixStream> {
@@ -138,6 +151,31 @@ fn send(writer: &Mutex<UnixStream>, msg: &ToGuest) -> proto::Result<()> {
     proto::write_frame(&mut *writer.lock().unwrap(), msg)
 }
 
+// Sends unless the writer is stalled; None if it is. Then nothing reaches the
+// guest until the command reads its stdin, and Firecracker likely won't pass
+// on a hang-up either: it stops reading this end while the guest is full.
+fn send_unless_stalled(writer: &Mutex<UnixStream>, msg: &ToGuest) -> Option<proto::Result<()>> {
+    let start = Instant::now();
+    loop {
+        match writer.try_lock() {
+            Ok(mut w) => return Some(proto::write_frame(&mut *w, msg)),
+            Err(TryLockError::Poisoned(_)) => return None,
+            Err(TryLockError::WouldBlock) if start.elapsed() > STALLED => return None,
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+// Shuts the connection down both ways when dropped, which ends any thread
+// still using it, whichever way the caller returns.
+struct Cut(UnixStream);
+
+impl Drop for Cut {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
 /// What a command did, as MCP's exec gives it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct Captured {
@@ -165,6 +203,7 @@ pub fn capture(
     timeout: Duration,
     cap: usize,
 ) -> Result<Captured> {
+    let _cut = Cut(clone(&conn)?);
     let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
     proto::write_frame(&mut *writer.lock().unwrap(), req)?;
     // Frames are read on their own thread, so the deadline never lands
@@ -219,8 +258,6 @@ pub fn capture(
             }
         }
     };
-    // Ends the reader and feeder, if they're still going.
-    let _ = conn.shutdown(Shutdown::Both);
     Ok(Captured {
         exit_code: match exit {
             Some(Exit::Code(code)) => Some(code),
@@ -239,18 +276,14 @@ pub fn capture(
 }
 
 // SIGKILL to the command's group; true if it went, so the exit will come.
-// While the feeder holds the writer, stalled behind a command that isn't
-// reading its input, it hangs up instead. Once that reaches the guest, it
-// sends SIGHUP, then SIGKILL, but Firecracker has ended the connection by
-// then, so no exit comes back. Nor does anything reach the guest while its
-// stdin queue is full, so in that case the command may live on.
+// With the writer stalled it hangs up instead, which may never reach the
+// guest, and no exit comes back after it.
 fn kill(writer: &Mutex<UnixStream>, conn: &UnixStream) -> bool {
-    if let Ok(mut w) = writer.try_lock()
-        && proto::write_frame(&mut *w, &ToGuest::Signal(libc::SIGKILL)).is_ok()
-    {
+    let sigkill = ToGuest::Signal(libc::SIGKILL);
+    if let Some(Ok(())) = send_unless_stalled(writer, &sigkill) {
         return true;
     }
-    let _ = conn.shutdown(Shutdown::Write);
+    let _ = conn.shutdown(Shutdown::Both);
     false
 }
 
@@ -276,8 +309,16 @@ impl Kept {
         self.bytes.extend_from_slice(&b[..b.len().min(room)]);
     }
 
+    // A character the cap cut in two goes, rather than ending in U+FFFD.
     fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).into_owned()
+        let mut bytes = &self.bytes[..];
+        if self.cut
+            && let Err(e) = std::str::from_utf8(bytes)
+            && e.error_len().is_none()
+        {
+            bytes = &bytes[..e.valid_up_to()];
+        }
+        String::from_utf8_lossy(bytes).into_owned()
     }
 }
 
@@ -301,19 +342,26 @@ pub fn terminal_size() -> WinSize {
 /// returns, whichever way it does, and the PTY follows its size.
 ///
 /// SIGINT and SIGQUIT go to the command. SIGTERM and SIGHUP hang it up, as
-/// closing its terminal would, and a second one cuts the connection. Output
-/// that can't be written to stdout hangs it up too, as with `| head`.
+/// closing its terminal would, and so does SIGINT or SIGQUIT when stdin is
+/// stalled and it can't get through. So does stdout closing, as with `| head`.
+/// A hang-up returns at once, as if the signal, or SIGPIPE, had killed the
+/// command: the exit can't come back after it.
 pub fn attach(conn: UnixStream, req: &Request) -> Result<Exit> {
     let tty = req.tty.is_some();
     let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
     proto::write_frame(&mut *writer.lock().unwrap(), req)?;
+    let hang_up = Arc::new(HangUp {
+        conn: clone(&conn)?,
+        by: AtomicI32::new(0),
+    });
+    // Signals first, so none can kill this process with the terminal raw.
+    forward_signals(&writer, &hang_up, tty)?;
     let _raw = if tty && io::stdin().is_terminal() {
         let raw = Raw::enter().map_err(|e| io_err("putting the terminal in raw mode")(e.into()))?;
         Some(raw)
     } else {
         None
     };
-    forward_signals(&writer, &conn, tty)?;
     let feeder = writer.clone();
     thread::Builder::new()
         .spawn(move || feed_stdin(&feeder, tty))
@@ -321,13 +369,16 @@ pub fn attach(conn: UnixStream, req: &Request) -> Result<Exit> {
 
     let mut reader = clone(&conn)?;
     let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
-    let mut stdout_open = true;
     loop {
-        match proto::read_frame::<FromGuest>(&mut reader)? {
+        let frame = match (proto::read_frame::<FromGuest>(&mut reader), hang_up.by()) {
+            (Ok(Some(FromGuest::Exit(exit))), _) => return Ok(exit),
+            (_, Some(sig)) => return Ok(Exit::Signal(sig)),
+            (frame, None) => frame?,
+        };
+        match frame {
             Some(FromGuest::Stdout(b)) => {
-                if stdout_open && stdout.write_all(&b).and_then(|()| stdout.flush()).is_err() {
-                    stdout_open = false;
-                    let _ = conn.shutdown(Shutdown::Write);
+                if stdout.write_all(&b).and_then(|()| stdout.flush()).is_err() {
+                    hang_up.up(libc::SIGPIPE);
                 }
             }
             Some(FromGuest::Stderr(b)) => {
@@ -340,15 +391,39 @@ pub fn attach(conn: UnixStream, req: &Request) -> Result<Exit> {
     }
 }
 
+// Ending the session from this side. The guest hangs the command up once it
+// hears, but Firecracker ends the connection both ways first, so attach
+// stops reading and reports the signal that did it.
+struct HangUp {
+    conn: UnixStream,
+    by: AtomicI32,
+}
+
+impl HangUp {
+    fn up(&self, sig: i32) {
+        let _ = self
+            .by
+            .compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self.conn.shutdown(Shutdown::Both);
+    }
+
+    fn by(&self) -> Option<i32> {
+        Some(self.by.load(Ordering::SeqCst)).filter(|&sig| sig != 0)
+    }
+}
+
 // Copies stdin to the command until it ends. A PTY ignores CloseStdin, so
-// there the end is the terminal's EOF character, ^D.
+// there the end is the terminal's EOF character, ^D, twice after a partial
+// line, since the first only sends the line.
 fn feed_stdin(writer: &Mutex<UnixStream>, tty: bool) {
     let mut stdin = io::stdin().lock();
     let mut buf = vec![0; CHUNK];
+    let mut line_done = true;
     loop {
         match stdin.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                line_done = buf[n - 1] == b'\n';
                 if send(writer, &ToGuest::Stdin(buf[..n].to_vec())).is_err() {
                     return;
                 }
@@ -357,31 +432,31 @@ fn feed_stdin(writer: &Mutex<UnixStream>, tty: bool) {
             Err(_) => break,
         }
     }
-    let end = if tty {
-        ToGuest::Stdin(vec![4])
-    } else {
-        ToGuest::CloseStdin
+    let end = match (tty, line_done) {
+        (true, true) => ToGuest::Stdin(vec![4]),
+        (true, false) => ToGuest::Stdin(vec![4, 4]),
+        (false, _) => ToGuest::CloseStdin,
     };
     let _ = send(writer, &end);
 }
 
 // Blocks the signals in this thread, so in every thread it starts after, and
 // takes them on two threads of their own. Hang-ups get their own, which never
-// waits on the writer, so they land even while stdin is stalled.
-fn forward_signals(writer: &Writer, conn: &UnixStream, tty: bool) -> Result<()> {
+// waits on the writer, so they're taken even while stdin is stalled.
+fn forward_signals(writer: &Writer, hang_up: &Arc<HangUp>, tty: bool) -> Result<()> {
     let set = |sigs: &[Signal]| {
         let mut set = SigSet::empty();
         sigs.iter().for_each(|s| set.add(*s));
         set
     };
     let pass = set(&[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGWINCH]);
-    let hang_up = set(&[Signal::SIGTERM, Signal::SIGHUP]);
+    let hang_ups = set(&[Signal::SIGTERM, Signal::SIGHUP]);
     let mut all = pass;
-    all.extend(&hang_up);
+    all.extend(&hang_ups);
     all.thread_block()
         .map_err(|e| io_err("blocking signals")(e.into()))?;
 
-    let writer = writer.clone();
+    let (writer, stalled) = (writer.clone(), hang_up.clone());
     let spawn = |f: Box<dyn FnOnce() + Send>| {
         thread::Builder::new()
             .spawn(f)
@@ -395,17 +470,19 @@ fn forward_signals(writer: &Writer, conn: &UnixStream, tty: bool) -> Result<()> 
                 Signal::SIGWINCH => continue,
                 sig => ToGuest::Signal(sig as i32),
             };
-            if send(&writer, &msg).is_err() {
-                return;
+            match send_unless_stalled(&writer, &msg) {
+                Some(Ok(())) => {}
+                Some(Err(_)) => return,
+                // A resize can wait for the next one.
+                None if sig == Signal::SIGWINCH => {}
+                None => stalled.up(sig as i32),
             }
         }
     }))?;
-    let conn = clone(conn)?;
+    let hang_up = hang_up.clone();
     spawn(Box::new(move || {
-        let mut how = Shutdown::Write;
-        while hang_up.wait().is_ok() {
-            let _ = conn.shutdown(how);
-            how = Shutdown::Both;
+        while let Ok(sig) = hang_ups.wait() {
+            hang_up.up(sig as i32);
         }
     }))
 }

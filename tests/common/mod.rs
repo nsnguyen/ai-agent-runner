@@ -322,10 +322,13 @@ impl FakeVsock {
                 let (mut from_host, mut to_vm) =
                     (host.try_clone().unwrap(), vm.try_clone().unwrap());
                 let (vm_end, host_end) = (vm.try_clone().unwrap(), host.try_clone().unwrap());
+                // An error is the guest gone, whose last frames the other
+                // thread still passes on.
                 std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut from_host, &mut to_vm);
-                    let _ = vm_end.shutdown(Shutdown::Both);
-                    let _ = host_end.shutdown(Shutdown::Both);
+                    if std::io::copy(&mut from_host, &mut to_vm).is_ok() {
+                        let _ = vm_end.shutdown(Shutdown::Both);
+                        let _ = host_end.shutdown(Shutdown::Both);
+                    }
                 });
                 let (mut from_vm, mut to_host) = (vm, host);
                 std::thread::spawn(move || {
