@@ -18,14 +18,19 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 
 ## Stack
 - Firecracker microVMs, driven through Firecracker's API socket. Everything else follows temper's defaults: one Rust binary on the host, `runner`, that is both the CLI and the MCP server.
+- `runner-guest`, a static binary in each VM, runs commands for the host over vsock in place of sshd. The protocol is `src/proto.rs`.
 - VM state is a directory per VM, not SQLite (docs/design.md). Disks are copied with GNU `cp --reflink=auto --sparse=always`.
 
 ## Commands
 - Build: `cargo build --release` (the binary is `target/release/runner`)
-- Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
+- Build the guest agent: `cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest` (static, for the base image)
+- Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && shellcheck host/*.sh`
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
+- Boot tests, on the KVM host only: `cargo test --test kvm -- --ignored` (docs/host.md).
 
 ## Sharp edges
 - On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
-- Old disk generations stay on disk until cleanup exists (design: Later).
+- Look at a failed run's disk before the next commit. That commit's gc keeps undo history first, so the failed disk usually goes then.
+- Space used in `list`, and what `gc` says it frees, sum each disk's allocated blocks. A block reflinked into several disks (forks, generations) counts in each, so on XFS or btrfs the real figure can be far less.
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
+- Making a tap needs CAP_NET_ADMIN and iproute2, so those tests are `#[ignore]`d too: `cargo test --test net --test boot -- --ignored`, as root (docs/host.md says how). Cloud sessions run as root; install iproute2 first.

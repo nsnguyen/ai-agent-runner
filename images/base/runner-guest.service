@@ -1,0 +1,12 @@
+[Unit]
+Description=runner guest agent: runs commands for the host over vsock
+Documentation=https://github.com/nsnguyen/ai-agent-runner
+
+[Service]
+# Root, because each request names the user its command runs as.
+ExecStart=/usr/local/bin/runner-guest
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
