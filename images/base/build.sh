@@ -71,6 +71,15 @@ ln -s /proc/net/pnp "$etc/resolv.conf"
 echo "== disk ($size)"
 truncate -s "$size" "$work/base.ext4"
 mkfs.ext4 -q -F -L runner-base -d "$work/root" "$work/base.ext4"
+
+# Check before the new disk replaces the last good one.
+echo "== check"
+"$here/check.sh" "$work/base.ext4"
+# The tools run on the image's userland, checked in a container with no
+# network. The boot test checks the guest kernel and runner-guest.
+"$engine" run --rm --network none -u agent "$tag" bash -c \
+  'claude --version && node --version && python3 --version && rustc --version && cargo --version' |
+  sed 's/^/ok    /'
 mv -f "$work/base.ext4" "$disk"
 
 echo "== kernel"
@@ -84,13 +93,6 @@ fi
 if [[ -n ${SUDO_UID:-} ]]; then
   chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$out" "$disk" "$kernel"
 fi
-
-echo "== check"
-"$here/check.sh" "$disk"
-# Claude Code runs on the image's userland, checked in a container with no
-# network. The boot test checks the guest kernel and runner-guest.
-version=$("$engine" run --rm --network none -u agent "$tag" claude --version)
-echo "ok    claude --version: $version"
 
 cat <<EOF
 

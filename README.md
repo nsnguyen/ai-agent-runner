@@ -14,7 +14,9 @@ cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
 sudo images/base/build.sh
 ```
 
-It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk (`SIZE=40G` for another size), and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Then it checks the disk with `images/base/check.sh`: runner-guest is enabled, and nothing is under `/home/agent/.claude` or `/root/.claude`.
+It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image.
+
+Settings go after `sudo`, which drops your environment: `sudo SIZE=40G images/base/build.sh`. The others are `OUT`, `ENGINE` and `RUNNER_GUEST`, described at the top of `build.sh`.
 
 On the runner host:
 

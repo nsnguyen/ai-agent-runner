@@ -85,14 +85,17 @@ fn check_passes_a_clean_image() {
 fn check_fails_when_the_guest_agent_is_not_enabled() {
     let tree = clean_tree();
     fs::remove_file(tree.path().join(WANTS)).unwrap();
-    fails_mentioning(&check(tree.path()), "runner-guest");
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  runner-guest.service is not enabled",
+    );
 }
 
 #[test]
 fn check_fails_when_the_guest_agent_is_missing() {
     let tree = clean_tree();
     fs::remove_file(tree.path().join("usr/local/bin/runner-guest")).unwrap();
-    fails_mentioning(&check(tree.path()), "/usr/local/bin/runner-guest");
+    fails_mentioning(&check(tree.path()), "FAIL  /usr/local/bin/runner-guest");
 }
 
 #[test]
@@ -101,14 +104,17 @@ fn check_fails_on_claude_state_in_the_agents_home() {
     let dir = tree.path().join("home/agent/.claude");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join(".credentials.json"), b"{}").unwrap();
-    fails_mentioning(&check(tree.path()), "/home/agent/.claude");
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /home/agent/.claude is not empty",
+    );
 }
 
 #[test]
 fn check_fails_on_claude_state_in_roots_home() {
     let tree = clean_tree();
     fs::write(tree.path().join("root/.claude.json"), b"{}").unwrap();
-    fails_mentioning(&check(tree.path()), "/root/.claude.json");
+    fails_mentioning(&check(tree.path()), "FAIL  /root/.claude.json exists");
 }
 
 #[test]
@@ -132,9 +138,7 @@ fn base_boots_and_runner_guest_accepts_on_vsock() {
         .output()
         .unwrap();
     let all = text(&out.stdout) + &text(&out.stderr);
-    if out.status.code() == Some(77) {
-        eprintln!("SKIPPED: {all}");
-        return;
-    }
+    // Asked for by --ignored, so a machine that can't boot is a failure.
+    assert_ne!(out.status.code(), Some(77), "{all}");
     assert!(out.status.success(), "{all}");
 }

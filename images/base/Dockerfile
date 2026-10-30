@@ -1,11 +1,13 @@
 # The base VM: Ubuntu 24.04 that boots systemd into a dev box with Claude
-# Code, like a fresh sprite. build.sh turns it into an ext4 disk; it never
-# runs as a container, so nothing here starts a service.
+# Code, like a fresh sprite. build.sh turns it into an ext4 disk. It boots as
+# a VM, not a container, so nothing here starts a service.
 FROM ubuntu:24.04
 
 ARG NODE_MAJOR=26
 ARG CLAUDE_CODE_VERSION=stable
 ARG DEBIAN_FRONTEND=noninteractive
+# A failed download piped into sh must fail the build, not install nothing.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # systemd is init. No sshd: the host reaches the VM through runner-guest.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && bash /tmp/nodesource.sh && rm /tmp/nodesource.sh \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
+
+# Undo the container tweaks in Ubuntu's image: in a VM, packages start their
+# services and dpkg syncs its writes. Tools see UTF-8, so tmux draws Claude
+# Code's TUI.
+RUN rm -f /usr/sbin/policy-rc.d /etc/dpkg/dpkg.cfg.d/docker-apt-speedup \
+ && echo 'LANG=C.UTF-8' > /etc/locale.conf
 
 # Ubuntu's image ships an `ubuntu` user at uid 1000; agent takes its place.
 RUN userdel -r ubuntu \

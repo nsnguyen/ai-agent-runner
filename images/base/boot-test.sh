@@ -21,7 +21,8 @@ command -v firecracker >/dev/null || skip "no firecracker on PATH"
 [[ -r $disk && -r $kernel ]] || die "no $disk or $kernel: run images/base/build.sh"
 port=${RUNNER_GUEST_PORT:?set RUNNER_GUEST_PORT to the vsock port runner-guest listens on}
 
-work=$(mktemp -d)
+# Next to the disk, so the copy below can be a reflink and isn't in a tmpfs.
+work=$(mktemp -d "$(dirname "$disk")/.boot.XXXXXX")
 fc=
 cleanup() {
   [[ -z $fc ]] || kill "$fc" 2>/dev/null || true
@@ -54,7 +55,8 @@ fc=$!
 
 started=
 for _ in $(seq "$wait_s"); do
-  if grep -q 'Started runner-guest.service' "$console"; then started=1; break; fi
+  # systemd colours the unit name on the console, so match around it.
+  if grep -aqE 'Started .*runner-guest\.service' "$console"; then started=1; break; fi
   kill -0 "$fc" 2>/dev/null || break
   sleep 1
 done
