@@ -237,3 +237,68 @@ mod props {
         }
     }
 }
+
+#[test]
+fn delete_removes_the_vm_and_every_generation() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    let run = store.begin_run("dev").unwrap();
+    run.commit().unwrap();
+    // A failed run's disk is left on disk too.
+    drop(store.begin_run("dev").unwrap());
+
+    assert_eq!(store.delete("dev").unwrap(), vm("dev", 1, 6));
+    assert_eq!(store.list().unwrap(), vec![vm("base", 0, 6)]);
+    let vms = dir.path().join("root/vms");
+    let left: Vec<_> = fs::read_dir(vms).unwrap().collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    // The name is free again.
+    assert_eq!(store.fork("base", "dev").unwrap(), vm("dev", 0, 6));
+}
+
+#[test]
+fn delete_leaves_forks_alone() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    store.delete("base").unwrap();
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 0, 6));
+}
+
+#[test]
+fn delete_refuses_a_busy_vm_and_an_unknown_one() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    let run = store.begin_run("base").unwrap();
+    assert!(matches!(store.delete("base"), Err(Error::Busy(n)) if n == "base"));
+    drop(run);
+    assert!(matches!(store.delete("nope"), Err(Error::NoVm(n)) if n == "nope"));
+    assert!(matches!(store.delete("../etc"), Err(Error::BadName(_))));
+    assert_eq!(store.get("base").unwrap(), vm("base", 0, 6));
+}
+
+#[test]
+fn a_create_sweeps_a_delete_that_died_but_not_a_live_one() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    let vms = dir.path().join("root/vms");
+    let dead = vms.join(".del-gone-1-4000000000");
+    let live = vms.join(format!(".del-live-1-{}", std::process::id()));
+    fs::create_dir(&dead).unwrap();
+    fs::create_dir(&live).unwrap();
+    store.fork("base", "dev").unwrap();
+    assert!(!dead.exists());
+    assert!(live.exists());
+    assert_eq!(store.list().unwrap().len(), 2);
+}
+
+#[test]
+fn deleting_twice_in_one_process_works() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    for _ in 0..2 {
+        store.fork("base", "dev").unwrap();
+        store.delete("dev").unwrap();
+    }
+}

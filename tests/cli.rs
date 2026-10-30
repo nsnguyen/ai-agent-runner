@@ -73,3 +73,17 @@ fn errors_go_to_stderr_with_a_failing_exit() {
         );
     }
 }
+
+#[test]
+fn delete_removes_a_vm() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let out = runner(dir.path(), &["delete", "dev"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "deleted dev  gen 0  6 bytes\n");
+    let out = runner(dir.path(), &["list"]);
+    assert_eq!(text(&out.stdout), "base  gen 0  6 bytes\n");
+    let out = runner(dir.path(), &["delete", "dev"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("no VM named dev"));
+}

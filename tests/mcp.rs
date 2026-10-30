@@ -89,7 +89,7 @@ fn lists_its_tools() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["create_vm", "list_vms", "undo_vm"]);
+    assert_eq!(names, ["create_vm", "delete_vm", "list_vms", "undo_vm"]);
 }
 
 #[test]
@@ -108,6 +108,12 @@ fn create_then_list() {
     let listed = s.call(3, "list_vms", json!({}));
     let base = json!({"name": "base", "generation": 0, "bytes": 6});
     assert_eq!(listed["structuredContent"], json!({"vms": [base, dev]}));
+
+    let gone = s.call(4, "delete_vm", json!({"name": "dev"}));
+    assert_eq!(gone["isError"], json!(false), "{gone}");
+    assert_eq!(gone["structuredContent"], dev);
+    let listed = s.call(5, "list_vms", json!({}));
+    assert_eq!(listed["structuredContent"], json!({"vms": [base]}));
 }
 
 #[test]

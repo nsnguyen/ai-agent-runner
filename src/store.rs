@@ -4,6 +4,7 @@
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
+//   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -11,6 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The VM `create` forks unless told otherwise.
 pub const BASE: &str = "base";
@@ -186,6 +188,32 @@ impl Store {
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
     }
+
+    /// Removes a VM and all its disk generations. Forks of it are unaffected:
+    /// each has a disk of its own.
+    pub fn delete(&self, name: &str) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        let vm = read_vm(name, &dir)?;
+        // Renamed first, so the VM is gone at once and the name is free; a
+        // delete killed partway leaves a dot-directory that the next create
+        // from a new process sweeps away. The lock goes with the rename, still held until we return.
+        let vms = self.vms();
+        // The nanos keep a leftover from colliding with the next delete of the
+        // same name in a long-lived `runner mcp`, whose pid never goes away.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let doomed = vms.join(format!(".del-{name}-{nanos}-{}", std::process::id()));
+        fs::rename(&dir, &doomed).map_err(at(&dir))?;
+        sync_dir(&vms)?;
+        // The VM is gone either way, so a failed removal is a warning, not a
+        // failure a caller would retry into "no such VM".
+        if let Err(e) = fs::remove_dir_all(&doomed) {
+            eprintln!("runner: {name} is deleted, but {}: {e}", doomed.display());
+        }
+        Ok(vm)
+    }
 }
 
 #[derive(Debug)]
@@ -215,7 +243,11 @@ fn take_lock(dir: &Path, name: &str) -> Result<File> {
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(at(&path))?;
+        .map_err(|e| match e.kind() {
+            // The VM was deleted between the caller's check and here.
+            io::ErrorKind::NotFound => Error::NoVm(name.to_string()),
+            _ => at(&path)(e),
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(Error::Busy(name.to_string())),
@@ -272,7 +304,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir).and_then(|d| d.sync_all()).map_err(at(dir))
 }
 
-// A staging directory whose creator is gone is what a killed create left.
+// A staging directory whose creator is gone is what a killed create or delete left.
 fn sweep_staging(vms: &Path) {
     let Ok(entries) = fs::read_dir(vms) else {
         return;
@@ -281,7 +313,11 @@ fn sweep_staging(vms: &Path) {
         let name = entry.file_name();
         let pid = name
             .to_str()
-            .and_then(|n| n.strip_prefix(".new-")?.rsplit_once('-'))
+            .and_then(|n| {
+                n.strip_prefix(".new-")
+                    .or(n.strip_prefix(".del-"))?
+                    .rsplit_once('-')
+            })
             .and_then(|(_, pid)| pid.parse::<u32>().ok());
         if pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
             let _ = fs::remove_dir_all(entry.path());
