@@ -128,7 +128,7 @@ If dev is stopped, the run boots it and shuts it down once Claude Code exits: ex
 }
 ```
 
-The run reads both disks whole, so it goes on looking `running` for a while after Claude Code exits: about 45 seconds per 4.6 GB of disk (#61). Changes the boot itself makes, like the journal under `/var/log/journal`, are listed too (#62). A run that joined a running VM has no disk from before it, so its `changed` says why instead of listing paths, with a null `outcome` and generations.
+The run reads both disks whole, so it goes on looking `running` for a while after Claude Code exits: about 45 seconds per 4.6 GB of disk (#61), and never more than 10 minutes. `runner cancel` stops the measuring, and `changed` then says so. Changes the boot itself makes, like the journal under `/var/log/journal`, are listed too (#62). Paths past 32 KiB of them are only counted, since the agent names them. A run that joined a running VM has no disk from before it, so its `changed` says why instead of listing paths, with a null `outcome` and generations, as does one that never got as far as starting its VM. With `--keep 0`, a commit's gc deletes the generation the run booted from before it's measured, so `changed` can only say it's gone. A lost run has no result.
 
 The stream is kept on the host, in `/var/lib/runner/vms/dev/runs/1/`, beside Claude Code's stderr, so it can be read with dev off, and goes when dev is deleted.
 

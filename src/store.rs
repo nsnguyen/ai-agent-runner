@@ -20,7 +20,6 @@
 //   <root>/slots.lock                flock'd while a slot is picked
 //
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
-use crate::changes::{self, Changes};
 use crate::creds::{self, Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -463,9 +462,9 @@ impl Store {
         write_aside(&self.existing(name)?, ROLLBACK, &format!("{by}\n"))
     }
 
-    /// The generations of the VM's latest boot, as begin_run noted them, for
-    /// a headless run in another process to know which disk it ran on. None
-    /// if the VM never booted.
+    /// The generations begin_run last noted, for a headless run in another
+    /// process to know which disk its boot runs; the disk may be gone since,
+    /// if that boot never got going. None if the VM never booted.
     pub fn booted(&self, name: &str) -> Result<Option<Booted>> {
         let path = self.existing(name)?.join(BOOTED);
         let text = match fs::read(&path) {
@@ -510,8 +509,9 @@ impl Store {
     }
 
     /// Clones the current disk into a new generation for one run to boot
-    /// from. Only `Run::commit` makes it current; dropping the run keeps the
-    /// old one current and leaves the new disk for a look.
+    /// from, and notes both generations (Store::booted). Only `Run::commit`
+    /// makes it current; dropping the run keeps the old one current and
+    /// leaves the new disk for a look.
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_lock(&dir, name)?;
@@ -523,7 +523,10 @@ impl Store {
         clone(&disk_of(&dir, from), &disk)?;
         let booted = Booted { from, generation };
         let text = serde_json::to_string(&booted).map_err(|e| at(&dir.join(BOOTED))(e.into()))?;
-        write_aside(&dir, BOOTED, &text)?;
+        if let Err(e) = write_aside(&dir, BOOTED, &text) {
+            remove_if_there(&disk)?;
+            return Err(e);
+        }
         let name = name.to_string();
         Ok(Run {
             from,
@@ -684,18 +687,6 @@ pub struct Run {
 }
 
 impl Run {
-    /// What the run changed: its disk against the generation it was cloned
-    /// from, read from the disks, at most `cap` paths. Measure before
-    /// `commit`, which takes the run.
-    pub fn changes(&self, cap: usize) -> changes::Result<Changes> {
-        changes::between(
-            &disk_of(&self.dir, self.from),
-            &self.disk,
-            cap,
-            changes::TIME,
-        )
-    }
-
     /// Makes this run's disk current, then collects the generations the store
     /// doesn't keep. That gc runs under the run's lock, so it never races one.
     pub fn commit(self) -> Result<Vm> {

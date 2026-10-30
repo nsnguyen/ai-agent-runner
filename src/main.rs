@@ -222,15 +222,16 @@ enum Cmd {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Print a run's result, as JSON, once it has ended: its exit code and
-    /// duration, whether the disk generation it booted was committed or
-    /// rolled back, and the paths that changed on that disk, which the
-    /// runner reads from the disks itself; with what the agent says it did
-    /// kept apart, as untrusted.
+    /// Print a run's result as JSON once it has ended. It has the exit code,
+    /// the duration, whether the disk generation the run booted was
+    /// committed or rolled back, and the paths that changed on that disk,
+    /// which the runner reads from the disks itself. What the agent says it
+    /// did is kept apart, marked untrusted.
     Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
-    /// booted rolls back and shuts down. Returns once the run has ended, or
-    /// after two minutes.
+    /// booted rolls back and shuts down. A run whose Claude Code is done
+    /// stops measuring its disk. Returns once the run has ended, or after two
+    /// minutes.
     Cancel { run: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,

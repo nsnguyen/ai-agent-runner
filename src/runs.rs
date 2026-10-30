@@ -34,7 +34,8 @@
 // still take it down. The result (result.rs) keeps that apart from what the
 // agent says it did, and is written just before the end, so a run that's
 // over has its result. Measuring reads the run's disk whole, so the run looks
-// to be running a while after Claude Code exits.
+// to be running a while after Claude Code exits, until it's measured or a
+// cancel stops the measuring.
 use crate::changes;
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
@@ -52,6 +53,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -408,10 +410,13 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         outcome: end.outcome,
         from_generation: gens.booted.map(|b| b.from).or(gens.from),
         generation: gens.booted.map(|b| b.generation),
-        changed: changed(store, vm, &ask, &gens, down),
+        changed: changed(store, vm, &ask, &gens, down, &|| dir.join(CANCEL).exists()),
         agent_says: agent_says(&dir.join(STREAM)),
     };
-    write_json(&dir, RESULT, &result)?;
+    // Without its end, a run would look lost, how it ended and all.
+    if let Err(e) = write_json(&dir, RESULT, &result) {
+        eprintln!("runner: {e}");
+    }
     write_json(&dir, END, &end)
 }
 
@@ -424,8 +429,16 @@ struct Gens {
     booted: Option<Booted>,
 }
 
-// What the run changed on its disk, measured from the disks.
-fn changed(store: &Store, vm: &str, ask: &Ask, gens: &Gens, down: bool) -> Changed {
+// What the run changed on its disk, measured from the disks, unless `stop`
+// says to give up.
+fn changed(
+    store: &Store,
+    vm: &str,
+    ask: &Ask,
+    gens: &Gens,
+    down: bool,
+    stop: &dyn Fn() -> bool,
+) -> Changed {
     let unmeasured = |error: String| Changed::Unmeasured { error };
     if !ask.boots {
         return unmeasured(format!(
@@ -434,7 +447,7 @@ fn changed(store: &Store, vm: &str, ask: &Ask, gens: &Gens, down: bool) -> Chang
     }
     let Some(booted) = gens.booted else {
         return unmeasured(format!(
-            "the run never reached {vm}'s guest, so it has no disk of its own to measure"
+            "{vm}'s guest never answered the run, so which generation it booted isn't known"
         ));
     };
     if !down {
@@ -443,14 +456,21 @@ fn changed(store: &Store, vm: &str, ask: &Ask, gens: &Gens, down: bool) -> Chang
             booted.generation
         ));
     }
-    let disks = store
-        .disk(vm, booted.from)
-        .and_then(|before| Ok((before, store.disk(vm, booted.generation)?)));
-    match disks {
-        Ok((before, after)) => {
-            changes::between(&before, &after, changes::CAP, changes::TIME).into()
-        }
-        Err(e) => unmeasured(e.to_string()),
+    let (before, after) = match (
+        store.disk(vm, booted.from),
+        store.disk(vm, booted.generation),
+    ) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(e), _) | (_, Err(e)) => return unmeasured(e.to_string()),
+    };
+    // A disk a guest crafted that panics the reader fails the measuring, not
+    // the run.
+    let measured = panic::catch_unwind(AssertUnwindSafe(|| {
+        changes::between_until(&before, &after, changes::CAP, changes::TIME, stop)
+    }));
+    match measured {
+        Ok(measured) => measured.into(),
+        Err(_) => unmeasured("measuring the disks panicked: the run's log says where".to_string()),
     }
 }
 
@@ -762,8 +782,12 @@ pub fn events(store: &Store, id: &str, cursor: u64, wait: Duration) -> Result<Ev
             .map_err(io_err(format!("reading {}", path.display())))?;
         if !got.lines.is_empty() || ended || Instant::now() >= deadline {
             let more = got.next < got.end;
+            // A result that can't be read mustn't cost the events.
             let result = if ended && !more {
-                read_result(store, &vm, n)?
+                read_result(store, &vm, n).unwrap_or_else(|e| {
+                    eprintln!("runner: {e}");
+                    None
+                })
             } else {
                 None
             };

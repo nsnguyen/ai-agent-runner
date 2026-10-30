@@ -16,15 +16,15 @@ pub struct RunResult {
     /// killed, or the VM went down).
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
-    /// What became of the disk generation a run that booted its VM ran; null
+    /// What became of the disk generation a run that booted its VM ran. Null
     /// for a run that joined its VM running, which commits or rolls back
-    /// nothing.
+    /// nothing, or one that never got as far as starting its VM.
     pub outcome: Option<Outcome>,
-    /// The disk generation the run started from; null for a joined run.
+    /// The disk generation the run started from. Null when outcome is.
     pub from_generation: Option<u64>,
     /// The generation the run wrote: current if committed, kept for a look if
-    /// rolled back. Null for a joined run, or one that never reached its
-    /// VM's guest.
+    /// rolled back. Null when outcome is, or when the VM's guest never
+    /// answered the run.
     pub generation: Option<u64>,
     /// The paths that differ between the two generations, read from the
     /// disks; or, when there was nothing to measure or measuring failed, why.

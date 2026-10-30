@@ -134,6 +134,40 @@ fn the_list_is_capped_and_counts_the_rest() {
     );
 }
 
+// Paths a guest names can be long, and a result goes to the caller whole.
+#[test]
+fn the_list_is_capped_by_its_bytes_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = image(&tree(&dir.path().join("before"), &[]));
+    let names: Vec<String> = (0..200)
+        .map(|i| format!("{i:03}{}", "x".repeat(240)))
+        .collect();
+    let files: Vec<_> = names.iter().map(|n| (n.as_str(), "")).collect();
+    let after = image(&tree(&dir.path().join("after"), &files));
+
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
+    let listed: usize = got.paths.iter().map(|c| c.path.len()).sum();
+    assert!(listed <= changes::PATH_BYTES, "{listed} bytes listed");
+    assert_eq!(got.paths.len(), changes::PATH_BYTES / 244);
+    assert_eq!(got.paths.len() as u64 + got.more, 200);
+}
+
+// As a cancel does to a run whose disk is being measured.
+#[test]
+fn measuring_stops_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = image(&tree(&dir.path().join("before"), &[]));
+    let after = image(&tree(&dir.path().join("after"), &[("a", "a")]));
+    let got = changes::between_until(&before, &after, changes::CAP, changes::TIME, &|| true);
+    let Err(e @ Error::Unbounded { .. }) = got else {
+        panic!("measuring went on: {got:?}");
+    };
+    assert!(
+        e.to_string().ends_with(".ext4: measuring was stopped"),
+        "{e}"
+    );
+}
+
 #[test]
 fn names_that_are_not_utf8_stay_distinct() {
     let dir = tempfile::tempdir().unwrap();
@@ -316,7 +350,8 @@ fn a_run_reports_what_its_guest_changed_on_its_disk() {
     debugfs(&run.disk, &write("main.rs"));
     debugfs(&run.disk, &write("new.rs"));
 
-    let got = run.changes(changes::CAP).unwrap();
+    let base = store.disk("dev", run.from).unwrap();
+    let got = changes::between(&base, &run.disk, changes::CAP, changes::TIME).unwrap();
     let want = vec![
         change("/home/agent/work/main.rs", Kind::Modified),
         change("/home/agent/work/new.rs", Kind::Added),
