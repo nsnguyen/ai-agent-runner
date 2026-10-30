@@ -86,19 +86,30 @@ fn a_run_that_did_not_exit_and_could_not_be_measured_says_so() {
 fn a_failed_measurement_becomes_unmeasured() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.ext4");
-    let changed = Changed::from(changes::between(&missing, &missing, changes::CAP));
+    let changed = Changed::from(changes::between(
+        &missing,
+        &missing,
+        changes::CAP,
+        changes::TIME,
+    ));
     let Changed::Unmeasured { error } = changed else {
         panic!("measured a disk that isn't there: {changed:?}");
     };
     assert!(error.contains("missing.ext4"), "{error}");
 }
 
-// Lines as `claude -p --verbose --output-format stream-json` writes them.
+// Lines as `claude -p --verbose --output-format stream-json` writes them: one
+// content block per event, so a message with several spans events that share
+// its id.
 const STREAM: &str = r#"{"type":"system","subtype":"init","session_id":"s1","tools":["Bash"]}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"main.rs"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done: "},{"type":"text","text":"I fixed main.rs."}]}}
+{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Looking."}]},"parent_tool_use_id":null,"session_id":"s1"}
+{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":null,"session_id":"s1"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"main.rs"}]},"parent_tool_use_id":null,"session_id":"s1"}
+{"type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"Done."}]},"parent_tool_use_id":null,"session_id":"s1"}
+{"type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"I fixed main.rs."}]},"parent_tool_use_id":null,"session_id":"s1"}
 "#;
+
+const LAST: &str = "Done.\n\nI fixed main.rs.";
 
 #[test]
 fn the_agent_says_its_final_result() {
@@ -116,23 +127,24 @@ fn without_a_result_the_agent_says_its_last_message() {
     // A cancelled run, cut off mid-line, with a line that isn't JSON.
     let stream = format!("not json\n{STREAM}{{\"type\":\"assist");
     let got = AgentSays::from_stream(stream.as_bytes()).unwrap();
-    assert_eq!(got, says("Done: I fixed main.rs."));
+    assert_eq!(got, says(LAST));
 }
 
 #[test]
 fn a_subagent_does_not_speak_for_the_agent() {
-    let sub = r#"{"type":"assistant","parent_tool_use_id":"t2","message":{"content":[{"type":"text","text":"Subagent here."}]}}"#;
+    let sub = r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"Subagent here."}]},"parent_tool_use_id":"t2"}"#;
     let got = AgentSays::from_stream(format!("{STREAM}{sub}\n").as_bytes()).unwrap();
-    assert_eq!(got, says("Done: I fixed main.rs."));
+    assert_eq!(got, says(LAST));
 }
 
-// A line too long to hold, like a huge tool result, is skipped, not read in.
+// A line too long to hold, like a huge tool result, is skipped, not read in,
+// even when it would parse.
 #[test]
 fn an_overlong_line_is_skipped() {
-    let huge = format!("{{\"type\":\"user\",\"x\":\"{}\"}}", "x".repeat(5 << 20));
-    let end = r#"{"type":"result","result":"Done."}"#;
-    let got = AgentSays::from_stream(format!("{huge}\n{end}\n").as_bytes()).unwrap();
-    assert_eq!(got, says("Done."));
+    let padding = " ".repeat(5 << 20);
+    let end = r#"{"type":"result","result":"Hidden."}"#;
+    let got = AgentSays::from_stream(format!("{STREAM}{padding}{end}\n").as_bytes()).unwrap();
+    assert_eq!(got, says(LAST));
 }
 
 #[test]

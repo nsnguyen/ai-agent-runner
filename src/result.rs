@@ -88,7 +88,9 @@ impl AgentSays {
     /// assistant message. A subagent's messages, lines that aren't JSON, like a
     /// torn last line, and lines too long to hold are skipped.
     pub fn from_stream(mut stream: impl BufRead) -> io::Result<Self> {
-        let (mut result, mut message) = (None, None);
+        let mut result = None;
+        // The last assistant message with text: its id, and its text so far.
+        let mut message: Option<(Value, String)> = None;
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -109,22 +111,30 @@ impl AgentSays {
             }
             match event["type"].as_str() {
                 Some("result") => result = event["result"].as_str().map(str::to_string),
+                // Each content block comes as its own event; the blocks of one
+                // message share its id.
                 Some("assistant") => {
+                    let id = event["message"]["id"].clone();
                     let blocks = event["message"]["content"].as_array();
-                    let text: String = blocks
+                    let texts = blocks
                         .into_iter()
                         .flatten()
                         .filter(|b| b["type"] == "text")
-                        .filter_map(|b| b["text"].as_str())
-                        .collect();
-                    if !text.is_empty() {
-                        message = Some(text);
+                        .filter_map(|b| b["text"].as_str());
+                    for text in texts {
+                        match &mut message {
+                            Some((last, so_far)) if *last == id && !id.is_null() => {
+                                so_far.push_str("\n\n");
+                                so_far.push_str(text);
+                            }
+                            _ => message = Some((id.clone(), text.to_string())),
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        Ok(AgentSays::new(result.or(message)))
+        Ok(AgentSays::new(result.or(message.map(|(_, text)| text))))
     }
 
     pub fn text(&self) -> Option<&str> {
