@@ -1,0 +1,70 @@
+# ai-agent-runner
+
+`runner` runs my AI agents on Firecracker microVMs, one microVM per agent, like fly.io Sprites: local Claude Code starts and drives one over MCP, or I land in its terminal over SSH. Design: [docs/design.md](docs/design.md).
+
+## Set up a host
+
+The host needs:
+
+- Linux on x86_64 or aarch64, with `/dev/kvm` and systemd.
+- On the tailnet, with no other way in over SSH (see Tailnet only).
+- `/var/lib/runner` on XFS or btrfs. On ext4 every fork and run is a full copy of the disk.
+
+Install, from a checkout:
+
+```sh
+git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
+cargo build --release
+sudo host/install.sh
+```
+
+VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/install.sh`, which reruns remember (`/etc/runner/net`). VMs reach the internet but not the tailnet, the LAN, cloud metadata (169.254.0.0/16) or each other. Docker and firewalld drop forwarded traffic by default, so on a host running either, allow the VM range there; `runner doctor` warns when one is active. It installs the pinned Firecracker (hash-checked, `host/firecracker.pin`) and `runner` into `/usr/local/bin`, makes the `runner` user, lets it start and stop `firecracker@<vm>` units through polkit, and sets up NAT for the VMs. It's safe to rerun, and rerunning it after a `git pull` and a build is how to upgrade. It ends with `runner doctor`, run as the runner user, which says what's still missing: usually a guest kernel at `/var/lib/runner/kernel/vmlinux`, the base disk (`runner import base <disk>`), and the laptop's key. Run it again any time with `ssh runner@kvm-host runner doctor`.
+
+### Add the laptop's key
+
+From the laptop, through your own sudo account on the host (`admin` here):
+
+```sh
+ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"
+```
+
+- `from=` takes this key only from Tailscale's IPv4 and IPv6 ranges: the tailnet-only rule, held per key.
+- `restrict` turns off port, agent and X11 forwarding.
+- `pty` gives back the terminal `restrict` takes away, so `ssh -t` works for `runner shell`.
+
+### Tailnet only
+
+The host takes SSH only over the tailnet. Never forward port 22 to it from a router or expose it on a public IP. If sshd does listen elsewhere, `from=` still refuses the runner user's key from outside the tailnet.
+
+This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailscaled answers port 22 on the tailnet address and never reads `authorized_keys`.
+
+## Build the base image
+
+`base` is the VM every other VM forks from: Ubuntu 24.04 booting systemd, with `runner-guest` as a service, git, curl, build-essential, tmux, Node LTS, Python, Rust (rustup) and Claude Code. You work as `agent`, with passwordless sudo, in `/home/agent`. Claude Code isn't logged in, and the image holds no credentials.
+
+On a Linux machine with docker or podman and e2fsprogs:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
+sudo images/base/build.sh
+```
+
+It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image.
+
+Settings go after `sudo`, which drops your environment: `sudo SIZE=40G images/base/build.sh`. The others are `OUT`, `ENGINE` and `RUNNER_GUEST`, described at the top of `build.sh`.
+
+On the runner host:
+
+```sh
+runner import base images/base/out/base.ext4
+sudo install -D -m 0644 images/base/out/vmlinux /var/lib/runner/kernel/vmlinux
+```
+
+The boot test needs `/dev/kvm` and `firecracker` on PATH. It boots a copy of the disk and checks that runner-guest starts and accepts on its vsock port:
+
+```sh
+RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
+```
+
+To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`.
