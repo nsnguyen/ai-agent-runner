@@ -27,5 +27,6 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 
 ## Sharp edges
 - On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
-- Old disk generations stay on disk until cleanup exists (design: Later).
+- gc runs at every commit, so a failed run's disk stays until the next commit or `runner gc`.
+- Space used in `list` sums each disk's allocated blocks, so a block reflinked into several disks (forks, generations) counts in each. The filesystem's real total can be less.
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
