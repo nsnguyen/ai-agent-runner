@@ -1,0 +1,440 @@
+// runner-guest: the agent inside each VM, so the guest needs no sshd and no
+// keys. It runs as root under systemd and runs one command per connection,
+// as any user, for the host (src/proto.rs has the protocol).
+//
+// Each connection has a thread that waits for the command, one per output
+// stream that forwards it, and one that applies the host's frames.
+use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
+use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::pty;
+use nix::sys::stat::Mode;
+use nix::sys::wait::{Id, WaitPidFlag, waitid};
+use nix::unistd::{Pid, User, geteuid, getgrouplist};
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+/// Commands start with this PATH, as under systemd.
+pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// After the command exits, its output is done once it closes or goes quiet
+/// this long, so a background process left holding it can't keep the
+/// request open.
+const QUIET: u16 = 100;
+
+/// A connection from the host: vsock in a VM, a Unix socket in tests.
+pub trait Conn: Read + Write + AsFd + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    /// Shuts down both ways, which wakes a thread reading it.
+    fn shutdown(&self) -> io::Result<()>;
+}
+
+impl Conn for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        UnixStream::shutdown(self, std::net::Shutdown::Both)
+    }
+}
+
+impl Conn for vsock::VsockStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        vsock::VsockStream::try_clone(self)
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        vsock::VsockStream::shutdown(self, std::net::Shutdown::Both)
+    }
+}
+
+/// Serves each connection on its own thread, for as long as they come.
+pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>) {
+    for conn in conns {
+        match conn {
+            Ok(conn) => {
+                thread::spawn(move || handle(conn));
+            }
+            Err(e) => {
+                eprintln!("runner-guest: accept: {e}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn handle<C: Conn>(mut conn: C) {
+    if let Err(e) = session(&mut conn) {
+        eprintln!("runner-guest: {e}");
+    }
+}
+
+fn session<C: Conn>(conn: &mut C) -> proto::Result<()> {
+    proto::hello(conn)?;
+    proto::check_hello(conn)?;
+    let Some(req) = proto::read_frame::<Request>(conn)? else {
+        return Ok(());
+    };
+    let out = Mutex::new(conn.try_clone()?);
+    let host = conn.try_clone()?;
+    let Running {
+        mut child,
+        group,
+        stdin,
+        pty,
+        outputs,
+    } = match start(&req) {
+        Ok(running) => running,
+        Err(e) => return send(&out, FromGuest::Error(e)),
+    };
+    let input = {
+        let group = group.clone();
+        thread::spawn(move || take_input(host, stdin, pty, &group))
+    };
+    // The scope joins the pumps, so all output is sent before the exit.
+    let status = thread::scope(|s| {
+        for (src, wrap) in outputs {
+            let (out, group) = (&out, &*group);
+            s.spawn(move || pump(src, wrap, out, group));
+        }
+        reap(&mut child, &group)
+    });
+    let last = match status {
+        Ok(status) => FromGuest::Exit(match status.code() {
+            Some(code) => Exit::Code(code),
+            None => Exit::Signal(status.signal().unwrap_or(0)),
+        }),
+        Err(e) => FromGuest::Error(format!("waiting for {}: {e}", req.argv[0])),
+    };
+    let sent = send(&out, last);
+    let _ = conn.shutdown();
+    let _ = input.join();
+    sent
+}
+
+fn send<C: Conn>(out: &Mutex<C>, msg: FromGuest) -> proto::Result<()> {
+    proto::write_frame(&mut *out.lock().unwrap(), &msg)
+}
+
+// A started command, and where its input goes and its output comes from.
+struct Running {
+    child: Child,
+    group: Arc<Group>,
+    stdin: File,
+    pty: Option<File>,
+    outputs: Vec<Output>,
+}
+
+// An output stream, and the frame its bytes go out in.
+type Output = (File, fn(Vec<u8>) -> FromGuest);
+
+fn start(req: &Request) -> Result<Running, String> {
+    let Some((program, args)) = req.argv.split_first() else {
+        return Err("nothing to run: argv is empty".into());
+    };
+    let user = match &req.user {
+        Some(name) => Some(
+            User::from_name(name)
+                .map_err(|e| format!("looking up user {name}: {e}"))?
+                .ok_or_else(|| format!("no user named {name}"))?,
+        ),
+        None => User::from_uid(geteuid()).ok().flatten(),
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args).env_clear().env("PATH", PATH);
+    if let Some(u) = &user {
+        cmd.env("HOME", &u.dir)
+            .env("USER", &u.name)
+            .env("LOGNAME", &u.name)
+            .env("SHELL", &u.shell);
+    }
+    if req.tty.is_some() {
+        cmd.env("TERM", "xterm-256color");
+    }
+    cmd.envs(req.env.iter().map(|(k, v)| (k, v)));
+    let cwd = match &req.cwd {
+        Some(cwd) if !Path::new(cwd).is_dir() => return Err(format!("no directory {cwd}")),
+        Some(cwd) => PathBuf::from(cwd),
+        None => user
+            .as_ref()
+            .map(|u| u.dir.clone())
+            .filter(|home| home.is_dir())
+            .unwrap_or_else(|| "/".into()),
+    };
+    cmd.current_dir(cwd);
+    let ids = match &user {
+        Some(u) if u.uid != geteuid() => Some(Ids::of(u)?),
+        _ => None,
+    };
+
+    let master = match req.tty {
+        Some(size) => {
+            let (master, slave) = open_pty(size).map_err(|e| format!("opening a pty: {e}"))?;
+            let dup = |fd: &OwnedFd| fd.try_clone().map_err(|e| e.to_string());
+            cmd.stdin(dup(&slave)?).stdout(dup(&slave)?).stderr(slave);
+            let dup = |f: &File| f.try_clone().map_err(|e| e.to_string());
+            Some((dup(&master)?, dup(&master)?, master))
+        }
+        None => {
+            let piped = Stdio::piped;
+            cmd.stdin(piped())
+                .stdout(piped())
+                .stderr(piped())
+                .process_group(0);
+            None
+        }
+    };
+    let tty = master.is_some();
+    // SAFETY: in_child makes only async-signal-safe calls.
+    unsafe { cmd.pre_exec(move || in_child(tty, ids.as_ref())) };
+    let spawned = cmd.spawn();
+    // Drops the slave ends it holds, so the PTY closes when the command does.
+    drop(cmd);
+    let mut child = spawned.map_err(|e| format!("couldn't run {program}: {e}"))?;
+    let group = Arc::new(Group {
+        pgid: child.id() as libc::pid_t,
+        exited: Mutex::new(false),
+    });
+
+    let (stdin, pty, outputs) = match master {
+        Some((stdin, out, master)) => {
+            let outputs = vec![(out, FromGuest::Stdout as fn(_) -> _)];
+            (stdin, Some(master), outputs)
+        }
+        None => {
+            let file = |fd: OwnedFd| File::from(fd);
+            let stdin = file(child.stdin.take().unwrap().into());
+            let out = file(child.stdout.take().unwrap().into());
+            let err = file(child.stderr.take().unwrap().into());
+            let outputs = vec![
+                (out, FromGuest::Stdout as fn(_) -> _),
+                (err, FromGuest::Stderr),
+            ];
+            (stdin, None, outputs)
+        }
+    };
+    // Blocking writes would still work, only without noticing a hang-up.
+    if let Err(e) = nonblocking(&stdin) {
+        eprintln!("runner-guest: stdin: {e}");
+    }
+    Ok(Running {
+        child,
+        group,
+        stdin,
+        pty,
+        outputs,
+    })
+}
+
+// Who a command runs as, looked up before the fork, after which nothing
+// may allocate.
+struct Ids {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+}
+
+impl Ids {
+    fn of(user: &User) -> Result<Ids, String> {
+        let name = CString::new(user.name.as_str()).map_err(|e| e.to_string())?;
+        let groups = getgrouplist(&name, user.gid)
+            .map_err(|e| format!("looking up the groups of {}: {e}", user.name))?;
+        Ok(Ids {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            groups: groups.iter().map(|g| g.as_raw()).collect(),
+        })
+    }
+}
+
+// Runs in the child between fork and exec, so it makes raw syscalls only.
+fn in_child(tty: bool, ids: Option<&Ids>) -> io::Result<()> {
+    let check = |r: libc::c_int| match r {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    };
+    // SAFETY: plain syscalls; groups outlives the call.
+    unsafe {
+        if tty {
+            // A new session, with the PTY on stdin as its controlling terminal.
+            check(libc::setsid())?;
+            check(libc::ioctl(0, libc::TIOCSCTTY, 0))?;
+        }
+        if let Some(ids) = ids {
+            check(libc::setgroups(ids.groups.len(), ids.groups.as_ptr()))?;
+            check(libc::setgid(ids.gid))?;
+            check(libc::setuid(ids.uid))?;
+        }
+    }
+    Ok(())
+}
+
+// Both ends close on exec, so one command's PTY never leaks into another
+// connection's command.
+fn open_pty(size: WinSize) -> nix::Result<(File, OwnedFd)> {
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = pty::posix_openpt(flags)?;
+    pty::grantpt(&master)?;
+    pty::unlockpt(&master)?;
+    let slave = nix::fcntl::open(pty::ptsname_r(&master)?.as_str(), flags, Mode::empty())?;
+    let master = File::from(OwnedFd::from(master));
+    resize(&master, size)?;
+    Ok((master, slave))
+}
+
+// The kernel signals SIGWINCH to the PTY's foreground process group.
+fn resize(pty: &File, size: WinSize) -> nix::Result<()> {
+    let ws = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads one winsize, which lives through the call.
+    Errno::result(unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &ws) }).map(drop)
+}
+
+fn nonblocking(file: &File) -> nix::Result<()> {
+    let flags = OFlag::from_bits_retain(fcntl(file, FcntlArg::F_GETFL)?);
+    fcntl(file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(drop)
+}
+
+// The command's process group. Signals reach the whole group until the
+// command is reaped, and never after, so a reused pid can't get one.
+struct Group {
+    pgid: libc::pid_t,
+    exited: Mutex<bool>,
+}
+
+impl Group {
+    fn signal(&self, sig: i32) {
+        let exited = self.exited.lock().unwrap();
+        if !*exited {
+            // SAFETY: kill takes no pointers. A bad signal number is EINVAL.
+            unsafe { libc::kill(-self.pgid, sig) };
+        }
+    }
+
+    fn has_exited(&self) -> bool {
+        *self.exited.lock().unwrap()
+    }
+}
+
+// Waits for the command to exit, stops signals to its group, then reaps it.
+fn reap(child: &mut Child, group: &Group) -> io::Result<ExitStatus> {
+    let exited = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
+    let waited = loop {
+        match waitid(Id::Pid(Pid::from_raw(group.pgid)), exited) {
+            Err(Errno::EINTR) => continue,
+            r => break r,
+        }
+    };
+    *group.exited.lock().unwrap() = true;
+    waited?;
+    child.wait()
+}
+
+// Forwards one output stream to the host until it closes, or until the
+// command has exited and the stream has gone quiet.
+fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, group: &Group) {
+    let mut buf = vec![0; 32 * 1024];
+    loop {
+        // Checked before the wait, so the last wait starts after the exit and
+        // still catches output on its way through the PTY.
+        let exited = group.has_exited();
+        let mut fds = [PollFd::new(src.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, QUIET) {
+            Ok(0) if exited => return,
+            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(e) => return eprintln!("runner-guest: output: {e}"),
+        }
+        match src.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if send(out, wrap(buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            // A PTY whose command has gone reads EIO.
+            Err(_) => return,
+        }
+    }
+}
+
+// Applies the host's frames until it hangs up, which hangs up the command,
+// as closing a terminal does.
+fn take_input<C: Conn>(mut host: C, stdin: File, pty: Option<File>, group: &Group) {
+    let mut stdin = Some(stdin);
+    loop {
+        match proto::read_frame::<ToGuest>(&mut host) {
+            Ok(Some(ToGuest::Stdin(data))) => {
+                let Some(file) = &mut stdin else { continue };
+                match feed(file, &data, host.as_fd()) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    // The command closed its stdin.
+                    Err(_) => stdin = None,
+                }
+            }
+            Ok(Some(ToGuest::CloseStdin)) => {
+                if pty.is_none() {
+                    stdin = None;
+                }
+            }
+            Ok(Some(ToGuest::Resize(size))) => {
+                if let Some(pty) = &pty {
+                    let _ = resize(pty, size);
+                }
+            }
+            Ok(Some(ToGuest::Signal(sig))) => group.signal(sig),
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("runner-guest: from the host: {e}");
+                break;
+            }
+        }
+    }
+    group.signal(libc::SIGHUP);
+}
+
+// Writes all of data to the command's stdin. A command that stops reading
+// holds up the host's later frames, but not its hang-up: false means the
+// host hung up first.
+fn feed(stdin: &mut File, mut data: &[u8], host: BorrowedFd) -> io::Result<bool> {
+    while !data.is_empty() {
+        match stdin.write(data) {
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let mut fds = [
+                    PollFd::new(stdin.as_fd(), PollFlags::POLLOUT),
+                    PollFd::new(host, PollFlags::from_bits_retain(libc::POLLRDHUP)),
+                ];
+                match poll(&mut fds, PollTimeout::NONE) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                // nix doesn't know RDHUP's bit, so it reads as None, not true.
+                if fds[1].any() != Some(false) {
+                    return Ok(false);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}

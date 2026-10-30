@@ -18,10 +18,12 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 
 ## Stack
 - Firecracker microVMs, driven through Firecracker's API socket. Everything else follows temper's defaults: one Rust binary on the host, `runner`, that is both the CLI and the MCP server.
+- `runner-guest`, a static binary in each VM, runs commands for the host over vsock in place of sshd. The protocol is `src/proto.rs`.
 - VM state is a directory per VM, not SQLite (docs/design.md). Disks are copied with GNU `cp --reflink=auto --sparse=always`.
 
 ## Commands
 - Build: `cargo build --release` (the binary is `target/release/runner`)
+- Build the guest agent: `cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest` (static, for the base image)
 - Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
 
