@@ -17,7 +17,9 @@ const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
 const HOST: &str = "runner@kvm-host";
 
 fn client(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("client").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("client")
+        .join(name)
 }
 
 fn text(b: &[u8]) -> String {
@@ -30,7 +32,12 @@ fn script(path: &Path, body: &str) {
 }
 
 fn ok(out: &Output) {
-    assert!(out.status.success(), "{:?}: {}", out.status, text(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{:?}: {}",
+        out.status,
+        text(&out.stderr)
+    );
 }
 
 // NUL-terminated, as the fakes write them.
@@ -124,7 +131,11 @@ fn a_command_typed_at_a_terminal_gets_a_tty() {
         let laptop = Laptop::new();
         let out = on_a_terminal(&mut laptop.runner(shell, &["shell", "dev"]));
         ok(&out);
-        assert_eq!(laptop.ssh_argv(), ["-t", HOST, "runner shell dev"], "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            ["-t", HOST, "runner shell dev"],
+            "{shell:?}"
+        );
         assert_eq!(laptop.host_argv(), ["shell", "dev"], "{shell:?}");
     }
 }
@@ -142,12 +153,20 @@ fn a_piped_command_gets_no_tty_and_its_stdin_passes_through() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(b"piped in\n").unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"piped in\n")
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         ok(&out);
         assert_eq!(
             laptop.ssh_argv(),
-            [HOST, r#"runner exec dev -- printf '%s\n' 'it'\''s a "test"'"#],
+            [
+                HOST,
+                r#"runner exec dev -- printf '%s\n' 'it'\''s a "test"'"#
+            ],
             "{shell:?}"
         );
         assert_eq!(laptop.host_argv(), args, "{shell:?}");
