@@ -1,6 +1,6 @@
 // The VM store on a temp directory: no KVM needed.
 use runner::creds::{Cred, DEFAULT};
-use runner::store::{Error, Store, Vm, check_name};
+use runner::store::{Config, Error, Machine, Store, Vm, check_name, parse_mem};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -213,6 +213,154 @@ fn copies_keep_holes_and_are_writable() {
     fs::write(&run.disk, b"agent was here").unwrap();
 }
 
+#[test]
+fn a_vm_without_sizes_takes_the_hosts_defaults() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"v0")).unwrap();
+    let want = Machine {
+        cpus: 2,
+        mem_mib: 2048,
+        kernel: dir.path().join("root/kernel/vmlinux"),
+    };
+    assert_eq!(store.machine("base").unwrap(), want);
+    assert_eq!(store.config("base").unwrap(), Config::default());
+}
+
+#[test]
+fn sizes_are_stored_and_a_fork_starts_from_its_parents() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"v0")).unwrap();
+    let kernel = dir.path().join("vmlinux");
+    fs::write(&kernel, b"kernel").unwrap();
+    let big = Config {
+        cpus: Some(8),
+        mem_mib: None,
+        kernel: Some(kernel.clone()),
+    };
+    store.fork_with("base", "big", &big).unwrap();
+    assert_eq!(store.config("big").unwrap(), big);
+    let more = Config {
+        mem_mib: Some(16384),
+        ..Config::default()
+    };
+    store.fork_with("big", "bigger", &more).unwrap();
+    let want = Machine {
+        cpus: 8,
+        mem_mib: 16384,
+        kernel,
+    };
+    assert_eq!(store.machine("bigger").unwrap(), want);
+    // The parent is unchanged, and a plain fork copies it as it is.
+    assert_eq!(store.config("big").unwrap(), big);
+    store.fork("big", "big-2").unwrap();
+    assert_eq!(store.config("big-2").unwrap(), big);
+}
+
+#[test]
+fn sizes_firecracker_would_refuse_are_refused_at_create() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"v0")).unwrap();
+    let bad = [
+        Config {
+            cpus: Some(0),
+            ..Config::default()
+        },
+        Config {
+            cpus: Some(33),
+            ..Config::default()
+        },
+        Config {
+            mem_mib: Some(64),
+            ..Config::default()
+        },
+        Config {
+            kernel: Some("relative/vmlinux".into()),
+            ..Config::default()
+        },
+        Config {
+            kernel: Some(dir.path().join("missing")),
+            ..Config::default()
+        },
+    ];
+    for config in bad {
+        let got = store.fork_with("base", "x", &config);
+        assert!(
+            matches!(got, Err(Error::BadConfig(_))),
+            "{config:?}: {got:?}"
+        );
+    }
+    assert!(matches!(store.get("x"), Err(Error::NoVm(_))));
+    // Odd counts are fine: only SMT, which runner never turns on, needs even ones.
+    for cpus in [1, 2, 3, 32] {
+        let config = Config {
+            cpus: Some(cpus),
+            ..Config::default()
+        };
+        store
+            .fork_with("base", &format!("c{cpus}"), &config)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_broken_config_is_an_error_not_a_default() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"v0")).unwrap();
+    fs::write(dir.path().join("root/vms/base/config.json"), "{cpus: 4").unwrap();
+    let err = store.machine("base").unwrap_err();
+    assert!(err.to_string().contains("config.json"), "{err}");
+}
+
+#[test]
+fn memory_sizes_read_like_people_write_them() {
+    for (s, mib) in [
+        ("2048", 2048),
+        ("512M", 512),
+        ("512MiB", 512),
+        ("4G", 4096),
+        ("4g", 4096),
+        ("4GiB", 4096),
+        ("1T", 1 << 20),
+    ] {
+        assert_eq!(parse_mem(s).unwrap(), mib, "{s}");
+    }
+    for bad in ["", "G", "1.5G", "-1G", "4 G", "4GB", "lots", "99999999999G"] {
+        assert!(
+            matches!(parse_mem(bad), Err(Error::BadConfig(_))),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn a_discarded_run_leaves_no_disk() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    let path = run.disk.clone();
+    run.discard();
+    assert!(!path.exists());
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 0, 2));
+    assert_eq!(store.begin_run("dev").unwrap().generation, 1);
+}
+
+#[test]
+fn wait_idle_returns_once_the_run_lets_go() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    let waiter = {
+        let store = store.clone();
+        std::thread::spawn(move || store.wait_idle("dev"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!waiter.is_finished(), "wait_idle didn't wait");
+    run.commit().unwrap();
+    waiter.join().unwrap().unwrap();
+    // It holds nothing once it returns.
+    store.begin_run("dev").unwrap();
+}
+
 mod props {
     use super::*;
     use proptest::prelude::*;
@@ -235,6 +383,23 @@ mod props {
         #[test]
         fn plain_names_are_accepted(name in "[a-z0-9][a-z0-9-]{0,31}") {
             prop_assert!(check_name(&name).is_ok());
+        }
+
+        #[test]
+        fn every_unit_means_the_same_memory(mib in 1u32..(1 << 20)) {
+            prop_assert_eq!(parse_mem(&mib.to_string()).unwrap(), mib);
+            prop_assert_eq!(parse_mem(&format!("{mib}M")).unwrap(), mib);
+            if mib <= 1 << 12 {
+                prop_assert_eq!(parse_mem(&format!("{mib}G")).unwrap(), mib << 10);
+            }
+        }
+
+        // Whatever comes in, the answer is a size or an error, never a panic or a zero.
+        #[test]
+        fn any_text_is_a_size_or_an_error(s in "[0-9a-zA-Z.-]{0,12}") {
+            if let Ok(mib) = parse_mem(&s) {
+                prop_assert!(mib > 0);
+            }
         }
     }
 }
