@@ -74,7 +74,9 @@ impl ServerHandler for Tools {
 // can read, not a broken session.
 #[tool_router]
 impl Tools {
-    #[tool(description = "List the VMs on this host and each one's current disk generation.")]
+    #[tool(
+        description = "List the VMs on this host, each one's current disk generation, and the space its disks use (allocated blocks, not apparent size)."
+    )]
     fn list_vms(&self) -> Result<Json<VmList>, String> {
         let vms = self.store.list().map_err(|e| e.to_string())?;
         Ok(Json(VmList { vms }))

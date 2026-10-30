@@ -37,13 +37,19 @@ fn disk(dir: &Path, bytes: &[u8]) -> PathBuf {
     path
 }
 
-fn vm(name: &str, generation: u64, bytes: u64) -> Vm {
-    let name = name.to_string();
-    Vm {
-        name,
-        generation,
-        bytes,
+// What a test expects of a VM. Space used hangs on the filesystem's block
+// size, so it has tests of its own and these compare the rest.
+#[derive(Debug)]
+struct Shown(&'static str, u64, u64);
+
+impl PartialEq<Shown> for Vm {
+    fn eq(&self, s: &Shown) -> bool {
+        (self.name.as_str(), self.generation, self.bytes) == (s.0, s.1, s.2)
     }
+}
+
+fn vm(name: &'static str, generation: u64, bytes: u64) -> Shown {
+    Shown(name, generation, bytes)
 }
 
 #[test]
@@ -57,7 +63,7 @@ fn import_makes_a_vm_at_generation_zero() {
 #[test]
 fn list_is_empty_before_anything_exists() {
     let (_dir, store) = store();
-    assert_eq!(store.list().unwrap(), vec![]);
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]
@@ -197,7 +203,7 @@ fn an_interrupted_create_does_not_take_the_name() {
     // What a create killed partway leaves: its staging directory, from a dead pid.
     let staged = dir.path().join("root/vms/.new-dev-999999999");
     fs::create_dir_all(staged.join("gens")).unwrap();
-    assert_eq!(store.list().unwrap(), vec![]);
+    assert!(store.list().unwrap().is_empty());
     store.import("dev", &disk(dir.path(), b"v0")).unwrap();
     assert!(!staged.exists(), "stale staging directory left behind");
 }
@@ -489,6 +495,176 @@ fn deleting_twice_in_one_process_works() {
     }
 }
 
+// gc: the current generation, every checkpoint and the newest few others
+// stay; everything else on disk goes.
+
+// A store that keeps everything, for building up generations to collect.
+fn hoarder(dir: &TempDir) -> Store {
+    Store::new(dir.path().join("root")).keeping(usize::MAX)
+}
+
+// `dev` at generation `n`, with every generation from 0 committed.
+fn committed(dir: &TempDir, n: u64) -> Store {
+    let store = hoarder(dir);
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    for g in 1..=n {
+        let run = store.begin_run("dev").unwrap();
+        fs::write(&run.disk, format!("v{g}")).unwrap();
+        run.commit().unwrap();
+    }
+    store
+}
+
+// dev's disks, by generation.
+fn on_disk(dir: &Path) -> Vec<u64> {
+    let gens = dir.join("root/vms/dev/gens");
+    let mut out: Vec<u64> = fs::read_dir(gens)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".ext4")?.parse().ok()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn undo_all(store: &Store) -> Vec<u64> {
+    let mut seen = Vec::new();
+    while let Ok(vm) = store.undo("dev") {
+        seen.push(vm.generation);
+    }
+    seen
+}
+
+#[test]
+fn gc_keeps_the_current_generation_and_the_newest_others() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    let freed = store.gc("dev", false).unwrap();
+    assert_eq!(freed.name, "dev");
+    assert_eq!(freed.generations, [0, 1, 2, 3]);
+    assert_eq!(on_disk(dir.path()), [4, 5, 6]);
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 6, 2));
+    // History lost the deleted ones, so undo stops at the oldest disk left.
+    assert_eq!(undo_all(&store), [5, 4]);
+}
+
+#[test]
+fn gc_keeps_every_checkpoint_and_drops_notes_with_their_disks() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    let named = store.checkpoint("dev", Some("before the upgrade")).unwrap();
+    let plain = store.checkpoint("dev", None).unwrap();
+    assert_eq!((named.id, plain.id), (7, 8));
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 1, 2, 3]);
+    assert_eq!(on_disk(dir.path()), [4, 5, 6, 7, 8]);
+    let gens = dir.path().join("root/vms/dev/gens");
+    assert!(!gens.join("0.json").exists());
+    assert!(gens.join("7.json").is_file());
+    let ids: Vec<u64> = store
+        .checkpoints("dev")
+        .unwrap()
+        .iter()
+        .filter(|c| !c.auto)
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, [8, 7]);
+    assert_eq!(undo_all(&store), [5, 4]);
+}
+
+#[test]
+fn gc_keeps_five_others_unless_told() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 8);
+    let store = Store::new(dir.path().join("root"));
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 1, 2]);
+    assert_eq!(on_disk(dir.path()), [3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
+fn gc_keeps_undo_history_ahead_of_failed_runs_disks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = committed(&dir, 1);
+    drop(store.begin_run("dev").unwrap());
+    drop(store.begin_run("dev").unwrap());
+    // Room for the one undo and the newest failed disk.
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [2]);
+    assert_eq!(on_disk(dir.path()), [0, 1, 3]);
+    let store = store.keeping(1);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [3]);
+    assert_eq!(undo_all(&store), [0]);
+}
+
+#[test]
+fn crashed_runs_never_cost_undo_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let hoard = committed(&dir, 3);
+    for _ in 0..5 {
+        drop(hoard.begin_run("dev").unwrap());
+    }
+    let store = Store::new(dir.path().join("root"));
+    store.begin_run("dev").unwrap().commit().unwrap();
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 8, 9]);
+    assert_eq!(undo_all(&store), [3, 2, 1, 0]);
+}
+
+#[test]
+fn gc_dry_run_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 6);
+    let history = dir.path().join("root/vms/dev/history");
+    let before = fs::read_to_string(&history).unwrap();
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    let would = store.gc("dev", true).unwrap();
+    assert_eq!(would.generations, [0, 1, 2, 3]);
+    assert!(would.bytes > 0);
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(fs::read_to_string(&history).unwrap(), before);
+    // The real thing frees just what the dry run said.
+    assert_eq!(store.gc("dev", false).unwrap(), would);
+}
+
+#[test]
+fn gc_counts_what_it_frees_in_allocated_blocks() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    committed(&dir, 3);
+    let gens = dir.path().join("root/vms/dev/gens");
+    let blocks = |g: u64| {
+        fs::metadata(gens.join(format!("{g}.ext4")))
+            .unwrap()
+            .blocks()
+            * 512
+    };
+    let want = blocks(0) + blocks(1);
+    let store = Store::new(dir.path().join("root")).keeping(1);
+    let freed = store.gc("dev", false).unwrap();
+    assert_eq!(freed.generations, [0, 1]);
+    assert_eq!(freed.bytes, want);
+}
+
+#[test]
+fn gc_leaves_alone_a_vm_a_run_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let hoard = committed(&dir, 6);
+    let run = hoard.begin_run("dev").unwrap();
+    fs::write(&run.disk, b"in progress").unwrap();
+    let store = Store::new(dir.path().join("root")).keeping(0);
+    assert!(matches!(store.gc("dev", false), Err(Error::Busy(n)) if n == "dev"));
+    assert!(matches!(store.gc("dev", true), Err(Error::Busy(_))));
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(fs::read(&run.disk).unwrap(), b"in progress");
+    run.commit().unwrap();
+    assert_eq!(
+        store.gc("dev", false).unwrap().generations,
+        [0, 1, 2, 3, 4, 5, 6]
+    );
+}
+
 fn gen_disk(dir: &Path, name: &str, generation: u64) -> PathBuf {
     dir.join(format!("root/vms/{name}/gens/{generation}.ext4"))
 }
@@ -656,6 +832,47 @@ fn a_note_left_without_its_disk_is_never_read_as_another() {
         summary(&store.checkpoints("dev").unwrap()),
         [(0, true, Some("import"), true)]
     );
+}
+
+#[test]
+fn every_commit_collects_what_the_store_does_not_keep() {
+    let (dir, store) = store();
+    let store = store.keeping(2);
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    for _ in 0..5 {
+        store.begin_run("dev").unwrap().commit().unwrap();
+    }
+    assert_eq!(on_disk(dir.path()), [3, 4, 5]);
+}
+
+#[test]
+fn gc_refuses_an_unknown_vm() {
+    let (_dir, store) = store();
+    assert!(matches!(store.gc("nope", false), Err(Error::NoVm(n)) if n == "nope"));
+    assert!(matches!(store.gc("../etc", true), Err(Error::BadName(_))));
+}
+
+#[test]
+fn used_is_allocated_blocks_of_every_generation_not_apparent_size() {
+    use std::os::unix::fs::MetadataExt;
+    let (dir, store) = store();
+    let src = dir.path().join("sparse.ext4");
+    fs::File::create(&src).unwrap().set_len(64 << 20).unwrap();
+    store.import("base", &src).unwrap();
+    let run = store.begin_run("base").unwrap();
+    fs::write(&run.disk, vec![7u8; 1 << 20]).unwrap();
+    // Synced, so block counts don't move under the test.
+    fs::File::open(&run.disk).unwrap().sync_all().unwrap();
+    run.commit().unwrap();
+    let got = store.get("base").unwrap();
+    let gens = dir.path().join("root/vms/base/gens");
+    let want: u64 = fs::read_dir(gens)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
+        .sum();
+    assert_eq!(got.used, want);
+    assert!(got.used < 4 << 20, "64 MB of holes counted: {}", got.used);
+    assert_eq!(store.list().unwrap()[0].used, want);
 }
 
 #[test]

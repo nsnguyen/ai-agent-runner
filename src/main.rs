@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
-use runner::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
+use runner::store::{BASE, Checkpoint, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,10 @@ struct Cli {
     /// Where VMs live.
     #[arg(long, env = "RUNNER_ROOT", default_value = "/var/lib/runner")]
     root: PathBuf,
+    /// How many disk generations gc keeps besides the current one and the
+    /// checkpoints, at every commit and in `gc`.
+    #[arg(long, env = "RUNNER_KEEP", default_value_t = KEEP, global = true)]
+    keep: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -39,7 +43,7 @@ enum Cmd {
         #[arg(long)]
         kernel: Option<PathBuf>,
     },
-    /// List VMs and their current disk generation.
+    /// List VMs, their current disk generation and the space their disks use.
     List,
     /// Boot a VM under systemd. Returns once its guest has started.
     Start { name: String },
@@ -61,6 +65,15 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Delete old disk generations: all but the current one, every checkpoint
+    /// and the newest --keep others. Every commit does this too.
+    Gc {
+        /// Only this VM. Every VM if left out.
+        name: Option<String>,
+        /// Print what would be freed, and free nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Freeze a copy of a VM's disk to restore later. The VM must be stopped.
     Checkpoint {
         name: String,
@@ -107,7 +120,7 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let store = Store::new(&cli.root);
+    let store = Store::new(&cli.root).keeping(cli.keep);
     match run(&cli.root, store, cli.cmd) {
         Ok(code) => code,
         Err(e) => {
@@ -139,8 +152,10 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             if vms.is_empty() {
                 println!("no VMs yet");
             }
-            vms.iter().for_each(show);
+            vms.iter()
+                .for_each(|vm| println!("{}  {} bytes used", line(vm), vm.used));
         }
+        Cmd::Gc { name, dry_run } => return Ok(gc(&store, name, dry_run)),
         Cmd::Start { name } => show_status(&systemd::start(&store, &name)?),
         Cmd::Stop { name } => show_status(&systemd::stop(&store, &name)?),
         Cmd::Status { name } => show_status(&systemd::status(&store, &name)?),
@@ -210,6 +225,45 @@ fn absolute_kernel(path: PathBuf) -> Result<PathBuf, String> {
 
 fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
+}
+
+// One VM failing, say because a run holds it, doesn't stop the rest; it
+// fails the command.
+fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
+    let names = match name {
+        Some(name) => vec![name],
+        None => match store.list() {
+            Ok(vms) => vms.into_iter().map(|vm| vm.name).collect(),
+            Err(e) => {
+                eprintln!("runner: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if names.is_empty() {
+        println!("no VMs yet");
+    }
+    let verb = if dry_run { "would free" } else { "freed" };
+    let mut code = ExitCode::SUCCESS;
+    for name in names {
+        match store.gc(&name, dry_run) {
+            Ok(f) if f.generations.is_empty() => println!("{name}  nothing to free"),
+            Ok(f) => {
+                let gens: Vec<String> = f.generations.iter().map(u64::to_string).collect();
+                // Up to: blocks a reflink shares with a disk that stays aren't freed.
+                println!(
+                    "{name}  {verb} gen {}  up to {} bytes",
+                    gens.join(" "),
+                    f.bytes
+                );
+            }
+            Err(e) => {
+                eprintln!("runner: {e}");
+                code = ExitCode::FAILURE;
+            }
+        }
+    }
+    code
 }
 
 // The comment is quoted, so one with a newline in it still takes one line.
