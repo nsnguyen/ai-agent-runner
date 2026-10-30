@@ -251,3 +251,105 @@ esac
             .collect()
     }
 }
+
+/// runner-guest on a Unix socket, standing in for the one in a VM.
+pub struct Guest {
+    child: std::process::Child,
+    pub sock: PathBuf,
+}
+
+impl Guest {
+    pub fn spawn(sock: &Path) -> Guest {
+        let child = Command::new(env!("CARGO_BIN_EXE_runner-guest"))
+            .arg("--unix")
+            .arg(sock)
+            .spawn()
+            .unwrap();
+        // bind makes the file before listen, so wait for a hello to come back.
+        let hello = |sock: &Path| -> runner::proto::Result<()> {
+            let mut conn = std::os::unix::net::UnixStream::connect(sock)?;
+            runner::proto::hello(&mut conn)?;
+            runner::proto::check_hello(&mut conn)
+        };
+        wait_for("runner-guest to listen", || hello(sock).is_ok());
+        let sock = sock.to_path_buf();
+        Guest { child, sock }
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Firecracker's host side of vsock, on a VM's `vsock.sock`. It takes
+/// `CONNECT <port>` and, if the guest socket answers, replies `OK <n>` and
+/// joins the two. If not, it hangs up, as Firecracker does when nothing in
+/// the guest listens on the port. As in Firecracker, the host closing its
+/// side, even only for writing, ends the connection both ways.
+pub struct FakeVsock {
+    connects: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeVsock {
+    pub fn serve(uds: &Path, guest: &Path) -> FakeVsock {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        let listener = UnixListener::bind(uds).unwrap();
+        let connects = Arc::new(Mutex::new(Vec::new()));
+        let seen = connects.clone();
+        let guest = guest.to_path_buf();
+        std::thread::spawn(move || {
+            for host in listener.incoming() {
+                let Ok(mut host) = host else { return };
+                let mut line = Vec::new();
+                let mut b = [0];
+                while !line.ends_with(b"\n") {
+                    match std::io::Read::read(&mut host, &mut b) {
+                        Ok(1) => line.push(b[0]),
+                        _ => break,
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(text(&line).trim_end().to_string());
+                let Ok(vm) = UnixStream::connect(&guest) else {
+                    continue;
+                };
+                host.write_all(b"OK 1073741824\n").unwrap();
+                let (mut from_host, mut to_vm) =
+                    (host.try_clone().unwrap(), vm.try_clone().unwrap());
+                let (vm_end, host_end) = (vm.try_clone().unwrap(), host.try_clone().unwrap());
+                // An error is the guest gone, whose last frames the other
+                // thread still passes on.
+                std::thread::spawn(move || {
+                    if std::io::copy(&mut from_host, &mut to_vm).is_ok() {
+                        let _ = vm_end.shutdown(Shutdown::Both);
+                        let _ = host_end.shutdown(Shutdown::Both);
+                    }
+                });
+                let (mut from_vm, mut to_host) = (vm, host);
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_vm, &mut to_host);
+                    let _ = to_host.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        FakeVsock { connects }
+    }
+
+    /// Each connection's first line, as the host sent it.
+    pub fn connects(&self) -> Vec<String> {
+        self.connects.lock().unwrap().clone()
+    }
+}
+
+/// The user running the tests, whom commands in the fake guest run as.
+pub fn me() -> String {
+    nix::unistd::User::from_uid(nix::unistd::geteuid())
+        .unwrap()
+        .unwrap()
+        .name
+}

@@ -2,16 +2,21 @@
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
 use crate::doctor::{self, Report, System};
+use crate::exec::{self, Captured};
+use crate::proto::Request;
 use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Tools {
     store: Store,
+    /// Who exec runs commands as.
+    user: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -58,6 +63,23 @@ pub struct RestoreArgs {
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct CheckpointList {
     checkpoints: Vec<Checkpoint>,
+}
+
+/// How long exec waits on a command unless told.
+pub const EXEC_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ExecArgs {
+    /// The VM's name. If it's stopped, it's started first.
+    name: String,
+    /// The program and its arguments, run as they are, not through a shell:
+    /// ["sh", "-c", "..."] for shell syntax.
+    argv: Vec<String>,
+    /// Text for the command's stdin, which then closes. Left out, stdin is
+    /// closed from the start.
+    stdin: Option<String>,
+    /// Seconds before the command is killed. Defaults to 120; at most 86400.
+    timeout_secs: Option<u64>,
 }
 
 // Named here, or clients see the SDK's own name.
@@ -184,6 +206,30 @@ impl Tools {
     }
 
     #[tool(
+        description = "Run a command in a VM, starting the VM first if it's stopped, and return its exit code (or the signal that ended it), stdout and stderr. It runs as the agent user in its home directory, without a terminal. Each stream keeps its first 32 KiB, with a truncated flag. Past timeout_secs (default 120) the command is killed and timed_out is true."
+    )]
+    async fn exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<Json<Captured>, String> {
+        if args.argv.is_empty() {
+            return Err("argv is empty: give the program and its arguments".into());
+        }
+        let store = self.store.clone();
+        let req = Request {
+            argv: args.argv,
+            env: Vec::new(),
+            cwd: None,
+            user: Some(self.user.clone()),
+            tty: None,
+        };
+        let stdin = args.stdin.unwrap_or_default();
+        let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(EXEC_TIMEOUT_SECS));
+        blocking(move || {
+            let conn = exec::open(&store, &args.name)?;
+            exec::capture(conn, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
+        })
+        .await
+    }
+
+    #[tool(
         description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. Fails if a run holds the VM."
     )]
     fn restore_vm(&self, Parameters(args): Parameters<RestoreArgs>) -> Result<Json<Vm>, String> {
@@ -194,7 +240,7 @@ impl Tools {
     }
 }
 
-// Starting and stopping wait on systemd for seconds, which would hold up
+// Starting, stopping and exec wait for seconds or more, which would hold up
 // every other request on this single-threaded server.
 async fn blocking<T, E>(
     f: impl FnOnce() -> Result<T, E> + Send + 'static,
@@ -209,9 +255,14 @@ where
     }
 }
 
-/// Serves until the client closes stdin.
-pub async fn serve(store: Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let running = Tools { store }.serve(rmcp::transport::stdio()).await?;
+/// Serves until the client closes stdin. exec runs commands as `user`.
+pub async fn serve(
+    store: Store,
+    user: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let running = Tools { store, user }
+        .serve(rmcp::transport::stdio())
+        .await?;
     running.waiting().await?;
     Ok(())
 }

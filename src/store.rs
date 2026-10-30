@@ -421,6 +421,11 @@ impl Store {
         Ok(api_socket(&self.existing(name)?))
     }
 
+    /// Where the host reaches the VM's guest through Firecracker, while it runs.
+    pub fn vsock(&self, name: &str) -> Result<PathBuf> {
+        Ok(vsock(&self.existing(name)?))
+    }
+
     /// Blocks until nothing holds the VM: what a stop waits on.
     pub fn wait_idle(&self, name: &str) -> Result<()> {
         let dir = self.existing(name)?;
@@ -677,12 +682,16 @@ impl Run {
     }
 
     pub fn vsock(&self) -> PathBuf {
-        self.dir.join("vsock.sock")
+        vsock(&self.dir)
     }
 }
 
 fn api_socket(dir: &Path) -> PathBuf {
     dir.join("api.sock")
+}
+
+fn vsock(dir: &Path) -> PathBuf {
+    dir.join("vsock.sock")
 }
 
 // The caller holds the VM's lock. History is rewritten before any disk goes,
