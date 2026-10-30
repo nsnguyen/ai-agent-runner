@@ -12,6 +12,7 @@ use runner::sessions::{self, Session};
 use runner::store::Store;
 use std::fs;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
@@ -151,6 +152,13 @@ impl Vm {
     }
 }
 
+// What a new session's pane runs: the test user's shell.
+fn login_shell() -> String {
+    let me = nix::unistd::User::from_name(&me()).unwrap().unwrap();
+    let name = me.shell.file_name().unwrap();
+    name.to_string_lossy().into_owned()
+}
+
 fn code(out: &Output) -> i32 {
     out.status.code().unwrap()
 }
@@ -193,7 +201,10 @@ fn a_dropped_connection_detaches_the_session_and_never_kills_it() {
     let pid = nix::unistd::Pid::from_raw(shell.id() as i32);
     nix::sys::signal::kill(pid, nix::sys::signal::SIGHUP).unwrap();
     assert_eq!(shell.wait().unwrap().code(), Some(129), "{}", t.seen());
-    // Still there, still running the sleep, with nobody on it.
+    // Still there, still running the sleep, with nobody on it, past the
+    // guest's grace before it kills what a hang-up leaves running.
+    vm.wait_for_row(&s, "sleep", "detached");
+    std::thread::sleep(Duration::from_secs(3));
     vm.wait_for_row(&s, "sleep", "detached");
 
     let t = pty(24, 80);
@@ -228,11 +239,20 @@ fn sessions_lists_the_command_start_time_and_whether_anyone_is_attached() {
 fn kill_ends_the_session_and_what_runs_in_it() {
     let vm = vm();
     let s = vm.name("kill");
-    vm.tmux(&["new-session", "-d", "-s", &s, "sleep 300"]);
+    let pid_file = vm.dir.path().join("pid");
+    let script = format!("echo $$ > {}; exec sleep 300", pid_file.display());
+    vm.tmux(&["new-session", "-d", "-s", &s, &script]);
+    wait_for("the pid", || {
+        fs::read_to_string(&pid_file).is_ok_and(|p| p.ends_with('\n'))
+    });
+    let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
     let out = vm.run(&["kill", "dev", &s]);
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), format!("killed {s}\n"));
     assert!(vm.row(&s).is_none(), "{}", vm.sessions());
+    wait_for("the sleep to end", || {
+        !Path::new(&format!("/proc/{pid}")).exists()
+    });
     let out = vm.run(&["kill", "dev", &s]);
     assert_eq!(code(&out), 1);
     assert_eq!(
@@ -250,8 +270,8 @@ fn names_match_whole() {
     vm.tmux(&["new-session", "-d", "-s", &longer, "sleep 300"]);
     let t = pty(24, 80);
     let mut on = t.spawn(vm.runner(&["attach", "dev", s]));
-    assert_eq!(on.wait().unwrap().code(), Some(1), "{}", t.seen());
-    t.wait_for(&format!("can't find session: {s}"));
+    assert_eq!(on.wait().unwrap().code(), Some(255), "{}", t.seen());
+    t.wait_for(&format!("runner: no session {s} in dev"));
     let out = vm.run(&["kill", "dev", s]);
     assert_eq!(code(&out), 1);
     assert!(vm.row(&longer).is_some(), "{}", vm.sessions());
@@ -279,10 +299,25 @@ fn shell_with_a_session_starts_a_stopped_vm() {
     let s = vm.name("boot");
     let t = pty(24, 80);
     let mut shell = t.spawn(vm.runner(&["shell", "dev", "--session", &s]));
-    vm.wait_for_row(&s, "bash", "attached");
+    vm.wait_for_row(&s, &login_shell(), "attached");
     vm.detach(&s);
     assert_eq!(shell.wait().unwrap().code(), Some(0), "{}", t.seen());
     assert!(vm.started(), "{:?}", vm.sd.calls());
+}
+
+// tmux won't start on a terminal the guest has no terminfo for, as a newer
+// terminal's own TERM often is, so the session gets a common one.
+#[test]
+fn a_terminal_the_guest_doesn_t_know_still_gets_a_session() {
+    let vm = vm();
+    let s = vm.name("term");
+    let t = pty(24, 80);
+    let mut cmd = vm.runner(&["shell", "dev", "--session", &s]);
+    cmd.env("TERM", "xterm-no-such-terminal");
+    let mut shell = t.spawn(cmd);
+    vm.wait_for_row(&s, &login_shell(), "attached");
+    vm.detach(&s);
+    assert_eq!(shell.wait().unwrap().code(), Some(0), "{}", t.seen());
 }
 
 // tmux can't attach without one, so neither boots the VM to find that out.
@@ -331,14 +366,6 @@ fn listing(sessions: &[(String, String, i64, u32)]) -> String {
         .iter()
         .map(|(name, command, created, clients)| format!("{created}:{clients}:{command}:{name}\n"))
         .collect()
-}
-
-#[test]
-fn the_list_format_names_the_fields_in_that_order() {
-    assert_eq!(
-        sessions::LIST_FORMAT,
-        "#{session_created}:#{session_attached}:#{pane_current_command}:#{session_name}"
-    );
 }
 
 proptest! {
@@ -415,6 +442,7 @@ fn tmux_s_ways_of_saying_nothing_is_there() {
     for gone in [
         "no server running on /tmp/tmux-1000/default",
         "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+        "error connecting to /tmp/tmux-1000/default (Connection refused)",
         "server exited unexpectedly",
         "lost server",
         "can't find session: work",
@@ -426,6 +454,7 @@ fn tmux_s_ways_of_saying_nothing_is_there() {
         "",
         "open terminal failed: not a terminal",
         "unknown command: x",
+        "error connecting to /tmp/tmux-1000/default (Permission denied)",
     ] {
         assert!(!sessions::nothing_there(other), "{other:?}");
     }

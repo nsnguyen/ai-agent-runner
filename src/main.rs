@@ -248,7 +248,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             name,
             user,
             session: Some(session),
-        } => return Ok(on_session(&store, &name, &session, user, true)),
+        } => return Ok(on_session(&store, &name, &session, &user, true)),
         Cmd::Shell {
             name,
             user,
@@ -264,7 +264,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 user: Some(user),
                 tty: tty.then(exec::terminal_size),
             };
-            return Ok(attach(exec::open(&store, &name).map_err(Into::into), &req));
+            return Ok(attach(|| Ok(exec::open(&store, &name)?), &req));
         }
         Cmd::Sessions { name, user } => {
             let all = sessions::list(&store, &name, &user)?;
@@ -277,7 +277,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             name,
             session,
             user,
-        } => return Ok(on_session(&store, &name, &session, user, false)),
+        } => return Ok(on_session(&store, &name, &session, &user, false)),
         Cmd::Kill {
             name,
             session,
@@ -304,7 +304,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 user: Some(user),
                 tty: tty.then(exec::terminal_size),
             };
-            return Ok(attach(exec::open(&store, &name).map_err(Into::into), &req));
+            return Ok(attach(|| Ok(exec::open(&store, &name)?), &req));
         }
         Cmd::Unit { user } => {
             let exe = std::env::current_exe()?;
@@ -357,8 +357,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
 
 // The command's exit code, or 128 plus the signal that killed it, as a
 // shell has it. 255 is the runner's own failure, as with ssh.
-fn attach(conn: Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
-    match conn.and_then(|conn| Ok(exec::attach(conn, req)?)) {
+fn attach(open: impl FnOnce() -> Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
+    match open().and_then(|conn| Ok(exec::attach(conn, req)?)) {
         Ok(Exit::Code(code)) => ExitCode::from(code as u8),
         Ok(Exit::Signal(sig)) => ExitCode::from(128u8.wrapping_add(sig as u8)),
         Err(e) => {
@@ -370,8 +370,8 @@ fn attach(conn: Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
 
 // This terminal on a tmux session, made first if `create`. Only that boots a
 // stopped VM, which has no sessions to attach to.
-fn on_session(store: &Store, name: &str, session: &str, user: String, create: bool) -> ExitCode {
-    let conn = || -> Result<UnixStream, Box<dyn Error>> {
+fn on_session(store: &Store, name: &str, session: &str, user: &str, create: bool) -> ExitCode {
+    let open = || -> Result<UnixStream, Box<dyn Error>> {
         sessions::check_name(session)?;
         if !std::io::stdin().is_terminal() {
             return Err("a session needs a terminal: run this from one, or over ssh -t".into());
@@ -383,16 +383,19 @@ fn on_session(store: &Store, name: &str, session: &str, user: String, create: bo
             vm: name.to_string(),
             session: session.to_string(),
         };
+        if !sessions::exists(store, name, user, session)? {
+            return Err(no_session().into());
+        }
         Ok(exec::open_running(store, name)?.ok_or_else(no_session)?)
     };
     let req = Request {
         argv: sessions::attach_argv(session, create),
         env: term(),
         cwd: None,
-        user: Some(user),
+        user: Some(user.to_string()),
         tty: Some(exec::terminal_size()),
     };
-    attach(conn(), &req)
+    attach(open, &req)
 }
 
 // A terminal of the guest's speaks this one's TERM, as over ssh.

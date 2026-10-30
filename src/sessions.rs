@@ -85,16 +85,30 @@ fn target(session: &str) -> String {
     format!("={session}")
 }
 
+// tmux won't start on a TERM the guest has no terminfo for, as a newer
+// terminal's own often is, where a plain shell only gets by. `-u` because guest
+// commands get no LANG, and tmux would otherwise draw lines as ASCII.
+const ON_A_KNOWN_TERM: &str =
+    r#"infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color; exec tmux -u "$@""#;
+
 /// What attaches a terminal to the session, making it first if `create`. It
-/// starts the user's shell as a login shell, as tmux does. `-u` because guest
-/// commands get no LANG, and tmux would otherwise draw lines as ASCII.
+/// starts the user's shell as a login shell, as tmux does.
 pub fn attach_argv(session: &str, create: bool) -> Vec<String> {
     let (verb, flag, name) = if create {
         ("new-session", "-As", session.to_string())
     } else {
         ("attach-session", "-t", target(session))
     };
-    ["tmux", "-u", verb, flag, &name].map(String::from).to_vec()
+    ["sh", "-c", ON_A_KNOWN_TERM, "sh", verb, flag, &name]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Whether the session is there. A VM that isn't running has none.
+pub fn exists(store: &Store, vm: &str, user: &str, session: &str) -> Result<bool> {
+    check_name(session)?;
+    let args = ["has-session", "-t", &target(session)];
+    Ok(tmux(store, vm, user, &args, 64 << 10)?.is_some())
 }
 
 /// Every session of `user`'s in the VM, by name. A VM that isn't running has
@@ -217,16 +231,18 @@ fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Resul
 /// there. A server that's exiting as its last session ends says so in ways of
 /// its own: it's gone, or has no sessions left to find.
 pub fn nothing_there(stderr: &str) -> bool {
-    [
+    let gone = [
         "no server running",
-        "error connecting",
         "server exited unexpectedly",
         "lost server",
         "can't find session",
         "no current target",
-    ]
-    .iter()
-    .any(|said| stderr.starts_with(said))
+    ];
+    // Not "Permission denied": that's a server it can't reach, not none.
+    let no_socket = stderr.starts_with("error connecting")
+        && (stderr.ends_with("(No such file or directory)")
+            || stderr.ends_with("(Connection refused)"));
+    no_socket || gone.iter().any(|said| stderr.starts_with(said))
 }
 
 fn no_session(vm: &str, session: &str) -> Error {

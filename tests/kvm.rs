@@ -244,7 +244,7 @@ fn a_session_outlives_a_dropped_connection() {
     ok(runner(&root, &["start", &name]));
     let on_a_terminal = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
-        cmd.env("RUNNER_ROOT", &root).args(args);
+        cmd.env("RUNNER_ROOT", &root).env_remove("TERM").args(args);
         cmd
     };
 

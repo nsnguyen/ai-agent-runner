@@ -495,12 +495,18 @@ fn sessions_are_listed_read_and_killed() {
         assert_eq!(got["isError"], json!(false), "{got}");
         got["structuredContent"].clone()
     };
-    let got = read(
-        &mut s,
-        300,
-        json!({"name": "dev", "session": name, "lines": 3}),
-    );
-    assert_eq!(got, json!({"text": "298\n299\n300\n", "truncated": false}));
+    // The pane's command is the sleep a moment before tmux has drawn seq's end.
+    let last3 = json!({"name": "dev", "session": name, "lines": 3});
+    let want = json!({"text": "298\n299\n300\n", "truncated": false});
+    let mut got = read(&mut s, 300, last3.clone());
+    for id in 400..500 {
+        if got == want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        got = read(&mut s, id, last3.clone());
+    }
+    assert_eq!(got, want);
     // 100 unless told, reaching back past the screen into tmux's history.
     let got = read(&mut s, 301, json!({"name": "dev", "session": name}));
     let want: String = (201..=300).map(|n| format!("{n}\n")).collect();
