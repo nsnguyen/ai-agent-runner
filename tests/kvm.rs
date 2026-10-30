@@ -16,7 +16,8 @@
 // /var/lib/runner. `exec_starts_the_vm_and_runs_in_the_guest` needs the same,
 // with the base image (images/base) as RUNNER_TEST_DISK, for its
 // runner-guest and agent user, and so does
-// `a_session_outlives_a_dropped_connection`, for its tmux.
+// `a_session_outlives_a_dropped_connection`, for its tmux, and
+// `claude_keeps_running_after_a_detach`, for Claude Code.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -273,6 +274,69 @@ fn a_session_outlives_a_dropped_connection() {
     ok(runner(&root, &detach));
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     ok(runner(&root, &["kill", &name, "work"]));
+}
+
+// No token needed: a logged-out claude waits at its login screen.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+fn claude_keeps_running_after_a_detach() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let src = format!("claude-src-{}", std::process::id());
+    let name = format!("claude-test-{}", std::process::id());
+    let disk = env_path("RUNNER_TEST_DISK");
+    ok(runner(&root, &["import", &src, disk.to_str().unwrap()]));
+    let _cleanup = [&src, &name].map(|vm| Cleanup {
+        root: root.clone(),
+        name: vm.clone(),
+    });
+    let on_a_terminal = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.env("RUNNER_ROOT", &root).env_remove("TERM").args(args);
+        cmd
+    };
+    let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let detach = [
+        "exec",
+        &name,
+        "--",
+        "tmux",
+        "detach-client",
+        "-s",
+        "=claude",
+    ];
+    let claude_sessions = || {
+        let listed = ok(runner(&root, &["sessions", &name]));
+        listed.lines().filter(|l| l.starts_with("claude  ")).count()
+    };
+
+    // Made from src, booted, and claude started in the claude session.
+    let t = common::pty(24, 80);
+    let mut first = t.spawn(on_a_terminal(&["claude", &name, "--from", &src]));
+    t.wait_for(&format!("runner: made {name} from {src}"));
+    eventually("claude's session", || claude_sessions() == 1);
+    std::thread::sleep(Duration::from_secs(5));
+    ok(runner(&root, &detach));
+    assert_eq!(first.wait().unwrap().code(), Some(0), "{}", t.seen());
+
+    // A pane closes with what it runs, so a pane still there runs claude.
+    std::thread::sleep(Duration::from_secs(5));
+    let pane = r#"pid=$(tmux list-panes -t =claude: -F '#{pane_pid}') &&
+        echo "$pid" && tr '\0' ' ' </proc/$pid/cmdline && echo && readlink /proc/$pid/cwd"#;
+    let before = in_vm(pane);
+    let lines: Vec<&str> = before.lines().collect();
+    assert_eq!(lines.len(), 3, "{before}");
+    assert!(lines[1].contains("claude"), "{before}");
+    assert_eq!(lines[2], "/home/agent/work", "{before}");
+
+    // Again, with arguments: the same claude, and a note that they're unused.
+    let t = common::pty(24, 80);
+    let mut again = t.spawn(on_a_terminal(&["claude", &name, "--", "--continue"]));
+    t.wait_for("claude is already running");
+    std::thread::sleep(Duration::from_secs(2));
+    ok(runner(&root, &detach));
+    assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
+    assert_eq!(claude_sessions(), 1);
+    assert_eq!(in_vm(pane), before);
 }
 
 // Booted by hand, so the token comes from this process's environment, the

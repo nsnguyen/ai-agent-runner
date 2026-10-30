@@ -2,6 +2,7 @@
 //! the KVM host and reached over SSH. docs/design.md says how it fits together.
 pub mod boot;
 pub mod changes;
+pub mod claude;
 pub mod creds;
 pub mod doctor;
 pub mod exec;
