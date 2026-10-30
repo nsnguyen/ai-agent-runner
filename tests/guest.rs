@@ -1,7 +1,8 @@
 // runner-guest end to end, on a Unix socket in place of vsock: no VM needed.
+use runner::creds::{Cred, Keyring, Source};
 use runner::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -22,25 +23,62 @@ impl Drop for Guest {
 // The agent's own environment carries a marker that commands must not see.
 fn guest() -> Guest {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("guest.sock");
-    let child = Command::new(env!("CARGO_BIN_EXE_runner-guest"))
-        .arg("--unix")
-        .arg(&sock)
+    let child = spawn(dir.path(), None);
+    listening(child, dir)
+}
+
+// runner-guest on `guest.sock` in `dir`, taking its credentials from `creds`
+// first if given, as it takes them from the host in a VM.
+fn spawn(dir: &Path, creds: Option<&Path>) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner-guest"));
+    cmd.arg("--unix")
+        .arg(dir.join("guest.sock"))
         .env("GUEST_ONLY", "leaked")
-        .spawn()
-        .unwrap();
-    // bind makes the file before listen, so wait for a connect to work.
-    let start = Instant::now();
-    let probe = |sock: &PathBuf| -> proto::Result<()> {
+        // A token this process holds mustn't reach a command either.
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "guest-only")
+        .env("GH_TOKEN", "guest-only");
+    if let Some(creds) = creds {
+        cmd.arg("--creds-unix").arg(creds);
+    }
+    cmd.spawn().unwrap()
+}
+
+fn answers(sock: &Path) -> bool {
+    let probe = || -> proto::Result<()> {
         let mut conn = UnixStream::connect(sock)?;
         proto::hello(&mut conn)?;
         proto::check_hello(&mut conn)
     };
-    while probe(&sock).is_err() {
+    probe().is_ok()
+}
+
+// bind makes the file before listen, so wait for a connect to work.
+fn listening(child: Child, dir: TempDir) -> Guest {
+    let sock = dir.path().join("guest.sock");
+    let start = Instant::now();
+    while !answers(&sock) {
         assert!(start.elapsed() < Duration::from_secs(10), "not listening");
         std::thread::sleep(Duration::from_millis(10));
     }
     Guest { child, sock, dir }
+}
+
+const TOKEN: &str = "fake-claude-token-for-guest-tests";
+
+fn keyring(vars: &[(&str, &str)]) -> Keyring {
+    let env = vars.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+    Keyring::gather(&Cred::ALL, &Source::new(None, env)).unwrap()
+}
+
+// A guest that took `keyring` from the host as it started.
+fn guest_holding(keyring: Keyring) -> Guest {
+    let dir = tempfile::tempdir().unwrap();
+    let creds = dir.path().join("creds.sock");
+    let host = UnixListener::bind(&creds).unwrap();
+    let child = spawn(dir.path(), Some(&creds));
+    let (mut conn, _) = host.accept().unwrap();
+    keyring.send(&mut conn).unwrap();
+    listening(child, dir)
 }
 
 struct Session {
@@ -539,4 +577,69 @@ fn exit_doesn_t_wait_for_a_fast_background_writer() {
         assert!(start.elapsed() < Duration::from_secs(10), "no exit");
     };
     assert_eq!(exit, Exit::Code(0));
+}
+
+#[test]
+fn commands_get_the_credentials_the_host_handed_over() {
+    let g = guest_holding(keyring(&[
+        ("CLAUDE_CODE_OAUTH_TOKEN", TOKEN),
+        ("GH_TOKEN", "ghp-fake"),
+    ]));
+    let script =
+        r#"printf '%s|%s|%s' "$CLAUDE_CODE_OAUTH_TOKEN" "$GH_TOKEN" "${ANTHROPIC_API_KEY-unset}""#;
+    let want = format!("{TOKEN}|ghp-fake|unset");
+    assert_eq!(g.run(sh(script), &[]).0, want);
+    // A terminal, as `runner shell` and sessions have, gets them too.
+    let (out, _, exit) = g.run(with_tty(sh(script), 24, 80), &[]);
+    assert_eq!((out, exit), (want, Exit::Code(0)));
+}
+
+// The allowlist is the only way in: a credential the request names is
+// dropped, and one the VM wasn't given stays out.
+#[test]
+fn a_request_can_t_add_or_change_a_credential() {
+    let g = guest_holding(keyring(&[("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)]));
+    let req = Request {
+        env: vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "from-the-request".into()),
+            ("GH_TOKEN".into(), "from-the-request".into()),
+            ("FOO".into(), "bar".into()),
+        ],
+        ..sh(r#"printf '%s|%s|%s' "$CLAUDE_CODE_OAUTH_TOKEN" "${GH_TOKEN-unset}" "$FOO""#)
+    };
+    assert_eq!(g.run(req, &[]).0, format!("{TOKEN}|unset|bar"));
+}
+
+// No command may run before the credentials are in, or it would run without
+// them: the guest listens only once it has them.
+#[test]
+fn the_guest_takes_its_credentials_before_it_runs_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let creds = dir.path().join("creds.sock");
+    let host = UnixListener::bind(&creds).unwrap();
+    let child = spawn(dir.path(), Some(&creds));
+    let (mut conn, _) = host.accept().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let sock = dir.path().join("guest.sock");
+    assert!(!answers(&sock), "it took a command before its credentials");
+    keyring(&[("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)])
+        .send(&mut conn)
+        .unwrap();
+    let g = listening(child, dir);
+    let seen = g.run(sh(r#"printf %s "$CLAUDE_CODE_OAUTH_TOKEN""#), &[]).0;
+    assert_eq!(seen, TOKEN);
+}
+
+// An older host that offers none, or a handoff that fails, leaves a guest
+// that still runs commands, with no credentials.
+#[test]
+fn a_guest_the_host_hands_nothing_runs_without_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = spawn(dir.path(), Some(&dir.path().join("no-such.sock")));
+    let g = listening(child, dir);
+    let script = r#"printf '%s|%s' "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${GH_TOKEN-unset}""#;
+    assert_eq!(g.run(sh(script), &[]).0, "unset|unset");
+
+    let empty = guest_holding(keyring(&[]));
+    assert_eq!(empty.run(sh(script), &[]).0, "unset|unset");
 }

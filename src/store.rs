@@ -7,7 +7,9 @@
 //   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
+//   <root>/vms/<name>/vsock.sock_10023  where its guest takes its credentials, while the VM runs
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
+//   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
@@ -16,7 +18,7 @@
 //
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
 use crate::changes::{self, Changes};
-use crate::creds::{Cred, DEFAULT};
+use crate::creds::{self, Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
 use rmcp::schemars;
@@ -557,21 +559,15 @@ impl Store {
     /// The credentials the VM gets at boot: what its allowlist names, or
     /// `creds::DEFAULT` if it has none. Names only; no value is kept here.
     pub fn creds(&self, name: &str) -> Result<Vec<Cred>> {
-        let path = self.existing(name)?.join("creds");
-        let text = match fs::read_to_string(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DEFAULT.to_vec()),
-            r => r.map_err(at(&path))?,
-        };
-        let bad = |e| at(&path)(io::Error::new(io::ErrorKind::InvalidData, e));
-        let mut creds = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|l| l.parse().map_err(bad))
-            .collect::<Result<Vec<Cred>>>()?;
-        creds.sort();
-        creds.dedup();
-        Ok(creds)
+        let creds = read_creds(&self.existing(name)?.join("creds"))?;
+        Ok(creds.unwrap_or_else(|| DEFAULT.to_vec()))
+    }
+
+    /// The credentials the VM's guest took this boot, by name: None until it
+    /// has, and once its boot is over. A boot that was killed leaves its
+    /// record until the next one, so this counts only while the VM is up.
+    pub fn handed(&self, name: &str) -> Result<Option<Vec<Cred>>> {
+        read_creds(&self.existing(name)?.join(HANDED))
     }
 
     /// Sets the VM's allowlist to exactly `creds`. It takes effect at the
@@ -684,6 +680,63 @@ impl Run {
     pub fn vsock(&self) -> PathBuf {
         vsock(&self.dir)
     }
+
+    /// Where the guest asks for its credentials: Firecracker passes a guest's
+    /// connection to host port P on to `vsock.sock_P`.
+    pub fn creds_socket(&self) -> PathBuf {
+        let mut path = vsock(&self.dir).into_os_string();
+        path.push(format!("_{}", creds::PORT));
+        path.into()
+    }
+
+    /// Where this boot notes which credentials its guest took.
+    pub fn handed(&self) -> Handed {
+        Handed {
+            dir: self.dir.clone(),
+        }
+    }
+}
+
+const HANDED: &str = "handed";
+
+/// A boot's note of which credentials its guest took, for `runner status`,
+/// which runs in another process. Names only.
+#[derive(Debug, Clone)]
+pub struct Handed {
+    dir: PathBuf,
+}
+
+impl Handed {
+    pub fn record(&self, creds: &[Cred]) -> Result<()> {
+        let text: String = creds.iter().map(|c| format!("{c}\n")).collect();
+        write_aside(&self.dir, HANDED, &text)
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let path = self.dir.join(HANDED);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(at(&path)(e)),
+            _ => Ok(()),
+        }
+    }
+}
+
+// A list of credential names, one per line, sorted; None if there's no file.
+fn read_creds(path: &Path) -> Result<Option<Vec<Cred>>> {
+    let text = match fs::read_to_string(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        r => r.map_err(at(path))?,
+    };
+    let bad = |e| at(path)(io::Error::new(io::ErrorKind::InvalidData, e));
+    let mut creds = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().map_err(bad))
+        .collect::<Result<Vec<Cred>>>()?;
+    creds.sort();
+    creds.dedup();
+    Ok(Some(creds))
 }
 
 fn api_socket(dir: &Path) -> PathBuf {

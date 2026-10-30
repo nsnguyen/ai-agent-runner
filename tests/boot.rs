@@ -3,12 +3,13 @@
 mod common;
 
 use common::{FakeApi, FakeFirecracker, Reply, Request, script, text, wait_for};
+use runner::creds::{self, Cred, Keyring};
 use runner::firecracker::{self, BOOT_ARGS};
 use runner::net::{self, HOST_RESOLV_CONFS};
 use runner::store::{Config, Error, Store};
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -84,6 +85,11 @@ impl Host {
             .env("FAKE_FC", &self.fc.dir)
             .env("FAKE_FC_VERSION", firecracker::VERSION)
             .env("NOTIFY_SOCKET", self.dir.path().join("notify"))
+            // Only the credentials a test gives it.
+            .env_remove("CREDENTIALS_DIRECTORY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GH_TOKEN")
     }
 
     /// Whether dev was still held when its tap was removed.
@@ -99,7 +105,14 @@ impl Host {
     }
 
     fn boot(&self, name: &str) -> Child {
+        self.boot_with(name, &[])
+    }
+
+    // With these variables, the way the host gets its credentials outside
+    // systemd.
+    fn boot_with(&self, name: &str, env: &[(&str, &str)]) -> Child {
         self.runner(&["boot", name])
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -504,4 +517,145 @@ fn halt_waits_even_when_ctrl_alt_del_fails() {
     assert!(text(&out.stderr).contains("The keyboard buffer is full"));
     assert!(finish(boot).status.success());
     assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
+const TOKEN: &str = "fake-claude-token-for-boot-tests";
+
+// What runner-guest does each time it starts in the VM: asks the host for
+// its credentials. Firecracker passes the guest's connection to host port P
+// on to `vsock.sock_P`.
+fn guest_asks(h: &Host, name: &str) -> Keyring {
+    let sock = h.vm_dir(name).join(format!("vsock.sock_{}", creds::PORT));
+    wait_for("boot to offer credentials", || sock.exists());
+    let mut conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    Keyring::receive(&mut conn).unwrap()
+}
+
+fn vars(keyring: &Keyring) -> Vec<(String, String)> {
+    let vars = keyring.vars().map(|(k, v)| (k.to_string(), v.to_string()));
+    vars.collect()
+}
+
+#[test]
+fn the_guest_is_handed_what_the_allowlist_names_each_time_it_asks() {
+    let h = Host::new();
+    let env = [("CLAUDE_CODE_OAUTH_TOKEN", TOKEN), ("GH_TOKEN", "ghp-fake")];
+    let boot = h.boot_with("dev", &env);
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(h.store.handed("dev").unwrap(), None, "before it asked");
+
+    // The default allowlist: Claude's token, not GitHub's.
+    let claude = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), TOKEN.to_string())];
+    assert_eq!(vars(&guest_asks(&h, "dev")), claude);
+    wait_for("the handoff to be noted", || {
+        h.store.handed("dev").unwrap().is_some()
+    });
+    assert_eq!(h.store.handed("dev").unwrap(), Some(vec![Cred::Claude]));
+    // A runner-guest that restarts asks again, and gets the same.
+    assert_eq!(vars(&guest_asks(&h, "dev")), claude);
+
+    h.fc.exit_with(0);
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(h.store.handed("dev").unwrap(), None, "once it's down");
+    let sock = h.vm_dir("dev").join(format!("vsock.sock_{}", creds::PORT));
+    assert!(!sock.exists(), "credentials socket left behind");
+    let said = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(said.contains("dev's guest took claude"), "{said}");
+    assert!(!said.contains(TOKEN), "a value in the journal: {said}");
+}
+
+#[test]
+fn a_vm_given_github_gets_both() {
+    let h = Host::new();
+    let env = [("CLAUDE_CODE_OAUTH_TOKEN", TOKEN), ("GH_TOKEN", "ghp-fake")];
+    h.store
+        .set_creds("dev", &[Cred::Claude, Cred::Github])
+        .unwrap();
+    let boot = h.boot_with("dev", &env);
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(guest_asks(&h, "dev").creds(), [Cred::Claude, Cred::Github]);
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+#[test]
+fn a_vm_given_nothing_is_handed_nothing() {
+    let h = Host::new();
+    let env = [("CLAUDE_CODE_OAUTH_TOKEN", TOKEN), ("GH_TOKEN", "ghp-fake")];
+    h.store.set_creds("dev", &[]).unwrap();
+    let boot = h.boot_with("dev", &env);
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(vars(&guest_asks(&h, "dev")), []);
+    wait_for("the handoff to be noted", || {
+        h.store.handed("dev").unwrap().is_some()
+    });
+    assert_eq!(h.store.handed("dev").unwrap(), Some(vec![]));
+    h.fc.exit_with(0);
+    let out = finish(boot);
+    assert!(out.status.success());
+    // Nothing missing to warn about: it may have none.
+    assert!(
+        !text(&out.stderr).contains("has none"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn boot_takes_credentials_from_systemd_s_directory_first() {
+    let h = Host::new();
+    let dir = h.dir.path().join("credentials");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("CLAUDE_CODE_OAUTH_TOKEN"), format!("{TOKEN}\n")).unwrap();
+    let dir = dir.to_str().unwrap();
+    let env = [
+        ("CREDENTIALS_DIRECTORY", dir),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "from-the-environment"),
+    ];
+    let boot = h.boot_with("dev", &env);
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    let got = vars(&guest_asks(&h, "dev"));
+    assert_eq!(got, [("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into())]);
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+// A host with no token still boots the VM, and the journal says what's
+// missing and where it goes.
+#[test]
+fn a_credential_the_host_lacks_is_named_and_the_vm_boots_anyway() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(vars(&guest_asks(&h, "dev")), []);
+    h.fc.exit_with(0);
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("dev may have claude, but this host has none")
+            && err.contains("/etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"),
+        "{err}"
+    );
+}
+
+// Left by a boot that was killed: its record goes before the guest can ask.
+#[test]
+fn a_stale_handoff_record_is_cleared_at_boot() {
+    let h = Host::new();
+    fs::write(h.vm_dir("dev").join("handed"), "github\n").unwrap();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(h.store.handed("dev").unwrap(), None);
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
 }

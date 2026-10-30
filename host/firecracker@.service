@@ -11,6 +11,11 @@ User=runner
 Group=runner
 SupplementaryGroups=kvm
 Environment=RUNNER_ROOT=/var/lib/runner
+# The credentials a VM may get, each from /etc/credstore/<name>. One that
+# isn't there is skipped. Boot hands a VM's to its guest (docs/host.md).
+LoadCredential=CLAUDE_CODE_OAUTH_TOKEN
+LoadCredential=ANTHROPIC_API_KEY
+LoadCredential=GH_TOKEN
 # %i, not %I: %I would unescape a VM name's dashes into slashes.
 ExecStart=/usr/local/bin/runner boot %i
 NoNewPrivileges=yes

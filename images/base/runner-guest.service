@@ -11,6 +11,9 @@ RestartSec=1
 # A restart, or the OOM killer taking one command, mustn't end every session.
 KillMode=process
 OOMPolicy=continue
+# The credentials it holds, and every command's, stay in memory: no core dump
+# of this agent or of a command it starts ever writes one to the disk.
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

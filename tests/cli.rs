@@ -287,6 +287,36 @@ fn start_status_and_stop_drive_the_vms_unit() {
     );
 }
 
+// Boot notes which credentials the guest took; status shows the names while
+// the VM is up, and never a value.
+#[test]
+fn status_shows_the_credentials_the_guest_took_while_it_runs() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    runner(dir.path(), &["create", "dev"]);
+    let run = |args: &[&str]| {
+        let out = runner_on(dir.path(), &sd, args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let handed = dir.path().join("vms/dev/handed");
+    sd.set_state("active");
+    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  running\n");
+    std::fs::write(&handed, "claude\ngithub\n").unwrap();
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  running  creds claude github\n"
+    );
+    std::fs::write(&handed, "").unwrap();
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  running  creds none\n"
+    );
+    // What a killed boot left is no VM's credentials.
+    sd.set_state("inactive");
+    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  stopped\n");
+}
+
 #[test]
 fn status_says_booting_and_stopping_in_between() {
     let dir = with_base();
