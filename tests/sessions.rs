@@ -320,6 +320,57 @@ fn a_terminal_the_guest_doesn_t_know_still_gets_a_session() {
     assert_eq!(shell.wait().unwrap().code(), Some(0), "{}", t.seen());
 }
 
+// What `runner claude` runs, with a stand-in for claude and a name of the
+// test's own: the program starts once, in the directory, with its arguments
+// whole, and running it again only reattaches.
+#[test]
+fn attach_or_run_starts_the_program_once_and_then_reattaches() {
+    let vm = vm();
+    let s = vm.name("claude");
+    let work = vm.dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let runs = vm.dir.path().join("runs");
+    let program = vm.dir.path().join("fake-claude");
+    let body = format!(
+        "echo ran >> {}\necho \"in $(pwd) with $(printf '[%s]' \"$@\")\"\nexec sleep 300\n",
+        runs.display()
+    );
+    common::script(&program, &body);
+    let open = |args: &[&str]| {
+        let argv: Vec<String> = std::iter::once(program.to_str().unwrap())
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        let tmux = sessions::attach_or_run(&s, work.to_str().unwrap(), &argv);
+        let mut cmd = vec!["exec", "dev", "--tty", "--"];
+        cmd.extend(tmux.iter().map(String::as_str));
+        vm.runner(&cmd)
+    };
+    // tmux reads a word ending in ; as the end of its command.
+    let said = format!(
+        "in {} with [--continue][fix it;][a\\;][;][--verbose]",
+        work.display()
+    );
+
+    let t = pty(24, 200);
+    let mut first = t.spawn(open(&["--continue", "fix it;", "a\\;", ";", "--verbose"]));
+    t.wait_for(&said);
+    vm.wait_for_row(&s, "sleep", "attached");
+    vm.detach(&s);
+    assert_eq!(first.wait().unwrap().code(), Some(0), "{}", t.seen());
+    vm.wait_for_row(&s, "sleep", "detached");
+
+    let t = pty(24, 200);
+    let mut second = t.spawn(open(&["--resume"]));
+    t.wait_for(&said);
+    vm.wait_for_row(&s, "sleep", "attached");
+    vm.detach(&s);
+    assert_eq!(second.wait().unwrap().code(), Some(0), "{}", t.seen());
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "ran\n");
+    let ours = vm.sessions().lines().filter(|l| l.starts_with(&s)).count();
+    assert_eq!(ours, 1, "{}", vm.sessions());
+}
+
 // tmux can't attach without one, so neither boots the VM to find that out.
 #[test]
 fn a_session_needs_a_terminal() {

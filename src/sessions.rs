@@ -99,9 +99,35 @@ pub fn attach_argv(session: &str, create: bool) -> Vec<String> {
     } else {
         ("attach-session", "-t", target(session))
     };
-    ["sh", "-c", ON_A_KNOWN_TERM, "sh", verb, flag, &name]
-        .map(String::from)
-        .to_vec()
+    on_a_known_term(&[verb, flag, &name])
+}
+
+/// What attaches a terminal to the session, first making it to run `argv` in
+/// `dir` if it isn't there. tmux decides, so two at once make one session.
+/// With more than one word, `argv` runs as it is, with no shell to split it.
+pub fn attach_or_run(session: &str, dir: &str, argv: &[String]) -> Vec<String> {
+    let dir = literal(dir);
+    let head = ["new-session", "-A", "-s", session, "-c", &dir, "--"];
+    let mut all = on_a_known_term(&head);
+    all.extend(argv.iter().map(|word| literal(word)));
+    all
+}
+
+// tmux ends its command at a word ending in `;`, even past `--`, unless a `\`
+// comes before that `;`, which tmux then drops.
+fn literal(word: &str) -> String {
+    match word.strip_suffix(';') {
+        Some(head) => format!("{head}\\;"),
+        None => word.to_string(),
+    }
+}
+
+fn on_a_known_term(args: &[&str]) -> Vec<String> {
+    ["sh", "-c", ON_A_KNOWN_TERM, "sh"]
+        .iter()
+        .chain(args)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Whether the session is there. A VM that isn't running has none.

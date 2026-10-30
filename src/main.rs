@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use runner::claude::{self, Claude};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
 use runner::exec;
@@ -145,6 +146,25 @@ enum Cmd {
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
     },
+    /// Claude Code in a VM, on this terminal. Makes the VM from base if it's
+    /// new and starts it if it's stopped, then attaches to its tmux session
+    /// named claude, starting claude there if it isn't running. Detach with
+    /// tmux's prefix key and d; a dropped connection detaches too.
+    Claude {
+        name: String,
+        /// The VM a new one forks.
+        #[arg(long)]
+        from: Option<String>,
+        /// Where a new session starts claude.
+        #[arg(short, long, default_value = claude::DIR)]
+        dir: String,
+        /// The user claude runs as.
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
+        /// Arguments for claude, after `--`, like --continue.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Run a command in a VM, starting the VM first if it's stopped. Stdin
     /// passes through, and it exits with the command's exit code, or 128
     /// plus the signal that killed it. 255 means it couldn't run.
@@ -286,6 +306,24 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             sessions::kill(&store, &name, &user, &session)?;
             println!("killed {session}");
         }
+        Cmd::Claude {
+            name,
+            from,
+            dir,
+            user,
+            args,
+        } => {
+            let c = Claude {
+                vm: name,
+                from,
+                dir,
+                user,
+                argv: std::iter::once("claude".to_string()).chain(args).collect(),
+                env: term(),
+                size: exec::terminal_size(),
+            };
+            return Ok(exit_code(open_claude(&store, &c)));
+        }
         Cmd::Exec {
             name,
             tty,
@@ -352,7 +390,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
 // The command's exit code, or 128 plus the signal that killed it, as a
 // shell has it. 255 is the runner's own failure, as with ssh.
 fn attach(open: impl FnOnce() -> Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
-    match open().and_then(|conn| Ok(exec::attach(conn, req)?)) {
+    exit_code(open().and_then(|conn| Ok(exec::attach(conn, req)?)))
+}
+
+fn exit_code(done: Result<Exit, Box<dyn Error>>) -> ExitCode {
+    match done {
         Ok(Exit::Code(code)) => ExitCode::from(code as u8),
         Ok(Exit::Signal(sig)) => ExitCode::from(128u8.wrapping_add(sig as u8)),
         Err(e) => {
@@ -390,6 +432,18 @@ fn on_session(store: &Store, name: &str, session: &str, user: &str, create: bool
         tty: Some(exec::terminal_size()),
     };
     attach(open, &req)
+}
+
+// Checked first, so a VM isn't made or booted for tmux to fail on.
+fn open_claude(store: &Store, c: &Claude) -> Result<Exit, Box<dyn Error>> {
+    if !std::io::stdin().is_terminal() {
+        return Err("claude needs a terminal: run this from one, or over ssh -t".into());
+    }
+    Ok(claude::open(
+        &claude::Host(store),
+        c,
+        &mut std::io::stderr(),
+    )?)
 }
 
 // A terminal of the guest's speaks this one's TERM, as over ssh.
