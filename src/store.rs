@@ -15,6 +15,7 @@
 //   <root>/slots.lock                flock'd while a slot is picked
 //
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
+use crate::changes::{self, Changes};
 use crate::creds::{Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -456,11 +457,13 @@ impl Store {
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_lock(&dir, name)?;
+        let from = current(&dir)?;
         let generation = next_generation(&dir)?;
         let disk = disk_of(&dir, generation);
-        clone(&disk_of(&dir, current(&dir)?), &disk)?;
+        clone(&disk_of(&dir, from), &disk)?;
         let name = name.to_string();
         Ok(Run {
+            from,
             generation,
             disk,
             name,
@@ -613,6 +616,8 @@ impl Store {
 
 #[derive(Debug)]
 pub struct Run {
+    /// The generation this run's disk was cloned from.
+    pub from: u64,
     pub generation: u64,
     pub disk: PathBuf,
     name: String,
@@ -622,6 +627,18 @@ pub struct Run {
 }
 
 impl Run {
+    /// What the run changed: its disk against the generation it was cloned
+    /// from, read from the disks, at most `cap` paths. Measure before
+    /// `commit`, which takes the run.
+    pub fn changes(&self, cap: usize) -> changes::Result<Changes> {
+        changes::between(
+            &disk_of(&self.dir, self.from),
+            &self.disk,
+            cap,
+            changes::TIME,
+        )
+    }
+
     /// Makes this run's disk current, then collects the generations the store
     /// doesn't keep. That gc runs under the run's lock, so it never races one.
     pub fn commit(self) -> Result<Vm> {

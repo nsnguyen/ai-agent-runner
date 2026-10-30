@@ -19,6 +19,7 @@ path = "src/bin/runner-guest.rs"
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+ext4-view = { version = "1", features = ["std"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "poll", "process", "signal", "socket", "term", "user"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
