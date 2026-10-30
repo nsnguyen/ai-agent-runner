@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use runner::creds::Cred;
+use runner::doctor::{self, System};
 use runner::store::{BASE, Store, Vm};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,6 +34,18 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Show or set which credentials a VM gets at boot: claude, github.
+    /// A VM gets claude until told otherwise.
+    Creds {
+        name: String,
+        /// Give it exactly these from the next boot on.
+        creds: Vec<Cred>,
+        /// Give it none from the next boot on.
+        #[arg(long, conflicts_with = "creds")]
+        none: bool,
+    },
+    /// Check this host can run VMs: one line per check, failing if any fails.
+    Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
 }
@@ -55,7 +69,39 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Cmd::Creds { name, creds, none } => {
+            let got = if none || !creds.is_empty() {
+                store.set_creds(&name, &creds)
+            } else {
+                store.creds(&name)
+            };
+            return match got {
+                Ok(creds) => {
+                    let names: Vec<_> = creds.iter().map(|c| c.name()).collect();
+                    let list = if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(" ")
+                    };
+                    println!("{name}  creds {list}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("runner: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Cmd::List => store.list(),
+        Cmd::Doctor => {
+            let report = doctor::check(&System, &store);
+            report.lines().for_each(|l| println!("{l}"));
+            return if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+        }
         Cmd::Mcp => return serve(store),
     };
     match shown {
