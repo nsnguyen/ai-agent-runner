@@ -100,10 +100,13 @@ fn lists_its_tools() {
     assert_eq!(
         names,
         [
+            "checkpoint_vm",
             "create_vm",
             "delete_vm",
             "doctor",
+            "list_checkpoints",
             "list_vms",
+            "restore_vm",
             "start_vm",
             "stop_vm",
             "undo_vm",
@@ -234,4 +237,50 @@ fn doctor_reports_every_check() {
     // No base VM in an empty root, so at least that one fails.
     assert_eq!(report["checks"][4]["status"], json!("fail"), "{report}");
     assert_eq!(report["ok"], json!(false), "{report}");
+}
+
+#[test]
+fn checkpoint_list_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    Store::new(dir.path()).import("dev", &disk).unwrap();
+
+    let mut s = start(dir.path());
+    let made = s.call(
+        2,
+        "checkpoint_vm",
+        json!({"name": "dev", "comment": "clean"}),
+    );
+    assert_eq!(made["isError"], json!(false), "{made}");
+    let mut c = made["structuredContent"].clone();
+    let time = c.as_object_mut().unwrap().remove("time").unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(time.as_str().unwrap()).is_ok());
+    let want = json!({"id": 1, "comment": "clean", "auto": false, "bytes": 6, "current": false});
+    assert_eq!(c, want);
+
+    let listed = s.call(3, "list_checkpoints", json!({"name": "dev"}));
+    let listed: Vec<_> = listed["structuredContent"]["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].clone(), c["auto"].clone(), c["current"].clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (json!(1), json!(false), json!(false)),
+            (json!(0), json!(true), json!(true))
+        ]
+    );
+
+    let back = s.call(4, "restore_vm", json!({"name": "dev", "id": 1}));
+    assert_eq!(back["isError"], json!(false), "{back}");
+    let dev = json!({"name": "dev", "generation": 2, "bytes": 6});
+    assert_eq!(back["structuredContent"], dev);
+
+    let bad = s.call(5, "restore_vm", json!({"name": "dev", "id": 9}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+    let why = bad["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("dev has no checkpoint 9"), "{why}");
 }

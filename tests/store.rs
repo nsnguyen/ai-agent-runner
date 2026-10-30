@@ -1,14 +1,34 @@
 // The VM store on a temp directory: no KVM needed.
 use runner::creds::{Cred, DEFAULT};
-use runner::store::{Config, Error, Machine, Store, Vm, check_name, parse_mem};
+use runner::store::{Checkpoint, Config, Error, Machine, Store, Vm, check_name, parse_mem};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
-fn store() -> (TempDir, Store) {
+// An flock belongs to the open file, and a child that another test's thread
+// forks to run `cp` shares it until it execs, so a lock a test just dropped
+// can still look held. The runner does store work on one thread, so the tests
+// take turns, as it does.
+static TURN: Mutex<()> = Mutex::new(());
+
+struct Scratch {
+    dir: TempDir,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn store() -> (Scratch, Store) {
+    // A test that failed holding the turn shouldn't fail the rest.
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path().join("root"));
-    (dir, store)
+    (Scratch { dir, _turn: turn }, store)
 }
 
 fn disk(dir: &Path, bytes: &[u8]) -> PathBuf {
@@ -467,6 +487,175 @@ fn deleting_twice_in_one_process_works() {
         store.fork("base", "dev").unwrap();
         store.delete("dev").unwrap();
     }
+}
+
+fn gen_disk(dir: &Path, name: &str, generation: u64) -> PathBuf {
+    dir.join(format!("root/vms/{name}/gens/{generation}.ext4"))
+}
+
+fn commit_run(store: &Store, name: &str, body: &[u8]) -> Vm {
+    let run = store.begin_run(name).unwrap();
+    fs::write(&run.disk, body).unwrap();
+    run.commit().unwrap()
+}
+
+// Everything but the time: (id, auto, comment, current).
+fn summary(cs: &[Checkpoint]) -> Vec<(u64, bool, Option<&str>, bool)> {
+    cs.iter()
+        .map(|c| (c.id, c.auto, c.comment.as_deref(), c.current))
+        .collect()
+}
+
+#[test]
+fn a_checkpoint_is_a_frozen_copy_with_its_comment() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let c = store.checkpoint("dev", Some("before upgrade")).unwrap();
+    assert_eq!(
+        summary(std::slice::from_ref(&c)),
+        [(1, false, Some("before upgrade"), false)]
+    );
+    assert_eq!(c.bytes, 2);
+    // The VM carries on from its own disk, and what it writes later leaves
+    // the copy alone.
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 0, 2));
+    commit_run(&store, "dev", b"v1!");
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 1)).unwrap(), b"v0");
+    assert_eq!(store.checkpoint("dev", None).unwrap().comment, None);
+}
+
+#[test]
+fn checkpoints_list_newest_first_with_what_runs_made_marked_auto() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    commit_run(&store, "dev", b"v1");
+    store.checkpoint("dev", Some("a")).unwrap();
+    commit_run(&store, "dev", b"v2");
+    store.checkpoint("dev", None).unwrap();
+    // A failed run's disk is no checkpoint.
+    drop(store.begin_run("dev").unwrap());
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(
+        summary(&listed),
+        [
+            (4, false, None, false),
+            (3, true, Some("run"), true),
+            (2, false, Some("a"), false),
+            (1, true, Some("run"), false),
+            (0, true, Some("import"), false),
+        ]
+    );
+    assert!(listed.windows(2).all(|w| w[0].time >= w[1].time));
+    store.fork("dev", "dev-2").unwrap();
+    let forked = store.checkpoints("dev-2").unwrap();
+    assert_eq!(summary(&forked), [(0, true, Some("fork of dev"), true)]);
+}
+
+#[test]
+fn restoring_an_old_checkpoint_makes_it_current() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("clean")).unwrap();
+    commit_run(&store, "dev", b"broken");
+    assert_eq!(store.restore("dev", 1).unwrap(), vm("dev", 3, 2));
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"v0");
+    assert_eq!(
+        summary(&store.checkpoints("dev").unwrap())[..2],
+        [
+            (3, true, Some("restore of 1"), true),
+            (2, true, Some("run"), false)
+        ]
+    );
+    // The VM gets a copy, so what it writes after a restore can't reach the
+    // checkpoint, and restoring it again gives the same disk.
+    fs::write(gen_disk(dir.path(), "dev", 3), b"scribbled").unwrap();
+    assert_eq!(store.restore("dev", 1).unwrap(), vm("dev", 4, 2));
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 4)).unwrap(), b"v0");
+    // What a run or an import made restores too.
+    store.restore("dev", 2).unwrap();
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 5)).unwrap(), b"broken");
+}
+
+#[test]
+fn undo_after_a_restore_brings_back_the_disk_before_it() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", None).unwrap();
+    commit_run(&store, "dev", b"v1!");
+    store.restore("dev", 1).unwrap();
+    assert_eq!(store.undo("dev").unwrap(), vm("dev", 2, 3));
+    let ids: Vec<u64> = store
+        .checkpoints("dev")
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, [2, 1, 0]);
+}
+
+#[test]
+fn restoring_a_missing_id_fails() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let missing = |id| matches!(store.restore("dev", id), Err(Error::NoCheckpoint(n, i)) if n == "dev" && i == id);
+    assert!(missing(7));
+    // Neither a failed run's disk nor a generation undo stepped back from is one.
+    drop(store.begin_run("dev").unwrap());
+    assert!(missing(1));
+    commit_run(&store, "dev", b"v2");
+    store.undo("dev").unwrap();
+    assert!(missing(2));
+    assert!(matches!(store.restore("nope", 0), Err(Error::NoVm(_))));
+    assert!(matches!(
+        store.checkpoint("nope", None),
+        Err(Error::NoVm(_))
+    ));
+    assert!(matches!(store.checkpoints("nope"), Err(Error::NoVm(_))));
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 0, 2));
+}
+
+#[test]
+fn checkpoint_and_restore_refuse_a_busy_vm() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", None).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    assert!(matches!(store.checkpoint("dev", None), Err(Error::Busy(n)) if n == "dev"));
+    assert!(matches!(store.restore("dev", 1), Err(Error::Busy(_))));
+    // Reading the list doesn't need the lock.
+    assert_eq!(store.checkpoints("dev").unwrap().len(), 2);
+    drop(run);
+}
+
+#[test]
+fn generations_without_notes_still_list() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    // As a VM made before generations had notes.
+    fs::remove_file(dir.path().join("root/vms/dev/gens/0.json")).unwrap();
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(summary(&listed), [(0, true, None, true)]);
+}
+
+#[test]
+fn a_note_left_without_its_disk_is_never_read_as_another() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("old")).unwrap();
+    // As a cleanup by hand that took the disk and missed its note.
+    fs::remove_file(gen_disk(dir.path(), "dev", 1)).unwrap();
+    assert!(matches!(
+        store.restore("dev", 1),
+        Err(Error::NoCheckpoint(_, 1))
+    ));
+    // A run that fails gets a number of its own, not the note's.
+    let run = store.begin_run("dev").unwrap();
+    assert_eq!(run.generation, 2);
+    drop(run);
+    assert_eq!(
+        summary(&store.checkpoints("dev").unwrap()),
+        [(0, true, Some("import"), true)]
+    );
 }
 
 #[test]

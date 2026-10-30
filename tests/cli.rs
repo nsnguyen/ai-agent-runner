@@ -88,6 +88,51 @@ fn delete_removes_a_vm() {
     assert!(text(&out.stderr).contains("no VM named dev"));
 }
 
+// Each line with its timestamp, which no test can know, as T.
+fn untimed(out: &[u8]) -> String {
+    let timed = |col: &str| chrono::DateTime::parse_from_rfc3339(col).is_ok();
+    text(out)
+        .lines()
+        .map(|l| {
+            let cols: Vec<&str> = l.split("  ").collect();
+            assert_eq!(cols.iter().filter(|c| timed(c)).count(), 1, "{l}");
+            let cols: Vec<&str> = cols
+                .into_iter()
+                .map(|c| if timed(c) { "T" } else { c })
+                .collect();
+            cols.join("  ") + "\n"
+        })
+        .collect()
+}
+
+#[test]
+fn checkpoint_list_and_restore() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let out = runner(dir.path(), &["checkpoint", "dev", "-m", "clean"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        untimed(&out.stdout),
+        "  1  T  checkpoint  6 bytes  \"clean\"\n"
+    );
+    let out = runner(dir.path(), &["checkpoint", "dev"]);
+    assert_eq!(untimed(&out.stdout), "  2  T  checkpoint  6 bytes\n");
+
+    let out = runner(dir.path(), &["checkpoints", "dev"]);
+    assert_eq!(
+        untimed(&out.stdout),
+        "  2  T  checkpoint  6 bytes\n  1  T  checkpoint  6 bytes  \"clean\"\n* 0  T  auto  6 bytes  \"fork of base\"\n"
+    );
+
+    let out = runner(dir.path(), &["restore", "dev", "1"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "dev  gen 3  6 bytes\n");
+    let out = runner(dir.path(), &["restore", "dev", "9"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(text(&out.stderr).contains("dev has no checkpoint 9"));
+}
+
 mod common;
 use common::FakeSystemd;
 

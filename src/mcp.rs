@@ -2,7 +2,7 @@
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
 use crate::doctor::{self, Report, System};
-use crate::store::{BASE, Config, Store, Vm, parse_mem};
+use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -37,6 +37,27 @@ pub struct NameArg {
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct VmList {
     vms: Vec<Vm>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CheckpointArgs {
+    /// The VM's name.
+    name: String,
+    /// A note to know the checkpoint by.
+    comment: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RestoreArgs {
+    /// The VM's name.
+    name: String,
+    /// The checkpoint's id, from list_checkpoints.
+    id: u64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct CheckpointList {
+    checkpoints: Vec<Checkpoint>,
 }
 
 // Named here, or clients see the SDK's own name.
@@ -134,6 +155,40 @@ impl Tools {
         Parameters(NameArg { name }): Parameters<NameArg>,
     ) -> Result<Json<Vm>, String> {
         self.store.undo(&name).map(Json).map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Freeze a copy of a VM's current disk, with an optional comment, for restore_vm to bring back. Fails if a run holds the VM."
+    )]
+    fn checkpoint_vm(
+        &self,
+        Parameters(args): Parameters<CheckpointArgs>,
+    ) -> Result<Json<Checkpoint>, String> {
+        self.store
+            .checkpoint(&args.name, args.comment.as_deref())
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "List a VM's checkpoints, newest first. Generations that runs, imports and restores made are listed too, with auto set; current marks the disk the next boot starts from."
+    )]
+    fn list_checkpoints(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<CheckpointList>, String> {
+        let checkpoints = self.store.checkpoints(&name).map_err(|e| e.to_string())?;
+        Ok(Json(CheckpointList { checkpoints }))
+    }
+
+    #[tool(
+        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. Fails if a run holds the VM."
+    )]
+    fn restore_vm(&self, Parameters(args): Parameters<RestoreArgs>) -> Result<Json<Vm>, String> {
+        self.store
+            .restore(&args.name, args.id)
+            .map(Json)
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
-use runner::store::{BASE, Config, Store, Vm, parse_mem};
+use runner::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,18 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Freeze a copy of a VM's disk to restore later. The VM must be stopped.
+    Checkpoint {
+        name: String,
+        /// A note to know it by.
+        #[arg(short = 'm', long)]
+        comment: Option<String>,
+    },
+    /// List a VM's checkpoints, and the generations runs made, newest first.
+    /// `*` marks the current one.
+    Checkpoints { name: String },
+    /// Make a copy of a checkpoint the VM's current disk. `undo` reverses it.
+    Restore { name: String, id: u64 },
     /// Print the firecracker@.service unit for this binary and root.
     Unit {
         /// The user VMs run as, who owns the root.
@@ -174,6 +186,16 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 ExitCode::FAILURE
             });
         }
+        Cmd::Checkpoint { name, comment } => {
+            println!("{}", row(&store.checkpoint(&name, comment.as_deref())?));
+        }
+        Cmd::Checkpoints { name } => {
+            store
+                .checkpoints(&name)?
+                .iter()
+                .for_each(|c| println!("{}", row(c)));
+        }
+        Cmd::Restore { name, id } => show(&store.restore(&name, id)?),
         Cmd::Mcp => return Ok(serve(store)),
         Cmd::Boot { name, firecracker } => runner::boot::boot(&store, &name, &firecracker)?,
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
@@ -188,6 +210,19 @@ fn absolute_kernel(path: PathBuf) -> Result<PathBuf, String> {
 
 fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
+}
+
+// The comment is quoted, so one with a newline in it still takes one line.
+fn row(c: &Checkpoint) -> String {
+    let mark = if c.current { '*' } else { ' ' };
+    let time = c.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let kind = if c.auto { "auto" } else { "checkpoint" };
+    let comment = c.comment.as_ref().map(|c| format!("  {c:?}"));
+    let comment = comment.unwrap_or_default();
+    format!(
+        "{mark} {}  {time}  {kind}  {} bytes{comment}",
+        c.id, c.bytes
+    )
 }
 
 fn show(vm: &Vm) {
