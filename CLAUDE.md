@@ -22,7 +22,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 
 ## Commands
 - Build: `cargo build --release` (the binary is `target/release/runner`)
-- Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
+- Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && shellcheck host/*.sh`
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
 
 ## Sharp edges
