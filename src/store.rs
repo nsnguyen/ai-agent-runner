@@ -354,7 +354,12 @@ fn read_vm(name: &str, dir: &Path) -> Result<Vm> {
     let gens = dir.join("gens");
     let mut used = 0;
     for entry in fs::read_dir(&gens).map_err(at(&gens))? {
-        used += allocated(&entry.and_then(|e| e.metadata()).map_err(at(&gens))?);
+        match entry.and_then(|e| e.metadata()) {
+            Ok(meta) => used += allocated(&meta),
+            // A gc in another process deleted it after read_dir saw it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(at(&gens)(e)),
+        }
     }
     let name = name.to_string();
     Ok(Vm {
