@@ -1,0 +1,395 @@
+// `runner boot` and `runner halt`, as the unit runs them, with a fake
+// Firecracker whose API socket this test serves. No KVM needed.
+mod common;
+
+use common::{FakeApi, FakeFirecracker, Reply, Request, text, wait_for};
+use runner::firecracker::{self, BOOT_ARGS};
+use runner::store::{Config, Error, Store};
+use serde_json::{Value, json};
+use std::fs;
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
+use tempfile::TempDir;
+
+struct Host {
+    dir: TempDir,
+    store: Store,
+    fc: FakeFirecracker,
+    notify: UnixDatagram,
+}
+
+impl Host {
+    fn new() -> Host {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let store = Store::new(&root);
+        let disk = dir.path().join("rootfs.ext4");
+        fs::write(&disk, b"rootfs").unwrap();
+        store.import("base", &disk).unwrap();
+        store.fork("base", "dev").unwrap();
+        fs::create_dir_all(root.join("kernel")).unwrap();
+        fs::write(root.join("kernel/vmlinux"), b"kernel").unwrap();
+        let fc = FakeFirecracker::new(&dir.path().join("fc"));
+        let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+        notify
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        Host {
+            dir,
+            store,
+            fc,
+            notify,
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("root")
+    }
+
+    fn vm_dir(&self, name: &str) -> PathBuf {
+        self.root().join("vms").join(name)
+    }
+
+    fn runner(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.env("RUNNER_ROOT", self.root())
+            .env("RUNNER_FIRECRACKER", &self.fc.bin)
+            .env("FAKE_FC", &self.fc.dir)
+            .env("FAKE_FC_VERSION", firecracker::VERSION)
+            .env("NOTIFY_SOCKET", self.dir.path().join("notify"))
+            .args(args);
+        cmd
+    }
+
+    fn boot(&self, name: &str) -> Child {
+        self.runner(&["boot", name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Serves the VM's API socket once the fake Firecracker is up, as the
+    /// real one would.
+    fn serve(&self, name: &str, respond: impl Fn(&Request) -> Reply + Send + 'static) -> FakeApi {
+        self.fc.argv();
+        FakeApi::serve(&self.vm_dir(name).join("api.sock"), respond)
+    }
+
+    fn ready(&self) -> String {
+        let mut buf = [0; 64];
+        let n = self
+            .notify
+            .recv(&mut buf)
+            .expect("no READY from runner boot");
+        text(&buf[..n])
+    }
+}
+
+fn finish(child: Child) -> Output {
+    child.wait_with_output().unwrap()
+}
+
+// Firecracker's answer to everything; Ctrl-Alt-Del makes the guest shut down.
+fn guest_that_shuts_down(fc: &FakeFirecracker) -> impl Fn(&Request) -> Reply + Send + 'static {
+    let fc = fc.clone();
+    move |req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            fc.exit_with(0);
+        }
+        (204, None)
+    }
+}
+
+fn boot_calls(root: &Path, kernel: &Path, cpus: u32, mem: u32) -> Vec<(String, Value)> {
+    let dev = root.join("vms/dev");
+    let call = |p: &str, b| (p.to_string(), b);
+    vec![
+        call(
+            "PUT /boot-source",
+            json!({"kernel_image_path": kernel, "boot_args": BOOT_ARGS}),
+        ),
+        call(
+            "PUT /drives/rootfs",
+            json!({"drive_id": "rootfs", "path_on_host": dev.join("gens/1.ext4"),
+                   "is_root_device": true, "is_read_only": false}),
+        ),
+        call(
+            "PUT /machine-config",
+            json!({"vcpu_count": cpus, "mem_size_mib": mem}),
+        ),
+        call(
+            "PUT /vsock",
+            json!({"guest_cid": 3, "uds_path": dev.join("vsock.sock")}),
+        ),
+        call("PUT /actions", json!({"action_type": "InstanceStart"})),
+    ]
+}
+
+#[test]
+fn boot_runs_the_next_generation_and_a_clean_halt_commits_it() {
+    let h = Host::new();
+    let dev = h.vm_dir("dev");
+    // Left by a Firecracker that crashed: binding over them would fail.
+    fs::write(dev.join("api.sock"), "").unwrap();
+    fs::write(dev.join("vsock.sock"), "").unwrap();
+
+    let boot = h.boot("dev");
+    let api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let api_sock = dev.join("api.sock");
+    assert_eq!(
+        h.fc.argv(),
+        ["--api-sock", api_sock.to_str().unwrap(), "--id", "dev"]
+    );
+    // Ready only once the guest is started.
+    let kernel = h.root().join("kernel/vmlinux");
+    assert_eq!(api.calls(), boot_calls(&h.root(), &kernel, 2, 2048));
+    assert!(!dev.join("vsock.sock").exists(), "stale vsock socket kept");
+
+    // While it runs, the VM is held.
+    assert!(matches!(h.store.delete("dev"), Err(Error::Busy(_))));
+    assert!(matches!(h.store.undo("dev"), Err(Error::Busy(_))));
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    // halt returns only after boot has committed and let go.
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+    let calls = api.calls();
+    assert_eq!(
+        calls.last().unwrap().1,
+        json!({"action_type": "SendCtrlAltDel"})
+    );
+
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("fake console: Linux version"));
+    assert!(
+        text(&out.stderr).contains("generation 1"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!api_sock.exists(), "API socket left behind");
+    h.store.delete("dev").unwrap();
+}
+
+#[test]
+fn a_vm_boots_with_its_own_sizes_and_kernel() {
+    let h = Host::new();
+    let kernel = h.dir.path().join("my-vmlinux");
+    fs::write(&kernel, b"kernel").unwrap();
+    let config = Config {
+        cpus: Some(4),
+        mem_mib: Some(4096),
+        kernel: Some(kernel.clone()),
+    };
+    h.store.delete("dev").unwrap();
+    h.store.fork_with("base", "dev", &config).unwrap();
+
+    let boot = h.boot("dev");
+    let api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(api.calls(), boot_calls(&h.root(), &kernel, 4, 4096));
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+#[test]
+fn a_crash_keeps_the_old_generation_current() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    h.fc.exit_with(1);
+    let out = finish(boot);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("exit status: 1"), "{err}");
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    // The crashed disk stays for a look, and the VM is free again.
+    assert!(h.vm_dir("dev").join("gens/1.ext4").exists());
+    h.store.delete("dev").unwrap();
+}
+
+#[test]
+fn an_api_fault_stops_the_boot_and_drops_its_disk() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let fault = json!({"fault_message": "The kernel file cannot be opened"}).to_string();
+    let _api = h.serve("dev", move |req| {
+        if req.path == "/boot-source" {
+            (400, Some(fault.clone()))
+        } else {
+            (204, None)
+        }
+    });
+    let out = finish(boot);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("The kernel file cannot be opened"), "{err}");
+    h.notify
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        h.notify.recv(&mut [0; 64]).is_err(),
+        "READY for a failed boot"
+    );
+    // The guest never ran, so its copy of the disk is gone.
+    assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    h.store.delete("dev").unwrap();
+}
+
+#[test]
+fn firecracker_dying_before_its_api_is_up_is_reported() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    h.fc.argv();
+    h.fc.exit_with(1);
+    let out = finish(boot);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("before its API"), "{err}");
+    assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
+}
+
+#[test]
+fn another_firecracker_version_is_refused_before_anything_starts() {
+    let h = Host::new();
+    let out = h
+        .runner(&["boot", "dev"])
+        .env("FAKE_FC_VERSION", "v1.0.0")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("v1.0.0") && err.contains(firecracker::VERSION),
+        "{err}"
+    );
+    assert!(!h.fc.started());
+    assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
+}
+
+#[test]
+fn a_missing_kernel_is_named() {
+    let h = Host::new();
+    fs::remove_file(h.root().join("kernel/vmlinux")).unwrap();
+    let out = h.runner(&["boot", "dev"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("kernel/vmlinux"), "{err}");
+    assert!(!h.fc.started());
+}
+
+#[test]
+fn a_held_vm_does_not_boot() {
+    let h = Host::new();
+    let _run = h.store.begin_run("dev").unwrap();
+    let out = h.runner(&["boot", "dev"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("dev is busy"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!h.fc.started());
+}
+
+#[test]
+fn halt_with_nothing_booted_returns_at_once() {
+    let h = Host::new();
+    let out = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // And the VM can still be booted afterwards.
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
+#[test]
+fn ready_waits_for_the_guest_to_start() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    // InstanceStart is held until the test lets it through.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let api = h.serve("dev", move |req| {
+        if req.body == json!({"action_type": "InstanceStart"}) {
+            held.lock().unwrap().recv().unwrap();
+        }
+        (204, None)
+    });
+    wait_for("InstanceStart", || {
+        api.requests().iter().any(|r| r.path == "/actions")
+    });
+    h.notify
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    assert!(
+        h.notify.recv(&mut [0; 64]).is_err(),
+        "READY before the guest started"
+    );
+    release.send(()).unwrap();
+    h.notify
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(h.ready(), "READY=1");
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+#[test]
+fn firecracker_holds_the_vm_even_if_boot_dies() {
+    let h = Host::new();
+    let mut boot = h.boot("dev");
+    let _api = h.serve("dev", |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    // What a `runner boot` killed outside systemd leaves: a guest still running.
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+    assert!(matches!(h.store.delete("dev"), Err(Error::Busy(_))));
+    assert!(matches!(h.store.undo("dev"), Err(Error::Busy(_))));
+    h.fc.exit_with(0);
+    // Once it's gone the VM is free, with nobody left to commit the run.
+    wait_for("firecracker to let go", || {
+        !matches!(h.store.undo("dev"), Err(Error::Busy(_)))
+    });
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+}
+
+#[test]
+fn halt_waits_even_when_ctrl_alt_del_fails() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let fault = json!({"fault_message": "The keyboard buffer is full"}).to_string();
+    let _api = h.serve("dev", move |req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            (400, Some(fault.clone()))
+        } else {
+            (204, None)
+        }
+    });
+    assert_eq!(h.ready(), "READY=1");
+    let mut halt = h
+        .runner(&["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Still waiting: the guest may be shutting down anyway, and the unit's
+    // stop timeout is what ends the wait.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(halt.try_wait().unwrap().is_none(), "halt gave up at once");
+    h.fc.exit_with(0);
+    let out = halt.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("The keyboard buffer is full"));
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}

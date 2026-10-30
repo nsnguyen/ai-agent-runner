@@ -37,3 +37,34 @@ ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict
 The host takes SSH only over the tailnet. Never forward port 22 to it from a router or expose it on a public IP. If sshd does listen elsewhere, `from=` still refuses the runner user's key from outside the tailnet.
 
 This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailscaled answers port 22 on the tailnet address and never reads `authorized_keys`.
+
+## Build the base image
+
+`base` is the VM every other VM forks from: Ubuntu 24.04 booting systemd, with `runner-guest` as a service, git, curl, build-essential, tmux, Node LTS, Python, Rust (rustup) and Claude Code. You work as `agent`, with passwordless sudo, in `/home/agent`. Claude Code isn't logged in, and the image holds no credentials.
+
+On a Linux machine with docker or podman and e2fsprogs:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
+sudo images/base/build.sh
+```
+
+It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image.
+
+Settings go after `sudo`, which drops your environment: `sudo SIZE=40G images/base/build.sh`. The others are `OUT`, `ENGINE` and `RUNNER_GUEST`, described at the top of `build.sh`.
+
+On the runner host:
+
+```sh
+runner import base images/base/out/base.ext4
+sudo install -D -m 0644 images/base/out/vmlinux /var/lib/runner/kernel/vmlinux
+```
+
+The boot test needs `/dev/kvm` and `firecracker` on PATH. It boots a copy of the disk and checks that runner-guest starts and accepts on its vsock port:
+
+```sh
+RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
+```
+
+To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`.

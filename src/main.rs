@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
-use runner::store::{BASE, Store, Vm};
-use std::path::PathBuf;
+use runner::store::{BASE, Checkpoint, Config, KEEP, Store, Vm, parse_mem};
+use runner::systemd::{self, VmStatus};
+use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Firecracker microVMs for AI agents. Runs on the KVM host, usually as
@@ -13,6 +15,10 @@ struct Cli {
     /// Where VMs live.
     #[arg(long, env = "RUNNER_ROOT", default_value = "/var/lib/runner")]
     root: PathBuf,
+    /// How many disk generations gc keeps besides the current one and the
+    /// checkpoints, at every commit and in `gc`.
+    #[arg(long, env = "RUNNER_KEEP", default_value_t = KEEP, global = true)]
+    keep: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -27,13 +33,65 @@ enum Cmd {
         /// The VM whose current disk to fork.
         #[arg(long, default_value = BASE)]
         from: String,
+        /// vCPUs: 1 or an even number up to 32. Defaults to that VM's, else 2.
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory, like 4G or 4096 (MiB). Defaults to that VM's, else 2G.
+        #[arg(long)]
+        mem: Option<String>,
+        /// A kernel for this VM, in place of the host's <root>/kernel/vmlinux.
+        #[arg(long)]
+        kernel: Option<PathBuf>,
     },
-    /// List VMs and their current disk generation.
+    /// List VMs, their current disk generation and the space their disks use.
     List,
+    /// Boot a VM under systemd. Returns once its guest has started.
+    Start { name: String },
+    /// Shut a VM down: Ctrl-Alt-Del, and a kill after 30 seconds.
+    Stop { name: String },
+    /// Say whether a VM is stopped, booting, running or stopping.
+    Status { name: String },
+    /// Show a VM's serial console and boot notes, from journald.
+    Logs {
+        name: String,
+        /// Keep printing as lines come.
+        #[arg(short, long)]
+        follow: bool,
+        /// Only the last N lines.
+        #[arg(short = 'n', long)]
+        lines: Option<u32>,
+    },
     /// Roll a VM back to its previous committed disk generation.
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Delete old disk generations: all but the current one, every checkpoint
+    /// and the newest --keep others. Every commit does this too.
+    Gc {
+        /// Only this VM. Every VM if left out.
+        name: Option<String>,
+        /// Print what would be freed, and free nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Freeze a copy of a VM's disk to restore later. The VM must be stopped.
+    Checkpoint {
+        name: String,
+        /// A note to know it by.
+        #[arg(short = 'm', long)]
+        comment: Option<String>,
+    },
+    /// List a VM's checkpoints, and the generations runs made, newest first.
+    /// `*` marks the current one.
+    Checkpoints { name: String },
+    /// Make a copy of a checkpoint the VM's current disk. `undo` reverses it.
+    Restore { name: String, id: u64 },
+    /// Print the firecracker@.service unit for this binary and root.
+    Unit {
+        /// The user VMs run as, who owns the root.
+        #[arg(long, env = "USER")]
+        user: String,
+    },
     /// Show or set which credentials a VM gets at boot: claude, github.
     /// A VM gets claude until told otherwise.
     Creds {
@@ -48,75 +106,185 @@ enum Cmd {
     Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
+    /// Run a VM until it shuts down: the unit's main process.
+    #[command(hide = true)]
+    Boot {
+        name: String,
+        #[arg(long, env = "RUNNER_FIRECRACKER", default_value = "firecracker")]
+        firecracker: PathBuf,
+    },
+    /// Shut a VM down and wait for it: the unit's ExecStop.
+    #[command(hide = true)]
+    Halt { name: String },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let store = Store::new(cli.root);
-    let shown = match cli.cmd {
-        Cmd::Import { name, disk } => store.import(&name, &disk).map(|vm| vec![vm]),
-        Cmd::Create { name, from } => store.fork(&from, &name).map(|vm| vec![vm]),
-        Cmd::Undo { name } => store.undo(&name).map(|vm| vec![vm]),
-        Cmd::Delete { name } => {
-            return match store.delete(&name) {
-                Ok(vm) => {
-                    println!("deleted {}", line(&vm));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("runner: {e}");
-                    ExitCode::FAILURE
-                }
-            };
+    let store = Store::new(&cli.root).keeping(cli.keep);
+    match run(&cli.root, store, cli.cmd) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("runner: {e}");
+            ExitCode::FAILURE
         }
-        Cmd::Creds { name, creds, none } => {
-            let got = if none || !creds.is_empty() {
-                store.set_creds(&name, &creds)
-            } else {
-                store.creds(&name)
+    }
+}
+
+fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> {
+    match cmd {
+        Cmd::Import { name, disk } => show(&store.import(&name, &disk)?),
+        Cmd::Create {
+            name,
+            from,
+            cpus,
+            mem,
+            kernel,
+        } => {
+            let config = Config {
+                cpus,
+                mem_mib: mem.as_deref().map(parse_mem).transpose()?,
+                kernel: kernel.map(absolute_kernel).transpose()?,
             };
-            return match got {
-                Ok(creds) => {
-                    let names: Vec<_> = creds.iter().map(|c| c.name()).collect();
-                    let list = if names.is_empty() {
-                        "none".into()
-                    } else {
-                        names.join(" ")
-                    };
-                    println!("{name}  creds {list}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("runner: {e}");
-                    ExitCode::FAILURE
-                }
-            };
+            show(&store.fork_with(&from, &name, &config)?);
         }
-        Cmd::List => store.list(),
-        Cmd::Doctor => {
-            let report = doctor::check(&System, &store);
-            report.lines().for_each(|l| println!("{l}"));
-            return if report.ok {
+        Cmd::List => {
+            let vms = store.list()?;
+            if vms.is_empty() {
+                println!("no VMs yet");
+            }
+            vms.iter()
+                .for_each(|vm| println!("{}  {} bytes used", line(vm), vm.used));
+        }
+        Cmd::Gc { name, dry_run } => return Ok(gc(&store, name, dry_run)),
+        Cmd::Start { name } => show_status(&systemd::start(&store, &name)?),
+        Cmd::Stop { name } => show_status(&systemd::stop(&store, &name)?),
+        Cmd::Status { name } => show_status(&systemd::status(&store, &name)?),
+        Cmd::Logs {
+            name,
+            follow,
+            lines,
+        } => {
+            let status = systemd::logs(&store, &name, follow, lines)?;
+            return Ok(if status.success() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            });
+        }
+        Cmd::Undo { name } => show(&store.undo(&name)?),
+        Cmd::Delete { name } => println!("deleted {}", line(&store.delete(&name)?)),
+        Cmd::Unit { user } => {
+            let exe = std::env::current_exe()?;
+            let root = std::path::absolute(root)?;
+            print!("{}", systemd::render_unit(&exe, &root, &user)?);
+        }
+        Cmd::Creds { name, creds, none } => {
+            let got = if none || !creds.is_empty() {
+                store.set_creds(&name, &creds)?
+            } else {
+                store.creds(&name)?
             };
+            let names: Vec<_> = got.iter().map(|c| c.name()).collect();
+            let list = if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(" ")
+            };
+            println!("{name}  creds {list}");
         }
-        Cmd::Mcp => return serve(store),
-    };
-    match shown {
-        Ok(vms) if vms.is_empty() => println!("no VMs yet"),
-        Ok(vms) => vms.iter().for_each(|vm| println!("{}", line(vm))),
-        Err(e) => {
-            eprintln!("runner: {e}");
-            return ExitCode::FAILURE;
+        Cmd::Doctor => {
+            let report = doctor::check(&System, &store);
+            report.lines().for_each(|l| println!("{l}"));
+            return Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
         }
+        Cmd::Checkpoint { name, comment } => {
+            println!("{}", row(&store.checkpoint(&name, comment.as_deref())?));
+        }
+        Cmd::Checkpoints { name } => {
+            store
+                .checkpoints(&name)?
+                .iter()
+                .for_each(|c| println!("{}", row(c)));
+        }
+        Cmd::Restore { name, id } => show(&store.restore(&name, id)?),
+        Cmd::Mcp => return Ok(serve(store)),
+        Cmd::Boot { name, firecracker } => runner::boot::boot(&store, &name, &firecracker)?,
+        Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
+}
+
+// The store keeps an absolute path, and the file has to be there now.
+fn absolute_kernel(path: PathBuf) -> Result<PathBuf, String> {
+    std::fs::canonicalize(&path).map_err(|e| format!("no kernel file at {}: {e}", path.display()))
 }
 
 fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
+}
+
+// One VM failing, say because a run holds it, doesn't stop the rest; it
+// fails the command.
+fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
+    let names = match name {
+        Some(name) => vec![name],
+        None => match store.list() {
+            Ok(vms) => vms.into_iter().map(|vm| vm.name).collect(),
+            Err(e) => {
+                eprintln!("runner: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if names.is_empty() {
+        println!("no VMs yet");
+    }
+    let verb = if dry_run { "would free" } else { "freed" };
+    let mut code = ExitCode::SUCCESS;
+    for name in names {
+        match store.gc(&name, dry_run) {
+            Ok(f) if f.generations.is_empty() => println!("{name}  nothing to free"),
+            Ok(f) => {
+                let gens: Vec<String> = f.generations.iter().map(u64::to_string).collect();
+                // Up to: blocks a reflink shares with a disk that stays aren't freed.
+                println!(
+                    "{name}  {verb} gen {}  up to {} bytes",
+                    gens.join(" "),
+                    f.bytes
+                );
+            }
+            Err(e) => {
+                eprintln!("runner: {e}");
+                code = ExitCode::FAILURE;
+            }
+        }
+    }
+    code
+}
+
+// The comment is quoted, so one with a newline in it still takes one line.
+fn row(c: &Checkpoint) -> String {
+    let mark = if c.current { '*' } else { ' ' };
+    let time = c.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let kind = if c.auto { "auto" } else { "checkpoint" };
+    let comment = c.comment.as_ref().map(|c| format!("  {c:?}"));
+    let comment = comment.unwrap_or_default();
+    format!(
+        "{mark} {}  {time}  {kind}  {} bytes{comment}",
+        c.id, c.bytes
+    )
+}
+
+fn show(vm: &Vm) {
+    println!("{}", line(vm));
+}
+
+fn show_status(status: &VmStatus) {
+    println!("{}  {}", line(&status.vm), status.state);
 }
 
 fn serve(store: Store) -> ExitCode {
