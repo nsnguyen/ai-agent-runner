@@ -1,5 +1,8 @@
 // `runner mcp` over real stdin and stdout, as local Claude Code drives it
 // through `ssh -T host runner mcp`.
+mod common;
+
+use common::FakeSystemd;
 use runner::store::Store;
 use serde_json::{Value, json};
 use std::fs;
@@ -52,8 +55,13 @@ impl Drop for Session {
 }
 
 fn start(root: &std::path::Path) -> Session {
+    start_with_path(root, &std::env::var("PATH").unwrap())
+}
+
+fn start_with_path(root: &std::path::Path, path: &str) -> Session {
     let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", root)
+        .env("PATH", path)
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -95,10 +103,14 @@ fn lists_its_tools() {
             "checkpoint_vm",
             "create_vm",
             "delete_vm",
+            "doctor",
             "list_checkpoints",
             "list_vms",
             "restore_vm",
-            "undo_vm"
+            "start_vm",
+            "stop_vm",
+            "undo_vm",
+            "vm_status"
         ]
     );
 }
@@ -143,6 +155,88 @@ fn a_bad_call_is_a_tool_error_not_a_crash() {
     let listed = s.call(3, "list_vms", json!({}));
     assert_eq!(listed["structuredContent"], json!({"vms": []}));
     assert!(s.hang_up().success());
+}
+
+#[test]
+fn start_status_and_stop_through_systemd() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    Store::new(dir.path()).import("base", &disk).unwrap();
+    let sd = FakeSystemd::new(dir.path());
+
+    let mut s = start_with_path(dir.path(), &sd.path());
+    let base = |state: &str| json!({"name": "base", "generation": 0, "bytes": 6, "state": state});
+    let got = s.call(2, "vm_status", json!({"name": "base"}));
+    assert_eq!(got["structuredContent"], base("stopped"), "{got}");
+    let got = s.call(3, "start_vm", json!({"name": "base"}));
+    assert_eq!(got["structuredContent"], base("running"), "{got}");
+    let got = s.call(4, "stop_vm", json!({"name": "base"}));
+    assert_eq!(got["structuredContent"], base("stopped"), "{got}");
+    assert!(
+        sd.calls()
+            .contains(&"systemctl start firecracker@base.service".to_string())
+    );
+
+    let got = s.call(5, "start_vm", json!({"name": "nope"}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    sd.fail_with("Job for firecracker@base.service failed.");
+    let got = s.call(6, "start_vm", json!({"name": "base"}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    let why = got["content"][0]["text"].as_str().unwrap();
+    assert!(
+        why.contains("Job for firecracker@base.service failed."),
+        "{why}"
+    );
+}
+
+#[test]
+fn create_vm_takes_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+
+    let mut s = start(dir.path());
+    let made = s.call(
+        2,
+        "create_vm",
+        json!({"name": "big", "cpus": 4, "mem": "8G"}),
+    );
+    assert_eq!(made["isError"], json!(false), "{made}");
+    let machine = store.machine("big").unwrap();
+    assert_eq!((machine.cpus, machine.mem_mib), (4, 8192));
+    let bad = s.call(3, "create_vm", json!({"name": "huge", "cpus": 64}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+}
+
+#[test]
+fn doctor_reports_every_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = start(dir.path());
+    let got = s.call(2, "doctor", json!({}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    let report = &got["structuredContent"];
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    let all = [
+        "kvm",
+        "firecracker",
+        "reflink",
+        "kernel",
+        "base",
+        "nat",
+        "unit",
+    ];
+    assert_eq!(names, all, "{report}");
+    // No base VM in an empty root, so at least that one fails.
+    assert_eq!(report["checks"][4]["status"], json!("fail"), "{report}");
+    assert_eq!(report["ok"], json!(false), "{report}");
 }
 
 #[test]

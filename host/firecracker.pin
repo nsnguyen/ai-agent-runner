@@ -1,0 +1,6 @@
+# The Firecracker release this runner is built against. host/install.sh
+# installs it, checking the tarball's hash, and `runner doctor` checks the
+# installed version. Change the version and both hashes together.
+FIRECRACKER_VERSION=v1.17.0
+FIRECRACKER_SHA256_x86_64=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+FIRECRACKER_SHA256_aarch64=e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256
