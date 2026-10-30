@@ -70,6 +70,10 @@ impl Store {
         Store { root: root.into() }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn vms(&self) -> PathBuf {
         self.root.join("vms")
     }
