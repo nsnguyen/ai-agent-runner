@@ -17,6 +17,7 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 - **Every VM is a fork.** Disks are reflink copies on XFS or btrfs, with a sparse full copy elsewhere. An image is a VM you stopped changing; `base` is the one you fork most. A run clones the current disk into a new generation that only a clean finish commits, so a crash rolls back for free and `undo` steps back one.
 - **One run per VM.** The process running a VM holds an flock on it, which the kernel drops if that process dies. In M2 that process is the VM's systemd unit.
 - **Runs are detached.** `run` starts `claude -p` in the VM and returns a run id at once; `output` reads its log by offset. A closed laptop or a dropped SSH connection can't kill a run.
+- **A fixed address per VM.** A slot picked at create gives each VM a tap and a /30 of the host's subnet (`<root>/subnet`, default 172.16.0.0/16); the guest gets its address, gateway and DNS from the kernel's `ip=` argument. The host's install sets up NAT once; the runner only adds and removes taps.
 - **Into the VM over vsock.** The host reaches a small guest agent through Firecracker's vsock socket, so the guest needs no sshd and no keys. `runner shell <vm>` is SSH to the host, then a terminal over vsock.
 
 ## Milestones

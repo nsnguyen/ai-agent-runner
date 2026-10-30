@@ -29,3 +29,4 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
 - Old disk generations stay on disk until cleanup exists (design: Later).
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
+- Making a tap needs CAP_NET_ADMIN and iproute2, so that test is `#[ignore]`d too. As root: `cargo test --test net -- --ignored`. Cloud sessions run as root; install iproute2 first.
