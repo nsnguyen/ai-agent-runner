@@ -80,6 +80,19 @@ pub fn open(store: &Store, name: &str) -> Result<UnixStream> {
     if systemd::status(store, name)?.state != State::Running {
         systemd::start(store, name)?;
     }
+    reach(store, name)
+}
+
+/// Connects to the VM's runner-guest if the VM is running; None if it isn't,
+/// and it stays that way.
+pub fn open_running(store: &Store, name: &str) -> Result<Option<UnixStream>> {
+    if systemd::status(store, name)?.state != State::Running {
+        return Ok(None);
+    }
+    reach(store, name).map(Some)
+}
+
+fn reach(store: &Store, name: &str) -> Result<UnixStream> {
     let sock = store.vsock(name)?;
     connect(&sock, proto::PORT, GUEST_WAIT).map_err(|e| match e {
         proto::Error::Io(last) => Error::NoGuest {

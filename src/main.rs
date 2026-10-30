@@ -3,10 +3,12 @@ use runner::creds::Cred;
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::proto::{Exit, Request};
+use runner::sessions::{self, Session};
 use runner::store::{BASE, Checkpoint, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::io::IsTerminal;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -114,6 +116,34 @@ enum Cmd {
         /// The user to log in as.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
+        /// Attach to this tmux session instead, making it if it's new. Detach
+        /// with tmux's prefix key and d; a dropped connection detaches too.
+        #[arg(short, long, allow_hyphen_values = true)]
+        session: Option<String>,
+    },
+    /// List a running VM's tmux sessions: name, the command in its active
+    /// pane, when it started, and whether a terminal is on it.
+    Sessions {
+        name: String,
+        /// Whose sessions.
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
+    },
+    /// Attach this terminal to a tmux session in a running VM.
+    Attach {
+        name: String,
+        #[arg(allow_hyphen_values = true)]
+        session: String,
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
+    },
+    /// End a tmux session in a VM, and what runs in it.
+    Kill {
+        name: String,
+        #[arg(allow_hyphen_values = true)]
+        session: String,
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
     },
     /// Run a command in a VM, starting the VM first if it's stopped. Stdin
     /// passes through, and it exits with the command's exit code, or 128
@@ -214,7 +244,16 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Undo { name } => show(&store.undo(&name)?),
         Cmd::Delete { name } => println!("deleted {}", line(&store.delete(&name)?)),
         Cmd::Ip { name } => println!("{}", store.net(&name)?.address),
-        Cmd::Shell { name, user } => {
+        Cmd::Shell {
+            name,
+            user,
+            session: Some(session),
+        } => return Ok(on_session(&store, &name, &session, user, true)),
+        Cmd::Shell {
+            name,
+            user,
+            session: None,
+        } => {
             // Without a terminal here, its input ends with a close, which a
             // PTY would ignore.
             let tty = std::io::stdin().is_terminal();
@@ -225,7 +264,27 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 user: Some(user),
                 tty: tty.then(exec::terminal_size),
             };
-            return Ok(attach(&store, &name, &req));
+            return Ok(attach(exec::open(&store, &name).map_err(Into::into), &req));
+        }
+        Cmd::Sessions { name, user } => {
+            let all = sessions::list(&store, &name, &user)?;
+            if all.is_empty() {
+                println!("no sessions");
+            }
+            all.iter().for_each(|s| println!("{}", session_row(s)));
+        }
+        Cmd::Attach {
+            name,
+            session,
+            user,
+        } => return Ok(on_session(&store, &name, &session, user, false)),
+        Cmd::Kill {
+            name,
+            session,
+            user,
+        } => {
+            sessions::kill(&store, &name, &user, &session)?;
+            println!("killed {session}");
         }
         Cmd::Exec {
             name,
@@ -245,7 +304,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 user: Some(user),
                 tty: tty.then(exec::terminal_size),
             };
-            return Ok(attach(&store, &name, &req));
+            return Ok(attach(exec::open(&store, &name).map_err(Into::into), &req));
         }
         Cmd::Unit { user } => {
             let exe = std::env::current_exe()?;
@@ -298,8 +357,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
 
 // The command's exit code, or 128 plus the signal that killed it, as a
 // shell has it. 255 is the runner's own failure, as with ssh.
-fn attach(store: &Store, name: &str, req: &Request) -> ExitCode {
-    match exec::open(store, name).and_then(|conn| exec::attach(conn, req)) {
+fn attach(conn: Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
+    match conn.and_then(|conn| Ok(exec::attach(conn, req)?)) {
         Ok(Exit::Code(code)) => ExitCode::from(code as u8),
         Ok(Exit::Signal(sig)) => ExitCode::from(128u8.wrapping_add(sig as u8)),
         Err(e) => {
@@ -307,6 +366,33 @@ fn attach(store: &Store, name: &str, req: &Request) -> ExitCode {
             ExitCode::from(255)
         }
     }
+}
+
+// This terminal on a tmux session, made first if `create`. Only that boots a
+// stopped VM, which has no sessions to attach to.
+fn on_session(store: &Store, name: &str, session: &str, user: String, create: bool) -> ExitCode {
+    let conn = || -> Result<UnixStream, Box<dyn Error>> {
+        sessions::check_name(session)?;
+        if !std::io::stdin().is_terminal() {
+            return Err("a session needs a terminal: run this from one, or over ssh -t".into());
+        }
+        if create {
+            return Ok(exec::open(store, name)?);
+        }
+        let no_session = || sessions::Error::NoSession {
+            vm: name.to_string(),
+            session: session.to_string(),
+        };
+        Ok(exec::open_running(store, name)?.ok_or_else(no_session)?)
+    };
+    let req = Request {
+        argv: sessions::attach_argv(session, create),
+        env: term(),
+        cwd: None,
+        user: Some(user),
+        tty: Some(exec::terminal_size()),
+    };
+    attach(conn(), &req)
 }
 
 // A terminal of the guest's speaks this one's TERM, as over ssh.
@@ -384,6 +470,12 @@ fn row(c: &Checkpoint) -> String {
         "{mark} {}  {time}  {kind}  {} bytes{comment}",
         c.id, c.bytes
     )
+}
+
+fn session_row(s: &Session) -> String {
+    let started = s.started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let on = if s.attached { "attached" } else { "detached" };
+    format!("{}  {}  {started}  {on}", s.name, s.command)
 }
 
 fn show(vm: &Vm) {

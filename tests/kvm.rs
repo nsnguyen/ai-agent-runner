@@ -12,7 +12,10 @@
 // host's kernel in place; it uses the unit's root, RUNNER_ROOT or
 // /var/lib/runner. `exec_starts_the_vm_and_runs_in_the_guest` needs the same,
 // with the base image (images/base) as RUNNER_TEST_DISK, for its
-// runner-guest and agent user.
+// runner-guest and agent user, and so does
+// `a_session_outlives_a_dropped_connection`, for its tmux.
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -225,6 +228,47 @@ fn exec_starts_the_vm_and_runs_in_the_guest() {
     let out = piped.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "over vsock");
     assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+fn a_session_outlives_a_dropped_connection() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("session-test-{}", std::process::id());
+    let disk = env_path("RUNNER_TEST_DISK");
+    ok(runner(&root, &["import", &name, disk.to_str().unwrap()]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    ok(runner(&root, &["start", &name]));
+    let on_a_terminal = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.env("RUNNER_ROOT", &root).args(args);
+        cmd
+    };
+
+    let t = common::pty(24, 80);
+    let mut shell = t.spawn(on_a_terminal(&["shell", &name, "--session", "work"]));
+    t.send("echo before-$((1+1))\r");
+    t.wait_for("before-2");
+    // What sshd does when the connection drops.
+    let pid = nix::unistd::Pid::from_raw(shell.id() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::SIGHUP).unwrap();
+    assert_eq!(shell.wait().unwrap().code(), Some(129), "{}", t.seen());
+    eventually("the session to detach", || {
+        ok(runner(&root, &["sessions", &name]))
+            .lines()
+            .any(|l| l.starts_with("work  bash  ") && l.ends_with("  detached"))
+    });
+
+    let t = common::pty(24, 80);
+    let mut again = t.spawn(on_a_terminal(&["attach", &name, "work"]));
+    t.wait_for("before-2");
+    let detach = ["exec", &name, "--", "tmux", "detach-client", "-s", "=work"];
+    ok(runner(&root, &detach));
+    assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
+    ok(runner(&root, &["kill", &name, "work"]));
 }
 
 // A failed test still leaves the host's VMs as it found them.
