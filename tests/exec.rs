@@ -3,18 +3,16 @@
 // runner-guest on a Unix socket behind a fake of Firecracker's vsock socket.
 mod common;
 
-use common::{FakeSystemd, FakeVsock, Guest, me, text, wait_for};
-use nix::sys::termios::{self, LocalFlags, Termios};
+use common::{FakeSystemd, FakeVsock, Guest, me, pty, set_size, text};
+use nix::sys::termios::Termios;
 use runner::exec::{self, Captured};
 use runner::proto::{self, Request};
 use runner::store::Store;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -251,79 +249,6 @@ fn shell_without_a_terminal_ends_with_its_input() {
     let out = vm.run(&["shell", "dev"], b"test -t 0 || echo no tty\n");
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "no tty\n");
-}
-
-// A terminal for the runner to run on, as ssh -t gives it on the host.
-struct Pty {
-    master: File,
-    slave: OwnedFd,
-    seen: Arc<Mutex<Vec<u8>>>,
-}
-
-fn pty(rows: u16, cols: u16) -> Pty {
-    use nix::fcntl::OFlag;
-    use nix::pty;
-    let master = pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).unwrap();
-    pty::grantpt(&master).unwrap();
-    pty::unlockpt(&master).unwrap();
-    let name = pty::ptsname_r(&master).unwrap();
-    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY;
-    let slave = nix::fcntl::open(name.as_str(), flags, nix::sys::stat::Mode::empty()).unwrap();
-    let master = File::from(OwnedFd::from(master));
-    set_size(&master, rows, cols);
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut reader = master.try_clone().unwrap();
-    let into = seen.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0; 4096];
-        // EIO once nothing holds the slave open.
-        while let Ok(n @ 1..) = reader.read(&mut buf) {
-            into.lock().unwrap().extend(&buf[..n]);
-        }
-    });
-    Pty {
-        master,
-        slave,
-        seen,
-    }
-}
-
-fn set_size(master: &File, rows: u16, cols: u16) {
-    use std::os::fd::AsRawFd;
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCSWINSZ reads one winsize, which lives through the call.
-    assert_eq!(
-        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) },
-        0
-    );
-}
-
-impl Pty {
-    fn spawn(&self, mut cmd: Command) -> Child {
-        let fd = || Stdio::from(self.slave.try_clone().unwrap());
-        cmd.stdin(fd()).stdout(fd()).stderr(fd()).spawn().unwrap()
-    }
-
-    fn seen(&self) -> String {
-        text(&self.seen.lock().unwrap())
-    }
-
-    fn wait_for(&self, want: &str) {
-        wait_for(want, || self.seen().contains(want));
-    }
-
-    fn modes(&self) -> Termios {
-        termios::tcgetattr(&self.slave).unwrap()
-    }
-
-    fn raw(&self) -> bool {
-        !self.modes().local_flags.contains(LocalFlags::ICANON)
-    }
 }
 
 fn same_modes(a: &Termios, b: &Termios) -> bool {
