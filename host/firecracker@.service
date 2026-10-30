@@ -14,3 +14,7 @@ Environment=RUNNER_ROOT=/var/lib/runner
 # %i, not %I: %I would unescape a VM name's dashes into slashes.
 ExecStart=/usr/local/bin/runner boot %i
 NoNewPrivileges=yes
+# For runner boot to add and remove the VM's tap, and for Firecracker to open
+# it. Nothing else.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN

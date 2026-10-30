@@ -21,8 +21,9 @@ die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 command -v systemctl >/dev/null || die "runner hosts need systemd, and there's no systemctl"
 [[ -f $bin ]] || die "no runner binary at $bin: build it first: cargo build --release"
 octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
-cidr="^$octet\.$octet\.$octet\.$octet/(3[0-2]|[12]?[0-9])$"
-[[ $net =~ $cidr ]] || die "RUNNER_NET=$net isn't an a.b.c.d/n range"
+# Up to /30: each VM takes a /30 of it.
+cidr="^$octet\.$octet\.$octet\.$octet/(30|[12]?[0-9])$"
+[[ $net =~ $cidr ]] || die "RUNNER_NET=$net isn't an a.b.c.d/n range of /30 or wider"
 
 missing=()
 command -v nft >/dev/null || missing+=(nftables)
@@ -124,6 +125,8 @@ sysctl -q -p /etc/sysctl.d/90-runner.conf
 # The first two lines make reapplying replace the table instead of adding to it.
 # VMs get the internet, but not the tailnet, the LAN, cloud metadata or each
 # other: an agent that's been talked into something can't reach my machines.
+# DNS is the exception: a guest uses the host's resolvers, which usually sit
+# on the LAN, the tailnet or the cloud's private network.
 cat >"$tmp/nat.nft" <<EOF
 table ip runner
 delete table ip runner
@@ -134,6 +137,7 @@ table ip runner {
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
+		ip saddr $net ip daddr != $net meta l4proto { tcp, udp } th dport 53 accept
 		ip saddr $net ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
 	}
 }
