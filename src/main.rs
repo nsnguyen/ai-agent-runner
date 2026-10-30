@@ -30,6 +30,8 @@ enum Cmd {
     List,
     /// Roll a VM back to its previous committed disk generation.
     Undo { name: String },
+    /// Remove a VM and all its disk generations.
+    Delete { name: String },
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
 }
@@ -41,6 +43,18 @@ fn main() -> ExitCode {
         Cmd::Import { name, disk } => store.import(&name, &disk).map(|vm| vec![vm]),
         Cmd::Create { name, from } => store.fork(&from, &name).map(|vm| vec![vm]),
         Cmd::Undo { name } => store.undo(&name).map(|vm| vec![vm]),
+        Cmd::Delete { name } => {
+            return match store.delete(&name) {
+                Ok(vm) => {
+                    println!("deleted {}", line(&vm));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("runner: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Cmd::List => store.list(),
         Cmd::Mcp => return serve(store),
     };

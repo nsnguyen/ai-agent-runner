@@ -62,6 +62,19 @@ impl Tools {
             .map_err(|e| e.to_string())
     }
 
+    #[tool(
+        description = "Delete a VM and all its disk generations. Returns the VM as it was. Fails if a run holds it."
+    )]
+    fn delete_vm(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<Vm>, String> {
+        self.store
+            .delete(&name)
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]
     fn undo_vm(
         &self,

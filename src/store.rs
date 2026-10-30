@@ -4,6 +4,7 @@
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
+//   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -186,6 +187,23 @@ impl Store {
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
     }
+
+    /// Removes a VM and all its disk generations. Forks of it are unaffected:
+    /// each has a disk of its own.
+    pub fn delete(&self, name: &str) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        let vm = read_vm(name, &dir)?;
+        // Renamed first, so the VM is gone at once and the name is free; a
+        // delete killed partway leaves a dot-directory that sweep_staging
+        // clears. The lock goes with the rename, still held until we return.
+        let vms = self.vms();
+        let doomed = vms.join(format!(".del-{name}-{}", std::process::id()));
+        fs::rename(&dir, &doomed).map_err(at(&dir))?;
+        sync_dir(&vms)?;
+        fs::remove_dir_all(&doomed).map_err(at(&doomed))?;
+        Ok(vm)
+    }
 }
 
 #[derive(Debug)]
@@ -272,7 +290,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir).and_then(|d| d.sync_all()).map_err(at(dir))
 }
 
-// A staging directory whose creator is gone is what a killed create left.
+// A staging directory whose creator is gone is what a killed create or delete left.
 fn sweep_staging(vms: &Path) {
     let Ok(entries) = fs::read_dir(vms) else {
         return;
@@ -281,7 +299,11 @@ fn sweep_staging(vms: &Path) {
         let name = entry.file_name();
         let pid = name
             .to_str()
-            .and_then(|n| n.strip_prefix(".new-")?.rsplit_once('-'))
+            .and_then(|n| {
+                n.strip_prefix(".new-")
+                    .or(n.strip_prefix(".del-"))?
+                    .rsplit_once('-')
+            })
             .and_then(|(_, pid)| pid.parse::<u32>().ok());
         if pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
             let _ = fs::remove_dir_all(entry.path());
