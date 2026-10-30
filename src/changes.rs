@@ -6,27 +6,34 @@
 //
 // Nothing in a disk is taken on trust. A guest with root can write any inode
 // field, times included, straight to its block device, so files of equal size
-// are compared byte for byte. For the same reason the walk has a budget: a
+// are compared byte for byte. For the same reason the walk has limits: a
 // directory linked into itself or fanned out through links would otherwise
-// never end, or never end in time.
+// never end, or never end in time. The time limit also covers ext4-view
+// finding each path from the root, a scan per lookup in a directory with no
+// hash index, as mkfs.ext4 -d leaves them.
 use ext4_view::{Ext4, Ext4Error, File, Metadata, Path as InPath, PathBuf as InPathBuf};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// How many changed paths a result lists before it only counts the rest.
 pub const CAP: usize = 200;
 
+/// How long measuring may take before it gives up.
+pub const TIME: Duration = Duration::from_secs(600);
+
 const MAX_DEPTH: usize = 256;
 const MAX_ENTRIES: u64 = 10_000_000;
+// Longer than any path a link can hold.
+const MAX_LINK: u64 = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{disk}: {source}")]
     Read { disk: PathBuf, source: Ext4Error },
-    #[error("{disk}: {why}; does a directory contain itself?")]
+    #[error("{disk}: {why}")]
     Unbounded { disk: PathBuf, why: String },
 }
 
@@ -63,19 +70,17 @@ pub struct Changes {
     pub more: u64,
 }
 
-/// The paths that differ between two ext4 disks, listing at most `cap`.
-pub fn between(before: &Path, after: &Path, cap: usize) -> Result<Changes> {
-    let (before, after) = (Disk::load(before)?, Disk::load(after)?);
-    // Each byte of data is read about once per disk, so twice the space both
-    // disks take on the host is more than an honest walk reads.
-    let bytes = 2 * (before.bytes + after.bytes);
+/// The paths that differ between two ext4 disks, listing at most `cap`, or an
+/// error once measuring takes longer than `time`.
+pub fn between(before: &Path, after: &Path, cap: usize, time: Duration) -> Result<Changes> {
     let mut walk = Walk {
-        before,
-        after,
+        before: Disk::load(before)?,
+        after: Disk::load(after)?,
         cap,
         budget: Budget {
             entries: MAX_ENTRIES,
-            bytes,
+            until: Instant::now() + time,
+            time,
         },
         out: Changes::default(),
     };
@@ -86,15 +91,12 @@ pub fn between(before: &Path, after: &Path, cap: usize) -> Result<Changes> {
 struct Disk<'a> {
     fs: Ext4,
     path: &'a Path,
-    /// Space the disk takes on the host, not its apparent size.
-    bytes: u64,
 }
 
 impl<'a> Disk<'a> {
     fn load(path: &'a Path) -> Result<Self> {
         let fs = Ext4::load_from_path(path).map_err(read(path))?;
-        let bytes = std::fs::metadata(path).map_or(0, |m| m.blocks() * 512);
-        Ok(Disk { fs, path, bytes })
+        Ok(Disk { fs, path })
     }
 
     fn entries(&self, dir: &InPathBuf, budget: &mut Budget) -> Result<BTreeMap<Vec<u8>, Metadata>> {
@@ -113,7 +115,7 @@ impl<'a> Disk<'a> {
     // Everything under `dir`, counted.
     fn count(&self, dir: &InPathBuf, depth: usize, budget: &mut Budget) -> Result<u64> {
         if depth > MAX_DEPTH {
-            return Err(self.unbounded(format!("more than {MAX_DEPTH} directories deep")));
+            return Err(self.unbounded(too_deep()));
         }
         let mut n = 0;
         for (name, m) in self.entries(dir, budget)? {
@@ -147,9 +149,14 @@ fn read(disk: &Path) -> impl Fn(Ext4Error) -> Error + use<> {
     }
 }
 
+fn too_deep() -> String {
+    format!("more than {MAX_DEPTH} directories deep; does a directory contain itself?")
+}
+
 struct Budget {
     entries: u64,
-    bytes: u64,
+    until: Instant,
+    time: Duration,
 }
 
 impl Budget {
@@ -158,15 +165,15 @@ impl Budget {
             .entries
             .checked_sub(1)
             .ok_or(format!("more than {MAX_ENTRIES} entries"))?;
-        Ok(())
+        self.in_time()
     }
 
-    fn read(&mut self, n: u64) -> std::result::Result<(), String> {
-        self.bytes = self
-            .bytes
-            .checked_sub(n)
-            .ok_or("more bytes to compare than both disks hold".to_string())?;
-        Ok(())
+    fn in_time(&self) -> std::result::Result<(), String> {
+        if Instant::now() < self.until {
+            Ok(())
+        } else {
+            Err(format!("measuring took over {}s", self.time.as_secs_f32()))
+        }
     }
 }
 
@@ -183,8 +190,7 @@ impl Walk<'_> {
     // `after`, which is the one a guest could have shaped.
     fn dir(&mut self, dir: &InPathBuf, depth: usize) -> Result<()> {
         if depth > MAX_DEPTH {
-            let why = format!("more than {MAX_DEPTH} directories deep");
-            return Err(self.after.unbounded(why));
+            return Err(self.after.unbounded(too_deep()));
         }
         let old = self.before.entries(dir, &mut self.budget)?;
         let new = self.after.entries(dir, &mut self.budget)?;
@@ -218,7 +224,7 @@ impl Walk<'_> {
         Ok(())
     }
 
-    fn same(&mut self, path: &InPathBuf, old: &Metadata, new: &Metadata) -> Result<bool> {
+    fn same(&self, path: &InPathBuf, old: &Metadata, new: &Metadata) -> Result<bool> {
         let shape = |m: &Metadata| (m.file_type(), m.mode(), m.uid(), m.gid());
         if shape(old) != shape(new) {
             return Ok(false);
@@ -227,21 +233,39 @@ impl Walk<'_> {
         if kind.is_dir() {
             // Its entries are walked on their own.
             Ok(true)
+        } else if old.len() != new.len() {
+            Ok(false)
         } else if kind.is_symlink() {
-            Ok(self.before.link(path)? == self.after.link(path)?)
-        } else if kind.is_regular_file() {
-            if old.len() != new.len() {
+            // ext4-view reads a link whole, at whatever length its inode
+            // claims, and no real link is this long.
+            if old.len() > MAX_LINK {
                 return Ok(false);
             }
-            self.budget
-                .read(2 * old.len())
-                .map_err(|why| self.after.unbounded(why))?;
-            same_bytes(self.before.open(path)?, self.after.open(path)?)
-                .map_err(|(which, e)| read([self.before.path, self.after.path][which])(e))
+            Ok(self.before.link(path)? == self.after.link(path)?)
+        } else if kind.is_regular_file() {
+            self.same_bytes(path)
         } else {
             // A device's numbers aren't readable here, so it counts as changed
             // whenever its inode does.
             Ok(old == new)
+        }
+    }
+
+    // A file of the same length on both disks, read side by side.
+    fn same_bytes(&self, path: &InPathBuf) -> Result<bool> {
+        let (mut a, mut b) = (self.before.open(path)?, self.after.open(path)?);
+        let (mut x, mut y) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+        loop {
+            let late = |why| self.after.unbounded(why);
+            self.budget.in_time().map_err(late)?;
+            let n = fill(&mut a, &mut x).map_err(read(self.before.path))?;
+            let m = fill(&mut b, &mut y).map_err(read(self.after.path))?;
+            if x[..n] != y[..m] {
+                return Ok(false);
+            }
+            if n == 0 {
+                return Ok(true);
+            }
         }
     }
 
@@ -270,21 +294,6 @@ fn shown(path: &[u8]) -> String {
         }
     }
     out
-}
-
-// Two files of the same length, read side by side. The error says which side.
-fn same_bytes(mut a: File, mut b: File) -> std::result::Result<bool, (usize, Ext4Error)> {
-    let (mut x, mut y) = (vec![0; 1 << 16], vec![0; 1 << 16]);
-    loop {
-        let n = fill(&mut a, &mut x).map_err(|e| (0, e))?;
-        let m = fill(&mut b, &mut y).map_err(|e| (1, e))?;
-        if x[..n] != y[..m] {
-            return Ok(false);
-        }
-        if n == 0 {
-            return Ok(true);
-        }
-    }
 }
 
 fn fill(file: &mut File, buf: &mut [u8]) -> std::result::Result<usize, Ext4Error> {

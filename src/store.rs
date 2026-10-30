@@ -235,7 +235,12 @@ impl Run {
     /// from, read from the disks, at most `cap` paths. Measure before
     /// `commit`, which takes the run.
     pub fn changes(&self, cap: usize) -> changes::Result<Changes> {
-        changes::between(&disk_of(&self.dir, self.from), &self.disk, cap)
+        changes::between(
+            &disk_of(&self.dir, self.from),
+            &self.disk,
+            cap,
+            changes::TIME,
+        )
     }
 
     pub fn commit(self) -> Result<Vm> {

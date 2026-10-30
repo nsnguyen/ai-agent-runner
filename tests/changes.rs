@@ -1,6 +1,6 @@
 // What a run changed, measured from two ext4 disks that the tests build with
 // mkfs.ext4 -d and edit with debugfs: no root, no mounts, no KVM.
-use runner::changes::{self, Change, Changes, Kind};
+use runner::changes::{self, Change, Changes, Error, Kind};
 use runner::store::Store;
 use std::ffi::OsStr;
 use std::fs;
@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 // A directory tree from (path, contents) pairs, parents made as needed.
 fn tree(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
@@ -68,7 +68,7 @@ fn whole_dir(path: &str, change: Kind, entries: u64) -> Change {
 }
 
 fn between(before: &Path, after: &Path) -> Changes {
-    changes::between(&image(before), &image(after), changes::CAP).unwrap()
+    changes::between(&image(before), &image(after), changes::CAP, changes::TIME).unwrap()
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn the_list_is_capped_and_counts_the_rest() {
     let files: Vec<_> = ["a", "b", "c", "d", "e"].map(|n| (n, n)).into();
     let after = image(&tree(&dir.path().join("after"), &files));
 
-    let got = changes::between(&before, &after, 2).unwrap();
+    let got = changes::between(&before, &after, 2, changes::TIME).unwrap();
     let want = vec![change("/a", Kind::Added), change("/b", Kind::Added)];
     assert_eq!(
         got,
@@ -212,7 +212,7 @@ fn bytes_written_under_the_filesystem_still_count() {
     let after = dir.path().join("after.ext4");
     fs::write(&after, raw).unwrap();
 
-    let got = changes::between(&before, &after, changes::CAP).unwrap();
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
     let want = vec![change("/run.sh", Kind::Modified)];
     assert_eq!(
         got,
@@ -229,7 +229,7 @@ fn identical_disks_have_no_changes() {
     let disk = image(&tree(&dir.path().join("t"), &[("a/b/c", "deep")]));
     let copy = dir.path().join("copy.ext4");
     fs::copy(&disk, &copy).unwrap();
-    let got = changes::between(&disk, &copy, changes::CAP).unwrap();
+    let got = changes::between(&disk, &copy, changes::CAP, changes::TIME).unwrap();
     assert_eq!(got, Changes::default());
 }
 
@@ -239,7 +239,7 @@ fn a_disk_that_is_not_ext4_is_an_error_naming_it() {
     let good = image(&tree(&dir.path().join("t"), &[]));
     let junk = dir.path().join("junk.ext4");
     fs::write(&junk, vec![0u8; 1 << 20]).unwrap();
-    let err = changes::between(&good, &junk, changes::CAP).unwrap_err();
+    let err = changes::between(&good, &junk, changes::CAP, changes::TIME).unwrap_err();
     assert!(err.to_string().contains("junk.ext4"), "{err}");
 }
 
@@ -252,19 +252,22 @@ fn a_directory_that_contains_itself_is_an_error_not_a_hang() {
     let after = dir.path().join("after.ext4");
     fs::copy(&before, &after).unwrap();
     debugfs(&after, "ln /d /d/again");
-    let err = changes::between(&before, &after, changes::CAP).unwrap_err();
-    assert!(err.to_string().contains("after.ext4"), "{err}");
+    let err = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap_err();
+    assert!(
+        matches!(&err, Error::Unbounded { disk, .. } if *disk == after),
+        "{err}"
+    );
 }
 
-// Directories linked twice into their parents, ten deep, reach one file over
-// a thousand ways: small on disk, a long walk. The bytes compared are bounded
-// by the disks' size, so it ends in an error.
+// Directories linked twice into their parents, sixteen deep, reach one file
+// over a hundred thousand ways: small on disk, a walk of minutes. The walk's
+// time is bounded, so it ends in an error.
 #[test]
 fn a_disk_that_fans_out_through_links_is_an_error_not_a_hang() {
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(256 << 10);
-    let before = image(&tree(&dir.path().join("before"), &[("d10/f", &big)]));
-    let links: String = (0..10)
+    let before = image(&tree(&dir.path().join("before"), &[("d16/f", &big)]));
+    let links: String = (0..16)
         .rev()
         .map(|i| {
             format!(
@@ -277,8 +280,53 @@ fn a_disk_that_fans_out_through_links_is_an_error_not_a_hang() {
     debugfs(&before, &links);
     let after = dir.path().join("after.ext4");
     fs::copy(&before, &after).unwrap();
-    let err = changes::between(&before, &after, changes::CAP).unwrap_err();
-    assert!(err.to_string().contains("after.ext4"), "{err}");
+    let started = Instant::now();
+    let err = changes::between(&before, &after, changes::CAP, Duration::from_secs(1)).unwrap_err();
+    assert!(matches!(err, Error::Unbounded { .. }), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+// A link's length is an inode field like any other, so a guest can claim a
+// target of a terabyte. It counts as changed, without reading it.
+#[test]
+fn a_link_claiming_a_huge_target_is_modified_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = tree(&dir.path().join("t"), &[]);
+    symlink("a", t.join("l")).unwrap();
+    let before = image(&t);
+    let after = dir.path().join("after.ext4");
+    fs::copy(&before, &after).unwrap();
+    debugfs(&after, "sif /l size 0x10000000000");
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
+    let want = vec![change("/l", Kind::Modified)];
+    assert_eq!(
+        got,
+        Changes {
+            paths: want,
+            more: 0
+        }
+    );
+}
+
+// A sparse file is mostly holes, so it can be far bigger than its disk.
+#[test]
+fn a_sparse_file_bigger_than_the_disk_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = tree(&dir.path().join("before"), &[("edit.txt", "aaaa")]);
+    let after = tree(&dir.path().join("after"), &[("edit.txt", "bbbb")]);
+    for t in [&before, &after] {
+        let f = fs::File::create(t.join("sparse.img")).unwrap();
+        f.set_len(64 << 20).unwrap();
+    }
+    let got = between(&before, &after);
+    let want = vec![change("/edit.txt", Kind::Modified)];
+    assert_eq!(
+        got,
+        Changes {
+            paths: want,
+            more: 0
+        }
+    );
 }
 
 // The way a real run looks: its disk is a clone of the last generation, and
