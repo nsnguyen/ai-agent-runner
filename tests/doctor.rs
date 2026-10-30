@@ -36,6 +36,15 @@ struct Fake {
     reflink: Result<bool, ErrorKind>,
 }
 
+// By full path: sshd gives the runner user a PATH without /usr/sbin.
+fn version() -> String {
+    format!("{} --version", host::FIRECRACKER)
+}
+
+fn list_nat() -> String {
+    format!("{} list table ip runner", host::NFT)
+}
+
 fn ran(ok: bool, stdout: &str, stderr: &str) -> Result<Ran, ErrorKind> {
     Ok(Ran {
         ok,
@@ -55,16 +64,16 @@ impl Fake {
             (host::UNIT_PATH.into(), Ok(host::UNIT.to_string())),
         ];
         let runs = [
-            ("firecracker --version", ran(true, &pinned, "")),
+            (version(), ran(true, &pinned, "")),
             (
-                "systemctl is-active runner-nat.service",
+                "systemctl is-active runner-nat.service".to_string(),
                 ran(true, "active\n", ""),
             ),
-            ("nft list table ip runner", ran(true, NAT, "")),
+            (list_nat(), ran(true, NAT, "")),
         ];
         Fake {
             files: files.into_iter().collect(),
-            runs: runs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            runs: runs.into_iter().collect(),
             reflink: Ok(true),
         }
     }
@@ -170,7 +179,7 @@ fn kvm_fails_when_missing_or_not_writable() {
 fn firecracker_fails_when_missing_or_not_the_pinned_version() {
     let (_dir, store) = with_base();
     let fake = || Fake::healthy(store.root());
-    let line = "firecracker --version";
+    let line = &version();
     let missing = fake().cmd(line, Err(ErrorKind::NotFound));
     assert_verdict(missing, &store, "firecracker", Status::Fail, "install.sh");
     let old = fake().cmd(line, ran(true, "Firecracker v1.0.0\n\n", ""));
@@ -225,7 +234,7 @@ fn nat_needs_forwarding_the_service_and_the_rules() {
     assert_verdict(stopped, &store, "nat", Status::Fail, "inactive");
 
     // A firewall reload flushed the ruleset under a still-active unit.
-    let list = "nft list table ip runner";
+    let list = &list_nat();
     let flushed = fake().cmd(list, ran(false, "", "Error: No such file or directory"));
     assert_verdict(flushed, &store, "nat", Status::Fail, "systemctl restart");
     let no_rule = fake().cmd(list, ran(true, "table ip runner {\n}\n", ""));
@@ -235,6 +244,19 @@ fn nat_needs_forwarding_the_service_and_the_rules() {
     let why = "Operation not permitted (you must be root)";
     let unprivileged = fake().cmd(list, ran(false, "", why));
     assert_verdict(unprivileged, &store, "nat", Status::Ok, "root");
+}
+
+// Both set forwarding to drop by default, so the VMs lose the internet while
+// the rules look fine.
+#[test]
+fn nat_warns_when_docker_or_firewalld_runs() {
+    let (_dir, store) = with_base();
+    for unit in ["docker.service", "firewalld.service"] {
+        let line = format!("systemctl is-active {unit}");
+        let fake = Fake::healthy(store.root()).cmd(&line, ran(true, "active\n", ""));
+        let report = assert_verdict(fake, &store, "nat", Status::Warn, unit);
+        assert!(verdict(&report, "nat").1.contains("172.16.0.0/16"));
+    }
 }
 
 #[test]

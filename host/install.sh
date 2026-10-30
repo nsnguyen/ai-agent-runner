@@ -4,13 +4,14 @@
 #
 #   sudo host/install.sh [path/to/runner]
 #
-# RUNNER_NET sets the VMs' address range (default 172.16.0.0/16). Safe to rerun,
-# after an upgrade too: every step overwrites or checks, never appends.
+# RUNNER_NET sets the VMs' address range (default 172.16.0.0/16), kept in
+# /etc/runner/net for reruns. Safe to rerun, after an upgrade too: every step
+# overwrites or checks, never appends.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bin=${1:-$(dirname "$here")/target/release/runner}
-net=${RUNNER_NET:-172.16.0.0/16}
+net=${RUNNER_NET:-$(cat /etc/runner/net 2>/dev/null || echo 172.16.0.0/16)}
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -121,6 +122,8 @@ EOF
 install -m 0644 "$tmp/90-runner.conf" /etc/sysctl.d/90-runner.conf
 sysctl -q -p /etc/sysctl.d/90-runner.conf
 # The first two lines make reapplying replace the table instead of adding to it.
+# VMs get the internet, but not the tailnet, the LAN, cloud metadata or each
+# other: an agent that's been talked into something can't reach my machines.
 cat >"$tmp/nat.nft" <<EOF
 table ip runner
 delete table ip runner
@@ -129,11 +132,17 @@ table ip runner {
 		type nat hook postrouting priority srcnat; policy accept;
 		ip saddr $net ip daddr != $net masquerade
 	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ip saddr $net ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+	}
 }
 EOF
 nft -c -f "$tmp/nat.nft"
 install -d -m 0755 /etc/runner
 install -m 0644 "$tmp/nat.nft" /etc/runner/nat.nft
+echo "$net" >"$tmp/net"
+install -m 0644 "$tmp/net" /etc/runner/net
 install -m 0644 "$here/runner-nat.service" /etc/systemd/system/runner-nat.service
 systemctl daemon-reload
 systemctl enable runner-nat.service

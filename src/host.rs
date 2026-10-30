@@ -10,6 +10,10 @@ pub const NAT_UNIT: &str = "runner-nat.service";
 pub const NAT_TABLE: [&str; 2] = ["ip", "runner"];
 pub const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
+// By full path, because sshd gives the runner user a PATH without /usr/sbin.
+pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
+pub const NFT: &str = "/usr/sbin/nft";
+
 const PIN: &str = include_str!("../host/firecracker.pin");
 
 /// The Firecracker release this runner is built against, like `v1.17.0`.

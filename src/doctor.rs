@@ -178,7 +178,7 @@ fn kvm(host: &impl Host) -> Verdict {
 
 fn firecracker(host: &impl Host) -> Verdict {
     let pinned = host::firecracker_version();
-    match host.run("firecracker", &["--version"]) {
+    match host.run(host::FIRECRACKER, &["--version"]) {
         Ok(r) if r.ok && r.stdout.split_whitespace().any(|w| w == pinned) => {
             ok(format!("Firecracker {pinned}"))
         }
@@ -253,26 +253,47 @@ fn nat(host: &impl Host) -> Verdict {
     }
     let [family, table] = host::NAT_TABLE;
     let restart = format!("systemctl restart {unit}");
-    match host.run("nft", &["list", "table", family, table]) {
+    let range = match host.run(host::NFT, &["list", "table", family, table]) {
         Ok(r) if r.ok && r.stdout.contains("masquerade") => {
             let mut words = r.stdout.split_whitespace();
             let range = words.find(|w| *w == "saddr").and(words.next());
-            ok(format!(
-                "forwarding on, masquerading {}",
-                range.unwrap_or("?")
-            ))
+            range.map(str::to_string)
         }
-        Ok(r) if r.ok => fail(format!(
-            "table {family} {table} has no masquerade rule: {restart}"
-        )),
-        Ok(r) if r.stderr.contains("Operation not permitted") => ok(format!(
-            "forwarding on, {unit} active (reading the rules needs root)"
-        )),
-        Ok(_) => fail(format!(
-            "no nftables table {family} {table}, though {unit} is active (a firewall reload?): {restart}"
-        )),
-        Err(e) => fail(format!("nft: {e}")),
+        Ok(r) if r.ok => {
+            return fail(format!(
+                "table {family} {table} has no masquerade rule: {restart}"
+            ));
+        }
+        // As the runner user, nft can't list rules, so the active unit has to do.
+        Ok(r) if r.stderr.contains("Operation not permitted") => None,
+        Ok(_) => {
+            return fail(format!(
+                "no nftables table {family} {table}, though {unit} is active (a firewall reload?): {restart}"
+            ));
+        }
+        Err(e) => return fail(format!("nft: {e}")),
+    };
+    let found = match &range {
+        Some(range) => format!("forwarding on, masquerading {range}"),
+        None => format!("forwarding on, {unit} active (run as root to read the rules)"),
+    };
+    // Both drop forwarded traffic by default, so the VMs would lose the
+    // internet under rules that look fine.
+    let blockers: Vec<&str> = ["docker.service", "firewalld.service"]
+        .into_iter()
+        .filter(|u| host.run("systemctl", &["is-active", u]).is_ok_and(|r| r.ok))
+        .collect();
+    if blockers.is_empty() {
+        return ok(found);
     }
+    let range = range.as_deref().unwrap_or("the VMs' range");
+    let blockers = blockers.join(" and ");
+    (
+        Status::Warn,
+        format!(
+            "{found}, but {blockers} is active and may drop forwarded traffic: allow {range} there"
+        ),
+    )
 }
 
 fn unit(host: &impl Host) -> Verdict {
