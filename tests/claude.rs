@@ -251,27 +251,23 @@ fn from_is_noted_and_unused_when_the_vm_exists() {
 
 #[test]
 fn a_failed_step_stops_the_rest() {
-    let new = Fake::default;
-    let stopped = || Fake::with("dev", false);
-    let running = || Fake::with("dev", true);
     let looked = ["exists dev", "running dev", "has_session dev agent claude"];
-    let cases: [(&str, fn() -> Fake, &[&str]); 6] = [
-        ("exists", new, &["exists dev"]),
-        ("create", new, &["exists dev", "create dev from base"]),
-        ("running", stopped, &["exists dev", "running dev"]),
+    let attached = [&looked[..], &["attach dev"]].concat();
+    // dev: None if it's new, else whether it's running.
+    for (fail, dev, want) in [
+        ("exists", None, &["exists dev"][..]),
+        ("create", None, &["exists dev", "create dev from base"]),
+        ("running", Some(false), &["exists dev", "running dev"]),
         (
             "start",
-            stopped,
+            Some(false),
             &["exists dev", "running dev", "start dev"],
         ),
-        ("has_session", running, &looked),
-        ("attach", running, &[&looked[..], &["attach dev"]].concat()),
-    ];
-    for (fail, fake, want) in cases {
-        let fake = Fake {
-            fail: Some(fail),
-            ..fake()
-        };
+        ("has_session", Some(true), &looked),
+        ("attach", Some(true), &attached),
+    ] {
+        let mut fake = dev.map_or_else(Fake::default, |on| Fake::with("dev", on));
+        fake.fail = Some(fail);
         let (_, got) = open(&fake, &ask("dev", &[]));
         let err = got.unwrap_err().to_string();
         assert_eq!(err, format!("{fail} failed"));
