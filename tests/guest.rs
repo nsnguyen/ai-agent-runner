@@ -522,3 +522,21 @@ fn a_session_leaves_no_threads_behind() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+// Output a host reads as fast as it comes doesn't keep the exit back
+// either. The bytes are counted, not kept.
+#[test]
+fn exit_doesn_t_wait_for_a_fast_background_writer() {
+    let g = guest();
+    let start = Instant::now();
+    let mut s = g.start(sh("yes & echo started"));
+    let exit = loop {
+        match proto::read_frame(&mut s.conn).unwrap() {
+            Some(FromGuest::Stdout(_)) => {}
+            Some(FromGuest::Exit(exit)) => break exit,
+            other => panic!("wanted output or an exit, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "no exit");
+    };
+    assert_eq!(exit, Exit::Code(0));
+}

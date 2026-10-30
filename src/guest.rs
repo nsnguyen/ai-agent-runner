@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 // After the command exits, its output is done once it closes, goes quiet for
 // QUIET ms, or DRAIN has passed, so a background process left holding it
-// can't keep the request open.
+// can't keep the request open. Sending what the command left unread
+// doesn't count toward DRAIN, so a slow host doesn't cost it its last output.
 const QUIET: u16 = 100;
 const DRAIN: Duration = Duration::from_secs(1);
 // Stdin queued for a command that isn't reading it. Past this, the host's
@@ -387,19 +388,23 @@ fn reap(child: &mut Child, group: &Group) -> io::Result<ExitStatus> {
 // command has exited and the stream has gone quiet.
 fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, group: &Group) {
     let mut buf = vec![0; 32 * 1024];
-    // Time spent sending after the exit, which DRAIN doesn't count, so a slow
-    // host doesn't cost the command its last output.
-    let mut sending = Duration::ZERO;
+    // Once the pump sees the exit: when, the bytes then unread, and the time
+    // spent sending those, which DRAIN doesn't count.
+    let mut drain: Option<(Instant, usize)> = None;
+    let mut excused = Duration::ZERO;
     loop {
         // Checked before the wait, so the last wait starts after the exit and
         // still catches output on its way through the PTY.
-        let exited = group.exited();
-        if exited.is_some_and(|at| at.elapsed().saturating_sub(sending) > DRAIN) {
+        let exited = group.exited().is_some();
+        if exited && drain.is_none() {
+            drain = Some((Instant::now(), unread(&src)));
+        }
+        if drain.is_some_and(|(since, _)| since.elapsed().saturating_sub(excused) > DRAIN) {
             return;
         }
         let mut fds = [PollFd::new(src.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, QUIET) {
-            Ok(0) if exited.is_some() => return,
+            Ok(0) if exited => return,
             Ok(0) | Err(Errno::EINTR) => continue,
             Ok(_) => {}
             Err(e) => return eprintln!("runner-guest: output: {e}"),
@@ -411,8 +416,9 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
                 if send(out, wrap(buf[..n].to_vec())).is_err() {
                     return;
                 }
-                if let Some(at) = group.exited() {
-                    sending += start.elapsed().min(at.elapsed());
+                if let Some((_, owed @ 1..)) = &mut drain {
+                    excused += start.elapsed();
+                    *owed = owed.saturating_sub(n);
                 }
             }
             // The PTY is nonblocking for its stdin's sake.
@@ -424,6 +430,16 @@ fn pump<C: Conn>(mut src: File, wrap: fn(Vec<u8>) -> FromGuest, out: &Mutex<C>, 
             // A PTY whose command has gone reads EIO.
             Err(_) => return,
         }
+    }
+}
+
+// Bytes waiting to be read from a pipe or PTY.
+fn unread(src: &File) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int, which lives through the call.
+    match unsafe { libc::ioctl(src.as_raw_fd(), libc::FIONREAD, &mut n) } {
+        -1 => 0,
+        _ => n.max(0) as usize,
     }
 }
 
