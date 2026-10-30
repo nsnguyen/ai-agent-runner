@@ -87,3 +87,27 @@ fn delete_removes_a_vm() {
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("no VM named dev"));
 }
+
+#[test]
+fn creds_shows_and_sets_what_a_vm_gets() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let out = runner(dir.path(), &["creds", "dev"]);
+    assert_eq!(text(&out.stdout), "dev  creds claude\n");
+    let out = runner(dir.path(), &["creds", "dev", "github", "claude"]);
+    assert_eq!(text(&out.stdout), "dev  creds claude github\n");
+    let out = runner(dir.path(), &["creds", "dev", "--none"]);
+    assert_eq!(text(&out.stdout), "dev  creds none\n");
+    let out = runner(dir.path(), &["creds", "dev"]);
+    assert_eq!(text(&out.stdout), "dev  creds none\n");
+}
+
+#[test]
+fn creds_refuses_an_unknown_name() {
+    let dir = with_base();
+    let out = runner(dir.path(), &["creds", "base", "aws"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("aws"), "{}", text(&out.stderr));
+    let out = runner(dir.path(), &["creds", "base", "claude", "--none"]);
+    assert!(!out.status.success());
+}

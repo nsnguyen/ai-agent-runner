@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use runner::creds::Cred;
 use runner::store::{BASE, Store, Vm};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,6 +33,16 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Show or set which credentials a VM gets at boot: claude, github.
+    /// A VM gets claude until told otherwise.
+    Creds {
+        name: String,
+        /// Give it exactly these from the next boot on.
+        creds: Vec<Cred>,
+        /// Give it none from the next boot on.
+        #[arg(long, conflicts_with = "creds")]
+        none: bool,
+    },
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
 }
@@ -47,6 +58,29 @@ fn main() -> ExitCode {
             return match store.delete(&name) {
                 Ok(vm) => {
                     println!("deleted {}", line(&vm));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("runner: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Cmd::Creds { name, creds, none } => {
+            let set = if none || !creds.is_empty() {
+                store.set_creds(&name, &creds)
+            } else {
+                store.creds(&name)
+            };
+            return match set {
+                Ok(creds) => {
+                    let names: Vec<_> = creds.iter().map(|c| c.name()).collect();
+                    let shown = if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(" ")
+                    };
+                    println!("{name}  creds {shown}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
