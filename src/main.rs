@@ -32,6 +32,8 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
+    /// Print a VM's address, which stays the same for as long as the VM exists.
+    Ip { name: String },
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
 }
@@ -47,6 +49,18 @@ fn main() -> ExitCode {
             return match store.delete(&name) {
                 Ok(vm) => {
                     println!("deleted {}", line(&vm));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("runner: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Cmd::Ip { name } => {
+            return match store.net(&name) {
+                Ok(net) => {
+                    println!("{}", net.address);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

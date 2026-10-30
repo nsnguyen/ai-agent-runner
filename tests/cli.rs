@@ -87,3 +87,15 @@ fn delete_removes_a_vm() {
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("no VM named dev"));
 }
+
+#[test]
+fn ip_prints_a_vm_s_address() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let out = runner(dir.path(), &["ip", "dev"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "172.16.0.6\n");
+    let out = runner(dir.path(), &["ip", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("no VM named nope"));
+}

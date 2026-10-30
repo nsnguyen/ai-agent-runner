@@ -3,10 +3,15 @@
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
+//   <root>/slots.lock                flock'd while a slot is picked
+//   <root>/subnet                    host config: the subnet slots carve up; 172.16.0.0/16 if absent
+use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use rmcp::schemars;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -29,6 +34,10 @@ pub enum Error {
     Busy(String),
     #[error("{0} has no earlier generation to go back to")]
     NothingToUndo(String),
+    #[error("no free address left in {0}: delete a VM, or widen <root>/subnet")]
+    NoSlot(Subnet),
+    #[error("{cmd}: {why}")]
+    Command { cmd: String, why: String },
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -111,11 +120,14 @@ impl Store {
         let made = fs::create_dir(&staged)
             .and_then(|()| fs::create_dir(staged.join("gens")))
             .map_err(at(&staged))
+            .and_then(|()| self.assign_slot(&staged).map(drop))
             .and_then(|()| clone(disk, &disk_of(&staged, 0)))
             .and_then(|()| write_history(&staged, &[0]))
             // rename won't replace a directory with anything in it, so a
-            // create that raced this one keeps its VM.
+            // create that raced this one keeps its VM. Under the slots lock,
+            // or a slot scan could miss this VM between its two names.
             .and_then(|()| {
+                let _slots = self.lock_slots()?;
                 fs::rename(&staged, &dir).map_err(|e| match e.kind() {
                     io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists => {
                         Error::Exists(name.to_string())
@@ -129,6 +141,79 @@ impl Store {
         }
         made?;
         read_vm(name, &dir)
+    }
+
+    /// The VM's tap and addresses, from its slot.
+    pub fn net(&self, name: &str) -> Result<Net> {
+        let dir = self.existing(name)?;
+        let slot = match read_slot(&dir)? {
+            Some(slot) => slot,
+            None => self.assign_slot(&dir)?,
+        };
+        let subnet = self.subnet()?;
+        subnet.net(slot).ok_or_else(|| {
+            let why = format!("slot {slot} is past the end of {subnet}");
+            invalid(&dir.join("slot"), why)
+        })
+    }
+
+    /// The subnet VM addresses come from. Changing it moves every VM's
+    /// address, but not its slot.
+    pub fn subnet(&self) -> Result<Subnet> {
+        let path = self.root.join("subnet");
+        match fs::read_to_string(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DEFAULT_SUBNET),
+            Err(e) => Err(at(&path)(e)),
+            Ok(text) => text.trim().parse().map_err(|why| invalid(&path, why)),
+        }
+    }
+
+    // The lowest slot no other VM holds, counting creates in flight, picked
+    // under a lock so two creates can't take the same one. A VM keeps the slot
+    // it has; one made before slots existed gets one here.
+    fn assign_slot(&self, dir: &Path) -> Result<u32> {
+        let _slots = self.lock_slots()?;
+        if let Some(slot) = read_slot(dir)? {
+            return Ok(slot);
+        }
+        let subnet = self.subnet()?;
+        let taken = self.taken_slots()?;
+        let slot = (0..subnet.slots())
+            .find(|s| !taken.contains(s))
+            .ok_or(Error::NoSlot(subnet))?;
+        write_file(dir, "slot", &format!("{slot}\n"))?;
+        Ok(slot)
+    }
+
+    // Held while slots are picked and while a new VM moves into place.
+    fn lock_slots(&self) -> Result<Lock> {
+        let path = self.root.join("slots.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(at(&path))?;
+        file.lock().map_err(at(&path))?;
+        Ok(Lock(file))
+    }
+
+    // A VM being deleted has let go of its slot.
+    fn taken_slots(&self) -> Result<HashSet<u32>> {
+        let vms = self.vms();
+        let mut taken = HashSet::new();
+        for entry in fs::read_dir(&vms).map_err(at(&vms))? {
+            let entry = entry.map_err(at(&vms))?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|n| n.starts_with(".del-")) {
+                continue;
+            }
+            // An unreadable slot fails its own VM's reads, not every create.
+            if let Ok(Some(slot)) = read_slot(&entry.path()) {
+                taken.insert(slot);
+            }
+        }
+        Ok(taken)
     }
 
     pub fn get(&self, name: &str) -> Result<Vm> {
@@ -222,7 +307,7 @@ pub struct Run {
     pub disk: PathBuf,
     name: String,
     dir: PathBuf,
-    _lock: File,
+    _lock: Lock,
 }
 
 impl Run {
@@ -236,7 +321,7 @@ impl Run {
 
 // flock, not a pid file: the kernel drops it when the holder dies, so a
 // crashed run never wedges its VM.
-fn take_lock(dir: &Path, name: &str) -> Result<File> {
+fn take_lock(dir: &Path, name: &str) -> Result<Lock> {
     let path = dir.join("lock");
     let file = OpenOptions::new()
         .create(true)
@@ -249,9 +334,38 @@ fn take_lock(dir: &Path, name: &str) -> Result<File> {
             _ => at(&path)(e),
         })?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Lock(file)),
         Err(TryLockError::WouldBlock) => Err(Error::Busy(name.to_string())),
         Err(TryLockError::Error(e)) => Err(at(&path)(e)),
+    }
+}
+
+fn invalid(path: &Path, why: impl Into<String>) -> Error {
+    at(path)(io::Error::new(io::ErrorKind::InvalidData, why.into()))
+}
+
+fn read_slot(dir: &Path) -> Result<Option<u32>> {
+    let path = dir.join("slot");
+    match fs::read_to_string(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(at(&path)(e)),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|e: std::num::ParseIntError| invalid(&path, e.to_string())),
+    }
+}
+
+// Unlocked on drop, not only closed: a child spawned on another thread holds a
+// copy of the descriptor until it execs, and the lock lasts while any copy is
+// open.
+#[derive(Debug)]
+struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -286,16 +400,20 @@ fn current(dir: &Path) -> Result<u64> {
     gens.last().copied().ok_or_else(empty)
 }
 
-// Written aside, synced and renamed, so even a host crash leaves either the old
-// history or the new.
 fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
-    let tmp = dir.join("history.tmp");
     let text: String = gens.iter().map(|g| format!("{g}\n")).collect();
+    write_file(dir, "history", &text)
+}
+
+// Written aside, synced and renamed, so even a host crash leaves either the old
+// file or the new.
+fn write_file(dir: &Path, name: &str, text: &str) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
     let mut f = File::create(&tmp).map_err(at(&tmp))?;
     f.write_all(text.as_bytes())
         .and_then(|()| f.sync_all())
         .map_err(at(&tmp))?;
-    let path = dir.join("history");
+    let path = dir.join(name);
     fs::rename(&tmp, &path).map_err(at(&path))?;
     sync_dir(dir)
 }
