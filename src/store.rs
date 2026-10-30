@@ -3,19 +3,27 @@
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
+//   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
+//   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
+//   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The VM `create` forks unless told otherwise.
 pub const BASE: &str = "base";
+
+/// What a VM gets when its config doesn't say.
+pub const DEFAULT_CPUS: u32 = 2;
+pub const DEFAULT_MEM_MIB: u32 = 2048;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,10 +33,12 @@ pub enum Error {
     NoVm(String),
     #[error("a VM named {0} already exists")]
     Exists(String),
-    #[error("{0} is busy: a run holds it")]
+    #[error("{0} is busy: it's running, or another runner command holds it")]
     Busy(String),
     #[error("{0} has no earlier generation to go back to")]
     NothingToUndo(String),
+    #[error("{0}")]
+    BadConfig(String),
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -47,6 +57,90 @@ pub struct Vm {
     pub generation: u64,
     /// Size of that disk.
     pub bytes: u64,
+}
+
+/// A VM's sizes and kernel as stored: each one left out is the host's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<PathBuf>,
+}
+
+impl Config {
+    /// `self`, with whatever `over` sets taking its place.
+    fn with(self, over: &Config) -> Config {
+        Config {
+            cpus: over.cpus.or(self.cpus),
+            mem_mib: over.mem_mib.or(self.mem_mib),
+            kernel: over.kernel.clone().or(self.kernel),
+        }
+    }
+
+    // Firecracker's limits, checked here so a bad size fails at create, not boot.
+    fn check(&self) -> Result<()> {
+        let bad = |why: String| Err(Error::BadConfig(why));
+        if let Some(n) = self.cpus
+            && !(n == 1 || (n % 2 == 0 && (2..=32).contains(&n)))
+        {
+            return bad(format!(
+                "a VM takes 1 or an even number of vCPUs, up to 32, not {n}"
+            ));
+        }
+        if let Some(mib) = self.mem_mib
+            && mib < 128
+        {
+            return bad(format!("a VM needs at least 128 MiB of memory, not {mib}"));
+        }
+        if let Some(kernel) = &self.kernel {
+            if !kernel.is_absolute() {
+                return bad(format!(
+                    "the kernel path {} isn't absolute",
+                    kernel.display()
+                ));
+            }
+            if !kernel.is_file() {
+                return bad(format!("no kernel file at {}", kernel.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a VM boots with: its config over the host's defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    pub cpus: u32,
+    pub mem_mib: u32,
+    pub kernel: PathBuf,
+}
+
+/// A memory size in MiB: a plain number is MiB, or it ends in M, G or T
+/// (MiB, GiB and TiB too, in any case).
+pub fn parse_mem(text: &str) -> Result<u32> {
+    let bad = || {
+        Error::BadConfig(format!(
+            "{text:?} isn't a memory size: use MiB, or a whole number with M, G or T, like 4G"
+        ))
+    };
+    let lower = text.to_ascii_lowercase();
+    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let shift = match &lower[digits.len()..] {
+        "" | "m" | "mib" => 0,
+        "g" | "gib" => 10,
+        "t" | "tib" => 20,
+        _ => return Err(bad()),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u32 = digits.parse().map_err(|_| bad())?;
+    let mib = n.checked_mul(1 << shift).ok_or_else(bad)?;
+    if mib == 0 { Err(bad()) } else { Ok(mib) }
 }
 
 // A name becomes a directory, so it has to be one plain path component.
@@ -87,19 +181,27 @@ impl Store {
 
     /// Brings an ext4 disk in as a new VM, usually `base`.
     pub fn import(&self, name: &str, disk: &Path) -> Result<Vm> {
-        self.make(name, disk)
+        self.make(name, disk, &Config::default())
     }
 
-    /// A new VM whose disk is a copy-on-write fork of `from`'s current disk.
+    /// A new VM whose disk is a copy-on-write fork of `from`'s current disk,
+    /// and whose sizes and kernel are `from`'s.
     pub fn fork(&self, from: &str, name: &str) -> Result<Vm> {
+        self.fork_with(from, name, &Config::default())
+    }
+
+    /// A fork, with whatever `over` sets in place of `from`'s sizes and kernel.
+    pub fn fork_with(&self, from: &str, name: &str, over: &Config) -> Result<Vm> {
         let src = self.existing(from)?;
-        self.make(name, &disk_of(&src, current(&src)?))
+        let config = read_config(&src)?.with(over);
+        self.make(name, &disk_of(&src, current(&src)?), &config)
     }
 
     // Built aside under a dot-name that list skips, then renamed into place, so
     // a create killed partway never takes the name.
-    fn make(&self, name: &str, disk: &Path) -> Result<Vm> {
+    fn make(&self, name: &str, disk: &Path, config: &Config) -> Result<Vm> {
         check_name(name)?;
+        config.check()?;
         let vms = self.vms();
         fs::create_dir_all(&vms).map_err(at(&vms))?;
         sweep_staging(&vms);
@@ -112,6 +214,7 @@ impl Store {
             .and_then(|()| fs::create_dir(staged.join("gens")))
             .map_err(at(&staged))
             .and_then(|()| clone(disk, &disk_of(&staged, 0)))
+            .and_then(|()| write_config(&staged, config))
             .and_then(|()| write_history(&staged, &[0]))
             // rename won't replace a directory with anything in it, so a
             // create that raced this one keeps its VM.
@@ -133,6 +236,40 @@ impl Store {
 
     pub fn get(&self, name: &str) -> Result<Vm> {
         read_vm(name, &self.existing(name)?)
+    }
+
+    /// The sizes and kernel a VM's directory names, without the defaults.
+    pub fn config(&self, name: &str) -> Result<Config> {
+        read_config(&self.existing(name)?)
+    }
+
+    /// What the VM boots with.
+    pub fn machine(&self, name: &str) -> Result<Machine> {
+        let config = self.config(name)?;
+        config.check()?;
+        Ok(Machine {
+            cpus: config.cpus.unwrap_or(DEFAULT_CPUS),
+            mem_mib: config.mem_mib.unwrap_or(DEFAULT_MEM_MIB),
+            kernel: config.kernel.unwrap_or_else(|| self.default_kernel()),
+        })
+    }
+
+    /// The host's kernel, for every VM that doesn't name its own.
+    pub fn default_kernel(&self) -> PathBuf {
+        self.root.join("kernel").join("vmlinux")
+    }
+
+    /// Where the VM's Firecracker listens, while it runs.
+    pub fn api_socket(&self, name: &str) -> Result<PathBuf> {
+        Ok(api_socket(&self.existing(name)?))
+    }
+
+    /// Blocks until nothing holds the VM: what a stop waits on.
+    pub fn wait_idle(&self, name: &str) -> Result<()> {
+        let dir = self.existing(name)?;
+        let path = dir.join("lock");
+        let file = open_lock(&path, name)?;
+        file.lock().map_err(at(&path))
     }
 
     pub fn list(&self) -> Result<Vec<Vm>> {
@@ -232,27 +369,85 @@ impl Run {
         write_history(&self.dir, &gens)?;
         read_vm(&self.name, &self.dir)
     }
+
+    /// Ends a run that never got going, with its disk: nothing wrote to it,
+    /// so there's nothing to look at.
+    pub fn discard(self) {
+        if let Err(e) = fs::remove_file(&self.disk) {
+            eprintln!("runner: couldn't remove {}: {e}", self.disk.display());
+        }
+    }
+
+    pub fn api_socket(&self) -> PathBuf {
+        api_socket(&self.dir)
+    }
+
+    pub fn vsock(&self) -> PathBuf {
+        self.dir.join("vsock.sock")
+    }
+}
+
+fn api_socket(dir: &Path) -> PathBuf {
+    dir.join("api.sock")
 }
 
 // flock, not a pid file: the kernel drops it when the holder dies, so a
 // crashed run never wedges its VM.
 fn take_lock(dir: &Path, name: &str) -> Result<File> {
     let path = dir.join("lock");
-    let file = OpenOptions::new()
+    let file = open_lock(&path, name)?;
+    // A process spawned by another thread holds a copy of every open fd from
+    // fork to exec, so a lock just let go can look held for that instant.
+    // Ask again for a moment before calling the VM busy.
+    for _ in 0..LOCK_TRIES {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_RETRY),
+            Err(TryLockError::Error(e)) => return Err(at(&path)(e)),
+        }
+    }
+    Err(Error::Busy(name.to_string()))
+}
+
+const LOCK_TRIES: u32 = 20;
+const LOCK_RETRY: Duration = Duration::from_millis(5);
+
+fn open_lock(path: &Path, name: &str) -> Result<File> {
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| match e.kind() {
             // The VM was deleted between the caller's check and here.
             io::ErrorKind::NotFound => Error::NoVm(name.to_string()),
-            _ => at(&path)(e),
-        })?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(Error::Busy(name.to_string())),
-        Err(TryLockError::Error(e)) => Err(at(&path)(e)),
+            _ => at(path)(e),
+        })
+}
+
+// No file means every default, which is what an imported VM has.
+fn read_config(dir: &Path) -> Result<Config> {
+    let path = dir.join("config.json");
+    match fs::read(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(at(&path)(e)),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| at(&path)(io::Error::new(io::ErrorKind::InvalidData, e))),
     }
+}
+
+// Only into a VM being built, so no reader sees it half-written.
+fn write_config(dir: &Path, config: &Config) -> Result<()> {
+    if *config == Config::default() {
+        return Ok(());
+    }
+    let path = dir.join("config.json");
+    let mut text = serde_json::to_string(config).map_err(|e| at(&path)(io::Error::other(e)))?;
+    text.push('\n');
+    let mut f = File::create(&path).map_err(at(&path))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(at(&path))
 }
 
 fn read_vm(name: &str, dir: &Path) -> Result<Vm> {
