@@ -1,8 +1,9 @@
-// A VM's network. Its slot, picked at create (store.rs), names its tap on the
-// host and gives it a /30 of the host's subnet: the network, the host's end of
-// the tap (the guest's gateway), the guest, and broadcast. NAT and forwarding
-// are the host's, set up once by its install; the runner only adds and removes
-// taps.
+// A VM's network. Its slot, picked at create (store.rs), gives it a /30 of the
+// host's range: the network, the host's end of the tap (the guest's gateway),
+// the guest, and broadcast. The tap is named for the /30. NAT and forwarding
+// are the host's, set up once by host/install.sh; the runner only adds and
+// removes taps.
+use crate::host;
 use crate::store::{Error, Result};
 use rmcp::schemars;
 use serde::Serialize;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-/// The subnet VM addresses come from unless `<root>/subnet` names another.
+/// The subnet VM addresses come from until host/install.sh writes another.
 pub const DEFAULT_SUBNET: Subnet = Subnet {
     base: Ipv4Addr::new(172, 16, 0, 0),
     prefix: 16,
@@ -47,7 +48,7 @@ impl Subnet {
         let [a, b, c, d] = address.octets();
         Some(Net {
             slot,
-            tap: format!("fctap{slot}"),
+            tap: format!("fc{network:08x}"),
             gateway: Ipv4Addr::from(network + 1),
             address,
             // Locally administered, and readable as the address it goes with.
@@ -90,7 +91,8 @@ impl fmt::Display for Subnet {
 pub struct Net {
     /// Unique among live VMs; picks everything below.
     pub slot: u32,
-    /// The tap device on the host.
+    /// The tap device on the host: fc and its /30 in hex. Unique to the
+    /// address, so another root's VMs in another range never share it.
     pub tap: String,
     /// The host's end of the tap, and the guest's gateway.
     pub gateway: Ipv4Addr,
@@ -151,14 +153,16 @@ pub struct Tap {
 
 impl Tap {
     pub fn add(net: &Net) -> Result<Tap> {
-        Tap::add_with(Path::new("ip"), net)
+        Tap::add_with(Path::new(host::IP), net)
     }
 
     /// `add`, with iproute2's `ip` at the given path.
     pub fn add_with(ip: &Path, net: &Net) -> Result<Tap> {
-        // Slots are unique among live VMs and only the VM's own boot asks for
-        // its tap, so one by this name was left by a boot that was killed.
-        let _ = run(ip, &["link", "del", "dev", &net.tap]);
+        // A tap by this name that nothing holds open was left by a boot that
+        // was killed. `tuntap del` removes only that: a tap still in use, by
+        // a VM in another root with the same range, makes the add below fail
+        // instead of losing it its network.
+        let _ = run(ip, &["tuntap", "del", "dev", &net.tap, "mode", "tap"]);
         run(ip, &["tuntap", "add", "dev", &net.tap, "mode", "tap"])?;
         // From here a failure drops the tap, which removes it.
         let tap = Tap {

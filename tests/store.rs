@@ -5,9 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+// The host's address range comes from a file in the temp directory, not
+// the real /etc/runner/net, which these tests never create.
 fn store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::new(dir.path().join("root"));
+    let store = Store::new(dir.path().join("root")).with_net_file(dir.path().join("net"));
     (dir, store)
 }
 
@@ -372,7 +374,7 @@ fn every_vm_gets_its_own_slot_and_a_fork_does_not_share_its_source_s() {
     let net = store.net("dev").unwrap();
     assert_eq!(
         (net.tap.as_str(), net.address.to_string()),
-        ("fctap1", "172.16.0.6".into())
+        ("fcac100004", "172.16.0.6".into())
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("root/vms/dev/slot")).unwrap(),
@@ -430,8 +432,8 @@ fn a_create_in_flight_holds_its_slot() {
 #[test]
 fn the_subnet_is_host_config_and_a_full_one_refuses_a_create() {
     let (dir, store) = store();
-    fs::create_dir_all(dir.path().join("root")).unwrap();
-    fs::write(dir.path().join("root/subnet"), "10.9.0.0/29\n").unwrap();
+    // As host/install.sh writes it.
+    fs::write(dir.path().join("net"), "10.9.0.0/29\n").unwrap();
     store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
     store.fork("base", "dev").unwrap();
     assert_eq!(store.net("dev").unwrap().address.to_string(), "10.9.0.6");
@@ -443,9 +445,28 @@ fn the_subnet_is_host_config_and_a_full_one_refuses_a_create() {
     let vms: Vec<_> = fs::read_dir(dir.path().join("root/vms")).unwrap().collect();
     assert_eq!(vms.len(), 2, "{vms:?}");
 
-    fs::write(dir.path().join("root/subnet"), "10.9.0.1/29\n").unwrap();
+    fs::write(dir.path().join("net"), "10.9.0.1/29\n").unwrap();
     let err = store.net("dev").unwrap_err();
-    assert!(err.to_string().contains("subnet"), "{err}");
+    let net = dir.path().join("net");
+    assert!(err.to_string().contains(net.to_str().unwrap()), "{err}");
+    assert!(err.to_string().contains("10.9.0.0/29"), "{err}");
+}
+
+#[test]
+fn a_slot_that_can_t_be_read_stops_a_create_rather_than_be_reused() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    let bad = dir.path().join("root/vms/dev/slot");
+    fs::write(&bad, "one\n").unwrap();
+    let err = store.fork("base", "more").unwrap_err();
+    assert!(err.to_string().contains(bad.to_str().unwrap()), "{err}");
+    assert!(matches!(store.get("more"), Err(Error::NoVm(_))));
+    // A stray file among the VMs isn't a VM with a slot, and stops nothing.
+    fs::write(&bad, "1\n").unwrap();
+    fs::write(dir.path().join("root/vms/stray"), "").unwrap();
+    store.fork("base", "more").unwrap();
+    assert_eq!(slot(&store, "more"), 2);
 }
 
 #[test]

@@ -61,7 +61,7 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
         s.net(0),
         Some(want(
             0,
-            "fctap0",
+            "fcac100000",
             "172.16.0.1",
             "172.16.0.2",
             "06:00:ac:10:00:02"
@@ -71,7 +71,7 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
         s.net(1),
         Some(want(
             1,
-            "fctap1",
+            "fcac100004",
             "172.16.0.5",
             "172.16.0.6",
             "06:00:ac:10:00:06"
@@ -81,7 +81,7 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
         s.net(64),
         Some(want(
             64,
-            "fctap64",
+            "fcac100100",
             "172.16.1.1",
             "172.16.1.2",
             "06:00:ac:10:01:02"
@@ -91,7 +91,7 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
         s.net(16383),
         Some(want(
             16383,
-            "fctap16383",
+            "fcac10fffc",
             "172.16.255.253",
             "172.16.255.254",
             "06:00:ac:10:ff:fe"
@@ -99,6 +99,9 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
     );
     assert_eq!(s.net(16384), None);
     assert_eq!(subnet("10.0.0.0/30").net(1), None);
+    // The tap is named for its /30, so the same slot in another subnet, as a
+    // test root might use, is another tap.
+    assert_eq!(subnet("10.254.0.0/16").net(1).unwrap().tap, "fc0afe0004");
 }
 
 #[test]
@@ -177,18 +180,20 @@ fn a_tap_replaces_a_stale_one_comes_up_and_goes_when_dropped() {
     let (ip_cmd, log) = fake_ip(dir.path());
     let net = DEFAULT_SUBNET.net(1).unwrap();
     let tap = Tap::add_with(&ip_cmd, &net).unwrap();
-    assert_eq!(tap.name(), "fctap1");
+    assert_eq!(tap.name(), "fcac100004");
+    // `tuntap del`, not `link del`: it won't remove a tap something holds
+    // open, or anything that isn't a tap.
     assert_eq!(
         lines(&log),
         [
-            "link del dev fctap1",
-            "tuntap add dev fctap1 mode tap",
-            "addr add 172.16.0.5/30 dev fctap1",
-            "link set dev fctap1 up",
+            "tuntap del dev fcac100004 mode tap",
+            "tuntap add dev fcac100004 mode tap",
+            "addr add 172.16.0.5/30 dev fcac100004",
+            "link set dev fcac100004 up",
         ]
     );
     drop(tap);
-    assert_eq!(lines(&log).last().unwrap(), "link del dev fctap1");
+    assert_eq!(lines(&log).last().unwrap(), "link del dev fcac100004");
     assert_eq!(lines(&log).len(), 5);
 }
 
@@ -202,9 +207,12 @@ fn a_tap_that_fails_partway_is_removed_and_says_why() {
     let err = Tap::add_with(&ip_cmd, &net).unwrap_err();
     let msg = err.to_string();
     assert!(matches!(err, Error::Command { .. }), "{err:?}");
-    assert!(msg.contains("addr add 172.16.0.1/30 dev fctap0"), "{msg}");
+    assert!(
+        msg.contains("addr add 172.16.0.1/30 dev fcac100000"),
+        "{msg}"
+    );
     assert!(msg.contains("Operation not permitted"), "{msg}");
-    assert_eq!(lines(&log).last().unwrap(), "link del dev fctap0");
+    assert_eq!(lines(&log).last().unwrap(), "link del dev fcac100000");
 
     // No tap made at all: nothing to remove.
     fs::write(dir.path().join("fail"), "tuntap add").unwrap();
@@ -212,12 +220,16 @@ fn a_tap_that_fails_partway_is_removed_and_says_why() {
     Tap::add_with(&ip_cmd, &net).unwrap_err();
     assert_eq!(
         lines(&log),
-        ["link del dev fctap0", "tuntap add dev fctap0 mode tap"]
+        [
+            "tuntap del dev fcac100000 mode tap",
+            "tuntap add dev fcac100000 mode tap"
+        ]
     );
 }
 
 #[test]
 fn a_missing_ip_is_an_error_not_a_panic() {
+    let _turn = FAKE_IP.lock().unwrap();
     let net = DEFAULT_SUBNET.net(0).unwrap();
     let err = Tap::add_with(Path::new("/nonexistent/ip"), &net).unwrap_err();
     assert!(err.to_string().contains("/nonexistent/ip"), "{err}");
@@ -227,7 +239,7 @@ fn a_missing_ip_is_an_error_not_a_panic() {
 #[test]
 #[ignore = "needs CAP_NET_ADMIN and iproute2"]
 fn a_real_tap_comes_up_with_the_gateway_address_and_goes() {
-    // A subnet and slot no real VM uses.
+    // A subnet no real VM uses, so a tap no real VM has.
     let net = subnet("10.254.0.0/16").net(16000).unwrap();
     let sys = Path::new("/sys/class/net").join(&net.tap);
     let tap = Tap::add_with(Path::new("ip"), &net).unwrap();
@@ -285,7 +297,7 @@ mod props {
             prop_assert_eq!(gw & 3, 1);
             prop_assert_eq!(addr, gw + 1);
             prop_assert_eq!((gw - base) / 4, slot);
-            prop_assert!(net.tap.len() <= 15, "{}", net.tap);
+            prop_assert_eq!(net.tap.len(), 10, "{}", net.tap);
             prop_assert_eq!(s.net(s.slots()), None);
         }
     }

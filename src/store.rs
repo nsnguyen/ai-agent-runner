@@ -8,7 +8,8 @@
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/slots.lock                flock'd while a slot is picked
-//   <root>/subnet                    host config: the subnet slots carve up; 172.16.0.0/16 if absent
+//
+// The range slots carve up is the host's, in /etc/runner/net (host.rs).
 use crate::creds::{Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use rmcp::schemars;
@@ -36,7 +37,9 @@ pub enum Error {
     Busy(String),
     #[error("{0} has no earlier generation to go back to")]
     NothingToUndo(String),
-    #[error("no free address left in {0}: delete a VM, or widen <root>/subnet")]
+    #[error(
+        "no free address left in {0}: delete a VM, or rerun host/install.sh with a wider RUNNER_NET"
+    )]
     NoSlot(Subnet),
     #[error("{cmd}: {why}")]
     Command { cmd: String, why: String },
@@ -74,11 +77,22 @@ pub fn check_name(name: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    net_file: PathBuf,
 }
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Store { root: root.into() }
+        let net_file = PathBuf::from(crate::host::NET);
+        Store {
+            root: root.into(),
+            net_file,
+        }
+    }
+
+    /// Reads the address range from `path` in place of /etc/runner/net.
+    pub fn with_net_file(self, path: impl Into<PathBuf>) -> Self {
+        let net_file = path.into();
+        Store { net_file, ..self }
     }
 
     pub fn root(&self) -> &Path {
@@ -163,14 +177,15 @@ impl Store {
         })
     }
 
-    /// The subnet VM addresses come from. Changing it moves every VM's
-    /// address, but not its slot.
+    /// The subnet VM addresses come from: the host's range, or
+    /// 172.16.0.0/16 before host/install.sh has run. Changing it moves every
+    /// VM's address, but not its slot.
     pub fn subnet(&self) -> Result<Subnet> {
-        let path = self.root.join("subnet");
-        match fs::read_to_string(&path) {
+        let path = &self.net_file;
+        match fs::read_to_string(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DEFAULT_SUBNET),
-            Err(e) => Err(at(&path)(e)),
-            Ok(text) => text.trim().parse().map_err(|why| invalid(&path, why)),
+            Err(e) => Err(at(path)(e)),
+            Ok(text) => text.trim().parse().map_err(|why| invalid(path, why)),
         }
     }
 
@@ -204,19 +219,23 @@ impl Store {
         Ok(Lock(file))
     }
 
-    // A VM being deleted has let go of its slot.
+    // A VM being deleted has let go of its slot. A slot that can't be read
+    // fails the create: taking it as free could hand it out twice.
     fn taken_slots(&self) -> Result<HashSet<u32>> {
         let vms = self.vms();
         let mut taken = HashSet::new();
         for entry in fs::read_dir(&vms).map_err(at(&vms))? {
             let entry = entry.map_err(at(&vms))?;
             let name = entry.file_name();
-            if name.to_str().is_some_and(|n| n.starts_with(".del-")) {
+            let dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if !dir || name.to_str().is_some_and(|n| n.starts_with(".del-")) {
                 continue;
             }
-            // An unreadable slot fails its own VM's reads, not every create.
-            if let Ok(Some(slot)) = read_slot(&entry.path()) {
-                taken.insert(slot);
+            match read_slot(&entry.path()) {
+                Ok(slot) => taken.extend(slot),
+                // Gone since the listing: a create renamed or a delete.
+                Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(taken)
