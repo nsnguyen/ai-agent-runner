@@ -18,6 +18,8 @@
 // runner-guest and agent user, and so does
 // `a_session_outlives_a_dropped_connection`, for its tmux, and
 // `claude_keeps_running_after_a_detach`, for Claude Code.
+// `a_headless_run_edits_a_file_and_commits_it` needs all that too, and the
+// host's Claude Code token in /etc/credstore (docs/host.md, step 6).
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -337,6 +339,40 @@ fn claude_keeps_running_after_a_detach() {
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     assert_eq!(claude_sessions(), 1);
     assert_eq!(in_vm(pane), before);
+}
+
+// A real `claude -p` under the unit: the run boots the VM, Claude Code edits
+// a file and exits 0, and the VM shuts down, committing the file.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit, the base image and the host's token"]
+fn a_headless_run_edits_a_file_and_commits_it() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("run-test-{}", std::process::id());
+    let disk = env_path("RUNNER_TEST_DISK");
+    ok(runner(&root, &["import", &name, disk.to_str().unwrap()]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+
+    let prompt = "Create a file named hello.txt in the current directory holding \
+                  exactly the text hi, then stop.";
+    let id = ok(runner(&root, &["run", &name, prompt]));
+    assert_eq!(id.trim(), format!("{name}.1"));
+    // Returns once the run is over, its VM shut down and all.
+    let stream = ok(runner(&root, &["output", id.trim(), "--follow"]));
+    let rows = ok(runner(&root, &["runs", &name]));
+    assert!(rows.contains("  exited 0, committed  "), "{rows}{stream}");
+    assert!(stream.contains(r#""type":"result""#), "{stream}");
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.ends_with("  stopped\n"), "{status}");
+
+    // The next boot starts from the committed generation, file and all.
+    let hello = ok(runner(
+        &root,
+        &["exec", &name, "--", "cat", "/home/agent/work/hello.txt"],
+    ));
+    assert_eq!(hello.trim(), "hi");
 }
 
 // Booted by hand, so the token comes from this process's environment, the
