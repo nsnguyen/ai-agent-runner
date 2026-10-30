@@ -12,5 +12,6 @@ pub mod mcp;
 pub mod net;
 pub mod proto;
 pub mod result;
+pub mod sessions;
 pub mod store;
 pub mod systemd;

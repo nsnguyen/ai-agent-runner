@@ -4,6 +4,7 @@
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::proto::Request;
+use crate::sessions::{self, Pane, Session};
 use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -80,6 +81,34 @@ pub struct ExecArgs {
     stdin: Option<String>,
     /// Seconds before the command is killed. Defaults to 120; at most 86400.
     timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct SessionList {
+    sessions: Vec<Session>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SessionArgs {
+    /// The VM's name.
+    name: String,
+    /// The tmux session's name.
+    session: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct Killed {
+    killed: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReadArgs {
+    /// The VM's name.
+    name: String,
+    /// The tmux session's name.
+    session: String,
+    /// How many of the pane's last lines: 1 to 2000, default 100.
+    lines: Option<u32>,
 }
 
 // Named here, or clients see the SDK's own name.
@@ -227,6 +256,42 @@ impl Tools {
             exec::capture(conn, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
         })
         .await
+    }
+
+    #[tool(
+        description = "List the agent user's tmux sessions in a running VM: each one's name, the command its active pane runs, when it started, and whether a terminal is attached. A VM that isn't running has none, and isn't started to look."
+    )]
+    async fn list_sessions(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<SessionList>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        let listed = move || sessions::list(&store, &name, &user);
+        let Json(sessions) = blocking(listed).await?;
+        Ok(Json(SessionList { sessions }))
+    }
+
+    #[tool(
+        description = "Read the last `lines` (default 100, at most 2000) of a tmux session's active pane in a running VM, as plain text, reaching back into its history past the screen. Keeps at most the last 32 KiB, with truncated set if fewer lines fit."
+    )]
+    async fn read_session(
+        &self,
+        Parameters(args): Parameters<ReadArgs>,
+    ) -> Result<Json<Pane>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        let lines = args.lines.unwrap_or(sessions::DEFAULT_LINES);
+        blocking(move || sessions::read(&store, &args.name, &user, &args.session, lines)).await
+    }
+
+    #[tool(description = "End a tmux session in a running VM, and everything running in it.")]
+    async fn kill_session(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<Json<Killed>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        let session = args.session.clone();
+        blocking(move || sessions::kill(&store, &args.name, &user, &args.session)).await?;
+        Ok(Json(Killed { killed: session }))
     }
 
     #[tool(

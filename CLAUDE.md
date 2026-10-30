@@ -33,4 +33,5 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Look at a failed run's disk before the next commit. That commit's gc keeps undo history first, so the failed disk usually goes then.
 - Space used in `list`, and what `gc` says it frees, sum each disk's allocated blocks. A block reflinked into several disks (forks, generations) counts in each, so on XFS or btrfs the real figure can be far less.
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
+- The session tests run the real tmux, as the test's user and on that user's own tmux server, so install tmux first. Each test names its sessions apart and kills them after.
 - Making a tap needs CAP_NET_ADMIN and iproute2, so those tests are `#[ignore]`d too: `cargo test --test net --test boot -- --ignored`, as root (docs/host.md says how). Cloud sessions run as root; install iproute2 first.

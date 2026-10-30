@@ -120,8 +120,11 @@ fn lists_its_tools() {
             "delete_vm",
             "doctor",
             "exec",
+            "kill_session",
             "list_checkpoints",
+            "list_sessions",
             "list_vms",
+            "read_session",
             "restore_vm",
             "start_vm",
             "stop_vm",
@@ -416,4 +419,140 @@ fn exec_errors_are_tool_errors() {
     );
     assert_eq!(got["isError"], json!(true), "{got}");
     assert!(why(&got).contains("couldn't run no-such-command"), "{got}");
+}
+
+// Sessions share the test user's tmux server with other tests, so this one's
+// has a name of its own and goes when the test does.
+struct Tmux<'a> {
+    vm: &'a GuestVm,
+    name: String,
+}
+
+impl Drop for Tmux<'_> {
+    fn drop(&mut self) {
+        let target = format!("={}", self.name);
+        let mut s = self.vm.serve();
+        s.call(
+            99,
+            "exec",
+            json!({"name": "dev", "argv": ["tmux", "kill-session", "-t", target]}),
+        );
+    }
+}
+
+fn sessions_of(s: &mut Session, id: u64) -> Vec<Value> {
+    let got = s.call(id, "list_sessions", json!({"name": "dev"}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    got["structuredContent"]["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn sessions_are_listed_read_and_killed() {
+    let vm = guest_vm();
+    vm.sd.set_state("active");
+    let mut s = vm.serve();
+    let name = format!("mcp-{}", std::process::id());
+    let _tmux = Tmux {
+        vm: &vm,
+        name: name.clone(),
+    };
+    // 300 lines, more than the pane's 24 rows, then a wait.
+    let script = "seq 300; exec sleep 300";
+    let argv = json!([
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        script
+    ]);
+    let got = s.call(2, "exec", json!({"name": "dev", "argv": argv}));
+    assert_eq!(got["structuredContent"]["exit_code"], json!(0), "{got}");
+
+    let mut id = 3;
+    let ours = loop {
+        id += 1;
+        let all = sessions_of(&mut s, id);
+        let ours = all.into_iter().find(|v| v["name"] == json!(name)).unwrap();
+        if ours["command"] == json!("sleep") || id > 200 {
+            break ours;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(ours["command"], json!("sleep"), "{ours}");
+    assert_eq!(ours["attached"], json!(false), "{ours}");
+    assert!(ours["started"].as_str().unwrap().ends_with('Z'), "{ours}");
+
+    let read = |s: &mut Session, id: u64, args: Value| {
+        let got = s.call(id, "read_session", args);
+        assert_eq!(got["isError"], json!(false), "{got}");
+        got["structuredContent"].clone()
+    };
+    // The pane's command is the sleep a moment before tmux has drawn seq's end.
+    let last3 = json!({"name": "dev", "session": name, "lines": 3});
+    let want = json!({"text": "298\n299\n300\n", "truncated": false});
+    let mut got = read(&mut s, 300, last3.clone());
+    for id in 400..500 {
+        if got == want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        got = read(&mut s, id, last3.clone());
+    }
+    assert_eq!(got, want);
+    // 100 unless told, reaching back past the screen into tmux's history.
+    let got = read(&mut s, 301, json!({"name": "dev", "session": name}));
+    let want: String = (201..=300).map(|n| format!("{n}\n")).collect();
+    assert_eq!(got["text"], json!(want));
+
+    let got = s.call(302, "kill_session", json!({"name": "dev", "session": name}));
+    assert_eq!(got["structuredContent"], json!({"killed": name}), "{got}");
+    let left = sessions_of(&mut s, 303);
+    assert!(left.iter().all(|v| v["name"] != json!(name)), "{left:?}");
+}
+
+#[test]
+fn session_errors_are_tool_errors() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let why = |got: &Value| got["content"][0]["text"].as_str().unwrap().to_string();
+    // Stopped: no sessions, and nothing boots to look.
+    assert_eq!(sessions_of(&mut s, 2), Vec::<Value>::new());
+    let got = s.call(3, "read_session", json!({"name": "dev", "session": "work"}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert_eq!(why(&got), "no session work in dev");
+    let got = s.call(4, "kill_session", json!({"name": "dev", "session": "work"}));
+    assert_eq!(why(&got), "no session work in dev");
+    assert!(
+        vm.sd
+            .calls()
+            .iter()
+            .all(|c| !c.starts_with("systemctl start"))
+    );
+
+    vm.sd.set_state("active");
+    let missing = format!("mcp-none-{}", std::process::id());
+    let got = s.call(
+        5,
+        "kill_session",
+        json!({"name": "dev", "session": missing}),
+    );
+    assert_eq!(why(&got), format!("no session {missing} in dev"));
+    let got = s.call(6, "read_session", json!({"name": "dev", "session": "a:b"}));
+    assert!(why(&got).contains("isn't a session name"), "{got}");
+    for lines in [0, 2001] {
+        let args = json!({"name": "dev", "session": "work", "lines": lines});
+        let got = s.call(7, "read_session", args);
+        assert_eq!(got["isError"], json!(true), "{got}");
+        assert!(why(&got).contains("lines"), "{got}");
+    }
+    let got = s.call(8, "list_sessions", json!({"name": "nope"}));
+    assert_eq!(why(&got), "no VM named nope");
 }

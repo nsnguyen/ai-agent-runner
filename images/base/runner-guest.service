@@ -7,6 +7,10 @@ Documentation=https://github.com/nsnguyen/ai-agent-runner
 ExecStart=/usr/local/bin/runner-guest
 Restart=always
 RestartSec=1
+# Each user's tmux server, which sessions live on, is in this unit's cgroup.
+# A restart, or the OOM killer taking one command, mustn't end every session.
+KillMode=process
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
