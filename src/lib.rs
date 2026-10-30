@@ -2,4 +2,5 @@
 //! the KVM host and reached over SSH. docs/design.md says how it fits together.
 pub mod changes;
 pub mod mcp;
+pub mod result;
 pub mod store;
