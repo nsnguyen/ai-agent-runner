@@ -158,6 +158,7 @@ impl FakeFirecracker {
         script(
             &bin,
             r#"if [ "$1" = --version ]; then printf 'Firecracker %s\n\n' "$FAKE_FC_VERSION"; exit 0; fi
+grep '^CapAmb' /proc/$$/status > "$FAKE_FC/caps"
 printf '%s\n' "$@" > "$FAKE_FC/argv.tmp" && mv "$FAKE_FC/argv.tmp" "$FAKE_FC/argv"
 echo "fake console: Linux version 6.1"
 read -r code < "$FAKE_FC/exit"

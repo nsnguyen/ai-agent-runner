@@ -7,6 +7,7 @@ pub mod firecracker;
 pub mod guest;
 pub mod host;
 pub mod mcp;
+pub mod net;
 pub mod proto;
 pub mod store;
 pub mod systemd;

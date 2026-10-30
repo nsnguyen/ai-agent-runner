@@ -10,9 +10,14 @@ pub const NAT_UNIT: &str = "runner-nat.service";
 pub const NAT_TABLE: [&str; 2] = ["ip", "runner"];
 pub const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
+/// The VMs' address range, as host/install.sh writes it for its NAT rules.
+/// The runner carves each VM's /30 from the same file, so the two agree.
+pub const NET: &str = "/etc/runner/net";
+
 // By full path, because sshd gives the runner user a PATH without /usr/sbin.
 pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
 pub const NFT: &str = "/usr/sbin/nft";
+pub const IP: &str = "/usr/sbin/ip";
 
 const PIN: &str = include_str!("../host/firecracker.pin");
 

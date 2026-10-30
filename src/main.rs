@@ -102,6 +102,8 @@ enum Cmd {
         #[arg(long, conflicts_with = "creds")]
         none: bool,
     },
+    /// Print a VM's address, which stays the same for as long as the VM exists.
+    Ip { name: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
@@ -112,6 +114,8 @@ enum Cmd {
         name: String,
         #[arg(long, env = "RUNNER_FIRECRACKER", default_value = "firecracker")]
         firecracker: PathBuf,
+        #[arg(long, env = "RUNNER_IP", default_value = runner::host::IP)]
+        ip: PathBuf,
     },
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
@@ -173,6 +177,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         }
         Cmd::Undo { name } => show(&store.undo(&name)?),
         Cmd::Delete { name } => println!("deleted {}", line(&store.delete(&name)?)),
+        Cmd::Ip { name } => println!("{}", store.net(&name)?.address),
         Cmd::Unit { user } => {
             let exe = std::env::current_exe()?;
             let root = std::path::absolute(root)?;
@@ -212,7 +217,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         }
         Cmd::Restore { name, id } => show(&store.restore(&name, id)?),
         Cmd::Mcp => return Ok(serve(store)),
-        Cmd::Boot { name, firecracker } => runner::boot::boot(&store, &name, &firecracker)?,
+        Cmd::Boot {
+            name,
+            firecracker,
+            ip,
+        } => runner::boot::boot(&store, &name, &firecracker, &ip)?,
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
     }
     Ok(ExitCode::SUCCESS)

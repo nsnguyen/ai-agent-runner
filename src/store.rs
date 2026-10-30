@@ -8,13 +8,19 @@
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
+//   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
+//   <root>/slots.lock                flock'd while a slot is picked
+//
+// The range slots carve up is the host's, in /etc/runner/net (host.rs).
 use crate::creds::{Cred, DEFAULT};
+use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -47,6 +53,12 @@ pub enum Error {
     NoCheckpoint(String, u64),
     #[error("{0}")]
     BadConfig(String),
+    #[error(
+        "no free address left in {0}: delete a VM, or rerun host/install.sh with a wider RUNNER_NET"
+    )]
+    NoSlot(Subnet),
+    #[error("{cmd}: {why}")]
+    Command { cmd: String, why: String },
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -194,13 +206,25 @@ pub fn check_name(name: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    net_file: PathBuf,
     keep: usize,
 }
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        Store { root, keep: KEEP }
+        let net_file = PathBuf::from(crate::host::NET);
+        Store {
+            root,
+            net_file,
+            keep: KEEP,
+        }
+    }
+
+    /// Reads the address range from `path` in place of /etc/runner/net.
+    pub fn with_net_file(self, path: impl Into<PathBuf>) -> Self {
+        let net_file = path.into();
+        Store { net_file, ..self }
     }
 
     /// Sets how many other generations gc keeps, at every commit and in `gc`.
@@ -266,13 +290,16 @@ impl Store {
         let made = fs::create_dir(&staged)
             .and_then(|()| fs::create_dir(staged.join("gens")))
             .map_err(at(&staged))
+            .and_then(|()| self.assign_slot(&staged).map(drop))
             .and_then(|()| clone(disk, &disk_of(&staged, 0)))
             .and_then(|()| write_config(&staged, config))
             .and_then(|()| write_note(&staged, 0, &Note::auto(why)))
             .and_then(|()| write_history(&staged, &[0]))
             // rename won't replace a directory with anything in it, so a
-            // create that raced this one keeps its VM.
+            // create that raced this one keeps its VM. Under the slots lock,
+            // or a slot scan could miss this VM between its two names.
             .and_then(|()| {
+                let _slots = self.lock_slots()?;
                 fs::rename(&staged, &dir).map_err(|e| match e.kind() {
                     io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists => {
                         Error::Exists(name.to_string())
@@ -286,6 +313,81 @@ impl Store {
         }
         made?;
         read_vm(name, &dir)
+    }
+
+    /// The VM's tap and addresses, from its slot.
+    pub fn net(&self, name: &str) -> Result<Net> {
+        let dir = self.existing(name)?;
+        let slot = match read_slot(&dir)? {
+            Some(slot) => slot,
+            None => self.assign_slot(&dir)?,
+        };
+        let subnet = self.subnet()?;
+        subnet.net(slot).ok_or_else(|| {
+            let why = format!("slot {slot} is past the end of {subnet}");
+            invalid(&dir.join("slot"), why)
+        })
+    }
+
+    /// The subnet VM addresses come from: the host's range, or
+    /// 172.16.0.0/16 before host/install.sh has run. Changing it moves every
+    /// VM's address, but not its slot.
+    pub fn subnet(&self) -> Result<Subnet> {
+        let path = &self.net_file;
+        match fs::read_to_string(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DEFAULT_SUBNET),
+            Err(e) => Err(at(path)(e)),
+            Ok(text) => text.trim().parse().map_err(|why| invalid(path, why)),
+        }
+    }
+
+    // The lowest slot no other VM holds, counting creates in flight, picked
+    // under a lock so two creates can't take the same one. A VM keeps the slot
+    // it has; one made before slots existed gets one here.
+    fn assign_slot(&self, dir: &Path) -> Result<u32> {
+        let _slots = self.lock_slots()?;
+        if let Some(slot) = read_slot(dir)? {
+            return Ok(slot);
+        }
+        let subnet = self.subnet()?;
+        let taken = self.taken_slots()?;
+        let slot = (0..subnet.slots())
+            .find(|s| !taken.contains(s))
+            .ok_or(Error::NoSlot(subnet))?;
+        write_aside(dir, "slot", &format!("{slot}\n"))?;
+        Ok(slot)
+    }
+
+    // Held while slots are picked and while a new VM moves into place.
+    fn lock_slots(&self) -> Result<File> {
+        let path = self.root.join("slots.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(at(&path))?;
+        file.lock().map_err(at(&path))?;
+        Ok(file)
+    }
+
+    // A VM being deleted has let go of its slot. A slot that can't be read
+    // fails the create: taking it as free could hand it out twice.
+    fn taken_slots(&self) -> Result<HashSet<u32>> {
+        let vms = self.vms();
+        let mut taken = HashSet::new();
+        for entry in fs::read_dir(&vms).map_err(at(&vms))? {
+            let entry = entry.map_err(at(&vms))?;
+            let name = entry.file_name();
+            // Following symlinks, as finding a VM does.
+            let dir = entry.path().is_dir();
+            if !dir || name.to_str().is_some_and(|n| n.starts_with(".del-")) {
+                continue;
+            }
+            // A VM deleted since the listing reads as no slot.
+            taken.extend(read_slot(&entry.path())?);
+        }
+        Ok(taken)
     }
 
     pub fn get(&self, name: &str) -> Result<Vm> {
@@ -657,6 +759,23 @@ fn open_lock(path: &Path, name: &str) -> Result<File> {
             io::ErrorKind::NotFound => Error::NoVm(name.to_string()),
             _ => at(path)(e),
         })
+}
+
+fn invalid(path: &Path, why: impl Into<String>) -> Error {
+    at(path)(io::Error::new(io::ErrorKind::InvalidData, why.into()))
+}
+
+fn read_slot(dir: &Path) -> Result<Option<u32>> {
+    let path = dir.join("slot");
+    match fs::read_to_string(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(at(&path)(e)),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|e: std::num::ParseIntError| invalid(&path, e.to_string())),
+    }
 }
 
 // No file means every default, which is what an imported VM has.

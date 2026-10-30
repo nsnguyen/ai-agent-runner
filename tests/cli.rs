@@ -484,3 +484,23 @@ fn doctor_prints_a_line_per_check_and_fails_on_any_failure() {
     let failed = lines.iter().any(|l| l.starts_with("fail"));
     assert_eq!(out.status.success(), !failed, "{stdout}");
 }
+
+#[test]
+fn ip_prints_a_vm_s_address() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    // The range is the host's (/etc/runner/net), so check the shape: base has
+    // the first /30's guest address and dev the next.
+    let addr = |name| {
+        let out = runner(dir.path(), &["ip", name]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        u32::from(shown.trim().parse::<std::net::Ipv4Addr>().unwrap())
+    };
+    let (base, dev) = (addr("base"), addr("dev"));
+    assert_eq!(base % 4, 2);
+    assert_eq!(dev, base + 4);
+    let out = runner(dir.path(), &["ip", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("no VM named nope"));
+}

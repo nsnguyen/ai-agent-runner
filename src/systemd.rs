@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
@@ -80,6 +81,9 @@ impl fmt::Display for State {
 pub struct VmStatus {
     #[serde(flatten)]
     pub vm: Vm,
+    /// Where the host reaches it, the same for as long as it exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<Ipv4Addr>,
     pub state: State,
 }
 
@@ -110,7 +114,10 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
         unit,
         state: active.to_string(),
     })?;
-    Ok(VmStatus { vm, state })
+    // A start or stop that worked shouldn't be reported as failed for want
+    // of an address.
+    let address = store.net(name).ok().map(|net| net.address);
+    Ok(VmStatus { vm, address, state })
 }
 
 /// The VM's journal: its serial console and the runner's own lines, on this
@@ -186,6 +193,12 @@ TimeoutStopSec={STOP_TIMEOUT_SECS}
 # The serial console.
 StandardOutput=journal
 StandardError=journal
+# For boot to add and remove the VM's tap, and nothing else. Boot clears it
+# before running Firecracker, which doesn't need it, and no setuid program
+# gets it back.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
 "
     ))
 }

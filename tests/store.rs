@@ -27,7 +27,9 @@ fn store() -> (Scratch, Store) {
     // A test that failed holding the turn shouldn't fail the rest.
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::new(dir.path().join("root"));
+    // The host's address range comes from a file in the temp directory, not
+    // the real /etc/runner/net, which these tests never create.
+    let store = Store::new(dir.path().join("root")).with_net_file(dir.path().join("net"));
     (Scratch { dir, _turn: turn }, store)
 }
 
@@ -925,4 +927,177 @@ fn credentials_need_a_vm_and_a_readable_allowlist() {
     store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
     fs::write(dir.path().join("root/vms/base/creds"), "claude\naws\n").unwrap();
     assert!(matches!(store.creds("base"), Err(Error::Io { .. })));
+}
+
+fn slot(store: &Store, name: &str) -> u32 {
+    store.net(name).unwrap().slot
+}
+
+#[test]
+fn every_vm_gets_its_own_slot_and_a_fork_does_not_share_its_source_s() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    store.fork("dev", "dev-2").unwrap();
+    assert_eq!(slot(&store, "base"), 0);
+    assert_eq!(slot(&store, "dev"), 1);
+    assert_eq!(slot(&store, "dev-2"), 2);
+    let net = store.net("dev").unwrap();
+    assert_eq!(
+        (net.tap.as_str(), net.address.to_string()),
+        ("fcac100004", "172.16.0.6".into())
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("root/vms/dev/slot")).unwrap(),
+        "1\n"
+    );
+    // A slot sticks: undo, runs and reading it again don't move it.
+    store.begin_run("dev").unwrap().commit().unwrap();
+    store.undo("dev").unwrap();
+    assert_eq!(slot(&store, "dev"), 1);
+}
+
+#[test]
+fn delete_frees_a_slot_for_the_next_create() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    for name in ["a", "b", "c"] {
+        store.fork("base", name).unwrap();
+    }
+    store.delete("b").unwrap();
+    store.fork("base", "d").unwrap();
+    assert_eq!(slot(&store, "d"), 2);
+    store.fork("base", "e").unwrap();
+    assert_eq!(slot(&store, "e"), 4);
+}
+
+#[test]
+fn creates_at_once_never_share_a_slot() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    std::thread::scope(|s| {
+        for i in 0..8 {
+            let store = &store;
+            s.spawn(move || store.fork("base", &format!("vm-{i}")).unwrap());
+        }
+    });
+    let mut slots: Vec<u32> = (0..8).map(|i| slot(&store, &format!("vm-{i}"))).collect();
+    slots.sort();
+    assert_eq!(slots, (1..=8).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_create_in_flight_holds_its_slot() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    // A create still copying its disk, in this live process.
+    let staged = dir
+        .path()
+        .join(format!("root/vms/.new-dev-{}", std::process::id()));
+    fs::create_dir(&staged).unwrap();
+    fs::write(staged.join("slot"), "1\n").unwrap();
+    store.fork("base", "other").unwrap();
+    assert_eq!(slot(&store, "other"), 2);
+}
+
+#[test]
+fn the_subnet_is_host_config_and_a_full_one_refuses_a_create() {
+    let (dir, store) = store();
+    // As host/install.sh writes it.
+    fs::write(dir.path().join("net"), "10.9.0.0/29\n").unwrap();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    assert_eq!(store.net("dev").unwrap().address.to_string(), "10.9.0.6");
+    let err = store.fork("base", "more").unwrap_err();
+    assert!(matches!(err, Error::NoSlot(_)), "{err:?}");
+    assert!(err.to_string().contains("10.9.0.0/29"), "{err}");
+    // The refused create left nothing behind.
+    assert!(matches!(store.get("more"), Err(Error::NoVm(_))));
+    let vms: Vec<_> = fs::read_dir(dir.path().join("root/vms")).unwrap().collect();
+    assert_eq!(vms.len(), 2, "{vms:?}");
+
+    fs::write(dir.path().join("net"), "10.9.0.1/29\n").unwrap();
+    let err = store.net("dev").unwrap_err();
+    let net = dir.path().join("net");
+    assert!(err.to_string().contains(net.to_str().unwrap()), "{err}");
+    assert!(err.to_string().contains("10.9.0.0/29"), "{err}");
+}
+
+#[test]
+fn a_slot_that_can_t_be_read_stops_a_create_rather_than_be_reused() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    let bad = dir.path().join("root/vms/dev/slot");
+    fs::write(&bad, "one\n").unwrap();
+    let err = store.fork("base", "more").unwrap_err();
+    assert!(err.to_string().contains(bad.to_str().unwrap()), "{err}");
+    assert!(matches!(store.get("more"), Err(Error::NoVm(_))));
+    // A stray file among the VMs isn't a VM with a slot, and stops nothing.
+    fs::write(&bad, "1\n").unwrap();
+    fs::write(dir.path().join("root/vms/stray"), "").unwrap();
+    store.fork("base", "more").unwrap();
+    assert_eq!(slot(&store, "more"), 2);
+}
+
+#[test]
+fn a_vm_whose_directory_is_a_symlink_keeps_its_slot() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    let real = dir.path().join("dev-elsewhere");
+    let vm = dir.path().join("root/vms/dev");
+    fs::rename(&vm, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &vm).unwrap();
+    assert_eq!(slot(&store, "dev"), 1);
+    store.fork("base", "more").unwrap();
+    assert_eq!(slot(&store, "more"), 2);
+}
+
+#[test]
+fn a_vm_made_before_slots_existed_gets_one_when_asked() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.fork("base", "dev").unwrap();
+    fs::remove_file(dir.path().join("root/vms/base/slot")).unwrap();
+    assert_eq!(slot(&store, "base"), 0);
+    fs::remove_file(dir.path().join("root/vms/dev/slot")).unwrap();
+    fs::remove_file(dir.path().join("root/vms/base/slot")).unwrap();
+    assert_eq!(slot(&store, "dev"), 0);
+    assert_eq!(slot(&store, "base"), 1);
+    assert!(matches!(store.net("nope"), Err(Error::NoVm(_))));
+}
+
+mod slot_props {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        // However creates and deletes interleave, live VMs never share a slot,
+        // and a create takes the lowest one free.
+        #[test]
+        fn live_vms_never_share_a_slot(ops in proptest::collection::vec((any::<bool>(), 0u8..6), 1..16)) {
+            let (dir, store) = store();
+            let d = disk(dir.path(), b"rootfs");
+            let mut live: BTreeMap<String, u32> = BTreeMap::new();
+            for (create, i) in ops {
+                let name = format!("vm-{i}");
+                if create && !live.contains_key(&name) {
+                    store.import(&name, &d).unwrap();
+                    let got = slot(&store, &name);
+                    let lowest = (0..).find(|s| !live.values().any(|v| v == s)).unwrap();
+                    prop_assert_eq!(got, lowest);
+                    live.insert(name, got);
+                } else if !create && live.remove(&name).is_some() {
+                    store.delete(&name).unwrap();
+                }
+                for (name, s) in &live {
+                    prop_assert_eq!(slot(&store, name), *s);
+                }
+            }
+        }
+    }
 }

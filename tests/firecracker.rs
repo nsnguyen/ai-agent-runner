@@ -3,6 +3,7 @@ mod common;
 
 use common::{FakeApi, script};
 use runner::firecracker::{self, Api, BOOT_ARGS, Error, Guest};
+use runner::net::DEFAULT_SUBNET;
 use serde_json::json;
 use std::path::Path;
 
@@ -72,12 +73,16 @@ fn configure_then_start_is_the_whole_boot() {
     let sock = dir.path().join("api.sock");
     let fake = FakeApi::serve(&sock, |_| (204, None));
     let api = Api::new(&sock);
+    let net = DEFAULT_SUBNET.net(1).unwrap();
+    let ip_arg = "ip=172.16.0.6::172.16.0.5:255.255.255.252:dev:eth0:off:1.1.1.1";
     let guest = Guest {
         kernel: Path::new("/k/vmlinux"),
         disk: Path::new("/vms/dev/gens/1.ext4"),
         cpus: 4,
         mem_mib: 4096,
         vsock: Path::new("/vms/dev/vsock.sock"),
+        net: &net,
+        ip_arg,
     };
     api.configure(&guest).unwrap();
     api.start().unwrap();
@@ -88,7 +93,8 @@ fn configure_then_start_is_the_whole_boot() {
         [
             call(
                 "PUT /boot-source",
-                json!({"kernel_image_path": "/k/vmlinux", "boot_args": BOOT_ARGS})
+                json!({"kernel_image_path": "/k/vmlinux",
+                       "boot_args": format!("{BOOT_ARGS} {ip_arg}")})
             ),
             call(
                 "PUT /drives/rootfs",
@@ -102,6 +108,11 @@ fn configure_then_start_is_the_whole_boot() {
             call(
                 "PUT /vsock",
                 json!({"guest_cid": 3, "uds_path": "/vms/dev/vsock.sock"})
+            ),
+            call(
+                "PUT /network-interfaces/eth0",
+                json!({"iface_id": "eth0", "host_dev_name": "fcac100004",
+                       "guest_mac": "06:00:ac:10:00:06"})
             ),
             call("PUT /actions", json!({"action_type": "InstanceStart"})),
             call("PUT /actions", json!({"action_type": "SendCtrlAltDel"})),

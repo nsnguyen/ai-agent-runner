@@ -5,7 +5,9 @@
 //
 // The rootfs's init must be systemd or another that takes Ctrl-Alt-Del, with
 // a login prompt on the serial console.
-// `boot_and_halt_by_hand` needs Firecracker on PATH and RUNNER_TEST_KERNEL.
+// `boot_and_halt_by_hand` and `a_booted_vm_answers_at_its_address` need
+// Firecracker on PATH, RUNNER_TEST_KERNEL, and root (or CAP_NET_ADMIN) for
+// the VM's tap: run them with sudo -E.
 // `start_logs_and_stop_under_systemd` needs `runner unit` installed and the
 // host's kernel in place; it uses the unit's root, RUNNER_ROOT or
 // /var/lib/runner.
@@ -82,6 +84,61 @@ fn boot_and_halt_by_hand() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(ok(runner(root, &["list"])).starts_with("dev  gen 1  "));
+}
+
+// The guest's side (pinging its gateway, resolving a name, fetching a page)
+// waits for `runner exec`. From the host: the guest kernel took its address
+// and DNS from the boot argument, it answers there, and its tap goes with it.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, Firecracker, a kernel, a rootfs and root"]
+fn a_booted_vm_answers_at_its_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    ok(runner(
+        root,
+        &[
+            "import",
+            "dev",
+            env_path("RUNNER_TEST_DISK").to_str().unwrap(),
+        ],
+    ));
+    std::fs::create_dir_all(root.join("kernel")).unwrap();
+    std::fs::copy(env_path("RUNNER_TEST_KERNEL"), root.join("kernel/vmlinux")).unwrap();
+    let address = ok(runner(root, &["ip", "dev"])).trim().to_string();
+    // Named for its /30, which starts two below the guest's address.
+    let ip: std::net::Ipv4Addr = address.parse().unwrap();
+    let tap = Path::new("/sys/class/net").join(format!("fc{:08x}", u32::from(ip) - 2));
+
+    let console = root.join("console.log");
+    let boot = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", root)
+        .args(["boot", "dev"])
+        .stdout(std::fs::File::create(&console).unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let read = || std::fs::read_to_string(&console).unwrap_or_default();
+    eventually("a login prompt", || read().contains("login:"));
+    let tap_up = tap.exists();
+    let pinged = Command::new("ping")
+        .args(["-c", "1", "-W", "5", &address])
+        .output()
+        .unwrap();
+    ok(runner(root, &["halt", "dev"]));
+    let out = boot.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The kernel prints what its ip= argument set: address, gateway, DNS.
+    let log = read();
+    assert!(log.contains("IP-Config: Complete"), "no IP-Config:\n{log}");
+    assert!(log.contains(&format!("ipaddr={address},")), "{log}");
+    assert!(tap_up, "no {} while the VM ran", tap.display());
+    assert!(pinged.status.success(), "{address} didn't answer a ping");
+    assert!(!tap.exists(), "{} left behind", tap.display());
 }
 
 #[test]
