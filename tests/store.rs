@@ -2,12 +2,32 @@
 use runner::store::{Checkpoint, Error, Store, Vm, check_name};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
-fn store() -> (TempDir, Store) {
+// An flock belongs to the open file, and a child that another test's thread
+// forks to run `cp` shares it until it execs, so a lock a test just dropped
+// can still look held. The runner does store work on one thread, so the tests
+// take turns, as it does.
+static TURN: Mutex<()> = Mutex::new(());
+
+struct Scratch {
+    dir: TempDir,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn store() -> (Scratch, Store) {
+    // A test that failed holding the turn shouldn't fail the rest.
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path().join("root"));
-    (dir, store)
+    (Scratch { dir, _turn: turn }, store)
 }
 
 fn disk(dir: &Path, bytes: &[u8]) -> PathBuf {
@@ -326,7 +346,7 @@ fn a_checkpoint_is_a_frozen_copy_with_its_comment() {
     store.import("dev", &disk(dir.path(), b"v0")).unwrap();
     let c = store.checkpoint("dev", Some("before upgrade")).unwrap();
     assert_eq!(
-        summary(&[c.clone()]),
+        summary(std::slice::from_ref(&c)),
         [(1, false, Some("before upgrade"), false)]
     );
     assert_eq!(c.bytes, 2);
