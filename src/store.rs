@@ -12,7 +12,8 @@
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/<name>/rollback       a run's ask that its boot not commit, naming the run
-//   <root>/vms/<name>/runs/          its headless runs: their streams and how each ended (runs.rs)
+//   <root>/vms/<name>/booted         the generations of its latest boot: the one it cloned, and its own
+//   <root>/vms/<name>/runs/          its headless runs: their streams, how each ended, and its result (runs.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
@@ -462,6 +463,25 @@ impl Store {
         write_aside(&self.existing(name)?, ROLLBACK, &format!("{by}\n"))
     }
 
+    /// The generations of the VM's latest boot, as begin_run noted them, for
+    /// a headless run in another process to know which disk it ran on. None
+    /// if the VM never booted.
+    pub fn booted(&self, name: &str) -> Result<Option<Booted>> {
+        let path = self.existing(name)?.join(BOOTED);
+        let text = match fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r.map_err(at(&path))?,
+        };
+        let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
+        Ok(Some(booted))
+    }
+
+    /// The disk of one of the VM's generations, whether or not it's still
+    /// there.
+    pub fn disk(&self, name: &str, generation: u64) -> Result<PathBuf> {
+        Ok(disk_of(&self.existing(name)?, generation))
+    }
+
     /// Takes back an ask_rollback, so a clean shutdown commits again.
     pub fn withdraw_rollback(&self, name: &str) -> Result<()> {
         remove_if_there(&self.existing(name)?.join(ROLLBACK))
@@ -501,6 +521,9 @@ impl Store {
         let generation = next_generation(&dir)?;
         let disk = disk_of(&dir, generation);
         clone(&disk_of(&dir, from), &disk)?;
+        let booted = Booted { from, generation };
+        let text = serde_json::to_string(&booted).map_err(|e| at(&dir.join(BOOTED))(e.into()))?;
+        write_aside(&dir, BOOTED, &text)?;
         let name = name.to_string();
         Ok(Run {
             from,
@@ -744,6 +767,16 @@ impl Run {
 
 const HANDED: &str = "handed";
 const ROLLBACK: &str = "rollback";
+const BOOTED: &str = "booted";
+
+/// A boot's generations (Store::booted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Booted {
+    /// The generation it cloned.
+    pub from: u64,
+    /// Its own: the one it runs, and commits if the VM shuts down cleanly.
+    pub generation: u64,
+}
 
 /// A boot's note of which credentials its guest took, for `runner status`,
 /// which runs in another process. Names only.

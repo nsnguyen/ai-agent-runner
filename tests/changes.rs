@@ -1,5 +1,8 @@
 // What a run changed, measured from two ext4 disks that the tests build with
 // mkfs.ext4 -d and edit with debugfs: no root, no mounts, no KVM.
+mod common;
+
+use common::{debugfs, image, tree};
 use runner::changes::{self, Change, Changes, Error, Kind};
 use runner::store::Store;
 use std::ffi::OsStr;
@@ -9,45 +12,6 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
-
-// A directory tree from (path, contents) pairs, parents made as needed.
-fn tree(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
-    fs::create_dir(dir).unwrap();
-    for (path, text) in files {
-        let path = dir.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    }
-    dir.to_path_buf()
-}
-
-fn ok(cmd: &mut Command) {
-    let out = cmd
-        .output()
-        .expect("e2fsprogs (mkfs.ext4, debugfs) is installed");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{cmd:?}: {err}");
-}
-
-// An ext4 disk holding a copy of `tree`, the way images/base builds one.
-fn image(tree: &Path) -> PathBuf {
-    let disk = tree.with_extension("ext4");
-    ok(Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .args([tree, &disk])
-        .arg("16M"));
-    disk
-}
-
-// Edits a disk in place, as a run's guest would: one request per line.
-fn debugfs(disk: &Path, requests: &str) {
-    let script = disk.with_extension("debugfs");
-    fs::write(&script, requests).unwrap();
-    ok(Command::new("debugfs")
-        .arg("-w")
-        .arg("-f")
-        .args([&script, disk]));
-}
 
 fn change(path: &str, change: Kind) -> Change {
     let path = path.to_string();

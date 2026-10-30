@@ -222,6 +222,12 @@ enum Cmd {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Print a run's result, as JSON, once it has ended: its exit code and
+    /// duration, whether the disk generation it booted was committed or
+    /// rolled back, and the paths that changed on that disk, which the
+    /// runner reads from the disks itself; with what the agent says it did
+    /// kept apart, as untrusted.
+    Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
     /// booted rolls back and shuts down. Returns once the run has ended, or
     /// after two minutes.
@@ -435,6 +441,10 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             if follow {
                 eprintln!("runner: {} {}", run.id, runs::describe(&run));
             }
+        }
+        Cmd::Result { run } => {
+            let result = runs::result(&store, &run)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Cmd::Cancel { run } => println!("{}", run_row(&runs::cancel(&store, &run)?)),
         Cmd::Doctor => {

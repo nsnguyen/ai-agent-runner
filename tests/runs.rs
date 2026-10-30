@@ -1,9 +1,11 @@
-// Headless runs end to end: `runner run`, `runs`, `output` and `cancel`, with
-// systemctl faked, runner-guest on a Unix socket behind a fake of
-// Firecracker's vsock socket, and a fake `claude` that prints stream-json.
+// Headless runs end to end: `runner run`, `runs`, `output`, `cancel` and
+// `result`, with systemctl faked, runner-guest on a Unix socket behind a fake
+// of Firecracker's vsock socket, and a fake `claude` that prints stream-json.
 mod common;
 
-use common::{FakeApi, FakeSystemd, FakeVsock, Guest, me, script, text, wait_for};
+use common::{
+    FakeApi, FakeSystemd, FakeVsock, Guest, debugfs, image, me, script, text, tree, wait_for,
+};
 use proptest::prelude::*;
 use runner::runs::{self, Line};
 use runner::store::Store;
@@ -16,10 +18,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tempfile::TempDir;
 
-// A VM named dev, stopped or running as far as systemctl says, whose guest
-// is up either way, and a `claude` for it to run. The fake writes what it
-// was given into `ctl`, prints an init event, waits for `ctl/go`, then
-// prints `ctl/events` more (3 unless set) and exits with `ctl/exit` (0
+// A VM named dev on a small ext4 disk, stopped or running as far as
+// systemctl says, whose guest is up either way, and a `claude` for it to
+// run. The fake writes what it was given into `ctl`, prints an init event,
+// waits for `ctl/go`, then prints `ctl/events` more (3 unless set), a result
+// event saying `ctl/says` if there is one, and exits with `ctl/exit` (0
 // unless set).
 struct Vm {
     dir: TempDir,
@@ -33,8 +36,11 @@ struct Vm {
 
 fn vm(running: bool) -> Vm {
     let dir = tempfile::tempdir().unwrap();
-    let disk = dir.path().join("rootfs.ext4");
-    fs::write(&disk, b"rootfs").unwrap();
+    let files = [
+        ("home/agent/work/main.rs", "fn main() {}"),
+        ("home/agent/work/old.rs", "// unused"),
+    ];
+    let disk = image(&tree(&dir.path().join("rootfs"), &files));
     let store = Store::new(dir.path());
     store.import("dev", &disk).unwrap();
     let sd = FakeSystemd::new(dir.path());
@@ -64,6 +70,9 @@ while [ "$i" -le "$n" ]; do
   printf '"n":%d}}\n' "$i"
   i=$((i + 1))
 done
+if [ -e "$c/says" ]; then
+  printf '{{"type":"result","result":"%s"}}\n' "$(cat "$c/says")"
+fi
 echo 'a note on stderr' >&2
 exit "$(cat "$c/exit" 2>/dev/null || echo 0)"
 "#,
@@ -113,6 +122,16 @@ impl Vm {
         fs::write(self.ctl.join("events"), events.to_string()).unwrap();
         fs::write(self.ctl.join("exit"), exit.to_string()).unwrap();
         fs::write(self.ctl.join("go"), "").unwrap();
+    }
+
+    fn says(&self, text: &str) {
+        fs::write(self.ctl.join("says"), text).unwrap();
+    }
+
+    /// `runner result <id>`, parsed.
+    fn result(&self, id: &str) -> Value {
+        let out = self.ok(&["result", id]);
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
     }
 
     fn started(&self) -> bool {
@@ -335,6 +354,50 @@ fn exit_0_commits_the_generation_a_run_boots() {
     assert_eq!(vm.generation(), 1);
 }
 
+// What the runner measured on the disk, read from the generation the run
+// booted against the one it booted from, apart from what the agent says.
+#[test]
+fn a_run_s_result_has_what_it_changed_on_its_disk() {
+    let vm = vm(false);
+    let _boot = boot(&vm);
+    // What the run's guest does to the disk boot runs.
+    let disk = vm.dir.path().join("vms/dev/gens/1.ext4");
+    let new = vm.dir.path().join("new.rs");
+    fs::write(&new, "fn main() { println!(\"hi\") }").unwrap();
+    let write = |to: &str| format!("write {} /home/agent/work/{to}", new.display());
+    debugfs(&disk, "rm /home/agent/work/old.rs");
+    debugfs(&disk, "rm /home/agent/work/main.rs");
+    debugfs(&disk, &write("main.rs"));
+    debugfs(&disk, &write("new.rs"));
+
+    let id = vm.start("fix main.rs");
+    wait_for("claude to start", || vm.started());
+    vm.says("I only read main.rs.");
+    vm.go(2, 0);
+    vm.wait_until_ended(&id);
+    let result = vm.result(&id);
+    assert_eq!(result["exit_code"], json!(0), "{result}");
+    assert_eq!(result["outcome"], json!("committed"));
+    assert_eq!(result["from_generation"], json!(0));
+    assert_eq!(result["generation"], json!(1));
+    assert!(result["duration_ms"].is_u64(), "{result}");
+    assert_eq!(
+        result["changed"],
+        json!({
+            "paths": [
+                {"path": "/home/agent/work/main.rs", "change": "modified"},
+                {"path": "/home/agent/work/new.rs", "change": "added"},
+                {"path": "/home/agent/work/old.rs", "change": "deleted"}
+            ],
+            "more": 0
+        })
+    );
+    assert_eq!(
+        result["agent_says"],
+        json!({"untrusted": true, "text": "I only read main.rs.", "truncated": false})
+    );
+}
+
 #[test]
 fn a_non_zero_exit_rolls_back_what_the_run_booted() {
     let vm = vm(false);
@@ -346,8 +409,34 @@ fn a_non_zero_exit_rolls_back_what_the_run_booted() {
     assert!(row.contains("  exited 3, rolled back  "), "{row}");
     assert_eq!(boot.asked().as_deref(), Some("run dev.1"));
     assert_eq!(vm.generation(), 0);
-    // The run's disk stays for a look.
-    assert!(vm.dir.path().join("vms/dev/gens/1.ext4").is_file());
+    // The run's disk stays for a look, and its result says which it is.
+    let disk = vm.dir.path().join("vms/dev/gens/1.ext4");
+    assert!(disk.is_file());
+    let result = vm.result(&id);
+    assert_eq!(result["exit_code"], json!(3), "{result}");
+    assert_eq!(result["outcome"], json!("rolled_back"));
+    assert_eq!(result["from_generation"], json!(0));
+    assert_eq!(result["generation"], json!(1));
+    assert_eq!(result["changed"], json!({"paths": [], "more": 0}));
+}
+
+// A running VM's disk has nothing from before the run to measure against.
+#[test]
+fn a_joined_run_s_result_measures_no_disk() {
+    let vm = vm(true);
+    let id = vm.start("look around");
+    wait_for("claude to start", || vm.started());
+    vm.says("Done.");
+    vm.go(1, 0);
+    vm.wait_until_ended(&id);
+    let result = vm.result(&id);
+    assert_eq!(result["exit_code"], json!(0), "{result}");
+    assert_eq!(result["outcome"], json!(null));
+    assert_eq!(result["from_generation"], json!(null));
+    assert_eq!(result["generation"], json!(null));
+    let error = result["changed"]["error"].as_str().unwrap();
+    assert!(error.contains("joined dev running"), "{error}");
+    assert_eq!(result["agent_says"]["text"], json!("Done."));
 }
 
 // As `runner stop`, a host reboot, or the agent's own `sudo reboot` would.
@@ -378,6 +467,10 @@ fn cancel_ends_the_run_and_rolls_back_what_it_booted() {
     assert!(row.contains("  cancelled, rolled back  "), "{row}");
     assert_eq!(boot.asked().as_deref(), Some("run dev.1"));
     assert_eq!(vm.generation(), 0);
+    let result = vm.result(&id);
+    assert_eq!(result["exit_code"], json!(null), "{result}");
+    assert_eq!(result["outcome"], json!("rolled_back"));
+    assert_eq!(result["agent_says"]["text"], json!(null));
     // It's over, so there's nothing to cancel.
     let again = vm.runner(&["cancel", &id]).output().unwrap();
     assert!(!again.status.success());
@@ -392,6 +485,13 @@ fn a_second_run_on_a_busy_vm_is_refused() {
     let vm = vm(true);
     let id = vm.start("first");
     wait_for("claude to start", || vm.started());
+
+    let result = vm.runner(&["result", &id]).output().unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        text(&result.stderr),
+        "runner: dev.1 is still running: its result comes once it ends\n"
+    );
 
     let second = vm.runner(&["run", "dev", "second"]).output().unwrap();
     assert!(!second.status.success());
@@ -421,6 +521,13 @@ fn a_run_whose_driver_died_is_lost() {
     let pid = driver(vm.dir.path(), "1").expect("no process drives dev.1");
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
     wait_for("dev.1 to be lost", || vm.row(&id).contains("  lost: "));
+    let result = vm.runner(&["result", &id]).output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        text(&result.stderr).starts_with("runner: dev.1 has no result: lost: "),
+        "{}",
+        text(&result.stderr)
+    );
     let log = vm.dir.path().join("vms/dev/runs/1/log");
     let row = vm.row(&id);
     assert!(
@@ -454,6 +561,7 @@ fn unknown_runs_and_bad_ids_are_named() {
         text(&out.stderr)
     };
     assert_eq!(fails(&["output", "dev.9"]), "runner: no run dev.9\n");
+    assert_eq!(fails(&["result", "dev.9"]), "runner: no run dev.9\n");
     assert_eq!(fails(&["cancel", "nope.1"]), "runner: no VM named nope\n");
     assert_eq!(
         fails(&["output", "dev"]),
@@ -610,8 +718,12 @@ fn mcp_runs_an_agent_and_reads_it_by_cursor() {
         if out["run"]["state"] != json!("running") && out["more"] == json!(false) {
             assert_eq!(out["run"]["exit_code"], json!(0));
             assert_eq!(out["run"]["stderr"], json!("a note on stderr\n"));
+            assert_eq!(out["result"]["exit_code"], json!(0), "{out}");
+            assert_eq!(out["result"]["agent_says"]["untrusted"], json!(true));
             break;
         }
+        // Only the reply that reaches the end of an ended run has it.
+        assert_eq!(out.get("result"), None, "{out}");
         assert!(id < 200, "run_output never reached the end");
     }
     assert_eq!(events.len(), 41);

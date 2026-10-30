@@ -1,6 +1,6 @@
 // Stand-ins for what the host provides: Firecracker's API socket, a
-// `firecracker` binary, and systemctl and journalctl on PATH. Each test file
-// uses its own share of them.
+// `firecracker` binary, systemctl and journalctl on PATH, and ext4 disks
+// built with e2fsprogs. Each test file uses its own share of them.
 #![allow(dead_code)]
 
 use serde_json::Value;
@@ -437,4 +437,43 @@ impl Pty {
         use nix::sys::termios::LocalFlags;
         !self.modes().local_flags.contains(LocalFlags::ICANON)
     }
+}
+
+// A directory tree from (path, contents) pairs, parents made as needed.
+pub fn tree(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+    fs::create_dir(dir).unwrap();
+    for (path, text) in files {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    dir.to_path_buf()
+}
+
+fn ok(cmd: &mut Command) {
+    let out = cmd
+        .output()
+        .expect("e2fsprogs (mkfs.ext4, debugfs) is installed");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{cmd:?}: {err}");
+}
+
+// An ext4 disk holding a copy of `tree`, the way images/base builds one.
+pub fn image(tree: &Path) -> PathBuf {
+    let disk = tree.with_extension("ext4");
+    ok(Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .args([tree, &disk])
+        .arg("16M"));
+    disk
+}
+
+// Edits a disk in place, as a run's guest would: one request per line.
+pub fn debugfs(disk: &Path, requests: &str) {
+    let script = disk.with_extension("debugfs");
+    fs::write(&script, requests).unwrap();
+    ok(Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .args([&script, disk]));
 }

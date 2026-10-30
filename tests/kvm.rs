@@ -364,6 +364,14 @@ fn a_headless_run_edits_a_file_and_commits_it() {
     let rows = ok(runner(&root, &["runs", &name]));
     assert!(rows.contains("  exited 0, committed  "), "{rows}{stream}");
     assert!(stream.contains(r#""type":"result""#), "{stream}");
+    // The runner read the file off the run's disk itself.
+    let result = ok(runner(&root, &["result", id.trim()]));
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["outcome"], "committed", "{result}");
+    let added = serde_json::json!({"path": "/home/agent/work/hello.txt", "change": "added"});
+    let paths = result["changed"]["paths"].as_array();
+    assert!(paths.is_some_and(|p| p.contains(&added)), "{result}");
+    assert_eq!(result["agent_says"]["untrusted"], true);
     let status = ok(runner(&root, &["status", &name]));
     assert!(status.ends_with("  stopped\n"), "{status}");
 

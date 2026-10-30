@@ -16,6 +16,7 @@
 //   <vm>/runs/<n>/stderr    claude's stderr
 //   <vm>/runs/<n>/log       what the driving process itself printed
 //   <vm>/runs/<n>/cancel    there once someone has asked to cancel the run
+//   <vm>/runs/<n>/result.json  what the runner measured once it was over
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
 // A run on a stopped VM boots it, which runs a new disk generation as every
@@ -26,11 +27,20 @@
 // the run, by a host reboot, `runner stop` or the agent itself, rolls back
 // too. A run on a running VM joins it as it is, and commits or rolls back
 // nothing.
+//
+// Once Claude Code is done, and a VM the run booted is down, the process
+// driving the run measures what the run changed on its disk (changes.rs), in
+// its own process, never `runner mcp`'s, since a disk a guest crafted could
+// still take it down. The result (result.rs) keeps that apart from what the
+// agent says it did, and is written just before the end, so a run that's
+// over has its result. Measuring reads the run's disk whole, so the run looks
+// to be running a while after Claude Code exits.
+use crate::changes;
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
 use crate::proto::{Exit, Request};
-use crate::result::Outcome;
-use crate::store::{self, Store};
+use crate::result::{AgentSays, Changed, Outcome, RunResult};
+use crate::store::{self, Booted, Store};
 use crate::systemd::{self, State as VmState};
 use chrono::{DateTime, SubsecRound, Utc};
 use rmcp::schemars;
@@ -77,6 +87,7 @@ const STREAM: &str = "stream";
 const STDERR: &str = "stderr";
 const LOG: &str = "log";
 const CANCEL: &str = "cancel";
+const RESULT: &str = "result.json";
 const END: &str = "end.json";
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +114,10 @@ pub enum Error {
     Gone(String),
     #[error("{id} has already ended: {how}")]
     Ended { id: String, how: String },
+    #[error("{0} is still running: its result comes once it ends")]
+    StillRunning(String),
+    #[error("{id} has no result: {how}")]
+    NoResult { id: String, how: String },
     #[error("{id}'s stream has only {len} bytes, so there's nothing at {from}")]
     PastEnd { id: String, len: u64, from: u64 },
     #[error("{what}: {source}")]
@@ -120,7 +135,7 @@ fn io_err(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 #[serde(rename_all = "lowercase")]
 pub enum State {
     /// Claude Code is running, or the VM is booting for it or shutting down
-    /// after it.
+    /// after it, or the runner is measuring what the run changed.
     Running,
     /// Claude Code exited: exit_code says how, or signal if one killed it.
     Exited,
@@ -334,11 +349,12 @@ fn spawn(exe: &Path, root: &Path, vm: &str, n: u64, lock: File, log: File) -> io
 /// Drives run `n` of `vm` to its end: `runner drive`, which `start` spawns
 /// with the VM's run lock as its stdin. `program` is claude.
 pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
+    let began = Instant::now();
     let run_id = id(vm, n);
     let dir = store.runs(vm)?.join(n.to_string());
     let ask: Ask = read_json(&dir.join(ASK))?.ok_or_else(|| Error::NoRun(run_id.clone()))?;
-    let mut from = None;
-    let ran = run_claude(store, vm, &run_id, &dir, &ask, program, &mut from);
+    let mut gens = Gens::default();
+    let ran = run_claude(store, vm, &run_id, &dir, &ask, program, &mut gens);
     let mut end = End::default();
     match ran {
         Ok(Streamed { exit, stopped }) => {
@@ -351,15 +367,18 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         }
         Err(e) => end.error = Some(e.to_string()),
     }
+    // A disk the VM may still be writing isn't measured.
+    let mut down = true;
     if ask.boots {
         let clean = end.exit_code == Some(0) && !end.cancelled && end.error.is_none();
         if let Err(e) = shut_down(store, vm, &run_id, clean) {
             eprintln!("runner: {e}");
             end.error.get_or_insert(e.to_string());
+            down = false;
         }
         // The generation the VM booted from stays current unless boot
         // committed the run's.
-        match from.map(|from| (from, store.get(vm))) {
+        match gens.from.map(|from| (from, store.get(vm))) {
             Some((from, Ok(after))) => {
                 let committed = after.generation != from;
                 end.outcome = Some(if committed {
@@ -382,11 +401,70 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         }
     }
     end.ended = now();
+    let took = began.elapsed();
+    let result = RunResult {
+        exit_code: end.exit_code,
+        duration_ms: took.as_millis().try_into().unwrap_or(u64::MAX),
+        outcome: end.outcome,
+        from_generation: gens.booted.map(|b| b.from).or(gens.from),
+        generation: gens.booted.map(|b| b.generation),
+        changed: changed(store, vm, &ask, &gens, down),
+        agent_says: agent_says(&dir.join(STREAM)),
+    };
+    write_json(&dir, RESULT, &result)?;
     write_json(&dir, END, &end)
 }
 
+// The generations of a run that boots its VM, as far as it got.
+#[derive(Default)]
+struct Gens {
+    // Current once the VM started, and so unless boot commits the run's.
+    from: Option<u64>,
+    // What boot noted once its guest answered: what it cloned, and its own.
+    booted: Option<Booted>,
+}
+
+// What the run changed on its disk, measured from the disks.
+fn changed(store: &Store, vm: &str, ask: &Ask, gens: &Gens, down: bool) -> Changed {
+    let unmeasured = |error: String| Changed::Unmeasured { error };
+    if !ask.boots {
+        return unmeasured(format!(
+            "the run joined {vm} running, so there's no disk from before it to measure against"
+        ));
+    }
+    let Some(booted) = gens.booted else {
+        return unmeasured(format!(
+            "the run never reached {vm}'s guest, so it has no disk of its own to measure"
+        ));
+    };
+    if !down {
+        return unmeasured(format!(
+            "{vm} may still be running on the run's disk, generation {}",
+            booted.generation
+        ));
+    }
+    let disks = store
+        .disk(vm, booted.from)
+        .and_then(|before| Ok((before, store.disk(vm, booted.generation)?)));
+    match disks {
+        Ok((before, after)) => {
+            changes::between(&before, &after, changes::CAP, changes::TIME).into()
+        }
+        Err(e) => unmeasured(e.to_string()),
+    }
+}
+
+// What the agent says it did, from its stream; nothing if that can't be read.
+fn agent_says(stream: &Path) -> AgentSays {
+    let read = File::open(stream).and_then(|f| AgentSays::from_stream(BufReader::new(f)));
+    read.unwrap_or_else(|e| {
+        eprintln!("runner: reading {}: {e}", stream.display());
+        AgentSays::new(None)
+    })
+}
+
 // Boots the VM if the run boots it, then runs claude there to its end, its
-// stdout into the stream. `from` is the generation a booted VM runs from.
+// stdout into the stream, noting a booted VM's generations in `gens`.
 fn run_claude(
     store: &Store,
     vm: &str,
@@ -394,7 +472,7 @@ fn run_claude(
     dir: &Path,
     ask: &Ask,
     program: &str,
-    from: &mut Option<u64>,
+    gens: &mut Gens,
 ) -> Result<Streamed> {
     let cancel = dir.join(CANCEL);
     let cancelled = || cancel.exists();
@@ -413,12 +491,14 @@ fn run_claude(
     }
     if ask.boots {
         systemd::start(store, vm)?;
-        *from = Some(store.get(vm)?.generation);
+        gens.from = Some(store.get(vm)?.generation);
     }
     // A guest that answers means boot is past begin_run, which drops any
-    // ask from before it, and holds the VM until it has shut down.
+    // ask from before it and notes this boot's generations, and holds the VM
+    // until it has shut down.
     let conn = exec::reach(store, vm)?;
     if ask.boots {
+        gens.booted = store.booted(vm)?;
         store.ask_rollback(vm, &format!("run {run}"))?;
     }
     if cancelled() {
@@ -504,6 +584,26 @@ pub fn list(store: &Store, vm: &str) -> Result<Vec<AgentRun>> {
 pub fn get(store: &Store, id: &str) -> Result<AgentRun> {
     let (vm, n) = parse_id(id)?;
     load(store, &vm, n)
+}
+
+/// What the runner measured of a run that's over, with what the agent says
+/// kept apart. Refused while the run goes on.
+pub fn result(store: &Store, id: &str) -> Result<RunResult> {
+    let (vm, n) = parse_id(id)?;
+    let run = load(store, &vm, n)?;
+    if run.state == State::Running {
+        return Err(Error::StillRunning(run.id));
+    }
+    let measured = read_result(store, &vm, n)?;
+    measured.ok_or_else(|| Error::NoResult {
+        how: describe(&run),
+        id: run.id,
+    })
+}
+
+// None for a run that's going, lost, or never got as far as running.
+fn read_result(store: &Store, vm: &str, n: u64) -> Result<Option<RunResult>> {
+    read_json(&store.runs(vm)?.join(n.to_string()).join(RESULT))
 }
 
 fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
@@ -638,6 +738,11 @@ pub struct Events {
     pub cursor: u64,
     /// True if more is there already, past what fit in this reply.
     pub more: bool,
+    /// Once the run is over, in the reply that reaches the end of its stream:
+    /// what the runner measured, with what the agent says kept apart, as
+    /// `runner result` gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
 }
 
 /// The run's events from byte `cursor` on, as many as fit in OUTPUT_CAP.
@@ -656,11 +761,18 @@ pub fn events(store: &Store, id: &str, cursor: u64, wait: Duration) -> Result<Ev
         let got = lines(&path, cursor, OUTPUT_CAP, ended)
             .map_err(io_err(format!("reading {}", path.display())))?;
         if !got.lines.is_empty() || ended || Instant::now() >= deadline {
+            let more = got.next < got.end;
+            let result = if ended && !more {
+                read_result(store, &vm, n)?
+            } else {
+                None
+            };
             return Ok(Events {
                 run,
                 events: got.lines.iter().filter_map(event).collect(),
                 cursor: got.next,
-                more: got.next < got.end,
+                more,
+                result,
             });
         }
         std::thread::sleep(POLL);

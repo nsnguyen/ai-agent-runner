@@ -108,6 +108,28 @@ prints the run's id, `dev.1`, at once, while Claude Code works on the prompt in 
 
 If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run joins it as it is, and nothing is committed or rolled back, so there's no undoing it until checkpoints work on running VMs (#22).
 
+`runner result dev.1` prints, once the run is over, what the runner measured: the exit code, how long it took, whether the disk generation it booted was committed or rolled back, and the paths that changed on that disk. The runner reads those from the disks itself, the generation the run booted against the one it booted from, and never asks the agent. Each directory added or deleted whole is one path with a count of what's under it, and past 200 paths the rest are only counted. What the agent says it did is kept apart, in `agent_says`, marked untrusted: check it against `changed`.
+
+```json
+{
+  "exit_code": 0,
+  "duration_ms": 81234,
+  "outcome": "committed",
+  "from_generation": 2,
+  "generation": 3,
+  "changed": {
+    "paths": [
+      {"path": "/home/agent/work/main.rs", "change": "modified"},
+      {"path": "/home/agent/work/target", "change": "added", "contains": 812}
+    ],
+    "more": 0
+  },
+  "agent_says": {"untrusted": true, "text": "Fixed the bug.", "truncated": false}
+}
+```
+
+The run reads both disks whole, so it goes on looking `running` for a while after Claude Code exits: about 45 seconds per 4.6 GB of disk (#61). Changes the boot itself makes, like the journal under `/var/log/journal`, are listed too (#62). A run that joined a running VM has no disk from before it, so its `changed` says why instead of listing paths, with a null `outcome` and generations.
+
 The stream is kept on the host, in `/var/lib/runner/vms/dev/runs/1/`, beside Claude Code's stderr, so it can be read with dev off, and goes when dev is deleted.
 
 ### MCP clients
@@ -137,6 +159,6 @@ Restart the app after editing its config.
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each cut at 32 KiB with a truncated flag. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
-`run_agent`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run.
+`run_agent`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
 
 `list_sessions`, `read_session` and `kill_session` do for an agent what `runner sessions`, `attach` and `kill` do for you. `read_session` returns the last `lines` (100 unless given, at most 2000) of a session's active pane as plain text, history included, cut at 32 KiB from the end.
