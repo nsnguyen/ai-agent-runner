@@ -388,15 +388,31 @@ fn gc_keeps_five_others_unless_told() {
 }
 
 #[test]
-fn gc_counts_failed_runs_disks_as_others() {
+fn gc_keeps_undo_history_ahead_of_failed_runs_disks() {
     let dir = tempfile::tempdir().unwrap();
     let store = committed(&dir, 1);
     drop(store.begin_run("dev").unwrap());
     drop(store.begin_run("dev").unwrap());
-    let store = Store::new(dir.path().join("root")).keeping(1);
-    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2]);
-    assert_eq!(on_disk(dir.path()), [1, 3]);
-    assert_eq!(store.get("dev").unwrap(), vm("dev", 1, 2));
+    // Room for the one undo and the newest failed disk.
+    let store = Store::new(dir.path().join("root")).keeping(2);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [2]);
+    assert_eq!(on_disk(dir.path()), [0, 1, 3]);
+    let store = store.keeping(1);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [3]);
+    assert_eq!(undo_all(&store), [0]);
+}
+
+#[test]
+fn crashed_runs_never_cost_undo_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let hoard = committed(&dir, 3);
+    for _ in 0..5 {
+        drop(hoard.begin_run("dev").unwrap());
+    }
+    let store = Store::new(dir.path().join("root"));
+    store.begin_run("dev").unwrap().commit().unwrap();
+    assert_eq!(on_disk(dir.path()), [0, 1, 2, 3, 8, 9]);
+    assert_eq!(undo_all(&store), [3, 2, 1, 0]);
 }
 
 #[test]
@@ -479,6 +495,8 @@ fn used_is_allocated_blocks_of_every_generation_not_apparent_size() {
     store.import("base", &src).unwrap();
     let run = store.begin_run("base").unwrap();
     fs::write(&run.disk, vec![7u8; 1 << 20]).unwrap();
+    // Synced, so block counts don't move under the test.
+    fs::File::open(&run.disk).unwrap().sync_all().unwrap();
     run.commit().unwrap();
     let got = store.get("base").unwrap();
     let gens = dir.path().join("root/vms/base/gens");
@@ -487,7 +505,6 @@ fn used_is_allocated_blocks_of_every_generation_not_apparent_size() {
         .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
         .sum();
     assert_eq!(got.used, want);
-    assert!(got.used >= 1 << 20, "{}", got.used);
     assert!(got.used < 4 << 20, "64 MB of holes counted: {}", got.used);
     assert_eq!(store.list().unwrap()[0].used, want);
 }

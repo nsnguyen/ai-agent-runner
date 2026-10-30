@@ -282,14 +282,21 @@ impl Run {
 fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> {
     let mut gens = history(dir)?;
     let current = current(dir)?;
-    let mut others: Vec<u64> = disks(dir)?
-        .into_iter()
-        .filter(|&g| g != current && !comment_of(dir, g).is_file())
-        .collect();
-    // Newest first, so the ones kept are the ones in front.
-    others.sort_unstable_by(|a, b| b.cmp(a));
+    let mut loose = disks(dir)?;
+    loose.retain(|&g| g != current && !comment_of(dir, g).is_file());
+    // In keeping order: undo's way back first, then the disks history doesn't
+    // name (failed and undone runs'), each newest first. A crash loop's
+    // disks can't push out what undo needs.
+    let mut others = Vec::new();
+    for &g in gens.iter().rev() {
+        if let Some(i) = loose.iter().position(|&l| l == g) {
+            others.push(loose.swap_remove(i));
+        }
+    }
+    loose.sort_unstable_by(|a, b| b.cmp(a));
+    others.extend(loose);
     let mut doomed = others.split_off(keep.min(others.len()));
-    doomed.reverse();
+    doomed.sort_unstable();
     let mut bytes = 0;
     for &g in &doomed {
         let disk = disk_of(dir, g);
