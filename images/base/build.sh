@@ -58,12 +58,15 @@ container=$("$engine" create "$tag")
 mkdir "$work/root"
 "$engine" export "$container" |
   tar -x -C "$work/root" --numeric-owner --xattrs --xattrs-include='*'
-# The engine leaves its own placeholders for these. The kernel's ip= argument
-# sets the address and hostname at boot, and writes DNS to /proc/net/pnp.
-rm -f "$work/root/.dockerenv"
-: > "$work/root/etc/hostname"
-printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' > "$work/root/etc/hosts"
-ln -sfn /proc/net/pnp "$work/root/etc/resolv.conf"
+# The engine leaves its own placeholders for these, with its own modes. The
+# kernel's ip= argument sets the address and hostname at boot, and writes DNS
+# to /proc/net/pnp.
+etc=$work/root/etc
+rm -f "$work/root/.dockerenv" "$etc/hostname" "$etc/hosts" "$etc/resolv.conf"
+install -m 0644 /dev/null "$etc/hostname"
+printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' > "$etc/hosts"
+chmod 0644 "$etc/hosts"
+ln -s /proc/net/pnp "$etc/resolv.conf"
 
 echo "== disk ($size)"
 truncate -s "$size" "$work/base.ext4"
