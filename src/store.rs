@@ -332,9 +332,10 @@ fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
 }
 
 // Written aside, synced and renamed, so even a host crash leaves either the old
-// file or the new.
+// file or the new. The temp name is per process, since `set_creds` runs
+// without the VM's lock and two of them must not share one.
 fn write_aside(dir: &Path, name: &str, text: &str) -> Result<()> {
-    let tmp = dir.join(format!("{name}.tmp"));
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
     let mut f = File::create(&tmp).map_err(at(&tmp))?;
     f.write_all(text.as_bytes())
         .and_then(|()| f.sync_all())

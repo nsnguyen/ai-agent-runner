@@ -37,8 +37,8 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 ## Credentials
 
 - The host holds `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`, and optionally `GH_TOKEN`. Each comes from a systemd credential of the same name (`LoadCredential=` in `firecracker@.service`), or else the environment, never from a file in the repo or a VM's directory.
-- Each VM has an allowlist of credential names in its directory: `claude` by default, `github` only when `runner creds <vm> claude github` adds it. A fork starts from the default. Setting it is CLI-only, so an MCP client can't grant itself a token.
-- After boot the host sends the allowed ones to `runner-guest` over vsock (`creds::Keyring`). The guest keeps them in memory, takes only those variables, and sets them in each session's and run's environment.
+- Each VM has an allowlist of credential names in its directory: `claude` by default, `github` only when `runner creds <vm> claude github` adds it. A fork starts from the default. No MCP tool sets it.
+- After boot the host sends the allowed ones to `runner-guest` over vsock (`creds::Keyring`). The guest keeps them in memory, takes only those variables, and sets exactly them in each session's and run's environment (`Keyring::apply`), removing any other credential variable.
 
 ## Assumptions (correct these)
 

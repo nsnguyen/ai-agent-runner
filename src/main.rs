@@ -67,20 +67,20 @@ fn main() -> ExitCode {
             };
         }
         Cmd::Creds { name, creds, none } => {
-            let set = if none || !creds.is_empty() {
+            let got = if none || !creds.is_empty() {
                 store.set_creds(&name, &creds)
             } else {
                 store.creds(&name)
             };
-            return match set {
+            return match got {
                 Ok(creds) => {
                     let names: Vec<_> = creds.iter().map(|c| c.name()).collect();
-                    let shown = if names.is_empty() {
+                    let list = if names.is_empty() {
                         "none".into()
                     } else {
                         names.join(" ")
                     };
-                    println!("{name}  creds {shown}");
+                    println!("{name}  creds {list}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
