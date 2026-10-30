@@ -111,3 +111,32 @@ fn creds_refuses_an_unknown_name() {
     let out = runner(dir.path(), &["creds", "base", "claude", "--none"]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn doctor_prints_a_line_per_check_and_fails_on_any_failure() {
+    let dir = with_base();
+    let out = runner(dir.path(), &["doctor"]);
+    let stdout = text(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|l| l.split_whitespace().nth(1).unwrap_or(""))
+        .collect();
+    let all = [
+        "kvm",
+        "firecracker",
+        "reflink",
+        "kernel",
+        "base",
+        "nat",
+        "unit",
+    ];
+    assert_eq!(names, all, "{stdout}");
+    for l in &lines {
+        let status = l.split_whitespace().next().unwrap();
+        assert!(["ok", "warn", "fail"].contains(&status), "{l}");
+    }
+    assert!(lines[4].starts_with("ok "), "{stdout}");
+    let failed = lines.iter().any(|l| l.starts_with("fail"));
+    assert_eq!(out.status.success(), !failed, "{stdout}");
+}

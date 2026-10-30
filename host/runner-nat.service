@@ -1,0 +1,18 @@
+# NAT from the VMs' range to the internet, and nowhere private, with the rules
+# host/install.sh writes to /etc/runner/nat.nft. It follows nftables.service,
+# whose start and reload flush the whole ruleset, ours included.
+[Unit]
+Description=runner: NAT for VMs
+After=nftables.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/runner/nat.nft
+ExecReload=/usr/sbin/nft -f /etc/runner/nat.nft
+ExecStop=/usr/sbin/nft delete table ip runner
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use runner::creds::Cred;
+use runner::doctor::{self, System};
 use runner::store::{BASE, Store, Vm};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,6 +44,8 @@ enum Cmd {
         #[arg(long, conflicts_with = "creds")]
         none: bool,
     },
+    /// Check this host can run VMs: one line per check, failing if any fails.
+    Doctor,
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp,
 }
@@ -90,6 +93,15 @@ fn main() -> ExitCode {
             };
         }
         Cmd::List => store.list(),
+        Cmd::Doctor => {
+            let report = doctor::check(&System, &store);
+            report.lines().for_each(|l| println!("{l}"));
+            return if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+        }
         Cmd::Mcp => return serve(store),
     };
     match shown {

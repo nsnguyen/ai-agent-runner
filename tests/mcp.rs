@@ -89,7 +89,10 @@ fn lists_its_tools() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["create_vm", "delete_vm", "list_vms", "undo_vm"]);
+    assert_eq!(
+        names,
+        ["create_vm", "delete_vm", "doctor", "list_vms", "undo_vm"]
+    );
 }
 
 #[test]
@@ -132,4 +135,32 @@ fn a_bad_call_is_a_tool_error_not_a_crash() {
     let listed = s.call(3, "list_vms", json!({}));
     assert_eq!(listed["structuredContent"], json!({"vms": []}));
     assert!(s.hang_up().success());
+}
+
+#[test]
+fn doctor_reports_every_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = start(dir.path());
+    let got = s.call(2, "doctor", json!({}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    let report = &got["structuredContent"];
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    let all = [
+        "kvm",
+        "firecracker",
+        "reflink",
+        "kernel",
+        "base",
+        "nat",
+        "unit",
+    ];
+    assert_eq!(names, all, "{report}");
+    // No base VM in an empty root, so at least that one fails.
+    assert_eq!(report["checks"][4]["status"], json!("fail"), "{report}");
+    assert_eq!(report["ok"], json!(false), "{report}");
 }
