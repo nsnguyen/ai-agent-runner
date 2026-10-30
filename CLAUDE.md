@@ -14,6 +14,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 
 ## Autonomy
 - Merging: only forge's review task merges, and only the build PRs it approves with every check passing, so issues that depend on each other build one after another. No other session merges, the builder included. The cloud has no KVM, so those PRs merge without a VM booted: at each milestone, run every `#[ignore]`d test on the KVM host (Commands and Sharp edges say how).
+- Builds: forge builds every open issue I opened, in dependency order. hold keeps one out.
 - Deploys: previews only.
 
 ## Stack
