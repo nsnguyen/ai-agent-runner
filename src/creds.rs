@@ -1,17 +1,12 @@
-// Credentials come in per boot and never land on a VM's disk (docs/design.md,
-// Guards), so no disk generation or fork holds a key.
-//
-// The host reads each one from a systemd credential (`LoadCredential=` in the
-// VM's unit puts a file in $CREDENTIALS_DIRECTORY) or else its own environment,
-// never from a file in the repo or a VM's directory. It keeps the ones the VM's
-// allowlist names and, after boot, sends them to `runner-guest` over vsock.
-// The guest holds them in memory and sets them in the environment of each
-// session and run it starts. Nothing here writes a value to a file or prints one.
+// Credentials reach a VM's memory per boot and never its disk: the host finds
+// them, the guest holds them for its sessions (docs/design.md, Credentials).
+// Nothing here writes a value to a file or prints one.
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 
 /// A credential a VM's allowlist can name.
@@ -59,7 +54,10 @@ impl FromStr for Cred {
         Cred::ALL
             .into_iter()
             .find(|c| c.name() == s)
-            .ok_or_else(|| format!("{s:?} isn't a credential: use claude or github"))
+            .ok_or_else(|| {
+                let names: Vec<_> = Cred::ALL.iter().map(|c| c.name()).collect();
+                format!("{s:?} isn't a credential: use {}", names.join(" or "))
+            })
     }
 }
 
@@ -87,33 +85,37 @@ pub struct Source {
 }
 
 impl Source {
+    /// A relative or empty `dir` is ignored: it would read the token from
+    /// wherever the runner happens to run, a repo checkout included.
     pub fn new(dir: Option<PathBuf>, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        let dir = dir.filter(|d| d.is_absolute());
         let env = env.into_iter().collect();
         Source { dir, env }
     }
 
     /// This process's: what systemd loaded for its unit, then its environment.
+    /// Only credential variables are read, one by one: `std::env::vars()`
+    /// panics on any variable that isn't UTF-8 and prints its value.
     pub fn from_process() -> Self {
         let dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
-        let known = |k: &String| Cred::of_var(k).is_some();
-        Source::new(dir, std::env::vars().filter(|(k, _)| known(k)))
+        let vars = Cred::ALL.iter().flat_map(|c| c.vars());
+        let env = vars.filter_map(|v| Some((v.to_string(), std::env::var(v).ok()?)));
+        Source::new(dir, env)
     }
 
     // Trimmed, since a token pasted into a file usually ends in a newline;
-    // blank counts as absent.
+    // blank counts as absent, in the directory and the environment alike.
     fn get(&self, var: &str) -> io::Result<Option<Secret>> {
+        let given = |v: &str| Some(v.trim().to_string()).filter(|v| !v.is_empty());
         let from_dir = match &self.dir {
             Some(dir) => match fs::read_to_string(dir.join(var)) {
-                Ok(v) => Some(v),
+                Ok(v) => given(&v),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(io::Error::new(e.kind(), format!("credential {var}: {e}"))),
             },
             None => None,
         };
-        let value = from_dir.or_else(|| self.env.get(var).cloned());
-        let value = value
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let value = from_dir.or_else(|| self.env.get(var).and_then(|v| given(v)));
         if value.as_ref().is_some_and(|v| v.contains('\0')) {
             return Err(bad(format!("credential {var} holds a NUL byte")));
         }
@@ -121,8 +123,9 @@ impl Source {
     }
 }
 
-// Past any real token, small enough that a bad length can't exhaust memory.
-const MAX_HANDOFF: u32 = 64 * 1024;
+/// The largest handoff body: past any real token, small enough that a bad
+/// length can't exhaust memory.
+pub const MAX_HANDOFF: u32 = 64 * 1024;
 
 /// Credentials in memory, each by the variable a session sees it as.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -151,9 +154,20 @@ impl Keyring {
         self.held.iter().map(|(c, _, _)| *c).collect()
     }
 
-    /// The variables to set in a session's environment, as `Command::envs` takes them.
+    /// The variables it holds and their values.
     pub fn vars(&self) -> impl Iterator<Item = (&str, &str)> {
         self.held.iter().map(|(_, k, v)| (*k, v.0.as_str()))
+    }
+
+    /// Sets a session's environment to exactly these credentials. Any other
+    /// credential variable is removed, so one the guest's own environment
+    /// holds can't slip past the allowlist. `Command`'s Debug output prints
+    /// these values: never log the command after this.
+    pub fn apply(&self, cmd: &mut Command) {
+        for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
+            cmd.env_remove(var);
+        }
+        cmd.envs(self.vars());
     }
 
     /// The host's half of the handoff: a big-endian u32 length, then
@@ -192,8 +206,9 @@ impl Keyring {
             let (var, value) = entry
                 .split_once('=')
                 .ok_or_else(|| bad("credential entry without =".into()))?;
-            let (cred, var) =
-                Cred::of_var(var).ok_or_else(|| bad(format!("{var:?} isn't a credential")))?;
+            // Not echoed: a sender that lost the name would log part of a value.
+            let (cred, var) = Cred::of_var(var)
+                .ok_or_else(|| bad("a handoff entry isn't a credential variable".into()))?;
             if value.is_empty() || held.iter().any(|(c, _, _)| *c == cred) {
                 return Err(bad(format!("{var} is empty or given twice")));
             }

@@ -1,10 +1,13 @@
 // Credentials from the host's source to a session's environment in the guest,
-// over a Unix socket in place of vsock: no KVM needed. Sessions run with a
+// over a Unix socket in place of vsock: no KVM needed. Sessions start from a
 // cleared environment, so a token this process happens to hold can't leak in.
 use proptest::prelude::*;
-use runner::creds::{Cred, DEFAULT, Keyring, Source};
+use runner::creds::{Cred, DEFAULT, Keyring, MAX_HANDOFF, Source};
+use runner::store::Store;
+use std::ffi::OsStr;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, ErrorKind};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
@@ -26,18 +29,21 @@ fn handed(source: &Source, allow: &[Cred]) -> Keyring {
     Keyring::receive(&mut guest).unwrap()
 }
 
-// A session the guest starts: `sh -c script` with the keyring's variables.
+// A session the guest starts: `sh -c script`, from a guest whose own
+// environment already holds stale credentials that `apply` must not pass on.
 fn session(keyring: &Keyring, dir: &Path, script: &str) -> String {
-    let out = Command::new("sh")
-        .args(["-c", script])
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", dir)
         .env("TMPDIR", dir)
-        .current_dir(dir)
-        .envs(keyring.vars())
-        .output()
-        .unwrap();
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "stale")
+        .env("ANTHROPIC_API_KEY", "stale")
+        .env("GH_TOKEN", "stale")
+        .current_dir(dir);
+    keyring.apply(&mut cmd);
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -75,13 +81,30 @@ fn a_session_has_the_claude_token_in_its_environment() {
     assert_eq!(seen, TOKEN);
 }
 
+// Every step short of a boot: the allowlist, gathering from systemd's
+// directory, the handoff and a session. Only the credentials directory,
+// which systemd keeps on a tmpfs outside the VM, may hold the token.
 #[test]
 fn the_guest_never_writes_a_credential_to_a_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let keyring = handed(&env(&[("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)]), DEFAULT);
-    session(&keyring, dir.path(), "echo work > out.txt; mkdir -p .cache");
+    let creds = tempfile::tempdir().unwrap();
+    fs::write(creds.path().join("CLAUDE_CODE_OAUTH_TOKEN"), TOKEN).unwrap();
+    let source = Source::new(Some(creds.path().to_path_buf()), []);
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path());
+    let disk = root.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    store.import("dev", &disk).unwrap();
+    let allow = store.set_creds("dev", DEFAULT).unwrap();
+
+    let keyring = handed(&source, &allow);
+    let seen = session(
+        &keyring,
+        root.path(),
+        "printf %s \"$CLAUDE_CODE_OAUTH_TOKEN\" | wc -c",
+    );
+    assert_eq!(seen.trim(), TOKEN.len().to_string());
     assert_eq!(
-        files_holding(dir.path(), TOKEN.as_bytes()),
+        files_holding(root.path(), TOKEN.as_bytes()),
         Vec::<String>::new()
     );
 }
@@ -126,6 +149,77 @@ fn a_systemd_credential_wins_over_the_environment() {
     let keyring = Keyring::gather(DEFAULT, &source).unwrap();
     let vars: Vec<_> = keyring.vars().collect();
     assert_eq!(vars, vec![("CLAUDE_CODE_OAUTH_TOKEN", "from-systemd")]);
+}
+
+// An empty or relative $CREDENTIALS_DIRECTORY would read the token from
+// wherever the runner happens to be, a repo checkout included.
+#[test]
+fn only_an_absolute_credentials_directory_counts() {
+    let planted = tempfile::tempdir().unwrap();
+    fs::write(planted.path().join("CLAUDE_CODE_OAUTH_TOKEN"), "planted").unwrap();
+    // The same directory, named relative to where the test runs.
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count() - 1);
+    let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+    assert_eq!(
+        fs::read_to_string(relative.join("CLAUDE_CODE_OAUTH_TOKEN")).unwrap(),
+        "planted"
+    );
+    let pairs = [(
+        "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "from-env".to_string(),
+    )];
+    let source = Source::new(Some(relative), pairs);
+    let keyring = Keyring::gather(DEFAULT, &source).unwrap();
+    assert_eq!(
+        keyring.vars().collect::<Vec<_>>(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN", "from-env")]
+    );
+}
+
+#[test]
+fn a_blank_systemd_credential_falls_through_to_the_environment() {
+    let creds = tempfile::tempdir().unwrap();
+    fs::write(creds.path().join("CLAUDE_CODE_OAUTH_TOKEN"), "\n").unwrap();
+    let pairs = [(
+        "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "from-env".to_string(),
+    )];
+    let source = Source::new(Some(creds.path().to_path_buf()), pairs);
+    let keyring = Keyring::gather(DEFAULT, &source).unwrap();
+    assert_eq!(
+        keyring.vars().collect::<Vec<_>>(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN", "from-env")]
+    );
+}
+
+// std::env::vars() panics on a variable that isn't UTF-8 and prints its
+// value. Run in a child test process, so the bad variable stays out of ours.
+#[test]
+fn from_process_survives_a_variable_that_isnt_utf8() {
+    if std::env::var_os("RUNNER_CREDS_CHILD").is_some() {
+        let keyring = Keyring::gather(&Cred::ALL, &Source::from_process()).unwrap();
+        assert_eq!(
+            keyring.vars().collect::<Vec<_>>(),
+            vec![("GH_TOKEN", "fine")]
+        );
+        return;
+    }
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "from_process_survives_a_variable_that_isnt_utf8"])
+        .env_clear()
+        .env("RUNNER_CREDS_CHILD", "1")
+        .env("ANTHROPIC_API_KEY", OsStr::from_bytes(b"bad-\xff-value"))
+        .env("UNRELATED", OsStr::from_bytes(b"also-\xff-bad"))
+        .env("GH_TOKEN", "fine")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(
+        !said.contains("-value") && !said.contains("also-"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -196,8 +290,10 @@ fn the_guest_takes_only_credential_variables() {
 
 #[test]
 fn an_oversized_or_truncated_handoff_is_refused() {
-    let huge = (1u32 << 20).to_be_bytes();
-    assert!(Keyring::receive(&mut Cursor::new(huge)).is_err());
+    let entry = format!("GH_TOKEN={}\0", "x".repeat(MAX_HANDOFF as usize - 9));
+    assert_eq!(entry.len(), MAX_HANDOFF as usize + 1);
+    let got = Keyring::receive(&mut Cursor::new(frame(entry.as_bytes())));
+    assert_eq!(got.unwrap_err().kind(), ErrorKind::InvalidData);
     let mut cut = frame(b"GH_TOKEN=ghp-x\0");
     cut.pop();
     assert!(Keyring::receive(&mut Cursor::new(cut)).is_err());
@@ -227,6 +323,30 @@ proptest! {
         // Every byte short of the whole frame is refused, never misread.
         for cut in 0..wire.len() {
             prop_assert!(Keyring::receive(&mut Cursor::new(&wire[..cut])).is_err());
+        }
+    }
+
+    // Framed with its true length, so the entry parser sees every body.
+    #[test]
+    fn receive_takes_only_well_formed_entries(parts in proptest::collection::vec(
+        prop_oneof![
+            Just(b"GH_TOKEN".to_vec()),
+            Just(b"CLAUDE_CODE_OAUTH_TOKEN".to_vec()),
+            Just(b"PATH".to_vec()),
+            Just(b"=".to_vec()),
+            Just(b"\0".to_vec()),
+            proptest::collection::vec(any::<u8>(), 0..6),
+        ],
+        0..12,
+    )) {
+        if let Ok(keyring) = Keyring::receive(&mut Cursor::new(frame(&parts.concat()))) {
+            let creds = keyring.creds();
+            let mut unique = creds.clone();
+            unique.dedup();
+            prop_assert_eq!(creds, unique);
+            for (var, value) in keyring.vars() {
+                prop_assert!(var != "PATH" && !value.is_empty() && !value.contains('\0'));
+            }
         }
     }
 
