@@ -186,11 +186,13 @@ pub fn render_unit(runner: &Path, root: &Path, user: &str) -> Result<String> {
         .collect();
     Ok(format!(
         "\
-# firecracker@.service, written by `runner unit`. Each instance is one VM:
-# `systemctl start firecracker@dev` boots dev. Write it again after moving
-# the runner binary or its root.
+# firecracker@.service, as `runner unit` writes it and host/install.sh
+# installs it. Each instance is one VM: `systemctl start firecracker@dev`
+# boots dev. Write it again after moving the runner binary or its root.
 [Unit]
 Description=Firecracker microVM %i
+# After the VMs' NAT, when both start at once.
+After=network.target runner-nat.service
 # Stopped before its disks' filesystem is unmounted, at host shutdown too.
 RequiresMountsFor={root}
 
@@ -205,7 +207,8 @@ SupplementaryGroups=kvm
 Environment=RUNNER_ROOT={root}
 # The credentials a VM may get, each from /etc/credstore/<name> on the host.
 # One that isn't there is skipped. Boot hands a VM's to its guest.
-{load}ExecStart={runner} boot %i
+{load}# %i, not %I: %I would unescape a VM name's dashes into slashes.
+ExecStart={runner} boot %i
 # Ctrl-Alt-Del, then wait for the guest to shut down. Past the timeout,
 # systemd kills the VM and its run isn't committed.
 ExecStop={runner} halt %i

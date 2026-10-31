@@ -1,26 +1,39 @@
-# One VM. `runner boot <vm>` runs Firecracker for it and holds the VM's lock
-# until Firecracker exits; `runner start` and `stop` drive it with systemctl.
-# host/install.sh installs this file, and `runner doctor` checks the installed
-# copy still matches it.
+# firecracker@.service, as `runner unit` writes it and host/install.sh
+# installs it. Each instance is one VM: `systemctl start firecracker@dev`
+# boots dev. Write it again after moving the runner binary or its root.
 [Unit]
-Description=runner VM %i
+Description=Firecracker microVM %i
+# After the VMs' NAT, when both start at once.
 After=network.target runner-nat.service
+# Stopped before its disks' filesystem is unmounted, at host shutdown too.
+RequiresMountsFor=/var/lib/runner
 
 [Service]
+# Ready once the guest is started; until then the VM is booting. Booting
+# copies the disk, which takes minutes for a big one without reflink.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=600
 User=runner
-Group=runner
 SupplementaryGroups=kvm
 Environment=RUNNER_ROOT=/var/lib/runner
-# The credentials a VM may get, each from /etc/credstore/<name>. One that
-# isn't there is skipped. Boot hands a VM's to its guest (docs/host.md).
+# The credentials a VM may get, each from /etc/credstore/<name> on the host.
+# One that isn't there is skipped. Boot hands a VM's to its guest.
 LoadCredential=CLAUDE_CODE_OAUTH_TOKEN
 LoadCredential=ANTHROPIC_API_KEY
 LoadCredential=GH_TOKEN
 # %i, not %I: %I would unescape a VM name's dashes into slashes.
 ExecStart=/usr/local/bin/runner boot %i
-NoNewPrivileges=yes
-# For runner boot to add and remove the VM's tap, and nothing else.
-# Firecracker doesn't need it to open the tap, so boot clears it from the
-# ambient set before running Firecracker.
+# Ctrl-Alt-Del, then wait for the guest to shut down. Past the timeout,
+# systemd kills the VM and its run isn't committed.
+ExecStop=/usr/local/bin/runner halt %i
+TimeoutStopSec=30
+# The serial console.
+StandardOutput=journal
+StandardError=journal
+# For boot to add and remove the VM's tap, and nothing else. Boot clears it
+# before running Firecracker, which doesn't need it, and no setuid program
+# gets it back.
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
