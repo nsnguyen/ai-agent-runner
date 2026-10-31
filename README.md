@@ -35,7 +35,7 @@ runner output dev.1 --follow              # its stream, until it ends
 runner result dev.1                       # what the runner measured, apart from what the agent says
 ```
 
-A run on a stopped VM boots it, and saves what it wrote only if Claude Code exits 0. A run on a running VM joins it as it is, saves nothing by itself, and can't say what changed.
+A run on a stopped VM boots it, and saves what it wrote only if Claude Code exits 0. A run on a running VM checkpoints it, then joins it as it is: exit 0 leaves it running on, and anything else restores the checkpoint, which restarts the VM. It can't say what changed.
 
 ### 4. From Claude Code on the laptop
 
@@ -219,7 +219,7 @@ prints the run's id, `dev.1`, at once, while Claude Code works on the prompt in 
 
 `runner output dev.1` prints the stream so far, an event per line, and `--follow` keeps printing until the run ends, then says on stderr how it did. `--from <bytes>` skips what an earlier read printed. `runner runs dev` lists dev's runs, newest first, and `runner cancel dev.1` stops one. A VM has one run at a time, so a second `runner run dev` is refused while one goes on.
 
-If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run checkpoints it first (`"before run dev.1"`), then joins it as it is. Exit 0 leaves dev running on, with nothing committed; anything else, a cancel included, restores that checkpoint, which stops dev and starts it again, ending whatever else was running in it. Either way the checkpoint stays, so `runner restore dev <id>` undoes a run that exited 0 too.
+If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run checkpoints it first (`"before run dev.1"`), then joins it as it is. Exit 0 leaves dev running on, with nothing committed; anything else once Claude Code has started, a cancel included, restores that checkpoint, which stops dev and starts it again, ending whatever else was running in it. Either way the checkpoint stays, so `runner restore dev <id>` undoes a run that exited 0 too.
 
 `runner result dev.1` prints, once the run is over, what the runner measured: the exit code, how long it took, whether the disk generation it booted was committed or rolled back, and the paths that changed on that disk. The runner reads those from the disks itself, the generation the run booted against the one it booted from, and never asks the agent. Each directory added or deleted whole is one path with a count of what's under it, and past 200 paths the rest are only counted. What the agent says it did is kept apart, in `agent_says`, marked untrusted: check it against `changed`.
 

@@ -890,6 +890,49 @@ fn a_running_checkpoint_killed_partway_is_never_listed_and_the_next_clears_it() 
     drop(run);
 }
 
+// A running VM's restore copies the checkpoint while the VM still runs, and
+// puts the copy in history only once it's stopped.
+#[test]
+fn a_staged_restore_goes_into_history_only_once_finished() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("clean")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    let freezer = store.hold_checkpoints("dev").unwrap();
+    assert!(matches!(
+        freezer.stage_restore(9),
+        Err(Error::NoCheckpoint(n, 9)) if n == "dev"
+    ));
+    let staged = freezer.stage_restore(1).unwrap();
+    assert_eq!((staged.from, staged.generation), (1, 3));
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"v0");
+    assert!(matches!(
+        store.finish_restore("dev", &staged),
+        Err(Error::Busy(_))
+    ));
+    run.commit().unwrap();
+    assert_eq!(
+        store.finish_restore("dev", &staged).unwrap(),
+        vm("dev", 3, 2)
+    );
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(summary(&listed)[0], (3, true, Some("restore of 1"), true));
+    assert_eq!(store.undo("dev").unwrap().generation, 2);
+
+    // One that didn't go ahead leaves nothing behind.
+    let staged = freezer.stage_restore(1).unwrap();
+    let generation = staged.generation;
+    store.drop_restore("dev", staged).unwrap();
+    assert!(!gen_disk(dir.path(), "dev", generation).exists());
+    assert!(
+        store
+            .checkpoints("dev")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != generation)
+    );
+}
+
 #[test]
 fn a_vm_that_never_booted_has_no_running_disk_to_checkpoint() {
     let (dir, store) = store();

@@ -501,6 +501,24 @@ fn a_joined_run_that_fails_restores_its_checkpoint() {
     assert_eq!(result["checkpoint"], json!(2));
 }
 
+// Nothing ran, so there's nothing to roll back, and the VM's sessions live on.
+#[test]
+fn a_joined_run_whose_claude_never_started_leaves_its_vm_running() {
+    let vm = vm(true);
+    let missing = vm.dir.path().join("no-such-dir");
+    let id = returns_at_once(vm.runner(&["run", "dev", "hi", "--dir", missing.to_str().unwrap()]));
+    let id = text(&id.stdout).trim().to_string();
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  failed, joined: "), "{row}");
+    assert!(
+        !vm.sd
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("systemctl stop"))
+    );
+    assert_eq!(vm.result(&id)["checkpoint"], json!(2));
+}
+
 // A running VM's disk has nothing from before the run to measure against.
 #[test]
 fn a_joined_run_s_result_measures_no_disk() {

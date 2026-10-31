@@ -367,7 +367,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run booted rolls back and shuts down. A run whose Claude Code is done stops measuring its disk, and its result says so. Returns the run once it has ended, or as it stands after two minutes. Fails for a run that's already over."
+        description = "Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run booted rolls back and shuts down, while one it joined running gets the checkpoint it took back, which restarts it. A run whose Claude Code is done stops measuring its disk, and its result says so. Returns the run once it has ended, or as it stands after two minutes. Fails for a run that's already over."
     )]
     async fn cancel_run(
         &self,

@@ -321,7 +321,13 @@ fn names(creds: &[Cred]) -> String {
 /// unit's stop timeout bounds the wait.
 pub fn halt(store: &Store, name: &str) -> Result<()> {
     let sock = store.api_socket(name)?;
-    match Api::new(&sock).ctrl_alt_del() {
+    let api = Api::new(&sock);
+    // A checkpoint under way finishes first (checkpoint.rs). A paused guest
+    // can't take Ctrl-Alt-Del, and one whose checkpoint was killed partway
+    // is still paused, so it's resumed; one that isn't says so, unheard.
+    drop(store.hold_checkpoints(name)?);
+    let _ = api.resume();
+    match api.ctrl_alt_del() {
         Ok(()) => note(format_args!("sent Ctrl-Alt-Del to {name}")),
         // Firecracker is gone already; boot may still be committing.
         Err(firecracker::Error::NotListening(_)) => {}

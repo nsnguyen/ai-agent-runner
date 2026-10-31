@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 const LIVE: &[u8] = b"written while running";
@@ -18,7 +20,9 @@ const LIVE: &[u8] = b"written while running";
 // dev, imported from a disk holding "at import", running generation 1, a copy
 // of it that the guest has since written LIVE to. As under the unit, `systemctl
 // stop` runs `runner halt dev`, whose Ctrl-Alt-Del has the stand-in commit
-// generation 1, as a clean shutdown does.
+// generation 1, as a clean shutdown does, and gc everything but the current
+// disk and the checkpoints, as `--keep 0` would. A pause takes a moment, so
+// two that overlapped would show.
 struct Running {
     dir: TempDir,
     store: Store,
@@ -29,6 +33,10 @@ struct Running {
     live: PathBuf,
     /// How many connections the guest had taken when the VM was paused.
     synced: Arc<Mutex<Option<usize>>>,
+    /// At each resume, whether generation 2's disk was there yet.
+    copied: Arc<Mutex<Vec<bool>>>,
+    /// Makes Firecracker refuse a pause.
+    refuse_pause: Arc<AtomicBool>,
     _guest: Guest,
 }
 
@@ -49,15 +57,26 @@ fn running() -> Running {
         &dir.path().join("vms/dev/vsock.sock"),
         &guest.sock,
     ));
-    let run = store.begin_run("dev").unwrap();
+    let run = store.clone().keeping(0).begin_run("dev").unwrap();
     let live = run.disk.clone();
     fs::write(&live, LIVE).unwrap();
     let run = Mutex::new(Some(run));
     let synced = Arc::new(Mutex::new(None));
+    let copied = Arc::new(Mutex::new(Vec::new()));
+    let refuse_pause = Arc::new(AtomicBool::new(false));
     let (seen, guest_conns) = (synced.clone(), vsock.clone());
+    let (resumed, refuse) = (copied.clone(), refuse_pause.clone());
+    let second = dir.path().join("vms/dev/gens/2.ext4");
     let api = FakeApi::serve(&dir.path().join("vms/dev/api.sock"), move |req| {
         if req.body == json!({"state": "Paused"}) {
             *seen.lock().unwrap() = Some(guest_conns.connects().len());
+            if refuse.load(Ordering::SeqCst) {
+                return (400, Some(json!({"fault_message": "no"}).to_string()));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if req.body == json!({"state": "Resumed"}) {
+            resumed.lock().unwrap().push(second.exists());
         }
         if req.body == json!({"action_type": "SendCtrlAltDel"})
             && let Some(run) = run.lock().unwrap().take()
@@ -74,6 +93,8 @@ fn running() -> Running {
         vsock,
         live,
         synced,
+        copied,
+        refuse_pause,
         _guest: guest,
     }
 }
@@ -143,6 +164,7 @@ fn a_running_vm_s_checkpoint_is_its_live_disk_copied_while_paused() {
             ("PATCH /vm".to_string(), json!({"state": "Resumed"})),
         ]
     );
+    assert_eq!(*vm.copied.lock().unwrap(), [true]);
     // The VM carries on from its own disk: the boot's generation isn't
     // current until it shuts down, and the copy is listed apart from it.
     assert_eq!(vm.store.get("dev").unwrap().generation, 0);
@@ -185,6 +207,32 @@ fn checkpoints_of_a_running_vm_take_turns() {
     assert_eq!(states, [paused.clone(), resumed.clone(), paused, resumed]);
 }
 
+// Whatever goes wrong once the VM may be paused, it's resumed.
+#[test]
+fn a_failed_copy_or_pause_still_resumes_the_vm() {
+    let vm = running();
+    fs::remove_file(&vm.live).unwrap();
+    vm.fails(&["checkpoint", "dev"]);
+    let states: Vec<Value> = vm.api_calls().into_iter().map(|(_, b)| b).collect();
+    assert_eq!(
+        states,
+        [json!({"state": "Paused"}), json!({"state": "Resumed"})]
+    );
+
+    // A refusal can come after the pause took.
+    fs::write(&vm.live, LIVE).unwrap();
+    vm.refuse_pause.store(true, Ordering::SeqCst);
+    let why = vm.fails(&["checkpoint", "dev"]);
+    assert!(why.contains("PATCH /vm"), "{why}");
+    let states: Vec<Value> = vm.api_calls().into_iter().map(|(_, b)| b).collect();
+    assert_eq!(
+        states[2..],
+        [json!({"state": "Paused"}), json!({"state": "Resumed"})]
+    );
+    let listed = vm.ok(&["checkpoints", "dev"]);
+    assert_eq!(listed.lines().count(), 1, "{listed}");
+}
+
 #[test]
 fn a_vm_booting_or_stopping_isn_t_checkpointed() {
     let vm = running();
@@ -223,6 +271,24 @@ fn restoring_a_running_vm_stops_it_restores_and_starts_it_again() {
     let out = vm.ok(&["undo", "dev"]);
     assert_eq!(out, "dev  gen 1  20 bytes\n");
     assert_eq!(vm.disk(1), b"after the checkpoint");
+}
+
+// The stop's commit runs gc, which can drop an old generation from history:
+// the restore copies it before anything stops.
+#[test]
+fn restoring_a_generation_the_stop_s_gc_drops_still_works() {
+    let vm = running();
+    let out = vm.ok(&["restore", "dev", "0"]);
+    assert_eq!(out, "dev  gen 2  9 bytes\n");
+    assert_eq!(vm.disk(2), b"at import");
+    assert!(!vm.dir.path().join("vms/dev/gens/0.ext4").exists());
+    assert_eq!(vm.stops_and_starts(), ["stop", "start"]);
+    let listed = vm.ok(&["checkpoints", "dev"]);
+    assert!(listed.starts_with("* 2  "), "{listed}");
+    assert!(
+        listed.contains("  auto  9 bytes  \"restore of 0\""),
+        "{listed}"
+    );
 }
 
 #[test]

@@ -8,14 +8,16 @@
 // VM. On XFS or btrfs the copy is a reflink and the pause a few milliseconds;
 // elsewhere the VM stays paused for the whole copy.
 //
-// Restoring a running VM stops it, which commits its disk as any clean
-// shutdown does, so `undo` goes back to it, then restores and starts it again.
+// Restoring a running VM copies the checkpoint first, then stops the VM, which
+// commits its disk as any clean shutdown does, so `undo` goes back to it, puts
+// the copy on top of history, and starts the VM again.
 use crate::exec;
 use crate::firecracker::{self, Api};
 use crate::proto::Request;
 use crate::runs;
 use crate::store::{self, Checkpoint, Store, Vm};
 use crate::systemd::{self, State};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use std::time::Duration;
 
 // A guest flushing a lot of writes takes a while; one stuck longer than this
@@ -76,17 +78,55 @@ pub fn checkpoint(store: &Store, name: &str, comment: Option<&str>) -> Result<Ch
     }
 }
 
+// From the pause to the resume, every way out resumes the VM. `runner halt`
+// waits on the freezer, then resumes the VM too, for one whose checkpoint was
+// killed with it paused.
 fn running(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
     let freezer = store.hold_checkpoints(name)?;
     sync(store, name)?;
     let api = Api::new(store.api_socket(name)?);
-    api.pause()?;
-    let frozen = freezer.freeze(comment);
-    if let Err(source) = api.resume() {
-        let vm = name.to_string();
-        return Err(Error::StillPaused { vm, source });
+    let _held = HoldSignals::new();
+    let frozen = match api.pause() {
+        // A refusal can come after the pause took, as a timeout can.
+        Err(e) => Err(Error::from(e)),
+        Ok(()) => freezer.freeze(comment).map_err(Error::from),
+    };
+    match api.resume() {
+        Err(source) if frozen.is_ok() => Err(Error::StillPaused {
+            vm: name.to_string(),
+            source,
+        }),
+        _ => frozen,
     }
-    Ok(frozen?)
+}
+
+// Ignores Ctrl-C, a dropped ssh connection and a polite kill until dropped,
+// so none leaves the VM paused. On ext4 that's the whole copy.
+struct HoldSignals(Vec<(Signal, SigAction)>);
+
+impl HoldSignals {
+    const SIGNALS: [Signal; 3] = [Signal::SIGINT, Signal::SIGHUP, Signal::SIGTERM];
+
+    fn new() -> HoldSignals {
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        let mut was = Vec::new();
+        for sig in Self::SIGNALS {
+            // SAFETY: SIG_IGN runs no code of ours in a signal handler.
+            if let Ok(old) = unsafe { sigaction(sig, &ignore) } {
+                was.push((sig, old));
+            }
+        }
+        HoldSignals(was)
+    }
+}
+
+impl Drop for HoldSignals {
+    fn drop(&mut self) {
+        for (sig, old) in &self.0 {
+            // SAFETY: puts back what was there before.
+            let _ = unsafe { sigaction(*sig, old) };
+        }
+    }
 }
 
 // What the guest wrote, onto the disk Firecracker gives it. A guest without
@@ -132,16 +172,21 @@ pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
 
 /// `restore`, for a caller holding the VM's run lock: a run rolling back.
 pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
-    // Before anything stops: a mistyped id leaves the VM as it was.
-    if !store.checkpoints(name)?.iter().any(|c| c.id == id) {
-        return Err(store::Error::NoCheckpoint(name.to_string(), id).into());
-    }
     match systemd::status(store, name)?.state {
         State::Stopped => Ok(store.restore(name, id)?),
         State::Running => {
-            systemd::stop(store, name)?;
-            // Started again either way: it was running when asked.
-            let restored = store.restore(name, id);
+            // The freezer goes before the stop, whose halt waits on it.
+            let staged = store.hold_checkpoints(name)?.stage_restore(id)?;
+            if let Err(e) = systemd::stop(store, name) {
+                drop_staged(store, name, staged);
+                return Err(e.into());
+            }
+            // Started again either way: it was running when asked. A restore
+            // that fails here found it started by someone else since.
+            let restored = store.finish_restore(name, &staged);
+            if restored.is_err() {
+                drop_staged(store, name, staged);
+            }
             let started = systemd::start(store, name);
             let vm = restored?;
             started.map_err(|source| Error::NotStarted {
@@ -152,6 +197,14 @@ pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
             Ok(vm)
         }
         state => Err(not_now(name, state)),
+    }
+}
+
+// A copy left would be listed as a checkpoint: harmless, so only noted.
+fn drop_staged(store: &Store, name: &str, staged: store::Staged) {
+    let generation = staged.generation;
+    if let Err(e) = store.drop_restore(name, staged) {
+        eprintln!("runner: couldn't remove {name}'s generation {generation}: {e}");
     }
 }
 

@@ -193,8 +193,9 @@ enum Cmd {
     /// Start Claude Code on a prompt in a VM, headless and detached, and
     /// print the run's id at once. A stopped VM is booted for the run and
     /// shut down after it: exit 0 commits what it wrote to its disk, and
-    /// anything else rolls that back. A running VM is joined as it is. One
-    /// run per VM at a time.
+    /// anything else rolls that back. A running VM is checkpointed and joined
+    /// as it is: exit 0 leaves it running, and anything else restores that
+    /// checkpoint, which restarts the VM. One run per VM at a time.
     Run {
         name: String,
         /// What to ask Claude Code. It reaches claude on its stdin.
@@ -232,7 +233,8 @@ enum Cmd {
     /// did is kept apart, marked untrusted.
     Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
-    /// booted rolls back and shuts down. A run whose Claude Code is done
+    /// booted rolls back and shuts down, while one it joined running gets the
+    /// checkpoint it took back, which restarts it. A run whose Claude Code is done
     /// stops measuring its disk. Returns once the run has ended, or after two
     /// minutes.
     Cancel { run: String },

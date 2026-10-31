@@ -430,6 +430,7 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
             None => {}
         }
     } else if let Some(id) = gens.checkpoint
+        && gens.ran
         && !(end.exit_code == Some(0) && !end.cancelled && end.error.is_none())
     {
         // Under the run lock this process holds, so no run starts on the VM
@@ -475,6 +476,9 @@ struct Gens {
     booted: Option<Booted>,
     // Taken of a running VM before the run, to restore if the run fails.
     checkpoint: Option<u64>,
+    // Whether claude started: a run cancelled or failed before then restores
+    // nothing, since stopping the VM would end its sessions for nothing.
+    ran: bool,
 }
 
 // What the run changed on its disk, measured from the disks, unless `stop`
@@ -603,7 +607,13 @@ fn run_claude(
     };
     let (mut out, mut err) = (append(STREAM)?, append(STDERR)?);
     let prompt = ask.prompt.as_bytes();
-    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, cancelled, GRACE)?;
+    gens.ran = true;
+    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, cancelled, GRACE);
+    // The guest couldn't start claude, so nothing ran.
+    if let Err(exec::Error::Guest(_)) = &streamed {
+        gens.ran = false;
+    }
+    let streamed = streamed?;
     // So a host crash after the end is written can't lose the stream's tail.
     out.sync_all().map_err(io_err("syncing the stream"))?;
     Ok(streamed)

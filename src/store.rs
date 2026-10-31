@@ -617,16 +617,34 @@ impl Store {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
         let mut gens = history(&dir)?;
-        let frozen = read_note(&dir, id)?.is_some_and(|n| !n.auto);
-        if !(gens.contains(&id) || frozen) || !disk_of(&dir, id).is_file() {
-            return Err(Error::NoCheckpoint(name.to_string(), id));
-        }
+        check_restorable(name, &dir, id)?;
         let generation = next_generation(&dir)?;
         clone(&disk_of(&dir, id), &disk_of(&dir, generation))?;
         write_note(&dir, generation, &Note::auto(&format!("restore of {id}")))?;
         gens.push(generation);
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
+    }
+
+    /// Puts a restore staged by Freezer::stage_restore on top of history, as
+    /// `restore` would have: `undo` goes back to the disk from before it.
+    /// Needs the VM stopped.
+    pub fn finish_restore(&self, name: &str, staged: &Staged) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        let note = Note::auto(&format!("restore of {}", staged.from));
+        write_note(&dir, staged.generation, &note)?;
+        let mut gens = history(&dir)?;
+        gens.push(staged.generation);
+        write_history(&dir, &gens)?;
+        read_vm(name, &dir)
+    }
+
+    /// Deletes a staged restore that didn't go ahead.
+    pub fn drop_restore(&self, name: &str, staged: Staged) -> Result<()> {
+        let dir = self.existing(name)?;
+        remove_if_there(&disk_of(&dir, staged.generation))?;
+        remove_if_there(&note_of(&dir, staged.generation))
     }
 
     /// The credentials the VM gets at boot: what its allowlist names, or
@@ -793,6 +811,36 @@ impl Freezer {
     pub fn freeze(&self, comment: Option<&str>) -> Result<Checkpoint> {
         let booted = read_booted(&self.dir)?;
         let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
+        let note = Note {
+            time: now(),
+            comment: comment.map(str::to_string),
+            auto: false,
+        };
+        let id = self.copy(booted.generation, &note)?;
+        read_checkpoint(&self.dir, id, Some(note), false)
+    }
+
+    /// Copies checkpoint `id` aside for a restore that has to stop the VM
+    /// first, before anything stops: a mistyped id stops nothing, and the
+    /// stop's commit, whose gc may drop `id`, can't take it from the restore.
+    /// The copy is noted as a checkpoint, which gc keeps, until
+    /// Store::finish_restore puts it in history; drop_restore deletes it.
+    pub fn stage_restore(&self, id: u64) -> Result<Staged> {
+        check_restorable(&self.name, &self.dir, id)?;
+        let note = Note {
+            time: now(),
+            comment: Some(format!("restore of {id}")),
+            auto: false,
+        };
+        let generation = self.copy(id, &note)?;
+        Ok(Staged {
+            from: id,
+            generation,
+        })
+    }
+
+    // A copy of generation `from` under a new number, with its note.
+    fn copy(&self, from: u64, note: &Note) -> Result<u64> {
         let gens = self.dir.join("gens");
         for left in numbered(&self.dir, PART)? {
             let part = part_of(&self.dir, left);
@@ -802,14 +850,9 @@ impl Freezer {
             }
         }
         let id = next_generation(&self.dir)?;
-        let note = Note {
-            time: now(),
-            comment: comment.map(str::to_string),
-            auto: false,
-        };
-        write_note(&self.dir, id, &note)?;
+        write_note(&self.dir, id, note)?;
         let (part, disk) = (part_of(&self.dir, id), disk_of(&self.dir, id));
-        let made = clone(&disk_of(&self.dir, booted.generation), &part)
+        let made = clone(&disk_of(&self.dir, from), &part)
             .and_then(|()| fs::rename(&part, &disk).map_err(at(&disk)))
             .and_then(|()| sync_dir(&gens));
         if let Err(e) = made {
@@ -817,8 +860,28 @@ impl Freezer {
             let _ = fs::remove_file(note_of(&self.dir, id));
             return Err(e);
         }
-        read_checkpoint(&self.dir, id, Some(note), false)
+        Ok(id)
     }
+}
+
+/// A restore's copy of a checkpoint, made while the VM still ran
+/// (Freezer::stage_restore).
+#[derive(Debug)]
+pub struct Staged {
+    /// The checkpoint it's a copy of.
+    pub from: u64,
+    /// The copy's own generation.
+    pub generation: u64,
+}
+
+// What `restore` takes: a checkpoint, or a generation in history, whose disk
+// is there.
+fn check_restorable(name: &str, dir: &Path, id: u64) -> Result<()> {
+    let frozen = read_note(dir, id)?.is_some_and(|n| !n.auto);
+    if !(history(dir)?.contains(&id) || frozen) || !disk_of(dir, id).is_file() {
+        return Err(Error::NoCheckpoint(name.to_string(), id));
+    }
+    Ok(())
 }
 
 const HANDED: &str = "handed";
