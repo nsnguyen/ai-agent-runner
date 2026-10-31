@@ -94,7 +94,8 @@ enum Cmd {
     /// `*` marks the current one.
     Checkpoints { name: String },
     /// Make a copy of a checkpoint the VM's current disk. `undo` reverses it.
-    /// A running VM is stopped first and started again after.
+    /// A running VM is stopped first and started again after; a stopping one
+    /// is waited out and stays stopped.
     Restore { name: String, id: u64 },
     /// Print the firecracker@.service unit for this binary and root.
     Unit {

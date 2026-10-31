@@ -273,6 +273,21 @@ fn restoring_a_running_vm_stops_it_restores_and_starts_it_again() {
     assert_eq!(vm.disk(1), b"after the checkpoint");
 }
 
+// A VM already stopping is waited out, and stays stopped after the restore.
+#[test]
+fn restoring_a_stopping_vm_waits_for_the_stop_and_leaves_it_stopped() {
+    let vm = running();
+    vm.ok(&["checkpoint", "dev", "-m", "before"]);
+    fs::write(&vm.live, b"after the checkpoint").unwrap();
+    vm.sd.set_state("deactivating");
+    let out = vm.ok(&["restore", "dev", "2"]);
+    assert_eq!(out, "dev  gen 3  21 bytes\n");
+    assert_eq!(vm.disk(3), LIVE);
+    assert_eq!(vm.stops_and_starts(), ["stop"]);
+    let out = vm.ok(&["undo", "dev"]);
+    assert_eq!(out, "dev  gen 1  20 bytes\n");
+}
+
 // The stop's commit runs gc, which can drop an old generation from history:
 // the restore copies it before anything stops.
 #[test]

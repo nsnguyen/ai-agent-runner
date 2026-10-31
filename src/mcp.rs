@@ -389,7 +389,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running VM is stopped first, ending what runs in it, and started again after. Fails while a run is going."
+        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running VM is stopped first, ending what runs in it, and started again after; one stopping is waited out and stays stopped. Fails while a run is going."
     )]
     async fn restore_vm(
         &self,

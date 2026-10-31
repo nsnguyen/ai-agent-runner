@@ -159,8 +159,9 @@ fn sync(store: &Store, name: &str) -> Result<()> {
 }
 
 /// Makes a copy of checkpoint `id` the VM's current disk. A running VM is
-/// stopped first and started again after. Refused while a run is going, which
-/// stopping the VM would end.
+/// stopped first and started again after; a stopping one is waited out and
+/// left stopped. Refused while a run is going, which stopping the VM would
+/// end.
 pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
     match store.restore(name, id) {
         Err(store::Error::Busy(_)) => {}
@@ -195,6 +196,13 @@ pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
                 source,
             })?;
             Ok(vm)
+        }
+        // Being stopped, as `runner stop` during a joined run does, which
+        // ends the run. `systemctl stop` waits for that stop, whose commit
+        // the restore goes on top of. It was asked to stop, so it stays down.
+        State::Stopping => {
+            systemd::stop(store, name)?;
+            Ok(store.restore(name, id)?)
         }
         state => Err(not_now(name, state)),
     }

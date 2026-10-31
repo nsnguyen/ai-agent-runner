@@ -171,8 +171,9 @@ impl Vm {
     }
 
     fn wait_until_ended(&self, id: &str) -> String {
+        // The third column; an error further on can say "running" too.
         wait_for(&format!("{id} to end"), || {
-            !self.row(id).contains("running")
+            !self.row(id).contains("Z  running  ")
         });
         self.row(id)
     }
@@ -499,6 +500,39 @@ fn a_joined_run_that_fails_restores_its_checkpoint() {
     let result = vm.result(&id);
     assert_eq!(result["outcome"], json!("rolled_back"), "{result}");
     assert_eq!(result["checkpoint"], json!(2));
+}
+
+// `runner stop` during a joined run ends Claude Code with the guest. The
+// rollback waits for the stop, which commits what the run wrote, then puts
+// the checkpoint on top, and leaves the VM stopped, as it was asked to be.
+// `systemctl stop` on a unit already stopping waits for that stop; here it
+// runs the stop's halt, as the stop already under way would.
+#[test]
+fn a_joined_run_whose_vm_is_stopped_under_it_still_rolls_back() {
+    let vm = vm(true);
+    let id = vm.start("break it");
+    wait_for("claude to start", || vm.started());
+    let disk = |g: u64| vm.dir.path().join(format!("vms/dev/gens/{g}.ext4"));
+    let before = fs::read(disk(1)).unwrap();
+    fs::write(disk(1), b"broken").unwrap();
+    vm.sd.set_state("deactivating");
+    vm.go(0, 143);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 143, rolled back  "), "{row}");
+    assert_eq!(vm.generation(), 3);
+    assert_eq!(fs::read(disk(3)).unwrap(), before);
+    assert_eq!(fs::read(disk(1)).unwrap(), b"broken");
+    let verbs: Vec<String> = vm
+        .sd
+        .calls()
+        .iter()
+        .filter_map(|c| c.split(' ').nth(1).map(String::from))
+        .filter(|v| v == "stop" || v == "start")
+        .collect();
+    assert_eq!(verbs, ["stop"]);
+    let result = vm.result(&id);
+    assert_eq!(result["outcome"], json!("rolled_back"), "{result}");
+    assert_eq!(result["error"], json!(null), "{result}");
 }
 
 // Nothing ran, so there's nothing to roll back, and the VM's sessions live on.
