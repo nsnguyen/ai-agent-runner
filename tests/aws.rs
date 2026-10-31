@@ -131,6 +131,15 @@ impl Aws {
             .find(|c| c.len() > 1 && c[0] == "ec2" && c[1] == op)
     }
 
+    /// What each `aws ec2 wait` waited for, in order.
+    fn waits(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.len() > 2 && c[0] == "ec2" && c[1] == "wait")
+            .map(|c| c[2].clone())
+            .collect()
+    }
+
     fn ssh_argv(&self) -> Vec<String> {
         let bytes = fs::read(self.dir.path().join("fake/ssh")).unwrap();
         text(&bytes)
@@ -230,6 +239,35 @@ fn up_finds_a_host_already_there() {
         assert!(out.contains("i-0old") && out.contains(HOST_IP), "{out}");
         assert_eq!(aws.call("run-instances"), None);
         assert_eq!(aws.call("create-key-pair"), None);
+    }
+}
+
+#[test]
+fn up_on_a_stopped_host_says_to_start_it() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", "i-0old\tstopped\tNone\n");
+        let out = ok(&aws.run(shell, &["up"]));
+        assert!(
+            out.contains("stopped") && out.contains("aws.sh start"),
+            "{out}"
+        );
+        assert!(!out.contains("None"), "{out}");
+        assert_eq!(aws.call("run-instances"), None);
+    }
+}
+
+#[test]
+fn start_on_a_stopping_host_waits_for_it_to_stop() {
+    // Or AWS refuses the start: IncorrectInstanceState.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", &format!("i-0old\tstopping\t{HOST_IP}\n"));
+        ok(&aws.run(shell, &["start"]));
+        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        let ops: Vec<String> = aws.calls().into_iter().map(|c| c[1].clone()).collect();
+        let at = |op: &str| ops.iter().position(|o| o == op).unwrap();
+        assert!(at("wait") < at("start-instances"), "{ops:?}");
     }
 }
 
@@ -404,11 +442,14 @@ fn stop_and_start() {
         ok(&aws.run(shell, &["stop"]));
         let stop = aws.call("stop-instances").expect("no stop-instances");
         assert_eq!(after(&stop, "--instance-ids"), "i-0old");
+        // Stopped, not stopping, so a start straight after doesn't get
+        // IncorrectInstanceState.
+        assert_eq!(aws.waits(), ["instance-stopped"]);
 
         let out = ok(&aws.run(shell, &["start"]));
         let start = aws.call("start-instances").expect("no start-instances");
         assert_eq!(after(&start, "--instance-ids"), "i-0old");
-        assert_eq!(aws.call("wait").expect("no wait")[2], "instance-status-ok");
+        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
         assert!(out.contains(HOST_IP), "{out}");
     }
 }

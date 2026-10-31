@@ -133,7 +133,12 @@ up() {
   found=$(instance)
   if [ -n "$found" ]; then
     parse
-    printf '%s is already there: %s, %s, at %s\n' "$name" "$id" "$state" "$addr"
+    case $state in
+    stopping | stopped)
+      printf '%s (%s) is already there, %s: start it with %s start\n' "$name" "$id" "$state" "$0"
+      ;;
+    *) printf '%s is already there: %s, %s, at %s\n' "$name" "$id" "$state" "$addr" ;;
+    esac
     return
   fi
   keypair
@@ -178,10 +183,15 @@ close) close_ssh ;;
 stop)
   find_host
   aws ec2 stop-instances --instance-ids "$id" >/dev/null
-  printf 'Stopping %s (%s).\n' "$name" "$id"
+  printf 'Stopping %s (%s)...\n' "$name" "$id"
+  # Stopped, not stopping: a start in between gets IncorrectInstanceState.
+  aws ec2 wait instance-stopped --instance-ids "$id"
+  printf '%s is stopped: only its disks cost now.\n' "$name"
   ;;
 start)
   find_host
+  # AWS refuses to start a stopping instance: IncorrectInstanceState.
+  [ "$state" != stopping ] || aws ec2 wait instance-stopped --instance-ids "$id"
   aws ec2 start-instances --instance-ids "$id" >/dev/null
   booted
   address
