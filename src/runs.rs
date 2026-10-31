@@ -16,7 +16,7 @@
 //   <vm>/runs/<n>/stderr    claude's stderr
 //   <vm>/runs/<n>/log       what the driving process itself printed
 //   <vm>/runs/<n>/cancel    there once someone has asked to cancel the run,
-//                           until Claude Code has stopped for it
+//                           until Claude Code is done
 //   <vm>/runs/<n>/result.json  what the runner measured once it was over
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
@@ -83,6 +83,8 @@ const GRACE: Duration = Duration::from_secs(10);
 // A guest that took Ctrl-Alt-Del is down within `runner stop`'s timeout.
 const HALT_WAIT: Duration = Duration::from_secs(systemd::STOP_TIMEOUT_SECS as u64);
 // Claude Code's grace, its kill, and the VM shutting down, with room to spare.
+// Measuring a cancelled run's disk comes after, so on a big disk the run can
+// still be running when this is up.
 const CANCEL_WAIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(100);
 
@@ -371,13 +373,15 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         }
         Err(e) => end.error = Some(e.to_string()),
     }
-    // The cancel that stopped Claude Code is spent: only one asked for after
-    // it stops the measuring.
+    // Claude Code is done, so a cancel asked for by now was for it, even one
+    // whose run then failed: only a cancel asked for after that stops the
+    // measuring.
     let cancel = dir.join(CANCEL);
-    if end.cancelled
-        && let Err(e) = fs::remove_file(&cancel)
-    {
-        eprintln!("runner: removing {}: {e}", cancel.display());
+    match fs::remove_file(&cancel) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            eprintln!("runner: removing {}: {e}", cancel.display());
+        }
+        _ => {}
     }
     // A disk the VM may still be writing isn't measured.
     let mut down = true;
