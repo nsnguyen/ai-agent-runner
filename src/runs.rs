@@ -563,9 +563,8 @@ fn run_claude(
     Ok(streamed)
 }
 
-// Shuts down a VM the run booted, as `runner stop` does, but by Ctrl-Alt-Del
-// straight to Firecracker: the stop of the unit host/install.sh installs
-// kills the VM (#51), which never commits. Only a clean run takes back its
+// Shuts down a VM the run booted by Ctrl-Alt-Del straight to Firecracker, as
+// the unit's ExecStop, `runner halt`, does. Only a clean run takes back its
 // ask to roll back first. A guest still up after HALT_WAIT is stopped through
 // systemd, which kills it past its timeout, so nothing commits.
 fn shut_down(store: &Store, vm: &str, run: &str, clean: bool) -> Result<()> {
@@ -590,8 +589,7 @@ fn shut_down(store: &Store, vm: &str, run: &str, clean: bool) -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
-    // The unit `runner unit` writes still runs its ExecStop once boot has
-    // exited. Waited out, so a run right after this one finds the VM stopped.
+    // The unit still runs its ExecStop once boot has exited. Waited out, so a run right after this one finds the VM stopped.
     let deadline = Instant::now() + HALT_WAIT;
     while systemd::status(store, vm)?.state != VmState::Stopped && Instant::now() < deadline {
         std::thread::sleep(POLL);

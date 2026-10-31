@@ -17,9 +17,9 @@ pub const VERSION: &str = include_str!("../host/firecracker-version").trim_ascii
 /// The console is on serial, so it lands in the unit's journal. The i8042
 /// flags skip slow probing but keep the keyboard that carries Ctrl-Alt-Del,
 /// and `reboot=k` resets through it, which is how Firecracker learns the
-/// guest is done. Not `i8042.nopnp`, which Firecracker's docs list too: the
-/// keyboard is found through ACPI, and without it the probe fails and every
-/// shutdown hangs. There's no `panic=`: a panicked guest hangs instead of
+/// guest is done. Not `i8042.nopnp`, which Firecracker's docs list too:
+/// Firecracker announces the keyboard through ACPI (PNP0303), and without PNP
+/// the probe fails and every shutdown hangs. There's no `panic=`: a panicked guest hangs instead of
 /// rebooting, so unless the guest sets kernel.panic itself, Firecracker
 /// doesn't exit 0 for it and its run isn't committed.
 pub const BOOT_ARGS: &str = "console=ttyS0 reboot=k pci=off i8042.noaux i8042.nomux i8042.dumbkbd";
