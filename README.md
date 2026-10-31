@@ -2,6 +2,78 @@
 
 `runner` runs my AI agents on Firecracker microVMs, one microVM per agent, like fly.io Sprites: local Claude Code starts and drives one over MCP, or I land in its terminal over SSH. Design: [docs/design.md](docs/design.md).
 
+## Day to day, on the AWS host
+
+For a host already set up as Set up a host and On AWS below say: `kvm-host` on the tailnet, the laptop's key in, `runner` installed on the laptop. Everything here runs on the laptop, from this checkout, with Tailscale connected.
+
+### 1. Start the host
+
+```sh
+aws login --profile runner      # only if aws.sh says AWS won't take the credentials: a login lasts 12 hours
+export AWS_PROFILE=runner       # or put it in ~/.zshrc once
+client/aws.sh start             # a few minutes: it waits until the host has booted
+runner list                     # over the tailnet; base and your VMs
+```
+
+The host comes back at a new public address, which doesn't matter: Tailscale reaches it as `kvm-host`.
+
+### 2. Claude Code in a VM
+
+```sh
+runner claude dev
+```
+
+Makes `dev` from `base` if it's new, boots it, and lands you in Claude Code running there, logged in with the host's token. Detach with Ctrl-b, then d: Claude Code keeps working. `runner claude dev` again comes back to it. To check where you are, type `! hostname; whoami` in Claude Code: `dev` and `agent`.
+
+### 3. Other ways in
+
+```sh
+runner shell dev                          # a shell in dev, as agent
+runner exec dev -- ls -la /home/agent/work
+runner run dev "Add a README to work/"    # headless: prints a run id, like dev.1
+runner output dev.1 --follow              # its stream, until it ends
+runner result dev.1                       # what the runner measured, apart from what the agent says
+```
+
+A run on a stopped VM boots it, and saves what it wrote only if Claude Code exits 0. A run on a running VM joins it as it is, saves nothing by itself, and can't say what changed.
+
+### 4. From Claude Code on the laptop
+
+Once:
+
+```sh
+claude mcp add --scope user runner -- ~/.local/bin/runner mcp
+```
+
+Then, in `claude` on the laptop, `/mcp` shows `runner` connected, and you can ask it things like: "use the runner MCP to run an agent in dev that adds a test for main.py, then show me run_output's result". Its tools are `run_agent`, `run_output`, `cancel_run`, `exec`, `start_vm`, `stop_vm` and the session ones.
+
+### 5. Stop it all
+
+```sh
+runner stop dev           # a clean shutdown saves the VM's disk: list shows its gen go up
+client/aws.sh stop        # the host: about $0.10 an hour while it runs, only its disks while stopped
+```
+
+### After merging a change
+
+The host runs whatever was last copied to it. Copy and install again:
+
+```sh
+git checkout main && git pull
+rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ ubuntu@kvm-host:ai-agent-runner/
+ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host 'cd ai-agent-runner && . ~/.cargo/env && cargo build --release && sudo host/install.sh'
+```
+
+The install ends with `runner doctor`: every line should be `ok`. The boot tests, at each milestone, are in docs/host.md (Boot tests): run them on the host, in `~/ai-agent-runner`.
+
+### When something's off
+
+- `aws.sh: AWS won't take this laptop's credentials`: run `aws login --profile runner`, and check `AWS_PROFILE=runner` is set.
+- `runner@kvm-host: Permission denied (publickey)`: the laptop's key line in the host's `~runner/.ssh/authorized_keys` must read `from="…",restrict,pty ssh-ed25519 AAAA…`, with nothing between `pty` and the key.
+- `runner list` hangs or can't resolve `kvm-host`: Tailscale isn't connected on the laptop, or the host is stopped (`client/aws.sh ip` says).
+- `client/aws.sh ssh` times out: SSH from the internet is closed (`client/aws.sh close`). Use `ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host` over the tailnet, or `client/aws.sh open` to let this laptop's address in again.
+- A VM won't start or stop: `runner logs dev` shows its console and boot notes.
+
 ## Set up a host
 
 The host needs:
