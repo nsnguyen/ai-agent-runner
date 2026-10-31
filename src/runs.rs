@@ -15,7 +15,8 @@
 //   <vm>/runs/<n>/stream    claude's stdout, stream-json, as it came
 //   <vm>/runs/<n>/stderr    claude's stderr
 //   <vm>/runs/<n>/log       what the driving process itself printed
-//   <vm>/runs/<n>/cancel    there once someone has asked to cancel the run
+//   <vm>/runs/<n>/cancel    there once someone has asked to cancel the run,
+//                           until Claude Code has stopped for it
 //   <vm>/runs/<n>/result.json  what the runner measured once it was over
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
@@ -35,7 +36,8 @@
 // agent says it did, and is written just before the end, so a run that's
 // over has its result. Measuring reads the run's disk whole, so the run looks
 // to be running a while after Claude Code exits, until it's measured or a
-// cancel stops the measuring.
+// cancel stops the measuring. A cancel that stopped Claude Code doesn't: a
+// cancelled run is measured too.
 use crate::changes;
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
@@ -369,6 +371,14 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         }
         Err(e) => end.error = Some(e.to_string()),
     }
+    // The cancel that stopped Claude Code is spent: only one asked for after
+    // it stops the measuring.
+    let cancel = dir.join(CANCEL);
+    if end.cancelled
+        && let Err(e) = fs::remove_file(&cancel)
+    {
+        eprintln!("runner: removing {}: {e}", cancel.display());
+    }
     // A disk the VM may still be writing isn't measured.
     let mut down = true;
     if ask.boots {
@@ -410,7 +420,7 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         outcome: end.outcome,
         from_generation: gens.booted.map(|b| b.from).or(gens.from),
         generation: gens.booted.map(|b| b.generation),
-        changed: changed(store, vm, &ask, &gens, down, &|| dir.join(CANCEL).exists()),
+        changed: changed(store, vm, &ask, &gens, down, &|| cancel.exists()),
         agent_says: agent_says(&dir.join(STREAM)),
     };
     // Without its end, a run would look lost, how it ended and all.

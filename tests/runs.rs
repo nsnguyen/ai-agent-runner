@@ -460,6 +460,8 @@ fn a_vm_shut_down_under_a_run_rolls_back() {
 fn cancel_ends_the_run_and_rolls_back_what_it_booted() {
     let vm = vm(false);
     let boot = boot(&vm);
+    let disk = vm.dir.path().join("vms/dev/gens/1.ext4");
+    debugfs(&disk, "rm /home/agent/work/old.rs");
     let id = vm.start("never ends");
     wait_for("claude to start", || vm.started());
 
@@ -471,6 +473,14 @@ fn cancel_ends_the_run_and_rolls_back_what_it_booted() {
     assert_eq!(result["exit_code"], json!(null), "{result}");
     assert_eq!(result["outcome"], json!("rolled_back"));
     assert_eq!(result["agent_says"]["text"], json!(null));
+    // The cancel stopped Claude Code, not the measuring after it.
+    assert_eq!(
+        result["changed"],
+        json!({
+            "paths": [{"path": "/home/agent/work/old.rs", "change": "deleted"}],
+            "more": 0
+        })
+    );
     // It's over, so there's nothing to cancel.
     let again = vm.runner(&["cancel", &id]).output().unwrap();
     assert!(!again.status.success());
