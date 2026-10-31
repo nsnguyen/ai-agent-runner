@@ -23,7 +23,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn env_path(name: &str) -> PathBuf {
@@ -44,6 +44,42 @@ fn ok(out: Output) -> String {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{text}{err}");
     text
+}
+
+/// Halts the VM `boot` booted by hand, and waits for boot to end for as long
+/// as the unit's stop timeout would. A guest that ignores Ctrl-Alt-Del fails
+/// the test there instead of hanging it: its Firecracker, whose socket is
+/// under `root`, is killed, and the console's i8042 lines say why.
+fn halt_by_hand(root: &Path, mut boot: Child, console: &Path) -> Output {
+    let halt = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", root)
+        .args(["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let limit = Duration::from_secs(runner::systemd::STOP_TIMEOUT_SECS.into());
+    let deadline = Instant::now() + limit;
+    while boot.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = Command::new("pkill").arg("-f").arg(root).status();
+            let _ = boot.wait();
+            let _ = halt.wait_with_output();
+            let log = std::fs::read_to_string(console).unwrap_or_default();
+            let keyboard: Vec<&str> = log.lines().filter(|l| l.contains("i8042")).collect();
+            panic!(
+                "the guest ignored Ctrl-Alt-Del for {limit:?}. Its keyboard:\n{}",
+                keyboard.join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let halted = halt.wait_with_output().unwrap();
+    assert!(
+        halted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&halted.stderr)
+    );
+    boot.wait_with_output().unwrap()
 }
 
 /// Polls `check` for up to a minute.
@@ -87,8 +123,7 @@ fn boot_and_halt_by_hand() {
     eventually("a login prompt", || {
         std::fs::read_to_string(&console).is_ok_and(|c| c.contains("login:"))
     });
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     assert!(
         out.status.success(),
         "{}",
@@ -135,8 +170,7 @@ fn a_booted_vm_answers_at_its_address() {
         .args(["-c", "1", "-W", "5", &address])
         .output()
         .unwrap();
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     assert!(
         out.status.success(),
         "{}",
@@ -433,8 +467,7 @@ fn the_token_reaches_the_vm_s_memory_and_never_its_disk() {
     // As a session would: Claude Code runs, and writes what it writes.
     let claude = run("claude -p 'Reply with the word ok' </dev/null; sync", 300);
     let handed = runner::store::Store::new(root).handed("dev").unwrap();
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     assert_eq!(seen.stdout, token, "the guest didn't have the token");

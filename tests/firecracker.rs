@@ -125,6 +125,10 @@ fn the_console_is_on_serial_and_ctrl_alt_del_can_reach_the_guest() {
     assert!(BOOT_ARGS.contains("console=ttyS0"));
     // i8042 carries Ctrl-Alt-Del; Firecracker's own defaults turn the serial port off.
     assert!(!BOOT_ARGS.contains("i8042.nokbd"));
+    // Firecracker announces its i8042 through ACPI (PNP0303). Without PNP the
+    // driver asks for legacy IRQ 1, which an ACPI guest without a PIC lacks:
+    // "i8042: probe of i8042 failed with error -22", and no keyboard.
+    assert!(!BOOT_ARGS.contains("i8042.nopnp"));
     assert!(!BOOT_ARGS.contains("8250.nr_uarts=0"));
     // A panicked guest hangs rather than reboots, so its exit can't pass for a clean one.
     assert!(!BOOT_ARGS.contains("panic="));
