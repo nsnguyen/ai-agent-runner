@@ -243,7 +243,14 @@ fn start_logs_and_stop_under_systemd() {
     eventually("the kernel in the journal", || {
         logs().contains("Linux version")
     });
-    eventually("a login prompt", || logs().contains("login:"));
+    // journald keeps a line until its newline, and getty's prompt has none,
+    // so `login:` never reaches the journal. Getty starting is the last line
+    // that does, and by then init takes Ctrl-Alt-Del.
+    eventually("getty on the serial console", || {
+        logs()
+            .lines()
+            .any(|l| l.contains("Started") && l.contains("serial-getty@ttyS0"))
+    });
 
     ok(runner(&root, &["stop", &name]));
     let status = ok(runner(&root, &["status", &name]));
