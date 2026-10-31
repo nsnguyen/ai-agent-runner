@@ -16,16 +16,22 @@ pub struct RunResult {
     /// killed, or the VM went down).
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
-    /// What became of the disk generation a run that booted its VM ran. Null
-    /// for a run that joined its VM running, which commits or rolls back
-    /// nothing, or one that never got as far as starting its VM.
+    /// What became of the disk generation a run that booted its VM ran. For
+    /// a run that joined its VM running, rolled_back if it failed and its
+    /// checkpoint was restored, else null: it commits nothing. Null too for a
+    /// run that never got as far as starting its VM.
     pub outcome: Option<Outcome>,
-    /// The disk generation the run started from. Null when outcome is.
+    /// The disk generation the run started from. Null when outcome is, and
+    /// for a run that joined its VM.
     pub from_generation: Option<u64>,
     /// The generation the run wrote: current if committed, kept for a look if
     /// rolled back. Null when outcome is, or when the VM's guest never
-    /// answered the run.
+    /// answered the run, and for a run that joined its VM.
     pub generation: Option<u64>,
+    /// For a run that joined its VM running: the checkpoint it took first,
+    /// which `restore` brings back. Null for a run that booted its VM.
+    #[serde(default)]
+    pub checkpoint: Option<u64>,
     /// The paths that differ between the two generations, read from the
     /// disks; or, when there was nothing to measure or measuring failed, why.
     pub changed: Changed,

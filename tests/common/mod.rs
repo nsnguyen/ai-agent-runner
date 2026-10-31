@@ -200,7 +200,8 @@ exit "$code"
 /// systemctl and journalctl on PATH. systemctl logs its argv to `calls`,
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
 /// `start` never reads it empty, and fails with the text in `fail` if that
-/// file exists. journalctl logs its argv and prints one line.
+/// file exists. A `stop` runs `on-stop` first if a test put one there, as the
+/// unit runs its ExecStop. journalctl logs its argv and prints one line.
 pub struct FakeSystemd {
     pub bin: PathBuf,
 }
@@ -217,7 +218,8 @@ impl FakeSystemd {
 if [ -f "{d}/fail" ]; then cat "{d}/fail" >&2; exit 1; fi
 case "$1" in
   start) echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
-  stop) echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
+  stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" || exit 1; fi
+    echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
   show) cat "{d}/state" 2>/dev/null || echo inactive ;;
 esac
 "#

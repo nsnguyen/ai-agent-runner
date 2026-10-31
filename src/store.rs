@@ -2,8 +2,10 @@
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, and whether it's a checkpoint
+//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
 //   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
@@ -56,6 +58,8 @@ pub enum Error {
     NothingToUndo(String),
     #[error("{0} has no checkpoint {1}")]
     NoCheckpoint(String, u64),
+    #[error("{0} has never booted, so it has no running disk to checkpoint")]
+    NeverBooted(String),
     #[error("{0}")]
     BadConfig(String),
     #[error(
@@ -466,13 +470,7 @@ impl Store {
     /// process to know which disk its boot runs; the disk may be gone since,
     /// if that boot never got going. None if the VM never booted.
     pub fn booted(&self, name: &str) -> Result<Option<Booted>> {
-        let path = self.existing(name)?.join(BOOTED);
-        let text = match fs::read(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            r => r.map_err(at(&path))?,
-        };
-        let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
-        Ok(Some(booted))
+        read_booted(&self.existing(name)?)
     }
 
     /// The disk of one of the VM's generations, whether or not it's still
@@ -578,6 +576,22 @@ impl Store {
         };
         write_note(&dir, id, &note)?;
         read_checkpoint(&dir, id, Some(note), false)
+    }
+
+    /// Waits until no other checkpoint of a running VM is being made, then
+    /// holds off the rest until the Freezer is dropped. A running VM's boot
+    /// holds the VM's own lock, so its checkpoints take turns on this one.
+    pub fn hold_checkpoints(&self, name: &str) -> Result<Freezer> {
+        let dir = self.existing(name)?;
+        let path = dir.join(FREEZE_LOCK);
+        let lock = open_lock(&path, name)?;
+        lock.lock().map_err(at(&path))?;
+        let name = name.to_string();
+        Ok(Freezer {
+            name,
+            dir,
+            _lock: lock,
+        })
     }
 
     /// Every checkpoint and every generation in history, newest first.
@@ -756,9 +770,62 @@ impl Run {
     }
 }
 
+/// A running VM's checkpoints, one at a time (Store::hold_checkpoints).
+#[derive(Debug)]
+pub struct Freezer {
+    name: String,
+    dir: PathBuf,
+    _lock: File,
+}
+
+impl Freezer {
+    /// Freezes a copy of the disk the VM's latest boot runs (Store::booted),
+    /// for `restore` to bring back: a running VM's checkpoint, as
+    /// Store::checkpoint is a stopped one's. Pause the VM first, so the copy
+    /// is of one moment. The VM carries on from its own disk, which it
+    /// commits or rolls back at shutdown as it would have.
+    ///
+    /// The note goes first, which takes the generation's number, so a boot
+    /// that starts while the copy goes on, Firecracker having been killed,
+    /// can't take it too. The copy is made aside and renamed into place, so
+    /// nothing lists a half-made one, and the next checkpoint clears what one
+    /// killed partway left.
+    pub fn freeze(&self, comment: Option<&str>) -> Result<Checkpoint> {
+        let booted = read_booted(&self.dir)?;
+        let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
+        let gens = self.dir.join("gens");
+        for left in numbered(&self.dir, PART)? {
+            let part = part_of(&self.dir, left);
+            fs::remove_file(&part).map_err(at(&part))?;
+            if !disk_of(&self.dir, left).exists() {
+                remove_if_there(&note_of(&self.dir, left))?;
+            }
+        }
+        let id = next_generation(&self.dir)?;
+        let note = Note {
+            time: now(),
+            comment: comment.map(str::to_string),
+            auto: false,
+        };
+        write_note(&self.dir, id, &note)?;
+        let (part, disk) = (part_of(&self.dir, id), disk_of(&self.dir, id));
+        let made = clone(&disk_of(&self.dir, booted.generation), &part)
+            .and_then(|()| fs::rename(&part, &disk).map_err(at(&disk)))
+            .and_then(|()| sync_dir(&gens));
+        if let Err(e) = made {
+            let _ = fs::remove_file(&part);
+            let _ = fs::remove_file(note_of(&self.dir, id));
+            return Err(e);
+        }
+        read_checkpoint(&self.dir, id, Some(note), false)
+    }
+}
+
 const HANDED: &str = "handed";
 const ROLLBACK: &str = "rollback";
 const BOOTED: &str = "booted";
+const FREEZE_LOCK: &str = "freeze.lock";
+const PART: &str = ".part";
 
 /// A boot's generations (Store::booted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,6 +1067,20 @@ fn note_of(dir: &Path, generation: u64) -> PathBuf {
     dir.join("gens").join(format!("{generation}.json"))
 }
 
+fn part_of(dir: &Path, generation: u64) -> PathBuf {
+    dir.join("gens").join(format!("{generation}{PART}"))
+}
+
+fn read_booted(dir: &Path) -> Result<Option<Booted>> {
+    let path = dir.join(BOOTED);
+    let text = match fs::read(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        r => r.map_err(at(&path))?,
+    };
+    let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
+    Ok(Some(booted))
+}
+
 #[derive(Serialize, Deserialize)]
 struct Note {
     time: DateTime<Utc>,
@@ -1125,6 +1206,7 @@ fn sweep_staging(vms: &Path) {
 fn next_generation(dir: &Path) -> Result<u64> {
     let mut all = numbered(dir, ".ext4")?;
     all.extend(numbered(dir, ".json")?);
+    all.extend(numbered(dir, PART)?);
     Ok(all.into_iter().max().unwrap_or(0) + 1)
 }
 

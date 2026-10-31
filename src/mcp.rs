@@ -1,6 +1,7 @@
 // The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
+use crate::checkpoint;
 use crate::claude;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
@@ -249,16 +250,14 @@ impl Tools {
     }
 
     #[tool(
-        description = "Freeze a copy of a VM's current disk, with an optional comment, for restore_vm to bring back. Fails if a run holds the VM."
+        description = "Freeze a copy of a VM's disk, with an optional comment, for restore_vm to bring back. A running VM is synced and paused for the copy, then carries on."
     )]
-    fn checkpoint_vm(
+    async fn checkpoint_vm(
         &self,
         Parameters(args): Parameters<CheckpointArgs>,
     ) -> Result<Json<Checkpoint>, String> {
-        self.store
-            .checkpoint(&args.name, args.comment.as_deref())
-            .map(Json)
-            .map_err(|e| e.to_string())
+        let store = self.store.clone();
+        blocking(move || checkpoint::checkpoint(&store, &args.name, args.comment.as_deref())).await
     }
 
     #[tool(
@@ -333,7 +332,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Start Claude Code in a VM on a prompt, headless (`claude -p`, stream-json) and detached, and return the run at once; read it with run_output. A stopped VM is booted for the run and shut down after it: exit 0 commits what the run wrote to the disk, and anything else rolls it back. A running VM is joined as it is, with nothing committed or rolled back. One run per VM at a time. Claude Code runs as the agent user, with its permission prompts skipped: the VM is the sandbox."
+        description = "Start Claude Code in a VM on a prompt, headless (`claude -p`, stream-json) and detached, and return the run at once; read it with run_output. A stopped VM is booted for the run and shut down after it: exit 0 commits what the run wrote to the disk, and anything else rolls it back. A running VM is checkpointed and joined as it is: exit 0 leaves it running, and anything else restores that checkpoint, which restarts the VM. One run per VM at a time. Claude Code runs as the agent user, with its permission prompts skipped: the VM is the sandbox."
     )]
     async fn run_agent(
         &self,
@@ -379,7 +378,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and for a run that booted the VM, its outcome, committed or rolled_back."
+        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, rolled_back for one that joined it running and restored the checkpoint it took first."
     )]
     fn list_runs(
         &self,
@@ -390,13 +389,14 @@ impl Tools {
     }
 
     #[tool(
-        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. Fails if a run holds the VM."
+        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running VM is stopped first, ending what runs in it, and started again after. Fails while a run is going."
     )]
-    fn restore_vm(&self, Parameters(args): Parameters<RestoreArgs>) -> Result<Json<Vm>, String> {
-        self.store
-            .restore(&args.name, args.id)
-            .map(Json)
-            .map_err(|e| e.to_string())
+    async fn restore_vm(
+        &self,
+        Parameters(args): Parameters<RestoreArgs>,
+    ) -> Result<Json<Vm>, String> {
+        let store = self.store.clone();
+        blocking(move || checkpoint::restore(&store, &args.name, args.id)).await
     }
 }
 

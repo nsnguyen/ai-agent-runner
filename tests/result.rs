@@ -10,6 +10,7 @@ fn result(changed: Changed, agent_says: AgentSays) -> RunResult {
         outcome: Some(Outcome::Committed),
         from_generation: Some(2),
         generation: Some(3),
+        checkpoint: None,
         changed,
         agent_says,
     }
@@ -43,6 +44,7 @@ fn the_json_shape_is_pinned() {
         "outcome": "committed",
         "from_generation": 2,
         "generation": 3,
+        "checkpoint": null,
         "changed": {
             "paths": [
                 {"path": "/home/agent/work/main.rs", "change": "modified"},
@@ -53,7 +55,12 @@ fn the_json_shape_is_pinned() {
         "agent_says": {"untrusted": true, "text": "Fixed the bug.", "truncated": false}
     });
     assert_eq!(serde_json::to_value(&got).unwrap(), want);
-    let back: RunResult = serde_json::from_value(want).unwrap();
+    let back: RunResult = serde_json::from_value(want.clone()).unwrap();
+    assert_eq!(back, got);
+    // As a run from before checkpoints wrote it.
+    let mut old = want;
+    old.as_object_mut().unwrap().remove("checkpoint");
+    let back: RunResult = serde_json::from_value(old).unwrap();
     assert_eq!(back, got);
 }
 
@@ -82,7 +89,8 @@ fn a_run_that_did_not_exit_and_could_not_be_measured_says_so() {
     assert_eq!(back, got);
 }
 
-// A run that joined a running VM: there's no disk from before it.
+// A run that joined a running VM: there's no disk from before it, only the
+// checkpoint it took.
 #[test]
 fn a_joined_run_has_no_outcome_or_generations() {
     let mut got = result(
@@ -92,12 +100,14 @@ fn a_joined_run_has_no_outcome_or_generations() {
         says("Done."),
     );
     (got.outcome, got.from_generation, got.generation) = (None, None, None);
+    got.checkpoint = Some(4);
     let want = json!({
         "exit_code": 0,
         "duration_ms": 81234,
         "outcome": null,
         "from_generation": null,
         "generation": null,
+        "checkpoint": 4,
         "changed": {"error": "joined dev running"},
         "agent_says": {"untrusted": true, "text": "Done.", "truncated": false}
     });

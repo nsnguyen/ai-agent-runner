@@ -16,6 +16,7 @@
 // claude get further than a login error.
 // The tests under the unit (`start_logs_and_stop_under_systemd`,
 // `exec_starts_the_vm_and_runs_in_the_guest`,
+// `a_running_vm_s_checkpoint_brings_a_deleted_file_back`,
 // `a_session_outlives_a_dropped_connection`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
@@ -496,6 +497,39 @@ fn a_headless_run_edits_a_file_and_commits_it() {
         &["exec", &name, "--", "cat", "/home/agent/work/hello.txt"],
     ));
     assert_eq!(hello.trim(), "hi");
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_running_vm_s_checkpoint_brings_a_deleted_file_back() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("checkpoint-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+
+    // Written, never synced by hand: the checkpoint syncs the guest first.
+    sh("echo kept > ~/checkpointed");
+    let made = Instant::now();
+    let row = ok(runner(&root, &["checkpoint", &name, "-m", "with the file"]));
+    let took = made.elapsed();
+    let id = row.split_whitespace().next().unwrap().to_string();
+    assert!(row.contains("  checkpoint  "), "{row}");
+    // Still the same boot, which carried on.
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.contains("  running"), "{status}");
+    sh("rm ~/checkpointed; sync");
+
+    ok(runner(&root, &["restore", &name, &id]));
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.contains("  running"), "restarted: {status}");
+    assert_eq!(sh("cat ~/checkpointed"), "kept\n");
+    // Says how long the whole checkpoint took, pause and all: on XFS, well
+    // under a second of it is the pause.
+    eprintln!("checkpoint of a running VM took {took:?}");
 }
 
 // Booted by hand, so the token comes from this process's environment, the

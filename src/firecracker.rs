@@ -35,8 +35,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Error {
     #[error("firecracker isn't listening on {}", .0.display())]
     NotListening(PathBuf),
-    #[error("firecracker refused PUT {path} ({status}): {message}")]
+    #[error("firecracker refused {method} {path} ({status}): {message}")]
     Api {
+        method: &'static str,
         path: String,
         status: u16,
         message: String,
@@ -111,11 +112,30 @@ impl Api {
         self.action("SendCtrlAltDel")
     }
 
+    /// Stops the guest's vCPUs where they are, for a checkpoint to copy its
+    /// disk while nothing writes to it. Its devices and memory stay as they were.
+    pub fn pause(&self) -> Result<()> {
+        self.patch("/vm", &json!({"state": "Paused"}))
+    }
+
+    /// Lets a paused guest carry on.
+    pub fn resume(&self) -> Result<()> {
+        self.patch("/vm", &json!({"state": "Resumed"}))
+    }
+
     fn action(&self, action: &str) -> Result<()> {
         self.put("/actions", &json!({"action_type": action}))
     }
 
     pub fn put(&self, path: &str, body: &Value) -> Result<()> {
+        self.send("PUT", path, body)
+    }
+
+    pub fn patch(&self, path: &str, body: &Value) -> Result<()> {
+        self.send("PATCH", path, body)
+    }
+
+    fn send(&self, method: &'static str, path: &str, body: &Value) -> Result<()> {
         let io = |source| Error::Io {
             sock: self.sock.clone(),
             source,
@@ -131,7 +151,7 @@ impl Api {
         conn.set_write_timeout(Some(TIMEOUT)).map_err(io)?;
         let body = body.to_string();
         let request = format!(
-            "PUT {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
@@ -145,6 +165,7 @@ impl Api {
             .and_then(|v| v["fault_message"].as_str().map(String::from))
             .unwrap_or_else(|| String::from_utf8_lossy(&reply).trim().to_string());
         Err(Error::Api {
+            method,
             path: path.to_string(),
             status,
             message,
