@@ -59,16 +59,26 @@ fn cli(root: &Path) -> Command {
     cmd
 }
 
-/// This build, where any user can run it. It stays in /tmp until a reboot.
+/// This build, where any user can run it: one copy, replaced each run. In
+/// /var/tmp, not TMPDIR, which sudo -E passes on and may be root's own.
 fn runner_copy() -> &'static Path {
     static COPY: OnceLock<PathBuf> = OnceLock::new();
     COPY.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("runner-kvm-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        let dir = Path::new("/var/tmp/runner-kvm");
+        match std::fs::create_dir(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{dir:?}: {e}"),
+            _ => {}
+        }
+        // Root's own directory, not one or a link someone else put there.
+        let meta = std::fs::symlink_metadata(dir).unwrap();
+        assert!(meta.is_dir() && meta.uid() == 0, "{dir:?} isn't root's");
+        std::fs::set_permissions(dir, Permissions::from_mode(0o755)).unwrap();
+        // Renamed over the old copy, which a run may still be executing.
+        let new = dir.join(format!("runner.{}", std::process::id()));
+        std::fs::copy(env!("CARGO_BIN_EXE_runner"), &new).unwrap();
+        std::fs::set_permissions(&new, Permissions::from_mode(0o755)).unwrap();
         let copy = dir.join("runner");
-        std::fs::copy(env!("CARGO_BIN_EXE_runner"), &copy).unwrap();
-        std::fs::set_permissions(&copy, Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&new, &copy).unwrap();
         copy
     })
 }
@@ -89,18 +99,38 @@ fn ok(out: Output) -> String {
 /// the test there instead of hanging it: its Firecracker, whose socket is
 /// under `root`, is killed, and the console's i8042 lines say why.
 fn halt_by_hand(root: &Path, mut boot: Child, console: &Path) -> Output {
-    let halt = cli(root)
+    let mut halt = cli(root)
         .args(["halt", "dev"])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Firecracker by its socket, the one process of this VM's that boot and
+    // halt wait on: a pattern for the whole root, /var/lib/runner say, would
+    // match every VM there.
+    let sock = root.join("vms/dev/api.sock");
+    let kill = |boot: &mut Child, halt: &mut Child| {
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f"])
+            .arg(&sock)
+            .status();
+        let _ = boot.kill();
+        let _ = halt.kill();
+        let _ = boot.wait();
+        let _ = halt.wait();
+    };
     let limit = Duration::from_secs(runner::systemd::STOP_TIMEOUT_SECS.into());
     let deadline = Instant::now() + limit;
     while boot.try_wait().unwrap().is_none() {
+        if let Some(status) = halt.try_wait().unwrap()
+            && !status.success()
+        {
+            let mut err = String::new();
+            std::io::Read::read_to_string(&mut halt.stderr.take().unwrap(), &mut err).unwrap();
+            kill(&mut boot, &mut halt);
+            panic!("runner halt failed: {err}");
+        }
         if Instant::now() >= deadline {
-            let _ = Command::new("pkill").arg("-f").arg(root).status();
-            let _ = boot.wait();
-            let _ = halt.wait_with_output();
+            kill(&mut boot, &mut halt);
             let log = std::fs::read_to_string(console).unwrap_or_default();
             let keyboard: Vec<&str> = log.lines().filter(|l| l.contains("i8042")).collect();
             panic!(
@@ -117,6 +147,25 @@ fn halt_by_hand(root: &Path, mut boot: Child, console: &Path) -> Output {
         String::from_utf8_lossy(&halted.stderr)
     );
     boot.wait_with_output().unwrap()
+}
+
+// No VM boots here: a halt that fails at once fails the test at once, with
+// halt's own words, rather than 30 seconds later blaming the guest.
+#[test]
+fn a_halt_that_fails_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let boot = Command::new("sleep").arg("60").spawn().unwrap();
+    let started = Instant::now();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        halt_by_hand(dir.path(), boot, &dir.path().join("console.log"))
+    }));
+    let why = failed.expect_err("halted a VM that isn't there");
+    let why = why.downcast_ref::<String>().expect("a formatted panic");
+    assert!(
+        why.contains("runner halt failed") && why.contains("dev"),
+        "{why}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10), "{why}");
 }
 
 /// Polls `check` for up to a minute.
