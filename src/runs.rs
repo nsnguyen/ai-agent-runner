@@ -589,7 +589,8 @@ fn shut_down(store: &Store, vm: &str, run: &str, clean: bool) -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
-    // The unit still runs its ExecStop once boot has exited. Waited out, so a run right after this one finds the VM stopped.
+    // The unit still runs its ExecStop once boot has exited. Waited out, so a
+    // run right after this one finds the VM stopped.
     let deadline = Instant::now() + HALT_WAIT;
     while systemd::status(store, vm)?.state != VmState::Stopped && Instant::now() < deadline {
         std::thread::sleep(POLL);

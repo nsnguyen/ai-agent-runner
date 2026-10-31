@@ -190,6 +190,8 @@ stop)
   ;;
 start)
   find_host
+  # AWS refuses to start a stopping instance: IncorrectInstanceState.
+  [ "$state" != stopping ] || aws ec2 wait instance-stopped --instance-ids "$id"
   aws ec2 start-instances --instance-ids "$id" >/dev/null
   booted
   address

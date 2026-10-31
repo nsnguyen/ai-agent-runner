@@ -60,7 +60,8 @@ fn cli(root: &Path) -> Command {
 }
 
 /// This build, where any user can run it: one copy, replaced each run. In
-/// /var/tmp, not TMPDIR, which sudo -E passes on and may be root's own.
+/// /var/tmp, not TMPDIR, which sudo -E passes on: the invoking user's, which
+/// the root's owner may not be able to read.
 fn runner_copy() -> &'static Path {
     static COPY: OnceLock<PathBuf> = OnceLock::new();
     COPY.get_or_init(|| {
@@ -113,6 +114,11 @@ fn halt_by_hand(root: &Path, mut boot: Child, console: &Path) -> Output {
             .args(["-KILL", "-f"])
             .arg(&sock)
             .status();
+        // A moment for boot to take its tap down once Firecracker's gone.
+        let gone = Instant::now() + Duration::from_secs(2);
+        while boot.try_wait().unwrap().is_none() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let _ = boot.kill();
         let _ = halt.kill();
         let _ = boot.wait();

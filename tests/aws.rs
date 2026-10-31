@@ -258,6 +258,20 @@ fn up_on_a_stopped_host_says_to_start_it() {
 }
 
 #[test]
+fn start_on_a_stopping_host_waits_for_it_to_stop() {
+    // Or AWS refuses the start: IncorrectInstanceState.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", &format!("i-0old\tstopping\t{HOST_IP}\n"));
+        ok(&aws.run(shell, &["start"]));
+        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        let ops: Vec<String> = aws.calls().into_iter().map(|c| c[1].clone()).collect();
+        let at = |op: &str| ops.iter().position(|o| o == op).unwrap();
+        assert!(at("wait") < at("start-instances"), "{ops:?}");
+    }
+}
+
+#[test]
 fn up_reuses_a_key_pair_and_a_group_aws_has() {
     for shell in SHELLS {
         let aws = Aws::new();

@@ -67,14 +67,14 @@ Then install as above. The repo is private, so copy the laptop's checkout over r
 rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ "ubuntu@$(client/aws.sh ip):ai-agent-runner/"
 ```
 
-Put the host on the tailnet as `kvm-host`, so the name the steps above use resolves (with MagicDNS, which a new tailnet has on), then add the laptop's key through `ubuntu`, the sudo account on AWS:
+Put the host on the tailnet as `kvm-host`, so the name the steps above use resolves (with MagicDNS, which a new tailnet has on; remove an old `kvm-host` from the tailnet first, or the new one becomes `kvm-host-1`), then add the laptop's key through `ubuntu`, the sudo account on AWS:
 
 ```sh
 curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname kvm-host   # on the host
-ssh -t -i ~/.ssh/kvm-host.pem ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
+ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
 ```
 
-Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` dials the public address, so it stops working too; `ssh -i ~/.ssh/kvm-host.pem ubuntu@kvm-host` reaches the host over the tailnet. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
+Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` dials the public address, so it stops working too; `ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host` reaches the host over the tailnet, and the rsync above, to `ubuntu@kvm-host:ai-agent-runner/`, upgrades it. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
 
 ## Build the base image
 
