@@ -10,7 +10,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 ## Not this
 - Not a hosted service for other people. It runs my agents.
 - Not a model client. The agent inside the VM talks to its own model; the runner starts, connects to, and stops VMs.
-- Not a cloud buyer. It never signs up for or rents hosts; it runs on machines I give it.
+- Not a cloud buyer. `runner` never signs up for or rents hosts; it runs on machines I give it. `client/aws.sh`, which I run by hand, is how I make one on AWS.
 
 ## Autonomy
 - Merging: only forge's review task merges, and only the build PRs it approves with every check passing, so issues that depend on each other build one after another. No other session merges, the builder included. The cloud has no KVM, so those PRs merge without a VM booted: at each milestone, run every `#[ignore]`d test on the KVM host (Commands and Sharp edges say how).
