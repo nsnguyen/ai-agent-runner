@@ -219,7 +219,7 @@ prints the run's id, `dev.1`, at once, while Claude Code works on the prompt in 
 
 `runner output dev.1` prints the stream so far, an event per line, and `--follow` keeps printing until the run ends, then says on stderr how it did. `--from <bytes>` skips what an earlier read printed. `runner runs dev` lists dev's runs, newest first, and `runner cancel dev.1` stops one. A VM has one run at a time, so a second `runner run dev` is refused while one goes on.
 
-If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run joins it as it is, and nothing is committed or rolled back, so there's no undoing it until checkpoints work on running VMs (#22).
+If dev is stopped, the run boots it and shuts it down once Claude Code exits: exit 0 commits what it wrote to dev's disk, and anything else, a cancel included, rolls it back, keeping the run's disk in dev's `gens/` for a look until a later commit's gc. So does dev going down under the run, by `runner stop` or a reboot. If dev is running, the run checkpoints it first (`"before run dev.1"`), then joins it as it is. Exit 0 leaves dev running on, with nothing committed; anything else, a cancel included, restores that checkpoint, which stops dev and starts it again, ending whatever else was running in it. Either way the checkpoint stays, so `runner restore dev <id>` undoes a run that exited 0 too.
 
 `runner result dev.1` prints, once the run is over, what the runner measured: the exit code, how long it took, whether the disk generation it booted was committed or rolled back, and the paths that changed on that disk. The runner reads those from the disks itself, the generation the run booted against the one it booted from, and never asks the agent. Each directory added or deleted whole is one path with a count of what's under it, and past 200 paths the rest are only counted. What the agent says it did is kept apart, in `agent_says`, marked untrusted: check it against `changed`.
 
@@ -241,9 +241,19 @@ If dev is stopped, the run boots it and shuts it down once Claude Code exits: ex
 }
 ```
 
-The run reads both disks whole, so it goes on looking `running` for a while after Claude Code exits: about 45 seconds per 4.6 GB of disk (#61), and never more than 10 minutes. `runner cancel` then stops the measuring, and `changed` says so. A cancelled run is measured too: only a cancel after Claude Code is done stops the measuring. Changes the boot itself makes, like the journal under `/var/log/journal`, are listed too (#62). Paths past 32 KiB of them are only counted, since the agent names them. A run that joined a running VM has no disk from before it, so its `changed` says why instead of listing paths, with a null `outcome` and generations, as does one that never got as far as starting its VM. With `--keep 0`, a commit's gc deletes the generation the run booted from before it's measured, so `changed` can only say it's gone. A lost run has no result.
+The run reads both disks whole, so it goes on looking `running` for a while after Claude Code exits: about 45 seconds per 4.6 GB of disk (#61), and never more than 10 minutes. `runner cancel` then stops the measuring, and `changed` says so. A cancelled run is measured too: only a cancel after Claude Code is done stops the measuring. Changes the boot itself makes, like the journal under `/var/log/journal`, are listed too (#62). Paths past 32 KiB of them are only counted, since the agent names them. A run that joined a running VM has no disk of its own to measure, so its `changed` says why instead of listing paths, with null generations, its `checkpoint`, and an `outcome` that's `rolled_back` if it restored that checkpoint and null otherwise. One that never got as far as starting its VM has nulls too. With `--keep 0`, a commit's gc deletes the generation the run booted from before it's measured, so `changed` can only say it's gone. A lost run has no result.
 
 The stream is kept on the host, in `/var/lib/runner/vms/dev/runs/1/`, beside Claude Code's stderr, so it can be read with dev off, and goes when dev is deleted.
+
+### Checkpoints
+
+```sh
+runner checkpoint dev -m "tests pass"   # a frozen copy of dev's disk, by id
+runner checkpoints dev                  # newest first; * marks the current disk
+runner restore dev 4                    # dev's disk is checkpoint 4's again
+```
+
+A checkpoint is a copy of dev's disk, running or not. Of a running VM, it runs `sync` in the guest, pauses the VM, copies the disk it's running, and resumes it, so dev carries on. On XFS or btrfs the copy is a reflink and the pause takes milliseconds; on ext4 dev stays paused for a full copy of its disk. `checkpoints` lists the generations runs and restores made too, as `auto`. `restore` puts a copy of the checkpoint on top of dev's history, so `undo` goes back to what dev had before it, and the checkpoint stays to restore again. A running dev is stopped first, which commits its disk as any clean shutdown does, and started again after; that ends its sessions and anything else in it, so it's refused while a run is going. Checkpoints stay until dev is deleted: gc keeps every one. Over MCP: `checkpoint_vm`, `list_checkpoints` and `restore_vm`.
 
 ### MCP clients
 
