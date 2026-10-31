@@ -15,8 +15,8 @@ const HOST_IP: &str = "203.0.113.7";
 
 // Each call's argv on a line, its args split by US. A file in $FAKE says
 // what AWS has: has-key, has-sg, instances (describe-instances' text), perms
-// (the group's IpPermissions); dup-rule, key-fails and signed-out make those
-// calls fail as AWS does.
+// (the group's IpPermissions); key-fails and signed-out make those calls fail
+// as AWS does.
 const FAKE_AWS: &str = r#"{ for arg; do printf '%s\037' "$arg"; done; printf '\n'; } >>"$FAKE/calls"
 fail() { echo "An error occurred ($1)" >&2; exit 254; }
 case "$1 $2" in
@@ -30,9 +30,8 @@ case "$1 $2" in
   [ -e "$FAKE/has-sg" ] || fail InvalidGroup.NotFound
   cat "$FAKE/perms" 2>/dev/null || echo '[]' ;;
 "ec2 create-security-group") touch "$FAKE/has-sg"; echo '{"GroupId": "sg-1"}' ;;
-"ec2 authorize-security-group-ingress") [ ! -e "$FAKE/dup-rule" ] || fail InvalidPermission.Duplicate ;;
 "ec2 run-instances") printf 'i-0new\trunning\t%s\n' "$HOST_IP" >"$FAKE/instances"; echo i-0new ;;
-"ec2 wait"|"ec2 stop-instances"|"ec2 start-instances"|"ec2 revoke-security-group-ingress") ;;
+"ec2 wait"|"ec2 stop-instances"|"ec2 start-instances"|"ec2 authorize-security-group-ingress"|"ec2 revoke-security-group-ingress") ;;
 *) echo "fake aws: unexpected $*" >&2; exit 99 ;;
 esac
 "#;
@@ -177,6 +176,15 @@ fn up_launches_a_host_with_kvm_and_a_disk_for_vms() {
             .map(|d| d["Ebs"]["VolumeSize"].as_u64().unwrap())
             .collect();
         assert_eq!(sizes, [40, 50], "{disks}");
+        // Ubuntu's root. Under another name the 40 GiB would be a third disk,
+        // beside the image's own 8 GiB root.
+        assert_eq!(disks[0]["DeviceName"], "/dev/sda1", "{disks}");
+        // One hop: the VMs behind the host's NAT never reach the metadata
+        // service, even without install.sh's drop of 169.254.0.0/16.
+        assert_eq!(
+            after(&run, "--metadata-options"),
+            "HttpTokens=required,HttpPutResponseHopLimit=1"
+        );
         assert!(
             after(&run, "--tag-specifications").contains("{Key=Name,Value=kvm-host}"),
             "{run:?}"
@@ -198,7 +206,16 @@ fn up_launches_a_host_with_kvm_and_a_disk_for_vms() {
         assert_eq!(after(&rule, "--port"), "22");
         assert_eq!(after(&rule, "--cidr"), format!("{LAPTOP_IP}/32"));
 
-        assert!(aws.call("wait").is_some(), "{:?}", aws.calls());
+        // AWS lists a terminated instance for an hour after: it isn't the host.
+        let find = aws.call("describe-instances").unwrap();
+        let at = find.iter().position(|a| a == "--filters").unwrap();
+        assert_eq!(
+            find[at + 2],
+            "Name=instance-state-name,Values=pending,running,stopping,stopped"
+        );
+
+        // Its status checks pass once it has booted, so the first ssh gets in.
+        assert_eq!(aws.call("wait").expect("no wait")[2], "instance-status-ok");
         assert!(out.contains(HOST_IP), "{shell:?}: {out}");
         assert!(out.contains("ssh ls -l /dev/kvm"), "{out}");
     }
@@ -273,13 +290,29 @@ fn a_key_pair_aws_refuses_leaves_no_key_file() {
 }
 
 #[test]
-fn opening_ssh_again_for_the_same_address_is_fine() {
+fn open_lets_only_this_laptop_in() {
+    // An address the laptop had before, a café's say, goes.
+    let perms = r#"[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "192.0.2.9/32"}]}]"#;
     for shell in SHELLS {
         let aws = Aws::new();
         aws.has("has-sg", "");
-        aws.has("dup-rule", "");
+        aws.has("perms", &format!("{perms}\n"));
         ok(&aws.run(shell, &["open"]));
-        ok(&aws.run(shell, &["up"]));
+        let revoke = aws
+            .call("revoke-security-group-ingress")
+            .expect("no revoke");
+        assert_eq!(after(&revoke, "--ip-permissions"), perms);
+        let rule = aws
+            .call("authorize-security-group-ingress")
+            .expect("no rule");
+        assert_eq!(after(&rule, "--cidr"), format!("{LAPTOP_IP}/32"));
+        // Revoked first, or the new one would go too.
+        let ops: Vec<String> = aws.calls().into_iter().map(|c| c[1].clone()).collect();
+        let at = |op: &str| ops.iter().position(|o| o == op).unwrap();
+        assert!(
+            at("revoke-security-group-ingress") < at("authorize-security-group-ingress"),
+            "{ops:?}"
+        );
     }
 }
 
@@ -302,6 +335,12 @@ fn ssh_logs_in_as_ubuntu_with_the_key() {
         ok(&aws.run(shell, &["ssh", "ls", "-l", "/dev/kvm"]));
         let argv = aws.ssh_argv();
         assert_eq!(after(&argv, "-i"), aws.key().display().to_string());
+        // Only that key: an agent offering six others first would use up
+        // sshd's tries.
+        assert!(
+            argv.windows(2).any(|w| w == ["-o", "IdentitiesOnly=yes"]),
+            "{argv:?}"
+        );
         assert_eq!(
             argv[argv.len() - 4..],
             [
@@ -369,7 +408,7 @@ fn stop_and_start() {
         let out = ok(&aws.run(shell, &["start"]));
         let start = aws.call("start-instances").expect("no start-instances");
         assert_eq!(after(&start, "--instance-ids"), "i-0old");
-        assert!(aws.call("wait").is_some());
+        assert_eq!(aws.call("wait").expect("no wait")[2], "instance-status-ok");
         assert!(out.contains(HOST_IP), "{out}");
     }
 }

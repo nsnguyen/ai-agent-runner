@@ -52,12 +52,12 @@ client/aws.sh ssh ls -l /dev/kvm
 
 If `aws login` refuses because the default profile already holds access keys, `aws login --profile runner` and `export AWS_PROFILE=runner` keep the two apart. If `up` says the CLI doesn't know `NestedVirtualization`, `brew upgrade awscli`.
 
-Until the host is on the tailnet, `up` lets only the laptop's address in over SSH, as `ubuntu` with the key it saves in `~/.ssh/kvm-host.pem`; after the laptop's address changes, `client/aws.sh open` lets the new one in. On the host, put the second disk on XFS before installing:
+`up` waits a few minutes, until the host has booted. Until it's on the tailnet, only the laptop's address gets in over SSH, as `ubuntu` with the key `up` saves in `~/.ssh/kvm-host.pem`; after the laptop's address changes, `client/aws.sh open` lets in the new one and no other. On the host, put the second disk on XFS before installing. NVMe disks on EC2 aren't named in a fixed order, so find it by its size:
 
 ```sh
-lsblk   # the 50G disk with no partitions, usually nvme1n1
-sudo mkfs.xfs /dev/nvme1n1
-echo "UUID=$(sudo blkid -s UUID -o value /dev/nvme1n1) /var/lib/runner xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
+disk=/dev/$(lsblk -dno NAME,SIZE | awk '$2 == "50G" {print $1}'); echo "$disk"
+sudo mkfs.xfs "$disk"
+echo "UUID=$(sudo blkid -s UUID -o value "$disk") /var/lib/runner xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
 sudo mkdir -p /var/lib/runner && sudo mount /var/lib/runner
 ```
 

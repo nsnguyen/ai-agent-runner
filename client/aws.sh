@@ -75,6 +75,12 @@ address() {
   [ "$addr" != None ] || die "$name is $state, with no address: $0 start"
 }
 
+# Waits for $id's status checks, which pass once it has booted, so the first
+# ssh gets in; running comes a minute before sshd does.
+booted() {
+  aws ec2 wait instance-status-ok --instance-ids "$id"
+}
+
 keypair() {
   if aws ec2 describe-key-pairs --key-names "$name" >/dev/null 2>&1; then
     [ -f "$key" ] || die "AWS has key pair $name, but its private key isn't at $key: set RUNNER_AWS_KEY to it, or delete the pair (aws ec2 delete-key-pair --key-name $name)"
@@ -93,31 +99,34 @@ keypair() {
   printf 'Made key pair %s: its private key is %s\n' "$name" "$key"
 }
 
+# Takes every inbound rule off the group. Fails if nothing was on it. It's
+# called as a condition, where set -e is off, so it exits by hand.
+revoke_all() {
+  perms=$(aws ec2 describe-security-groups --group-names "$name" \
+    --query 'SecurityGroups[0].IpPermissions' --output json) || exit 1
+  [ "$perms" != "[]" ] || return 1
+  aws ec2 revoke-security-group-ingress --group-name "$name" \
+    --ip-permissions "$perms" >/dev/null || exit 1
+}
+
+# Only this laptop's address now: the ones it had before, a café's say, go.
 open_ssh() {
   aws ec2 describe-security-groups --group-names "$name" >/dev/null 2>&1 ||
     aws ec2 create-security-group --group-name "$name" \
       --description "runner host: SSH from the laptop until client/aws.sh close" >/dev/null
   ip=$(curl -fsS https://checkip.amazonaws.com) || die "can't tell this laptop's address"
-  if ! err=$(aws ec2 authorize-security-group-ingress --group-name "$name" \
-    --protocol tcp --port 22 --cidr "$ip/32" 2>&1 >/dev/null); then
-    case $err in
-    *InvalidPermission.Duplicate*) ;;
-    *) die "$err" ;;
-    esac
-  fi
+  revoke_all || true
+  aws ec2 authorize-security-group-ingress --group-name "$name" \
+    --protocol tcp --port 22 --cidr "$ip/32" >/dev/null
   printf 'SSH to %s is open to %s only.\n' "$name" "$ip"
 }
 
 close_ssh() {
-  perms=$(aws ec2 describe-security-groups --group-names "$name" \
-    --query 'SecurityGroups[0].IpPermissions' --output json)
-  if [ "$perms" = "[]" ]; then
+  if revoke_all; then
+    printf 'Nothing gets in to %s now: reach it over the tailnet.\n' "$name"
+  else
     printf 'Nothing gets in to %s.\n' "$name"
-    return
   fi
-  aws ec2 revoke-security-group-ingress --group-name "$name" \
-    --ip-permissions "$perms" >/dev/null
-  printf 'Nothing gets in to %s now: reach it over the tailnet.\n' "$name"
 }
 
 up() {
@@ -136,10 +145,11 @@ up() {
     --key-name "$name" \
     --security-groups "$name" \
     --block-device-mappings "$disks" \
+    --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$name}]" \
     --query 'Instances[0].InstanceId' --output text)
-  printf 'Launched %s (%s), waiting for it to run...\n' "$name" "$id"
-  aws ec2 wait instance-running --instance-ids "$id"
+  printf 'Launched %s (%s), waiting a few minutes for it to boot...\n' "$name" "$id"
+  booted
   address
   printf '%s is up at %s. Check it has KVM: %s ssh ls -l /dev/kvm\n' "$name" "$addr" "$0"
 }
@@ -159,7 +169,9 @@ ip)
   ;;
 ssh)
   address
-  exec ssh -i "$key" -o StrictHostKeyChecking=accept-new "ubuntu@$addr" "$@"
+  # IdentitiesOnly: an agent offering six other keys first would use up
+  # sshd's tries.
+  exec ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "ubuntu@$addr" "$@"
   ;;
 open) open_ssh ;;
 close) close_ssh ;;
@@ -171,7 +183,7 @@ stop)
 start)
   find_host
   aws ec2 start-instances --instance-ids "$id" >/dev/null
-  aws ec2 wait instance-running --instance-ids "$id"
+  booted
   address
   printf '%s is up at %s.\n' "$name" "$addr"
   ;;
