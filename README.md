@@ -47,12 +47,15 @@ claude mcp add --scope user runner -- ~/.local/bin/runner mcp
 
 Then, in `claude` on the laptop, `/mcp` shows `runner` connected, and you can ask it things like: "use the runner MCP to run an agent in dev that adds a test for main.py, then show me run_output's result". Its tools are `run_agent`, `run_output`, `cancel_run`, `exec`, `start_vm`, `stop_vm` and the session ones.
 
-### 5. Stop it all
+### 5. When you're done: stop it all
 
 ```sh
 runner stop dev           # a clean shutdown saves the VM's disk: list shows its gen go up
+client/aws.sh close       # SSH from the internet off again, if `open` let you in; says so if it's off already
 client/aws.sh stop        # the host: about $0.10 an hour while it runs, only its disks while stopped
 ```
+
+`client/aws.sh stop` waits until the host has stopped. Next time, start again at step 1.
 
 ### After merging a change
 
