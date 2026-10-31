@@ -1,7 +1,10 @@
 // Boot tests: real Firecracker, real KVM. Skipped unless asked for, since
-// cloud sessions have no /dev/kvm. On the host:
+// cloud sessions have no /dev/kvm. On the host, as docs/host.md says:
 //
-//   RUNNER_TEST_DISK=/path/rootfs.ext4 cargo test --test kvm -- --ignored
+//   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+//   RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 \
+//   RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux \
+//   cargo test --test kvm -- --ignored --test-threads=1
 //
 // The rootfs's init must be systemd or another that takes Ctrl-Alt-Del, with
 // a login prompt on the serial console.
@@ -11,19 +14,23 @@
 // `the_token_reaches_the_vm_s_memory_and_never_its_disk`, with the base
 // image as RUNNER_TEST_DISK; a real token in CLAUDE_CODE_OAUTH_TOKEN lets
 // claude get further than a login error.
-// `start_logs_and_stop_under_systemd` needs `runner unit` installed and the
-// host's kernel in place; it uses the unit's root, RUNNER_ROOT or
-// /var/lib/runner. `exec_starts_the_vm_and_runs_in_the_guest` needs the same,
-// with the base image (images/base) as RUNNER_TEST_DISK, for its
-// runner-guest and agent user, and so does
-// `a_session_outlives_a_dropped_connection`, for its tmux, and
-// `claude_keeps_running_after_a_detach`, for Claude Code.
-// `a_headless_run_edits_a_file_and_commits_it` needs all that too, and the
-// host's Claude Code token in /etc/credstore (docs/host.md, step 6).
+// The tests under the unit (`start_logs_and_stop_under_systemd`,
+// `exec_starts_the_vm_and_runs_in_the_guest`,
+// `a_session_outlives_a_dropped_connection`,
+// `claude_keeps_running_after_a_detach` and
+// `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
+// docs/host.md says, with `runner doctor` all ok: they fork its base, in the
+// unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
+// root's owner. The unit boots them with the installed runner, so rerun
+// host/install.sh after a build. The headless run needs the host's Claude
+// Code token in /etc/credstore (docs/host.md, step 6).
 mod common;
 
+use std::fs::Permissions;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 fn env_path(name: &str) -> PathBuf {
@@ -31,12 +38,43 @@ fn env_path(name: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// `runner` on `root`, as the user who owns it, as over SSH. Run as root, the
+/// tests would make VMs only root can open, which the unit, running as the
+/// root's owner, then fails to boot: "lock: Permission denied". That user
+/// can't reach this build in a home it can't read, so it gets a copy.
+fn cli(root: &Path) -> Command {
+    let owner = std::fs::metadata(root).unwrap();
+    let mut cmd = if nix::unistd::geteuid().is_root() && owner.uid() != 0 {
+        let mut cmd = Command::new("setpriv");
+        cmd.arg(format!("--reuid={}", owner.uid()))
+            .arg(format!("--regid={}", owner.gid()))
+            .args(["--init-groups", "--"])
+            .arg(runner_copy())
+            .current_dir("/");
+        cmd
+    } else {
+        Command::new(env!("CARGO_BIN_EXE_runner"))
+    };
+    cmd.env("RUNNER_ROOT", root);
+    cmd
+}
+
+/// This build, where any user can run it. It stays in /tmp until a reboot.
+fn runner_copy() -> &'static Path {
+    static COPY: OnceLock<PathBuf> = OnceLock::new();
+    COPY.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("runner-kvm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        let copy = dir.join("runner");
+        std::fs::copy(env!("CARGO_BIN_EXE_runner"), &copy).unwrap();
+        std::fs::set_permissions(&copy, Permissions::from_mode(0o755)).unwrap();
+        copy
+    })
+}
+
 fn runner(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_runner"))
-        .env("RUNNER_ROOT", root)
-        .args(args)
-        .output()
-        .unwrap()
+    cli(root).args(args).output().unwrap()
 }
 
 fn ok(out: Output) -> String {
@@ -44,6 +82,41 @@ fn ok(out: Output) -> String {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{text}{err}");
     text
+}
+
+/// Halts the VM `boot` booted by hand, and waits for boot to end for as long
+/// as the unit's stop timeout would. A guest that ignores Ctrl-Alt-Del fails
+/// the test there instead of hanging it: its Firecracker, whose socket is
+/// under `root`, is killed, and the console's i8042 lines say why.
+fn halt_by_hand(root: &Path, mut boot: Child, console: &Path) -> Output {
+    let halt = cli(root)
+        .args(["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let limit = Duration::from_secs(runner::systemd::STOP_TIMEOUT_SECS.into());
+    let deadline = Instant::now() + limit;
+    while boot.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = Command::new("pkill").arg("-f").arg(root).status();
+            let _ = boot.wait();
+            let _ = halt.wait_with_output();
+            let log = std::fs::read_to_string(console).unwrap_or_default();
+            let keyboard: Vec<&str> = log.lines().filter(|l| l.contains("i8042")).collect();
+            panic!(
+                "the guest ignored Ctrl-Alt-Del for {limit:?}. Its keyboard:\n{}",
+                keyboard.join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let halted = halt.wait_with_output().unwrap();
+    assert!(
+        halted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&halted.stderr)
+    );
+    boot.wait_with_output().unwrap()
 }
 
 /// Polls `check` for up to a minute.
@@ -87,8 +160,7 @@ fn boot_and_halt_by_hand() {
     eventually("a login prompt", || {
         std::fs::read_to_string(&console).is_ok_and(|c| c.contains("login:"))
     });
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     assert!(
         out.status.success(),
         "{}",
@@ -135,8 +207,7 @@ fn a_booted_vm_answers_at_its_address() {
         .args(["-c", "1", "-W", "5", &address])
         .output()
         .unwrap();
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     assert!(
         out.status.success(),
         "{}",
@@ -153,18 +224,11 @@ fn a_booted_vm_answers_at_its_address() {
 }
 
 #[test]
-#[ignore = "boots a VM: needs /dev/kvm and the firecracker@ unit installed"]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
 fn start_logs_and_stop_under_systemd() {
     let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
     let name = format!("boot-test-{}", std::process::id());
-    ok(runner(
-        &root,
-        &[
-            "import",
-            &name,
-            env_path("RUNNER_TEST_DISK").to_str().unwrap(),
-        ],
-    ));
+    ok(runner(&root, &["create", &name]));
     let _cleanup = Cleanup {
         root: root.clone(),
         name: name.clone(),
@@ -179,7 +243,14 @@ fn start_logs_and_stop_under_systemd() {
     eventually("the kernel in the journal", || {
         logs().contains("Linux version")
     });
-    eventually("a login prompt", || logs().contains("login:"));
+    // journald keeps a line until its newline, and getty's prompt has none,
+    // so `login:` never reaches the journal. Getty starting is the last line
+    // that does, and by then init takes Ctrl-Alt-Del.
+    eventually("getty on the serial console", || {
+        logs()
+            .lines()
+            .any(|l| l.contains("Started") && l.contains("serial-getty@ttyS0"))
+    });
 
     ok(runner(&root, &["stop", &name]));
     let status = ok(runner(&root, &["status", &name]));
@@ -189,18 +260,11 @@ fn start_logs_and_stop_under_systemd() {
 }
 
 #[test]
-#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
 fn exec_starts_the_vm_and_runs_in_the_guest() {
     let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
     let name = format!("exec-test-{}", std::process::id());
-    ok(runner(
-        &root,
-        &[
-            "import",
-            &name,
-            env_path("RUNNER_TEST_DISK").to_str().unwrap(),
-        ],
-    ));
+    ok(runner(&root, &["create", &name]));
     let _cleanup = Cleanup {
         root: root.clone(),
         name: name.clone(),
@@ -221,8 +285,7 @@ fn exec_starts_the_vm_and_runs_in_the_guest() {
         &["exec", &name, "--", "sh", "-c", "whoami; pwd"],
     ));
     assert_eq!(who, "agent\n/home/agent\n");
-    let mut piped = Command::new(env!("CARGO_BIN_EXE_runner"))
-        .env("RUNNER_ROOT", &root)
+    let mut piped = cli(&root)
         .args(["exec", &name, "--", "sh", "-c", "cat; exit 7"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -238,20 +301,19 @@ fn exec_starts_the_vm_and_runs_in_the_guest() {
 }
 
 #[test]
-#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
 fn a_session_outlives_a_dropped_connection() {
     let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
     let name = format!("session-test-{}", std::process::id());
-    let disk = env_path("RUNNER_TEST_DISK");
-    ok(runner(&root, &["import", &name, disk.to_str().unwrap()]));
+    ok(runner(&root, &["create", &name]));
     let _cleanup = Cleanup {
         root: root.clone(),
         name: name.clone(),
     };
     ok(runner(&root, &["start", &name]));
     let on_a_terminal = |args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
-        cmd.env("RUNNER_ROOT", &root).env_remove("TERM").args(args);
+        let mut cmd = cli(&root);
+        cmd.env_remove("TERM").args(args);
         cmd
     };
 
@@ -280,20 +342,19 @@ fn a_session_outlives_a_dropped_connection() {
 
 // No token needed: a logged-out claude waits at its login screen.
 #[test]
-#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit and the base image"]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
 fn claude_keeps_running_after_a_detach() {
     let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
     let src = format!("claude-src-{}", std::process::id());
     let name = format!("claude-test-{}", std::process::id());
-    let disk = env_path("RUNNER_TEST_DISK");
-    ok(runner(&root, &["import", &src, disk.to_str().unwrap()]));
+    ok(runner(&root, &["create", &src]));
     let _cleanup = [&src, &name].map(|vm| Cleanup {
         root: root.clone(),
         name: vm.clone(),
     });
     let on_a_terminal = |args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
-        cmd.env("RUNNER_ROOT", &root).env_remove("TERM").args(args);
+        let mut cmd = cli(&root);
+        cmd.env_remove("TERM").args(args);
         cmd
     };
     let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
@@ -344,12 +405,11 @@ fn claude_keeps_running_after_a_detach() {
 // A real `claude -p` under the unit: the run boots the VM, Claude Code edits
 // a file and exits 0, and the VM shuts down, committing the file.
 #[test]
-#[ignore = "boots a VM: needs /dev/kvm, the firecracker@ unit, the base image and the host's token"]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and its token"]
 fn a_headless_run_edits_a_file_and_commits_it() {
     let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
     let name = format!("run-test-{}", std::process::id());
-    let disk = env_path("RUNNER_TEST_DISK");
-    ok(runner(&root, &["import", &name, disk.to_str().unwrap()]));
+    ok(runner(&root, &["create", &name]));
     let _cleanup = Cleanup {
         root: root.clone(),
         name: name.clone(),
@@ -433,8 +493,7 @@ fn the_token_reaches_the_vm_s_memory_and_never_its_disk() {
     // As a session would: Claude Code runs, and writes what it writes.
     let claude = run("claude -p 'Reply with the word ok' </dev/null; sync", 300);
     let handed = runner::store::Store::new(root).handed("dev").unwrap();
-    ok(runner(root, &["halt", "dev"]));
-    let out = boot.wait_with_output().unwrap();
+    let out = halt_by_hand(root, boot, &console);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     assert_eq!(seen.stdout, token, "the guest didn't have the token");

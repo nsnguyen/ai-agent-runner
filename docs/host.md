@@ -45,13 +45,13 @@ The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own roo
 
 ## Boot tests
 
-They need KVM, so they're `#[ignore]`d and skipped everywhere else:
+They need KVM, so they're `#[ignore]`d and skipped everywhere else. On a host set up as above, with `runner doctor` all ok, from a checkout:
 
 ```
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
-RUNNER_TEST_DISK=rootfs.ext4 RUNNER_TEST_KERNEL=vmlinux cargo test --test kvm -- --ignored
+RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux cargo test --test kvm -- --ignored --test-threads=1
 ```
 
-The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
+The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so rerun `host/install.sh` after a build. One test at a time, since a small host (2 vCPUs) can't boot eight VMs at once. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
 
 The rootfs's init must take Ctrl-Alt-Del (systemd does) and print a login prompt on the serial console.

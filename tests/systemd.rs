@@ -17,11 +17,13 @@ fn the_unit_boots_and_halts_each_vm_as_the_runner_user() {
     )
     .unwrap();
     let want = "\
-# firecracker@.service, written by `runner unit`. Each instance is one VM:
-# `systemctl start firecracker@dev` boots dev. Write it again after moving
-# the runner binary or its root.
+# firecracker@.service, as `runner unit` writes it and host/install.sh
+# installs it. Each instance is one VM: `systemctl start firecracker@dev`
+# boots dev. Write it again after moving the runner binary or its root.
 [Unit]
 Description=Firecracker microVM %i
+# After the VMs' NAT, when both start at once.
+After=network.target runner-nat.service
 # Stopped before its disks' filesystem is unmounted, at host shutdown too.
 RequiresMountsFor=/var/lib/runner
 
@@ -39,6 +41,7 @@ Environment=RUNNER_ROOT=/var/lib/runner
 LoadCredential=CLAUDE_CODE_OAUTH_TOKEN
 LoadCredential=ANTHROPIC_API_KEY
 LoadCredential=GH_TOKEN
+# %i, not %I: %I would unescape a VM name's dashes into slashes.
 ExecStart=/usr/local/bin/runner boot %i
 # Ctrl-Alt-Del, then wait for the guest to shut down. Past the timeout,
 # systemd kills the VM and its run isn't committed.
@@ -120,21 +123,27 @@ fn ready_reaches_a_path_socket_and_an_abstract_one() {
     assert_eq!(&buf[..n], b"READY=1");
 }
 
-// Both units, the one host/install.sh installs and `runner unit`'s, load
-// every variable a credential can arrive as, in the terse form: a missing
-// one is skipped rather than failing the boot.
+// The unit host/install.sh installs, which `runner doctor` checks against, is
+// `runner unit`'s for the install's binary, root and user. A hand-kept copy
+// once lost ExecStop: every `runner stop` killed its VM, and no run was
+// committed.
 #[test]
-fn both_units_load_every_credential() {
+fn the_installed_unit_is_runner_units() {
     let rendered = systemd::render_unit(
         Path::new("/usr/local/bin/runner"),
         Path::new("/var/lib/runner"),
         "runner",
     )
     .unwrap();
-    for unit in [runner::host::UNIT, &rendered] {
-        for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
-            let line = format!("\nLoadCredential={var}\n");
-            assert!(unit.contains(&line), "no {line:?} in\n{unit}");
-        }
+    assert_eq!(runner::host::UNIT, rendered);
+}
+
+// Every variable a credential can arrive as, in the terse form: a missing
+// one is skipped rather than failing the boot.
+#[test]
+fn the_unit_loads_every_credential() {
+    for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
+        let line = format!("\nLoadCredential={var}\n");
+        assert!(runner::host::UNIT.contains(&line), "no {line:?}");
     }
 }

@@ -10,7 +10,7 @@ The host needs:
 - On the tailnet, with no other way in over SSH (see Tailnet only).
 - `/var/lib/runner` on XFS or btrfs. On ext4 every fork and run is a full copy of the disk.
 
-Install, from a checkout:
+On AWS, `client/aws.sh` makes one (see On AWS). Install, from a checkout:
 
 ```sh
 git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
@@ -37,6 +37,31 @@ ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict
 The host takes SSH only over the tailnet. Never forward port 22 to it from a router or expose it on a public IP. If sshd does listen elsewhere, `from=` still refuses the runner user's key from outside the tailnet.
 
 This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailscaled answers port 22 on the tailnet address and never reads `authorized_keys`.
+
+### On AWS
+
+`client/aws.sh`, run on the laptop, makes a host on EC2 with the AWS CLI: an `m7i-flex.large` with nested virtualization on, which gives it `/dev/kvm` at a regular instance's price (a `.metal` costs dollars an hour), running Ubuntu 24.04, with a 50 GiB second disk for `/var/lib/runner`.
+
+```sh
+brew install awscli
+aws configure set region us-west-2
+aws login
+client/aws.sh up
+client/aws.sh ssh ls -l /dev/kvm
+```
+
+If `aws login` refuses because the default profile already holds access keys, `aws login --profile runner` and `export AWS_PROFILE=runner` keep the two apart. If `up` says the CLI doesn't know `NestedVirtualization`, `brew upgrade awscli`.
+
+`up` waits a few minutes, until the host has booted. Until it's on the tailnet, only the laptop's address gets in over SSH, as `ubuntu` with the key `up` saves in `~/.ssh/kvm-host.pem`; after the laptop's address changes, `client/aws.sh open` lets in the new one and no other. On the host, put the second disk on XFS before installing. NVMe disks on EC2 aren't named in a fixed order, so find it by its size:
+
+```sh
+disk=/dev/$(lsblk -dno NAME,SIZE | awk '$2 == "50G" {print $1}'); echo "$disk"
+sudo mkfs.xfs "$disk"
+echo "UUID=$(sudo blkid -s UUID -o value "$disk") /var/lib/runner xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
+sudo mkdir -p /var/lib/runner && sudo mount /var/lib/runner
+```
+
+Then install as above and join the tailnet, and `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new address, and `ip` prints it.
 
 ## Build the base image
 
