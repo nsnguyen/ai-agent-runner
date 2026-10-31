@@ -14,12 +14,17 @@
 use ext4_view::{Ext4, Ext4Error, File, Metadata, Path as InPath, PathBuf as InPathBuf};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How many changed paths a result lists before it only counts the rest.
 pub const CAP: usize = 200;
+
+/// How many bytes of paths a result lists before it only counts the rest: a
+/// guest names its paths, and can make each one long.
+pub const PATH_BYTES: usize = 32 * 1024;
 
 /// How long measuring may take before it gives up.
 pub const TIME: Duration = Duration::from_secs(600);
@@ -28,6 +33,8 @@ const MAX_DEPTH: usize = 256;
 const MAX_ENTRIES: u64 = 10_000_000;
 // Longer than any path a link can hold.
 const MAX_LINK: u64 = 4096;
+// How often measuring asks whether to stop, in entries and blocks read.
+const ASK_EVERY: u32 = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -73,6 +80,17 @@ pub struct Changes {
 /// The paths that differ between two ext4 disks, listing at most `cap`, or an
 /// error once measuring takes longer than `time`.
 pub fn between(before: &Path, after: &Path, cap: usize, time: Duration) -> Result<Changes> {
+    between_until(before, after, cap, time, &|| false)
+}
+
+/// As `between`, but an error too as soon as `stop` says to.
+pub fn between_until(
+    before: &Path,
+    after: &Path,
+    cap: usize,
+    time: Duration,
+    stop: &dyn Fn() -> bool,
+) -> Result<Changes> {
     let mut walk = Walk {
         before: Disk::load(before)?,
         after: Disk::load(after)?,
@@ -81,7 +99,10 @@ pub fn between(before: &Path, after: &Path, cap: usize, time: Duration) -> Resul
             entries: MAX_ENTRIES,
             until: Instant::now() + time,
             time,
+            stop,
+            asked: Cell::new(0),
         },
+        listed: 0,
         out: Changes::default(),
     };
     walk.dir(&InPath::ROOT.into(), 0)?;
@@ -153,13 +174,16 @@ fn too_deep() -> String {
     format!("more than {MAX_DEPTH} directories deep; does a directory contain itself?")
 }
 
-struct Budget {
+struct Budget<'a> {
     entries: u64,
     until: Instant,
     time: Duration,
+    stop: &'a dyn Fn() -> bool,
+    // How often it's been asked whether to go on.
+    asked: Cell<u32>,
 }
 
-impl Budget {
+impl Budget<'_> {
     fn entry(&mut self) -> std::result::Result<(), String> {
         self.entries = self
             .entries
@@ -169,11 +193,15 @@ impl Budget {
     }
 
     fn in_time(&self) -> std::result::Result<(), String> {
-        if Instant::now() < self.until {
-            Ok(())
-        } else {
-            Err(format!("measuring took over {}s", self.time.as_secs_f32()))
+        if Instant::now() >= self.until {
+            return Err(format!("measuring took over {}s", self.time.as_secs_f32()));
         }
+        let asked = self.asked.get();
+        self.asked.set(asked.wrapping_add(1));
+        if asked.is_multiple_of(ASK_EVERY) && (self.stop)() {
+            return Err("measuring was stopped".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -181,7 +209,9 @@ struct Walk<'a> {
     before: Disk<'a>,
     after: Disk<'a>,
     cap: usize,
-    budget: Budget,
+    budget: Budget<'a>,
+    // The bytes of the paths listed so far.
+    listed: usize,
     out: Changes,
 }
 
@@ -269,17 +299,22 @@ impl Walk<'_> {
         }
     }
 
+    // Once a path doesn't fit, the rest are only counted, so the list stays
+    // in order.
     fn note(&mut self, path: &InPathBuf, change: Kind, contains: Option<u64>) {
-        if self.out.paths.len() < self.cap {
+        if self.out.more == 0 && self.out.paths.len() < self.cap {
             let path = shown(path.as_ref());
-            self.out.paths.push(Change {
-                path,
-                change,
-                contains,
-            });
-        } else {
-            self.out.more += 1;
+            if self.listed + path.len() <= PATH_BYTES {
+                self.listed += path.len();
+                self.out.paths.push(Change {
+                    path,
+                    change,
+                    contains,
+                });
+                return;
+            }
         }
+        self.out.more += 1;
     }
 }
 

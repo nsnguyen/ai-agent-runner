@@ -1,6 +1,6 @@
 // The VM store on a temp directory: no KVM needed.
 use runner::creds::{Cred, DEFAULT};
-use runner::store::{Checkpoint, Config, Error, Machine, Store, Vm, check_name, parse_mem};
+use runner::store::{Booted, Checkpoint, Config, Error, Machine, Store, Vm, check_name, parse_mem};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -79,6 +79,29 @@ fn fork_copies_the_current_disk_and_shares_nothing_after() {
     run.commit().unwrap();
     assert_eq!(store.get("base").unwrap(), vm("base", 0, 6));
     assert_eq!(store.get("dev").unwrap(), vm("dev", 1, 14));
+}
+
+// So a headless run, in another process, knows which disk it ran on.
+#[test]
+fn begin_run_notes_the_generations_of_the_boot() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    assert_eq!(store.booted("dev").unwrap(), None);
+    let run = store.begin_run("dev").unwrap();
+    let booted = Booted {
+        from: 0,
+        generation: 1,
+    };
+    assert_eq!(store.booted("dev").unwrap(), Some(booted));
+    assert_eq!(store.disk("dev", 1).unwrap(), run.disk);
+    run.commit().unwrap();
+    let next = store.begin_run("dev").unwrap();
+    assert_eq!((next.from, next.generation), (1, 2));
+    let booted = Booted {
+        from: 1,
+        generation: 2,
+    };
+    assert_eq!(store.booted("dev").unwrap(), Some(booted));
 }
 
 #[test]

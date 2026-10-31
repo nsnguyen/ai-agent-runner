@@ -12,14 +12,14 @@
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
 //   <root>/vms/<name>/rollback       a run's ask that its boot not commit, naming the run
-//   <root>/vms/<name>/runs/          its headless runs: their streams and how each ended (runs.rs)
+//   <root>/vms/<name>/booted         the generations of its latest boot: the one it cloned, and its own
+//   <root>/vms/<name>/runs/          its headless runs: their streams, how each ended, and its result (runs.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
 //   <root>/slots.lock                flock'd while a slot is picked
 //
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
-use crate::changes::{self, Changes};
 use crate::creds::{self, Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -462,6 +462,25 @@ impl Store {
         write_aside(&self.existing(name)?, ROLLBACK, &format!("{by}\n"))
     }
 
+    /// The generations begin_run last noted, for a headless run in another
+    /// process to know which disk its boot runs; the disk may be gone since,
+    /// if that boot never got going. None if the VM never booted.
+    pub fn booted(&self, name: &str) -> Result<Option<Booted>> {
+        let path = self.existing(name)?.join(BOOTED);
+        let text = match fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r.map_err(at(&path))?,
+        };
+        let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
+        Ok(Some(booted))
+    }
+
+    /// The disk of one of the VM's generations, whether or not it's still
+    /// there.
+    pub fn disk(&self, name: &str, generation: u64) -> Result<PathBuf> {
+        Ok(disk_of(&self.existing(name)?, generation))
+    }
+
     /// Takes back an ask_rollback, so a clean shutdown commits again.
     pub fn withdraw_rollback(&self, name: &str) -> Result<()> {
         remove_if_there(&self.existing(name)?.join(ROLLBACK))
@@ -490,8 +509,9 @@ impl Store {
     }
 
     /// Clones the current disk into a new generation for one run to boot
-    /// from. Only `Run::commit` makes it current; dropping the run keeps the
-    /// old one current and leaves the new disk for a look.
+    /// from, and notes both generations (Store::booted). Only `Run::commit`
+    /// makes it current; dropping the run keeps the old one current and
+    /// leaves the new disk for a look.
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_lock(&dir, name)?;
@@ -501,6 +521,12 @@ impl Store {
         let generation = next_generation(&dir)?;
         let disk = disk_of(&dir, generation);
         clone(&disk_of(&dir, from), &disk)?;
+        let booted = Booted { from, generation };
+        let text = serde_json::to_string(&booted).map_err(|e| at(&dir.join(BOOTED))(e.into()))?;
+        if let Err(e) = write_aside(&dir, BOOTED, &text) {
+            remove_if_there(&disk)?;
+            return Err(e);
+        }
         let name = name.to_string();
         Ok(Run {
             from,
@@ -661,18 +687,6 @@ pub struct Run {
 }
 
 impl Run {
-    /// What the run changed: its disk against the generation it was cloned
-    /// from, read from the disks, at most `cap` paths. Measure before
-    /// `commit`, which takes the run.
-    pub fn changes(&self, cap: usize) -> changes::Result<Changes> {
-        changes::between(
-            &disk_of(&self.dir, self.from),
-            &self.disk,
-            cap,
-            changes::TIME,
-        )
-    }
-
     /// Makes this run's disk current, then collects the generations the store
     /// doesn't keep. That gc runs under the run's lock, so it never races one.
     pub fn commit(self) -> Result<Vm> {
@@ -744,6 +758,16 @@ impl Run {
 
 const HANDED: &str = "handed";
 const ROLLBACK: &str = "rollback";
+const BOOTED: &str = "booted";
+
+/// A boot's generations (Store::booted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Booted {
+    /// The generation it cloned.
+    pub from: u64,
+    /// Its own: the one it runs, and commits if the VM shuts down cleanly.
+    pub generation: u64,
+}
 
 /// A boot's note of which credentials its guest took, for `runner status`,
 /// which runs in another process. Names only.

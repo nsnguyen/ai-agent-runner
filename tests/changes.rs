@@ -1,53 +1,16 @@
 // What a run changed, measured from two ext4 disks that the tests build with
 // mkfs.ext4 -d and edit with debugfs: no root, no mounts, no KVM.
+mod common;
+
+use common::{debugfs, image, tree};
 use runner::changes::{self, Change, Changes, Error, Kind};
 use runner::store::Store;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
-
-// A directory tree from (path, contents) pairs, parents made as needed.
-fn tree(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
-    fs::create_dir(dir).unwrap();
-    for (path, text) in files {
-        let path = dir.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    }
-    dir.to_path_buf()
-}
-
-fn ok(cmd: &mut Command) {
-    let out = cmd
-        .output()
-        .expect("e2fsprogs (mkfs.ext4, debugfs) is installed");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{cmd:?}: {err}");
-}
-
-// An ext4 disk holding a copy of `tree`, the way images/base builds one.
-fn image(tree: &Path) -> PathBuf {
-    let disk = tree.with_extension("ext4");
-    ok(Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .args([tree, &disk])
-        .arg("16M"));
-    disk
-}
-
-// Edits a disk in place, as a run's guest would: one request per line.
-fn debugfs(disk: &Path, requests: &str) {
-    let script = disk.with_extension("debugfs");
-    fs::write(&script, requests).unwrap();
-    ok(Command::new("debugfs")
-        .arg("-w")
-        .arg("-f")
-        .args([&script, disk]));
-}
 
 fn change(path: &str, change: Kind) -> Change {
     let path = path.to_string();
@@ -168,6 +131,40 @@ fn the_list_is_capped_and_counts_the_rest() {
             paths: want,
             more: 3
         }
+    );
+}
+
+// Paths a guest names can be long, and a result goes to the caller whole.
+#[test]
+fn the_list_is_capped_by_its_bytes_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = image(&tree(&dir.path().join("before"), &[]));
+    let names: Vec<String> = (0..200)
+        .map(|i| format!("{i:03}{}", "x".repeat(240)))
+        .collect();
+    let files: Vec<_> = names.iter().map(|n| (n.as_str(), "")).collect();
+    let after = image(&tree(&dir.path().join("after"), &files));
+
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
+    let listed: usize = got.paths.iter().map(|c| c.path.len()).sum();
+    assert!(listed <= changes::PATH_BYTES, "{listed} bytes listed");
+    assert_eq!(got.paths.len(), changes::PATH_BYTES / 244);
+    assert_eq!(got.paths.len() as u64 + got.more, 200);
+}
+
+// As a cancel does to a run whose disk is being measured.
+#[test]
+fn measuring_stops_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = image(&tree(&dir.path().join("before"), &[]));
+    let after = image(&tree(&dir.path().join("after"), &[("a", "a")]));
+    let got = changes::between_until(&before, &after, changes::CAP, changes::TIME, &|| true);
+    let Err(e @ Error::Unbounded { .. }) = got else {
+        panic!("measuring went on: {got:?}");
+    };
+    assert!(
+        e.to_string().ends_with(".ext4: measuring was stopped"),
+        "{e}"
     );
 }
 
@@ -353,7 +350,8 @@ fn a_run_reports_what_its_guest_changed_on_its_disk() {
     debugfs(&run.disk, &write("main.rs"));
     debugfs(&run.disk, &write("new.rs"));
 
-    let got = run.changes(changes::CAP).unwrap();
+    let base = store.disk("dev", run.from).unwrap();
+    let got = changes::between(&base, &run.disk, changes::CAP, changes::TIME).unwrap();
     let want = vec![
         change("/home/agent/work/main.rs", Kind::Modified),
         change("/home/agent/work/new.rs", Kind::Added),

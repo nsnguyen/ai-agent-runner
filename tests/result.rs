@@ -7,9 +7,9 @@ fn result(changed: Changed, agent_says: AgentSays) -> RunResult {
     RunResult {
         exit_code: Some(0),
         duration_ms: 81234,
-        outcome: Outcome::Committed,
-        from_generation: 2,
-        generation: 3,
+        outcome: Some(Outcome::Committed),
+        from_generation: Some(2),
+        generation: Some(3),
         changed,
         agent_says,
     }
@@ -66,7 +66,7 @@ fn a_run_that_did_not_exit_and_could_not_be_measured_says_so() {
         AgentSays::new(None),
     );
     got.exit_code = None;
-    got.outcome = Outcome::RolledBack;
+    got.outcome = Some(Outcome::RolledBack);
     let json = serde_json::to_value(&got).unwrap();
     assert_eq!(json["exit_code"], json!(null));
     assert_eq!(json["outcome"], "rolled_back");
@@ -79,6 +79,30 @@ fn a_run_that_did_not_exit_and_could_not_be_measured_says_so() {
         json!({"untrusted": true, "text": null, "truncated": false})
     );
     let back: RunResult = serde_json::from_value(json).unwrap();
+    assert_eq!(back, got);
+}
+
+// A run that joined a running VM: there's no disk from before it.
+#[test]
+fn a_joined_run_has_no_outcome_or_generations() {
+    let mut got = result(
+        Changed::Unmeasured {
+            error: "joined dev running".to_string(),
+        },
+        says("Done."),
+    );
+    (got.outcome, got.from_generation, got.generation) = (None, None, None);
+    let want = json!({
+        "exit_code": 0,
+        "duration_ms": 81234,
+        "outcome": null,
+        "from_generation": null,
+        "generation": null,
+        "changed": {"error": "joined dev running"},
+        "agent_says": {"untrusted": true, "text": "Done.", "truncated": false}
+    });
+    assert_eq!(serde_json::to_value(&got).unwrap(), want);
+    let back: RunResult = serde_json::from_value(want).unwrap();
     assert_eq!(back, got);
 }
 
