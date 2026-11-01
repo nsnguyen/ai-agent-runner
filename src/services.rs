@@ -51,10 +51,29 @@ pub enum Error {
     /// What add needs in the guest isn't there: the user or the directory.
     #[error("{why} in {vm}")]
     Missing { vm: String, why: String },
-    #[error("{name} didn't start in {vm}, so it was removed:\n{why}")]
+    /// Its start failed: `why` is the journal's last lines, or systemctl's.
+    #[error(
+        "{name} didn't start in {vm}, so it was removed. systemd couldn't start {command}:\n{why}"
+    )]
     NotStarted {
         vm: String,
         name: String,
+        /// The command, as a shell would take it.
+        command: String,
+        why: String,
+    },
+    /// systemd couldn't run the program at all (203/EXEC), which its journal
+    /// says without naming it.
+    #[error(
+        "{name} didn't start in {vm}, so it was removed. {} couldn't be run: it {}, or isn't executable.\n{why}",
+        shell_word(.program),
+        if .program.contains('/') { "isn't there" } else { "isn't in PATH" }
+    )]
+    CantRun {
+        vm: String,
+        name: String,
+        /// The program as the unit runs it: a name looked up in PATH, or a path.
+        program: String,
         why: String,
     },
     #[error("services in {vm}: {why}")]
@@ -165,11 +184,18 @@ pub fn check_name(name: &str) -> Result<()> {
 /// The unit file for `spec`, refusing anything systemd would read some other
 /// way than as given.
 pub fn render_unit(spec: &Spec) -> Result<String> {
-    Ok(prepare(spec)?.1)
+    Ok(prepare(spec)?.unit)
 }
 
-// The service's directory, normalized, and its unit.
-fn prepare(spec: &Spec) -> Result<(String, String)> {
+struct Prepared {
+    /// The service's directory, normalized.
+    dir: String,
+    /// The program as ExecStart= runs it.
+    program: String,
+    unit: String,
+}
+
+fn prepare(spec: &Spec) -> Result<Prepared> {
     check_name(&spec.name)?;
     check_user(&spec.user)?;
     let dir = check_dir(&spec.dir)?;
@@ -178,7 +204,9 @@ fn prepare(spec: &Spec) -> Result<(String, String)> {
         return Err(Error::Nul);
     }
     let program = check_program(program, &dir)?;
-    let argv: Vec<String> = std::iter::once(program).chain(args.to_vec()).collect();
+    let argv: Vec<String> = std::iter::once(program.clone())
+        .chain(args.to_vec())
+        .collect();
     let name = &spec.name;
     // StartLimitIntervalSec=0: systemd's start limit counts restarts, and
     // would give up on a service that crash-loops for 5 seconds, say a dev
@@ -210,7 +238,7 @@ WantedBy=multi-user.target
         dir = dir.replace('%', "%%"),
         exec = exec_start(&argv),
     );
-    Ok((dir, unit))
+    Ok(Prepared { dir, program, unit })
 }
 
 fn check_user(user: &str) -> Result<()> {
@@ -386,7 +414,8 @@ pub fn parse_exec_start(line: &str) -> Option<Vec<String>> {
 // $2 the unit, $3 the service, $4 its user, $5 its directory; the unit's text
 // on stdin. Exits 3 if the name is taken, 4 if the user or directory isn't
 // there, and 5, having removed the unit, with the journal's say on stderr,
-// if it didn't start. It enables, then starts, in two calls: systemd 255's
+// if it didn't start, or 6 if that's because the program couldn't be run:
+// systemd's 203/EXEC. It enables, then starts, in two calls: systemd 255's
 // `enable --now` says a start failed, but exits 0.
 const ADD: &str = r#"d=$1 unit=$2 user=$4 dir=$5
 f=$d/$unit
@@ -397,6 +426,7 @@ since=$(date +%s)
 (set -C; cat > "$f") || exit 1
 systemctl daemon-reload || { rm -f -- "$f"; exit 1; }
 said=$(systemctl enable "$unit" 2>&1) && said=$(systemctl start "$unit" 2>&1) && exit 0
+status=$(systemctl show -p ExecMainStatus --value "$unit" 2>/dev/null)
 journalctl --sync >/dev/null 2>&1
 log=$(journalctl -u "$unit" --since "@$since" -n 20 --no-pager -o cat 2>/dev/null)
 systemctl disable --now "$unit" >/dev/null 2>&1
@@ -404,6 +434,7 @@ rm -f -- "$f"
 systemctl daemon-reload
 systemctl reset-failed "$unit" >/dev/null 2>&1
 printf '%s\n' "${log:-$said}" >&2
+[ "$status" = 203 ] && exit 6
 exit 5
 "#;
 
@@ -448,9 +479,9 @@ fn script(body: &str, args: &[&str]) -> Vec<String> {
 /// Writes the service's unit, then enables and starts it. Returns once its
 /// program has started, which a crash a moment later doesn't undo: `list`
 /// and `logs` show that. A program that can't start leaves no unit behind,
-/// and the error has the journal's last lines.
+/// and the error names its command and has the journal's last lines.
 pub fn add(guest: &impl Guest, spec: &Spec) -> Result<Service> {
-    let (dir, unit) = prepare(spec)?;
+    let Prepared { dir, program, unit } = prepare(spec)?;
     let (vm, name) = (guest.vm(), spec.name.as_str());
     let (units, unit_file) = (guest.unit_dir(), unit_name(name));
     let args = [units.as_str(), &unit_file, name, &spec.user, &dir];
@@ -468,6 +499,15 @@ pub fn add(guest: &impl Guest, spec: &Spec) -> Result<Service> {
             return Err(Error::NotStarted {
                 vm: vm.to_string(),
                 name: name.to_string(),
+                command: shell_words(&spec.argv),
+                why: got.stderr.trim().to_string(),
+            });
+        }
+        6 => {
+            return Err(Error::CantRun {
+                vm: vm.to_string(),
+                name: name.to_string(),
+                program,
                 why: got.stderr.trim().to_string(),
             });
         }
@@ -566,9 +606,13 @@ pub fn parse_list(out: &str) -> Vec<Service> {
 /// A service on one line: name, state, directory and command, its words
 /// quoted as a shell would need them.
 pub fn row(s: &Service) -> String {
-    let words: Vec<String> = s.argv.iter().map(|w| shell_word(w)).collect();
     let (state, sub, dir) = (&s.state, &s.sub_state, &s.dir);
-    format!("{}  {state}/{sub}  {dir}  {}", s.name, words.join(" "))
+    format!("{}  {state}/{sub}  {dir}  {}", s.name, shell_words(&s.argv))
+}
+
+fn shell_words(argv: &[String]) -> String {
+    let words: Vec<String> = argv.iter().map(|w| shell_word(w)).collect();
+    words.join(" ")
 }
 
 fn shell_word(word: &str) -> String {

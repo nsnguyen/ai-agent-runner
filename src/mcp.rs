@@ -399,7 +399,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Run a command in a VM as a service: a systemd unit that runs it as the agent user, starts it now and at every boot, and starts it again a second after it exits; sleep keeps it running as it was. Starts a stopped VM, or wakes a sleeping one, first. Returns the service once its program has started; one that can't start fails, leaving nothing behind, with the journal's last lines. A service gets no credentials. Fails if the VM has a service by that name: remove_service it first."
+        description = "Run a command in a VM as a service: a systemd unit that runs it as the agent user, starts it now and at every boot, and starts it again a second after it exits; sleep keeps it running as it was. Starts a stopped VM, or wakes a sleeping one, first. Returns the service once its program has started; one that can't start fails, leaving nothing behind, with its command and the journal's last lines. A service gets no credentials. Fails if the VM has a service by that name: remove_service it first."
     )]
     async fn add_service(
         &self,

@@ -231,8 +231,10 @@ fn refuses_what_systemd_would_read_otherwise() {
 
 // The guest, here: a unit directory of its own, and systemctl and journalctl
 // that keep what's asked of them in a log. systemctl keeps each unit's state
-// in a file of its own; `fail` makes the next start fail. Like systemd 255's,
-// `enable --now` says a start failed but exits 0; only `start` exits 1.
+// in a file of its own; `fail` makes the next start fail, with what it holds,
+// if anything, as ExecMainStatus. Like systemd 255's, `enable --now` says a
+// start failed but exits 0; only `start` exits 1. journalctl says what
+// systemd 255 does when a start fails, which never names the program.
 struct Here {
     dir: TempDir,
 }
@@ -249,7 +251,9 @@ impl Here {
 for unit; do :; done
 case "$1" in
   show)
-    if [ -f "$STATE/$unit" ]; then cat "$STATE/$unit"
+    if [ "$3" = ExecMainStatus ]; then
+      if [ -s "$STATE/fail" ]; then cat "$STATE/fail"; else echo 0; fi
+    elif [ -f "$STATE/$unit" ]; then cat "$STATE/$unit"
     else printf 'ActiveState=inactive\nSubState=dead\n'; fi ;;
   start|enable)
     [ "$1" = enable ] && [ "$2" != --now ] && exit 0
@@ -266,7 +270,8 @@ esac
         script(
             &dir.path().join("bin/journalctl"),
             r#"echo "journalctl $*" >> "$LOG"
-echo "$unit: Failed to locate executable nope: No such file or directory"
+echo "$2: Failed with result 'exit-code'."
+echo "Failed to start $2 - runner service."
 "#,
         );
         Here { dir }
@@ -393,12 +398,19 @@ fn add_refuses_a_name_that_s_taken() {
 fn a_service_that_won_t_start_leaves_nothing_behind() {
     let here = Here::new();
     fs::write(here.path("state/fail"), "").unwrap();
-    let got = services::add(&here, &here.spec("web", &["nope"]));
-    let Err(Error::NotStarted { vm, name, why }) = got else {
+    let got = services::add(&here, &here.spec("web", &["serve", "--port", "8 0"]));
+    let Err(err @ Error::NotStarted { .. }) = got else {
         panic!("{got:?}")
     };
-    assert_eq!((vm.as_str(), name.as_str()), ("dev", "web"));
-    assert!(why.contains("Failed to locate executable nope"), "{why}");
+    let journal = "runner-svc-web.service: Failed with result 'exit-code'.\n\
+        Failed to start runner-svc-web.service - runner service.";
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "web didn't start in dev, so it was removed. \
+            systemd couldn't start serve --port '8 0':\n{journal}"
+        )
+    );
     assert!(!unit_file(&here, "web").exists());
     let calls = here.calls();
     assert!(
@@ -426,6 +438,39 @@ fn a_start_that_fails_says_why_even_with_the_journal_quiet() {
     };
     assert_eq!(why, "Job for runner-svc-web.service failed.");
     assert!(!unit_file(&here, "web").exists());
+}
+
+// systemd's 203/EXEC: its journal says only that, so the error names the
+// program, and where it was looked for.
+#[test]
+fn a_program_that_can_t_be_run_is_named() {
+    let here = Here::new();
+    fs::write(here.path("state/fail"), "203\n").unwrap();
+    let got = services::add(&here, &here.spec("nope", &["no-such-program", "-v"]));
+    let Err(err @ Error::CantRun { .. }) = got else {
+        panic!("{got:?}")
+    };
+    let journal = "runner-svc-nope.service: Failed with result 'exit-code'.\n\
+        Failed to start runner-svc-nope.service - runner service.";
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "nope didn't start in dev, so it was removed. \
+            no-such-program couldn't be run: it isn't in PATH, or isn't executable.\n{journal}"
+        )
+    );
+    assert!(!unit_file(&here, "nope").exists());
+    assert_eq!(services::list(&here).unwrap(), []);
+
+    // A relative program is named as it was run: from the directory.
+    let got = services::add(&here, &here.spec("nope", &["./serve"]));
+    let why = got.unwrap_err().to_string();
+    let serve = here.path("serve");
+    let named = format!(
+        "{} couldn't be run: it isn't there, or isn't executable.",
+        serve.display()
+    );
+    assert!(why.contains(&named), "{why}");
 }
 
 #[test]
