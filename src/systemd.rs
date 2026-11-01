@@ -1,7 +1,9 @@
 // Each VM is an instance of one template unit, firecracker@<vm>.service,
 // whose main process is `runner boot <vm>`. start, stop and status are
 // systemctl on it, logs is journalctl. systemctl's output is captured, never
-// inherited: under `runner mcp`, stdout is protocol.
+// inherited: under `runner mcp`, stdout is protocol. A VM that sleeps keeps
+// its unit active, since its boot stays up (src/sleep.rs): status tells it
+// apart by its snapshot.
 use crate::boot::RESTART;
 use crate::creds::Cred;
 use crate::store::{Store, Vm};
@@ -39,6 +41,10 @@ pub enum Error {
     UnknownState { unit: String, state: String },
     #[error("{0}")]
     BadUnitValue(String),
+    #[error(transparent)]
+    Sleep(#[from] crate::sleep::Error),
+    #[error("{0}")]
+    NotNow(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -52,6 +58,9 @@ pub enum State {
     Running,
     /// Shutting down after Ctrl-Alt-Del.
     Stopping,
+    /// Its memory in a snapshot and its Firecracker stopped, while its boot
+    /// waits to wake it.
+    Sleeping,
 }
 
 impl State {
@@ -75,6 +84,7 @@ impl fmt::Display for State {
             State::Booting => "booting",
             State::Running => "running",
             State::Stopping => "stopping",
+            State::Sleeping => "sleeping",
         })
     }
 }
@@ -96,17 +106,53 @@ pub fn unit_name(vm: &str) -> String {
     format!("firecracker@{vm}.service")
 }
 
-/// Boots the VM and returns once its guest is started.
+/// Boots the VM, or wakes it if it's sleeping, and returns once its guest is
+/// started.
 pub fn start(store: &Store, name: &str) -> Result<VmStatus> {
     store.get(name)?;
     systemctl(name, &["start", &unit_name(name)])?;
-    status(store, name)
+    let status = status(store, name)?;
+    if status.state != State::Sleeping {
+        return Ok(status);
+    }
+    crate::sleep::wake(store, name)?;
+    self::status(store, name)
 }
 
-/// Returns once the VM is down, cleanly or, past the timeout, killed.
+/// Returns once the VM is down, cleanly or, past the timeout, killed. A
+/// sleeping VM is woken to shut down (boot::halt).
 pub fn stop(store: &Store, name: &str) -> Result<VmStatus> {
     store.get(name)?;
     systemctl(name, &["stop", &unit_name(name)])?;
+    status(store, name)
+}
+
+/// Puts a running VM to sleep (src/sleep.rs). One asleep already stays so.
+pub fn sleep(store: &Store, name: &str) -> Result<VmStatus> {
+    match status(store, name)?.state {
+        State::Running => crate::sleep::sleep(store, name)?,
+        State::Sleeping => {}
+        state => {
+            return Err(Error::NotNow(format!(
+                "{name} is {state}: only a running VM sleeps"
+            )));
+        }
+    }
+    status(store, name)
+}
+
+/// Wakes a sleeping VM. One awake already stays so.
+pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
+    match status(store, name)?.state {
+        State::Sleeping => crate::sleep::wake(store, name)?,
+        State::Running => {}
+        State::Stopped => {
+            return Err(Error::NotNow(format!(
+                "{name} is stopped, not sleeping: `runner start {name}` boots it"
+            )));
+        }
+        state => return Err(Error::NotNow(format!("{name} is {state}, not sleeping"))),
+    }
     status(store, name)
 }
 
@@ -115,10 +161,14 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
     let unit = unit_name(name);
     let active = systemctl(name, &["show", "--property=ActiveState", "--value", &unit])?;
     let active = active.trim();
-    let state = State::from_active_state(active).ok_or_else(|| Error::UnknownState {
+    let mut state = State::from_active_state(active).ok_or_else(|| Error::UnknownState {
         unit,
         state: active.to_string(),
     })?;
+    // Only while its boot is up: one killed asleep leaves its snapshot.
+    if state == State::Running && store.sleeping(name)?.is_some() {
+        state = State::Sleeping;
+    }
     // A start or stop that worked shouldn't be reported as failed for want
     // of an address.
     let address = store.net(name).ok().map(|net| net.address);

@@ -87,6 +87,11 @@ pub fn checkpoint(store: &Store, name: &str, comment: Option<&str>) -> Result<Ch
     }
     match systemd::status(store, name)?.state {
         State::Running => running(store, name, comment),
+        // Its guest syncs its disk first, which it can only do awake.
+        State::Sleeping => {
+            systemd::wake(store, name)?;
+            running(store, name, comment)
+        }
         // Held, but not by a boot: another runner command, gone in a moment.
         State::Stopped => Ok(store.checkpoint(name, comment)?),
         state => Err(not_now(name, state)),
@@ -203,8 +208,10 @@ fn sync(store: &Store, name: &str) -> Result<()> {
 
 /// Makes a copy of checkpoint `id` the VM's current disk. A running VM is
 /// stopped first and started again after; a stopping one is waited out and
-/// left stopped. Refused while a run is going, which stopping the VM would
-/// end.
+/// left stopped. A sleeping one is restored as a running one is: its
+/// snapshot runs on the disk the restore replaces, so the stop wakes it to
+/// shut down, and it starts again awake. Refused while a run is going, which
+/// stopping the VM would end.
 pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
     match store.restore(name, id) {
         Err(store::Error::Busy(_)) => {}
@@ -219,7 +226,7 @@ pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
     let state = systemd::status(store, name)?.state;
     match state {
         State::Stopped => return Ok(store.restore(name, id)?),
-        State::Running | State::Stopping => {}
+        State::Running | State::Stopping | State::Sleeping => {}
         state => return Err(not_now(name, state)),
     }
     // The freezer goes before the stop, whose halt waits on it.

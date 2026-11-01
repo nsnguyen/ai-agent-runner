@@ -494,3 +494,59 @@ pub fn debugfs(disk: &Path, requests: &str) {
         .arg("-f")
         .args([&script, disk]));
 }
+
+/// A VM's boot as src/sleep.rs asks it, standing in for `runner boot`: it
+/// holds the VM as a boot does, notes a snapshot when asked to sleep and
+/// clears it when asked to wake, and at a halt clears it and commits its run,
+/// as waking and shutting down cleanly would. It records each ask, and
+/// refuses with the text in `refuse` while there is one.
+pub struct StandIn {
+    asked: Arc<Mutex<Vec<runner::sleep::Ask>>>,
+    pub refuse: Arc<Mutex<Option<String>>>,
+    _asks: runner::sleep::Asks,
+}
+
+impl StandIn {
+    pub fn serve(store: &runner::store::Store, name: &str) -> StandIn {
+        use runner::sleep::{Ask, Asks, Reply};
+        let run = store.begin_run(name).unwrap();
+        let generation = run.generation;
+        let run = Mutex::new(Some(run));
+        let snap = store.snapshot(name).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let refuse = Arc::new(Mutex::new(None::<String>));
+        let (seen, refusing) = (asked.clone(), refuse.clone());
+        let answer = move |ask| {
+            seen.lock().unwrap().push(ask);
+            if let Some(why) = refusing.lock().unwrap().clone() {
+                return Reply::Refused(why);
+            }
+            match ask {
+                Ask::Sleep => {
+                    snap.make_room().unwrap();
+                    let at = chrono::Utc::now();
+                    snap.note(&runner::store::Slept { generation, at }).unwrap();
+                }
+                Ask::Wake => snap.clear().unwrap(),
+                Ask::Halt => {
+                    snap.clear().unwrap();
+                    if let Some(run) = run.lock().unwrap().take() {
+                        run.commit().unwrap();
+                    }
+                }
+            }
+            Reply::Done
+        };
+        let sock = store.boot_socket(name).unwrap();
+        let asks = Asks::serve(&sock, answer).unwrap();
+        StandIn {
+            asked,
+            refuse,
+            _asks: asks,
+        }
+    }
+
+    pub fn asked(&self) -> Vec<runner::sleep::Ask> {
+        self.asked.lock().unwrap().clone()
+    }
+}
