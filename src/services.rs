@@ -63,9 +63,10 @@ pub enum Error {
         why: String,
     },
     /// systemd couldn't run the program at all (203/EXEC), which its journal
-    /// says without naming it.
+    /// says without naming it. A script whose #! interpreter is missing
+    /// fails the same way.
     #[error(
-        "{name} didn't start in {vm}, so it was removed. {} couldn't be run: it {}, or isn't executable.\n{why}",
+        "{name} didn't start in {vm}, so it was removed. {} couldn't be run: it {}, isn't executable, or its #! interpreter is missing.\n{why}",
         shell_word(.program),
         if .program.contains('/') { "isn't there" } else { "isn't in PATH" }
     )]

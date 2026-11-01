@@ -232,9 +232,10 @@ fn refuses_what_systemd_would_read_otherwise() {
 // The guest, here: a unit directory of its own, and systemctl and journalctl
 // that keep what's asked of them in a log. systemctl keeps each unit's state
 // in a file of its own; `fail` makes the next start fail, with what it holds,
-// if anything, as ExecMainStatus. Like systemd 255's, `enable --now` says a
-// start failed but exits 0; only `start` exits 1. journalctl says what
-// systemd 255 does when a start fails, which never names the program.
+// if anything, as ExecMainStatus until a disable. Like systemd 255's,
+// `enable --now` says a start failed but exits 0; only `start` exits 1.
+// journalctl says what systemd 255 does when a start fails, which never
+// names the program.
 struct Here {
     dir: TempDir,
 }
@@ -252,26 +253,35 @@ for unit; do :; done
 case "$1" in
   show)
     if [ "$3" = ExecMainStatus ]; then
-      if [ -s "$STATE/fail" ]; then cat "$STATE/fail"; else echo 0; fi
+      status=$(cat "$STATE/$unit.status" 2>/dev/null)
+      [ "$4" = --value ] || printf 'ExecMainStatus='
+      echo "${status:-0}"
     elif [ -f "$STATE/$unit" ]; then cat "$STATE/$unit"
     else printf 'ActiveState=inactive\nSubState=dead\n'; fi ;;
   start|enable)
     [ "$1" = enable ] && [ "$2" != --now ] && exit 0
     if [ -e "$STATE/fail" ]; then
+      cp "$STATE/fail" "$STATE/$unit.status"
       echo "Job for $unit failed." >&2
       [ "$1" = start ] && exit 1
       exit 0
     fi
     printf 'ActiveState=active\nSubState=running\n' > "$STATE/$unit" ;;
-  disable) rm -f "$STATE/$unit" ;;
+  disable) rm -f "$STATE/$unit" "$STATE/$unit.status" ;;
 esac
 "#,
         );
         script(
             &dir.path().join("bin/journalctl"),
             r#"echo "journalctl $*" >> "$LOG"
+name=${2#runner-svc-}
+case $(cat "$STATE/$2.status" 2>/dev/null) in
+  203) status=203/EXEC ;;
+  *) status=1/FAILURE ;;
+esac
+echo "$2: Main process exited, code=exited, status=$status"
 echo "$2: Failed with result 'exit-code'."
-echo "Failed to start $2 - runner service."
+echo "Failed to start $2 - runner service ${name%.service}."
 "#,
         );
         Here { dir }
@@ -402,8 +412,9 @@ fn a_service_that_won_t_start_leaves_nothing_behind() {
     let Err(err @ Error::NotStarted { .. }) = got else {
         panic!("{got:?}")
     };
-    let journal = "runner-svc-web.service: Failed with result 'exit-code'.\n\
-        Failed to start runner-svc-web.service - runner service.";
+    let journal = "runner-svc-web.service: Main process exited, code=exited, status=1/FAILURE\n\
+        runner-svc-web.service: Failed with result 'exit-code'.\n\
+        Failed to start runner-svc-web.service - runner service web.";
     assert_eq!(
         err.to_string(),
         format!(
@@ -450,13 +461,15 @@ fn a_program_that_can_t_be_run_is_named() {
     let Err(err @ Error::CantRun { .. }) = got else {
         panic!("{got:?}")
     };
-    let journal = "runner-svc-nope.service: Failed with result 'exit-code'.\n\
-        Failed to start runner-svc-nope.service - runner service.";
+    let journal = "runner-svc-nope.service: Main process exited, code=exited, status=203/EXEC\n\
+        runner-svc-nope.service: Failed with result 'exit-code'.\n\
+        Failed to start runner-svc-nope.service - runner service nope.";
     assert_eq!(
         err.to_string(),
         format!(
             "nope didn't start in dev, so it was removed. \
-            no-such-program couldn't be run: it isn't in PATH, or isn't executable.\n{journal}"
+            no-such-program couldn't be run: it isn't in PATH, isn't executable, \
+            or its #! interpreter is missing.\n{journal}"
         )
     );
     assert!(!unit_file(&here, "nope").exists());
@@ -467,7 +480,7 @@ fn a_program_that_can_t_be_run_is_named() {
     let why = got.unwrap_err().to_string();
     let serve = here.path("serve");
     let named = format!(
-        "{} couldn't be run: it isn't there, or isn't executable.",
+        "{} couldn't be run: it isn't there, isn't executable,",
         serve.display()
     );
     assert!(why.contains(&named), "{why}");
