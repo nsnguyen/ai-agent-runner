@@ -4,6 +4,7 @@ use runner::claude::{self, Claude};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
 use runner::exec;
+use runner::idle::Idle;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::sessions::{self, Session};
@@ -50,6 +51,10 @@ enum Cmd {
         /// A kernel for this VM, in place of the host's <root>/kernel/vmlinux.
         #[arg(long)]
         kernel: Option<PathBuf>,
+        /// How long it goes unused before it sleeps: minutes, or with s, m
+        /// or h, like 90s or 2h, or never. Defaults to that VM's, else 10.
+        #[arg(long)]
+        idle: Option<Idle>,
     },
     /// List VMs, their current disk generation and the space their disks use.
     List,
@@ -69,6 +74,16 @@ enum Cmd {
     Sleep { name: String },
     /// Bring a sleeping VM back where it was, and set its clock.
     Wake { name: String },
+    /// Show or set how long a VM goes unused before it sleeps. Use is a
+    /// shell, exec, attached session, run or MCP call on it; a detached tmux
+    /// session doesn't count, and sleeps with the VM. Anything that needs the
+    /// VM wakes it. A running VM counts from the next look, every 10 seconds.
+    Idle {
+        name: String,
+        /// Minutes, or with s, m or h, like 90s or 2h, or never. Ten minutes
+        /// until set.
+        idle: Option<Idle>,
+    },
     /// Show a VM's serial console and boot notes, from journald.
     Logs {
         name: String,
@@ -301,11 +316,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             cpus,
             mem,
             kernel,
+            idle,
         } => {
             let config = Config {
                 cpus,
                 mem_mib: mem.as_deref().map(parse_mem).transpose()?,
                 kernel: kernel.map(absolute_kernel).transpose()?,
+                idle,
             };
             show(&store.fork_with(&from, &name, &config)?);
         }
@@ -323,6 +340,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Status { name } => show_status(&systemd::status(&store, &name)?),
         Cmd::Sleep { name } => show_status(&systemd::sleep(&store, &name)?),
         Cmd::Wake { name } => show_status(&systemd::wake(&store, &name)?),
+        Cmd::Idle { name, idle } => {
+            let idle = match idle {
+                Some(idle) => store.set_idle(&name, idle)?,
+                None => store.idle(&name)?,
+            };
+            println!("{name}  idle {idle}");
+        }
         Cmd::Logs {
             name,
             follow,

@@ -290,6 +290,7 @@ fn sizes_are_stored_and_a_fork_starts_from_its_parents() {
         cpus: Some(8),
         mem_mib: None,
         kernel: Some(kernel.clone()),
+        idle: None,
     };
     store.fork_with("base", "big", &big).unwrap();
     assert_eq!(store.config("big").unwrap(), big);
