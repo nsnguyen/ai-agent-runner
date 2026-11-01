@@ -1,6 +1,6 @@
 # ai-agent-runner
 
-`runner` runs my AI agents on Firecracker microVMs, one microVM per agent, like fly.io Sprites: local Claude Code starts and drives one over MCP, or I land in its terminal over SSH. Design: [docs/design.md](docs/design.md).
+`runner` runs my AI agents on Firecracker microVMs, one microVM per agent, like fly.io Sprites: local Claude Code starts and drives one over MCP, or I land in its terminal over SSH. Design: [docs/design.md](docs/design.md). New to it? [EXAMPLES.md](EXAMPLES.md) shows each command with an example.
 
 ## Day to day, on the AWS host
 
