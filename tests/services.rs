@@ -33,6 +33,7 @@ fn renders_a_unit_that_runs_as_the_user_from_every_boot() {
 [Unit]
 Description=runner service web
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -101,11 +102,53 @@ proptest! {
                 .map(|l| l.split_once('=').unwrap().0)
                 .collect();
             prop_assert_eq!(keys, [
-                "Description", "After", "Type", "User", "WorkingDirectory", "ExecStart",
+                "Description", "After", "StartLimitIntervalSec", "Type", "User", "WorkingDirectory", "ExecStart",
                 "Restart", "RestartSec", "TimeoutStopSec", "WantedBy",
             ]);
         }
     }
+}
+
+// systemd 255's own reading of a unit, as `systemd-analyze verify` dumps it:
+// every word as given. `$$` stays doubled there, since systemd replaces
+// variables only as it runs the command.
+#[test]
+fn systemd_reads_each_word_as_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = [
+        "sh",
+        "-c",
+        "echo \"$HOME\" 100% 'done'; exit",
+        "a\\b",
+        "",
+        ";",
+        "two\nlines\tand\x07bell",
+        "ünï",
+    ];
+    let s = Spec {
+        dir: "/srv/100% x".to_string(),
+        user: me(),
+        ..spec("web", &argv)
+    };
+    let unit = dir.path().join(services::unit_name("web"));
+    fs::write(&unit, services::render_unit(&s).unwrap()).unwrap();
+    let out = Command::new("systemd-analyze")
+        .args(["verify", "--man=no"])
+        .arg(&unit)
+        .env("SYSTEMD_LOG_LEVEL", "debug")
+        .output()
+        .expect("systemd-analyze, from systemd, to be installed");
+    let dump = text(&out.stderr) + &text(&out.stdout);
+    let field = |key: &str| {
+        let line = dump.lines().find_map(|l| l.trim().strip_prefix(key));
+        line.unwrap_or_else(|| panic!("no {key} in:\n{dump}"))
+            .to_string()
+    };
+    assert_eq!(
+        field("Command Line: "),
+        r#"sh -c "echo \"\$\$HOME\" 100% 'done'; exit" "a\\b" "" ";" "two\nlines\tand\abell" ünï"#
+    );
+    assert_eq!(field("WorkingDirectory: "), "/srv/100% x");
 }
 
 #[test]
@@ -149,11 +192,20 @@ fn refuses_what_systemd_would_read_otherwise() {
     assert!(bad(spec("web", &[])).contains("no command"));
     // systemd reads these as prefixes, variables, specifiers or quotes in a program.
     for program in [
-        "", "-serve", "@serve", "+serve", "!serve", ":serve", "a$b", "100%", "it's", "a\\b",
+        "", "-serve", "@serve", "+serve", "!serve", ":serve", ";", "a$b", "100%", "it's", "a\\b",
         "a\nb", ".", "..",
     ] {
         let why = bad(spec("web", &[program, "x"]));
         assert!(why.contains("program"), "{program:?}: {why}");
+    }
+    // A relative program's path takes the directory's $ or % in with it.
+    for dir in ["/home/agent/a$b", "/home/agent/100%"] {
+        let mut s = spec("web", &["./serve"]);
+        s.dir = dir.to_string();
+        let why = bad(s.clone());
+        assert!(why.contains("program"), "{dir:?}: {why}");
+        s.argv = vec!["serve".to_string()];
+        assert!(services::render_unit(&s).is_ok(), "{dir:?}");
     }
     for dir in [
         "work",
@@ -353,6 +405,20 @@ fn a_service_that_won_t_start_leaves_nothing_behind() {
         "{calls:?}"
     );
     assert_eq!(services::list(&here).unwrap(), []);
+}
+
+// Without the journal's say, systemctl's.
+#[test]
+fn a_start_that_fails_says_why_even_with_the_journal_quiet() {
+    let here = Here::new();
+    fs::write(here.path("state/fail"), "").unwrap();
+    script(&here.path("bin/journalctl"), "exit 0\n");
+    let got = services::add(&here, &here.spec("web", &["nope"]));
+    let Err(Error::NotStarted { why, .. }) = got else {
+        panic!("{got:?}")
+    };
+    assert_eq!(why, "Job for runner-svc-web.service failed.");
+    assert!(!unit_file(&here, "web").exists());
 }
 
 #[test]

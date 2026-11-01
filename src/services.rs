@@ -21,8 +21,7 @@ pub const UNIT_DIR: &str = "/etc/systemd/system";
 /// What every service's unit is named for, so `list` finds only the runner's.
 pub const PREFIX: &str = "runner-svc-";
 
-// Long enough for a start that fails into systemd's start limit, five tries
-// a second apart, and for a stop's TimeoutStopSec.
+// Long enough for a stop's TimeoutStopSec and its kill, with room to spare.
 const TIMEOUT: Duration = Duration::from_secs(60);
 // A listed service is a few hundred bytes.
 const CAP: usize = 1 << 20;
@@ -176,15 +175,19 @@ fn prepare(spec: &Spec) -> Result<(String, String)> {
     let program = check_program(program, &dir)?;
     let argv: Vec<String> = std::iter::once(program).chain(args.to_vec()).collect();
     let name = &spec.name;
-    // Type=exec: a start fails if the program can't be run, so add can say
-    // so. TimeoutStopSec: a service that ignores SIGTERM can't hold the VM's
-    // shutdown past the 30 seconds after which it's killed and its disk
+    // StartLimitIntervalSec=0: systemd's start limit counts restarts, and
+    // would give up on a service that crash-loops for 5 seconds, say a dev
+    // server started before its dependencies are installed, until the next
+    // boot. Type=exec: a start fails if the program can't be run, so add can
+    // say so. TimeoutStopSec: a service that ignores SIGTERM can't hold the
+    // VM's shutdown past the 30 seconds after which it's killed and its disk
     // rolled back.
     let unit = format!(
         "# Made by `runner service add {name}`; `runner service rm` removes it.
 [Unit]
 Description=runner service {name}
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -216,9 +219,10 @@ fn check_user(user: &str) -> Result<()> {
     }
 }
 
-// An absolute path without `.` or empty parts. systemd ignores a
-// WorkingDirectory= with `..` in it, and strips the whitespace a line ends
-// with; it doesn't unquote it, so quotes and backslashes are left out too.
+// An absolute path without `.` or empty parts. systemd fails a unit whose
+// WorkingDirectory= has `..` in it, and strips the whitespace a line ends
+// with. Quotes and backslashes it would take as they are, but they're left
+// out, as in a program.
 fn check_dir(dir: &str) -> Result<String> {
     let bad = |why| {
         Err(Error::BadDir {
@@ -252,7 +256,8 @@ fn check_dir(dir: &str) -> Result<String> {
 // The program as ExecStart= runs it: a name looked up in PATH, or an absolute
 // path, a relative one taken from `dir`. systemd takes no quotes, backslashes
 // or control characters in it, replaces no variables, and does expand
-// specifiers, so `$` and `%` are left out too.
+// specifiers, so `$` and `%` are left out too, the directory's included. A
+// first word of `;`, even quoted, separates commands.
 fn check_program(program: &str, dir: &str) -> Result<String> {
     let bad = |why| {
         Err(Error::BadProgram {
@@ -273,6 +278,9 @@ fn check_program(program: &str, dir: &str) -> Result<String> {
         if program == "." || program == ".." {
             return bad("it's a directory");
         }
+        if program == ";" {
+            return bad("systemd reads it as the end of a command");
+        }
         if program.starts_with(PREFIXES) {
             return bad("systemd reads a leading -, @, :, +, ! or | as a prefix");
         }
@@ -286,6 +294,9 @@ fn check_program(program: &str, dir: &str) -> Result<String> {
     } else {
         format!("{dir}/{program}")
     };
+    if path.contains(['$', '%']) {
+        return bad("systemd won't take $ or % in its path, which comes from the directory");
+    }
     let parts: Vec<&str> = path
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
@@ -380,6 +391,7 @@ since=$(date +%s)
 (set -C; cat > "$f") || exit 1
 systemctl daemon-reload || { rm -f -- "$f"; exit 1; }
 said=$(systemctl enable --now "$unit" 2>&1) && exit 0
+journalctl --sync >/dev/null 2>&1
 log=$(journalctl -u "$unit" --since "@$since" -n 20 --no-pager -o cat 2>/dev/null)
 systemctl disable --now "$unit" >/dev/null 2>&1
 rm -f -- "$f"
