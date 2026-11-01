@@ -47,6 +47,11 @@ ExecStart=/usr/local/bin/runner boot %i
 # systemd kills the VM and its run isn't committed.
 ExecStop=/usr/local/bin/runner halt %i
 TimeoutStopSec=30
+# A guest's own restore (runner-guest restore) ends its boot with 75, once
+# the restored disk is current: boot the VM again, onto that disk, unless
+# it's being stopped.
+SuccessExitStatus=75
+RestartForceExitStatus=75
 # The serial console.
 StandardOutput=journal
 StandardError=journal
@@ -58,6 +63,8 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ";
     assert_eq!(unit, want);
+    let restart = format!("\nRestartForceExitStatus={}\n", runner::boot::RESTART);
+    assert!(unit.contains(&restart), "{unit}");
 }
 
 #[test]

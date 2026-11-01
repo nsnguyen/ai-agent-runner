@@ -7,7 +7,11 @@
 // headless run that hasn't ended cleanly asks to roll back (Store::ask_rollback).
 //
 // While the VM runs, boot hands its guest the credentials the VM may have
-// whenever runner-guest asks, which it does at each start (src/creds.rs).
+// whenever runner-guest asks, which it does at each start (src/creds.rs), and
+// serves the guest's own calls: checkpoint, list and restore (src/calls.rs).
+// A restore the guest asked for is finished at the clean shutdown that
+// follows, and ends the boot with RESTART, for the unit to boot it again.
+use crate::calls::{Calls, Restore};
 use crate::creds::{Cred, Keyring, Source};
 use crate::firecracker::{self, Api, Guest};
 use crate::net::{self, HOST_RESOLV_CONFS, Tap};
@@ -58,6 +62,20 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The exit status of a boot that ended to restore a checkpoint the guest
+/// asked for: the unit's RestartForceExitStatus, so systemd boots the VM
+/// again, onto the restored disk, unless it's being stopped.
+pub const RESTART: u8 = 75;
+
+/// How a boot that went well ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The VM is down, and stays down.
+    Down,
+    /// Down, with a restore the guest asked for made current: boot it again.
+    Restart,
+}
+
 fn io_err(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
     let what = what.into();
     move |source| Error::Io { what, source }
@@ -65,7 +83,7 @@ fn io_err(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 
 /// Boots the VM and returns when Firecracker exits. Its console goes to
 /// stdout, which the unit sends to journald. `ip` is iproute2's, for the tap.
-pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
+pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     let machine = store.machine(name)?;
     if !machine.kernel.is_file() {
         return Err(Error::NoKernel(machine.kernel));
@@ -102,12 +120,18 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     let api_sock = run.api_socket();
     let vsock = run.vsock();
     let creds_sock = run.creds_socket();
-    let sockets = [api_sock.as_path(), &vsock, &creds_sock];
+    let calls_sock = run.calls_socket();
+    let sockets = [api_sock.as_path(), &vsock, &creds_sock, &calls_sock];
     // Firecracker binds two, and won't over a file a crashed one left.
     remove_sockets(&sockets)?;
-    // Bound before the guest can boot, so it's there when the guest asks.
-    let offer = match Offer::start(name, &creds_sock, keyring, handed.clone()) {
-        Ok(offer) => offer,
+    // Bound before the guest can boot, so they're there when the guest asks.
+    let served = Offer::start(name, &creds_sock, keyring, handed.clone()).and_then(|offer| {
+        let calls = Calls::start(store, name, &calls_sock)
+            .map_err(io_err(format!("serving calls on {}", calls_sock.display())))?;
+        Ok((offer, calls))
+    });
+    let (offer, calls) = match served {
+        Ok(served) => served,
         Err(e) => {
             let _ = remove_sockets(&sockets);
             drop(tap);
@@ -170,6 +194,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     if let Err(e) = started {
         let _ = child.kill();
         let _ = child.wait();
+        drop(calls);
         drop(offer);
         let _ = remove_sockets(&sockets);
         drop(tap);
@@ -187,6 +212,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
     }
 
     let status = child.wait().map_err(io_err("waiting for firecracker"));
+    let restore = calls.close();
+    drop(calls);
     // Before the clear, so a handoff in flight can't note after it.
     drop(offer);
     let _ = remove_sockets(&sockets);
@@ -194,7 +221,13 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
         note(format_args!("{e}"));
     }
     drop(tap);
-    let status = status?;
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            drop_restore(store, name, restore, "boot lost track of firecracker");
+            return Err(e);
+        }
+    };
     // A clean shutdown under a run that hadn't ended cleanly (src/runs.rs).
     if status.success()
         && let Some(by) = run.take_rollback()?
@@ -204,16 +237,32 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<()> {
              stays current, and generation {} is kept for a look",
             run.from, run.generation
         ));
-        return Ok(());
+        drop_restore(store, name, restore, &format!("{by} asked to roll back"));
+        return Ok(Ended::Down);
     }
     if status.success() {
-        let vm = run.commit()?;
+        let from = run.generation;
+        let vm = run.commit_then(restore.as_ref().map(|r| &r.staged))?;
+        let Some(restore) = restore else {
+            note(format_args!(
+                "{name} shut down cleanly; generation {} is current",
+                vm.generation
+            ));
+            return Ok(Ended::Down);
+        };
         note(format_args!(
-            "{name} shut down cleanly; generation {} is current",
-            vm.generation
+            "{name} shut down cleanly to restore checkpoint {}: generation {from} is \
+             committed, generation {} is current, and the VM boots again",
+            restore.staged.from, vm.generation
         ));
-        return Ok(());
+        return Ok(Ended::Restart);
     }
+    drop_restore(
+        store,
+        name,
+        restore,
+        &format!("firecracker exited with {status}"),
+    );
     Err(Error::Crashed {
         name: name.to_string(),
         status,
@@ -306,6 +355,22 @@ impl Drop for Offer {
             let _ = thread.join();
         }
         let _ = fs::remove_file(&self.sock);
+    }
+}
+
+// A restore the guest asked for, which a VM that didn't shut down cleanly
+// doesn't get: the copy goes, and its VM stays as it would have.
+fn drop_restore(store: &Store, name: &str, restore: Option<Restore>, why: &str) {
+    let Some(restore) = restore else { return };
+    let from = restore.staged.from;
+    let generation = restore.staged.generation;
+    note(format_args!(
+        "{name}'s restore of checkpoint {from} is dropped: {why}"
+    ));
+    if let Err(e) = store.drop_restore(name, restore.staged) {
+        note(format_args!(
+            "couldn't remove {name}'s generation {generation}: {e}"
+        ));
     }
 }
 

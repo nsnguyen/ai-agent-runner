@@ -9,7 +9,7 @@
 //   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
-//   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT), while it runs
+//   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
@@ -22,6 +22,7 @@
 //   <root>/slots.lock                flock'd while a slot is picked
 //
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
+use crate::calls;
 use crate::creds::{self, Cred, DEFAULT};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -102,8 +103,10 @@ pub struct Freed {
 }
 
 /// A disk generation `restore` can bring back: one `checkpoint` froze, or one
-/// in the VM's history, which runs, imports and restores make.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+/// in the VM's history, which runs, imports and restores make. It's also what
+/// the guest's calls answer with (src/calls.rs), in postcard, which is by
+/// field order: a change here changes that protocol, so bump calls::VERSION.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Checkpoint {
     /// Its generation; `restore` takes it.
     pub id: u64,
@@ -113,10 +116,33 @@ pub struct Checkpoint {
     pub comment: Option<String>,
     /// Made by a run, an import, a fork or a restore, not by `checkpoint`.
     pub auto: bool,
+    /// Made by the agent in the VM, with `runner-guest checkpoint`.
+    pub agent: bool,
     /// Size of its disk.
     pub bytes: u64,
     /// The disk the next boot starts from.
     pub current: bool,
+}
+
+impl Checkpoint {
+    /// One line, as `runner checkpoints` and `runner-guest checkpoints` list
+    /// it. The comment is quoted, so one with a newline in it still takes
+    /// one line.
+    pub fn row(&self) -> String {
+        let mark = if self.current { '*' } else { ' ' };
+        let time = self.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let kind = match (self.auto, self.agent) {
+            (true, _) => "auto",
+            (false, true) => "agent",
+            (false, false) => "checkpoint",
+        };
+        let comment = self.comment.as_ref().map(|c| format!("  {c:?}"));
+        let comment = comment.unwrap_or_default();
+        format!(
+            "{mark} {}  {time}  {kind}  {} bytes{comment}",
+            self.id, self.bytes
+        )
+    }
 }
 
 /// A VM's sizes and kernel as stored: each one left out is the host's default.
@@ -569,11 +595,7 @@ impl Store {
         let id = next_generation(&dir)?;
         clone(&disk_of(&dir, current), &disk_of(&dir, id))?;
         // Written last: a disk without its note is a leftover nothing lists.
-        let note = Note {
-            time: now(),
-            comment: comment.map(str::to_string),
-            auto: false,
-        };
+        let note = Note::frozen(comment, false);
         write_note(&dir, id, &note)?;
         read_checkpoint(&dir, id, Some(note), false)
     }
@@ -722,6 +744,14 @@ impl Run {
     /// Makes this run's disk current, then collects the generations the store
     /// doesn't keep. That gc runs under the run's lock, so it never races one.
     pub fn commit(self) -> Result<Vm> {
+        self.commit_then(None)
+    }
+
+    /// `commit`, then, if given, a restore staged while the VM ran, on top,
+    /// as Store::finish_restore would put it: `undo` goes back to this run's
+    /// disk. Both go into history at once, under this run's lock: a guest's
+    /// own restore (src/calls.rs), which nothing can come between.
+    pub fn commit_then(self, restore: Option<&Staged>) -> Result<Vm> {
         // Firecracker leaves the guest's writes in the page cache, and history
         // mustn't point at a disk a power cut could tear.
         File::open(&self.disk)
@@ -730,6 +760,11 @@ impl Run {
         write_note(&self.dir, self.generation, &Note::auto("run"))?;
         let mut gens = history(&self.dir)?;
         gens.push(self.generation);
+        if let Some(staged) = restore {
+            let note = Note::auto(&format!("restore of {}", staged.from));
+            write_note(&self.dir, staged.generation, &note)?;
+            gens.push(staged.generation);
+        }
         write_history(&self.dir, &gens)?;
         // The commit stands either way; the next one tries again.
         if let Err(e) = collect(&self.name, &self.dir, self.keep, false) {
@@ -775,9 +810,12 @@ impl Run {
     /// Where the guest asks for its credentials: Firecracker passes a guest's
     /// connection to host port P on to `vsock.sock_P`.
     pub fn creds_socket(&self) -> PathBuf {
-        let mut path = vsock(&self.dir).into_os_string();
-        path.push(format!("_{}", creds::PORT));
-        path.into()
+        port_socket(&self.dir, creds::PORT)
+    }
+
+    /// Where the guest makes its calls: checkpoint, list, restore.
+    pub fn calls_socket(&self) -> PathBuf {
+        port_socket(&self.dir, calls::PORT)
     }
 
     /// Where this boot notes which credentials its guest took.
@@ -809,13 +847,37 @@ impl Freezer {
     /// nothing lists a half-made one, and the next checkpoint clears what one
     /// killed partway left.
     pub fn freeze(&self, comment: Option<&str>) -> Result<Checkpoint> {
+        self.freeze_noted(Note::frozen(comment, false))
+    }
+
+    /// `freeze`, for the agent in the VM, which asks through its boot
+    /// (src/calls.rs): noted as the agent's, which `agent_since` counts.
+    /// gc keeps it as it keeps every checkpoint.
+    pub fn freeze_for_agent(&self, comment: Option<&str>) -> Result<Checkpoint> {
+        self.freeze_noted(Note::frozen(comment, true))
+    }
+
+    /// When each checkpoint the agent made after `since` was made, oldest
+    /// first. Under the freezer, so a count and the checkpoint it allows
+    /// can't be split by another.
+    pub fn agent_since(&self, since: DateTime<Utc>) -> Result<Vec<DateTime<Utc>>> {
+        let mut times = Vec::new();
+        for id in generations(&self.dir)? {
+            if let Some(note) = read_note(&self.dir, id)?
+                && note.agent
+                && !note.auto
+                && note.time > since
+            {
+                times.push(note.time);
+            }
+        }
+        times.sort();
+        Ok(times)
+    }
+
+    fn freeze_noted(&self, note: Note) -> Result<Checkpoint> {
         let booted = read_booted(&self.dir)?;
         let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
-        let note = Note {
-            time: now(),
-            comment: comment.map(str::to_string),
-            auto: false,
-        };
         let id = self.copy(booted.generation, &note)?;
         read_checkpoint(&self.dir, id, Some(note), false)
     }
@@ -827,11 +889,7 @@ impl Freezer {
     /// Store::finish_restore puts it in history; drop_restore deletes it.
     pub fn stage_restore(&self, id: u64) -> Result<Staged> {
         check_restorable(&self.name, &self.dir, id)?;
-        let note = Note {
-            time: now(),
-            comment: Some(format!("restore of {id}")),
-            auto: false,
-        };
+        let note = Note::frozen(Some(&format!("restore of {id}")), false);
         let generation = self.copy(id, &note)?;
         Ok(Staged {
             from: id,
@@ -948,6 +1006,12 @@ fn api_socket(dir: &Path) -> PathBuf {
 
 fn vsock(dir: &Path) -> PathBuf {
     dir.join("vsock.sock")
+}
+
+fn port_socket(dir: &Path, port: u32) -> PathBuf {
+    let mut path = vsock(dir).into_os_string();
+    path.push(format!("_{port}"));
+    path.into()
 }
 
 // The caller holds the VM's lock. History is rewritten before any disk goes,
@@ -1149,6 +1213,9 @@ struct Note {
     time: DateTime<Utc>,
     comment: Option<String>,
     auto: bool,
+    // Left out unless set, so a runner from before it reads the note the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    agent: bool,
 }
 
 impl Note {
@@ -1158,6 +1225,17 @@ impl Note {
             time: now(),
             comment,
             auto: true,
+            agent: false,
+        }
+    }
+
+    // A checkpoint's: kept by gc, made now.
+    fn frozen(comment: Option<&str>, agent: bool) -> Note {
+        Note {
+            time: now(),
+            comment: comment.map(str::to_string),
+            auto: false,
+            agent,
         }
     }
 }
@@ -1193,6 +1271,7 @@ fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Re
             time: DateTime::<Utc>::from(meta.modified().map_err(at(&disk))?).trunc_subsecs(0),
             comment: None,
             auto: true,
+            agent: false,
         },
     };
     Ok(Checkpoint {
@@ -1200,6 +1279,7 @@ fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Re
         time: note.time,
         comment: note.comment,
         auto: note.auto,
+        agent: note.agent,
         bytes: meta.len(),
         current,
     })

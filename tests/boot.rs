@@ -3,6 +3,8 @@
 mod common;
 
 use common::{FakeApi, FakeFirecracker, Reply, Request, script, text, wait_for};
+use runner::boot;
+use runner::calls::{self, Answer, Call};
 use runner::creds::{self, Cred, Keyring};
 use runner::firecracker::{self, BOOT_ARGS};
 use runner::net::{self, HOST_RESOLV_CONFS};
@@ -756,4 +758,84 @@ fn a_rollback_ask_no_boot_took_is_dropped_at_the_next_boot() {
     assert!(halt.status.success(), "{}", text(&halt.stderr));
     assert!(finish(boot).status.success());
     assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
+// The guest's own restore, as `runner-guest restore` asks for it.
+fn guest_restores(h: &Host, id: u64) -> Answer {
+    let mut conn = UnixStream::connect(calls_socket(h)).unwrap();
+    calls::ask(&mut conn, &Call::Restore { id }).unwrap()
+}
+
+fn calls_socket(h: &Host) -> PathBuf {
+    h.vm_dir("dev").join(format!("vsock.sock_{}", calls::PORT))
+}
+
+#[test]
+fn a_guest_s_restore_commits_its_boot_puts_the_copy_on_top_and_boots_again() {
+    let h = Host::new();
+    let clean = h.store.checkpoint("dev", Some("clean")).unwrap();
+    let boot = h.boot("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    assert!(calls_socket(&h).exists(), "no calls socket while it runs");
+
+    let answer = guest_restores(&h, clean.id);
+    let Answer::Restoring { id, generation } = answer else {
+        panic!("{answer:?}")
+    };
+    assert_eq!((id, generation), (clean.id, 3));
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    // The unit's RestartForceExitStatus boots it again.
+    assert_eq!(out.status.code(), Some(boot::RESTART.into()), "{notes}");
+    assert!(notes.contains("to restore checkpoint 1"), "{notes}");
+    // The boot's own disk was committed first, as at any clean shutdown, so
+    // `undo` goes back to it.
+    let listed = h.store.checkpoints("dev").unwrap();
+    let top = &listed[0];
+    let what = (top.id, top.current, top.auto, top.comment.as_deref());
+    assert_eq!(what, (3, true, true, Some("restore of 1")));
+    assert_eq!(
+        fs::read(h.vm_dir("dev").join("gens/3.ext4")).unwrap(),
+        b"rootfs"
+    );
+    assert_eq!(h.store.undo("dev").unwrap().generation, 2);
+    assert!(!calls_socket(&h).exists(), "calls socket left behind");
+}
+
+#[test]
+fn a_guest_s_restore_is_dropped_if_its_vm_crashes() {
+    let h = Host::new();
+    let clean = h.store.checkpoint("dev", Some("clean")).unwrap();
+    let boot = h.boot("dev");
+    let fc = h.fc.clone();
+    let _api = h.serve("dev", move |req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            fc.exit_with(1);
+        }
+        (204, None)
+    });
+    assert_eq!(h.ready(), "READY=1");
+    let answer = guest_restores(&h, clean.id);
+    let Answer::Restoring { generation, .. } = answer else {
+        panic!("{answer:?}")
+    };
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{notes}");
+    assert!(
+        notes.contains("restore of checkpoint 1 is dropped"),
+        "{notes}"
+    );
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    let copy = h.vm_dir("dev").join(format!("gens/{generation}.ext4"));
+    assert!(!copy.exists(), "the staged copy was kept");
+    let ids: Vec<u64> = h
+        .store
+        .checkpoints("dev")
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, [1, 0]);
 }

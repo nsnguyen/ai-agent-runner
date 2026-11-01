@@ -100,27 +100,37 @@ pub enum Exit {
 }
 
 pub fn hello(w: &mut impl Write) -> io::Result<()> {
-    let mut buf = [0; 8];
-    buf[..4].copy_from_slice(&MAGIC);
-    buf[4..].copy_from_slice(&VERSION.to_be_bytes());
-    w.write_all(&buf)?;
-    w.flush()
+    hello_with(w, MAGIC, VERSION)
 }
 
 /// Reads the peer's hello and checks it matches this end's.
 pub fn check_hello(r: &mut impl Read) -> Result<()> {
+    check_hello_with(r, MAGIC, VERSION)
+}
+
+/// A hello for another protocol framed the same way, with a magic and a
+/// version of its own: the guest's calls to the host (src/calls.rs).
+pub fn hello_with(w: &mut impl Write, magic: [u8; 4], version: u32) -> io::Result<()> {
+    let mut buf = [0; 8];
+    buf[..4].copy_from_slice(&magic);
+    buf[4..].copy_from_slice(&version.to_be_bytes());
+    w.write_all(&buf)?;
+    w.flush()
+}
+
+pub fn check_hello_with(r: &mut impl Read, magic: [u8; 4], version: u32) -> Result<()> {
     let mut buf = [0; 8];
     r.read_exact(&mut buf).map_err(|e| match e.kind() {
         io::ErrorKind::UnexpectedEof => Error::NotPeer,
         _ => e.into(),
     })?;
-    if buf[..4] != MAGIC {
+    if buf[..4] != magic {
         return Err(Error::NotPeer);
     }
     let theirs = u32::from_be_bytes(buf[4..].try_into().unwrap());
-    if theirs != VERSION {
+    if theirs != version {
         return Err(Error::Version {
-            ours: VERSION,
+            ours: version,
             theirs,
         });
     }

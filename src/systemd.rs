@@ -2,6 +2,7 @@
 // whose main process is `runner boot <vm>`. start, stop and status are
 // systemctl on it, logs is journalctl. systemctl's output is captured, never
 // inherited: under `runner mcp`, stdout is protocol.
+use crate::boot::RESTART;
 use crate::creds::Cred;
 use crate::store::{Store, Vm};
 use rmcp::schemars;
@@ -213,6 +214,11 @@ ExecStart={runner} boot %i
 # systemd kills the VM and its run isn't committed.
 ExecStop={runner} halt %i
 TimeoutStopSec={STOP_TIMEOUT_SECS}
+# A guest's own restore (runner-guest restore) ends its boot with {RESTART}, once
+# the restored disk is current: boot the VM again, onto that disk, unless
+# it's being stopped.
+SuccessExitStatus={RESTART}
+RestartForceExitStatus={RESTART}
 # The serial console.
 StandardOutput=journal
 StandardError=journal
