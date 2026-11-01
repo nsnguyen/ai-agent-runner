@@ -47,8 +47,8 @@ enum Cmd {
         #[arg(short = 'm', long)]
         comment: Option<String>,
     },
-    /// List this VM's checkpoints, newest first, and the generations its
-    /// boots made. `*` marks the one the next boot starts from.
+    /// List this VM's checkpoints, newest first, and the generations in its
+    /// history. `*` marks the one the next boot starts from.
     Checkpoints,
     /// Reboot this VM onto a copy of a checkpoint. Everything since it is
     /// gone, and every process in the VM ends, this command's caller too.

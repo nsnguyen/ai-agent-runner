@@ -261,7 +261,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List a VM's checkpoints, newest first. Generations that runs, imports and restores made are listed too, with auto set; current marks the disk the next boot starts from."
+        description = "List a VM's checkpoints, newest first. Generations that runs, imports and restores made are listed too, with auto set; agent marks one the agent in the VM made itself (runner-guest checkpoint); current marks the disk the next boot starts from."
     )]
     fn list_checkpoints(
         &self,

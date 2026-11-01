@@ -6,7 +6,7 @@
 // sync. No KVM needed; tests/kvm.rs has the real thing.
 mod common;
 
-use common::{FakeApi, FakeVsock, Guest, text, wait_for};
+use common::{FakeApi, FakeVsock, Guest, Reply, Request, text, wait_for};
 use runner::calls::{self, Answer, Call, Calls};
 use runner::checkpoint::AGENT_PER_HOUR;
 use runner::store::{Run, Store};
@@ -37,6 +37,11 @@ struct Host {
 }
 
 fn host() -> Host {
+    host_with(|_| (204, None))
+}
+
+// With Firecracker's API answering as `respond` says.
+fn host_with(respond: impl Fn(&Request) -> Reply + Send + 'static) -> Host {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path());
     let disk = dir.path().join("rootfs.ext4");
@@ -47,7 +52,7 @@ fn host() -> Host {
     let vsock = FakeVsock::serve(&dir.path().join("vms/dev/vsock.sock"), &guest.sock);
     let run = store.begin_run("dev").unwrap();
     fs::write(&run.disk, LIVE).unwrap();
-    let api = FakeApi::serve(&dir.path().join("vms/dev/api.sock"), |_| (204, None));
+    let api = FakeApi::serve(&dir.path().join("vms/dev/api.sock"), respond);
     let sock = run.calls_socket();
     let calls = Calls::start(&store, "dev", &sock).unwrap();
     Host {
@@ -311,4 +316,48 @@ fn runner_guest_says_when_it_can_t_reach_the_host() {
     let mut lines = err.lines();
     assert!(lines.next().unwrap().contains("reboots this VM"), "{err}");
     assert!(lines.next().unwrap().contains("can't reach"), "{err}");
+}
+
+// Firecracker already gone when the restore's Ctrl-Alt-Del goes, as when
+// `runner stop` got there first: the VM is down anyway, and boot finishes
+// the restore.
+#[test]
+fn a_restore_whose_vm_is_already_down_is_left_for_boot() {
+    let h = host();
+    fs::remove_file(h.dir.path().join("vms/dev/api.sock")).unwrap();
+    let answer = h.ask(&Call::Restore { id: 0 });
+    assert!(matches!(answer, Answer::Restoring { .. }), "{answer:?}");
+    // Calls take turns, so this one is answered once the restore's is done.
+    assert!(matches!(h.ask(&Call::Checkpoints), Answer::Listed(_)));
+    let restore = h.calls.close().expect("the restore was dropped");
+    assert!(
+        h.dir
+            .path()
+            .join(format!("vms/dev/gens/{}.ext4", restore.staged.generation))
+            .exists()
+    );
+}
+
+// One Firecracker won't shut down for is dropped: the VM carries on as it was.
+#[test]
+fn a_restore_firecracker_won_t_reboot_for_is_dropped() {
+    let h = host_with(|req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            return (400, Some(json!({"fault_message": "no"}).to_string()));
+        }
+        (204, None)
+    });
+    let answer = h.ask(&Call::Restore { id: 0 });
+    let Answer::Restoring { generation, .. } = answer else {
+        panic!("{answer:?}")
+    };
+    assert!(matches!(h.ask(&Call::Checkpoints), Answer::Listed(_)));
+    assert!(h.calls.close().is_none());
+    assert!(
+        !h.dir
+            .path()
+            .join(format!("vms/dev/gens/{generation}.ext4"))
+            .exists()
+    );
+    assert_eq!(h.ids("dev"), [0]);
 }

@@ -20,7 +20,7 @@
 // commits the disk the VM ran, puts the copy on top, and exits with
 // boot::RESTART, which the unit boots again (src/systemd.rs).
 use crate::checkpoint;
-use crate::firecracker::Api;
+use crate::firecracker::{self, Api};
 use crate::proto;
 use crate::runs;
 use crate::store::{Checkpoint, Staged, Store};
@@ -275,18 +275,26 @@ impl Host {
     fn reboot(&self, conn: &mut UnixStream) {
         let _ = conn.set_read_timeout(Some(HANG_UP_WAIT));
         let _ = io::copy(conn, &mut io::sink());
-        let asked = self
-            .store
-            .api_socket(&self.name)
-            .map_err(|e| e.to_string())
-            .and_then(|sock| Api::new(sock).ctrl_alt_del().map_err(|e| e.to_string()));
-        let Err(e) = asked else {
-            note(format_args!(
+        let asked = match self.store.api_socket(&self.name) {
+            Ok(sock) => Api::new(sock).ctrl_alt_del(),
+            Err(e) => {
+                self.give_up(&e.to_string());
+                return;
+            }
+        };
+        match asked {
+            Ok(()) => note(format_args!(
                 "sent Ctrl-Alt-Del to {} for its restore",
                 self.name
-            ));
-            return;
-        };
+            )),
+            // Firecracker is gone already, as after a `runner stop` that got
+            // here first: the VM is down, and boot finishes the restore.
+            Err(firecracker::Error::NotListening(_)) => {}
+            Err(e) => self.give_up(&e.to_string()),
+        }
+    }
+
+    fn give_up(&self, e: &str) {
         note(format_args!(
             "couldn't shut {} down for its restore, so it's dropped: {e}",
             self.name
