@@ -386,7 +386,7 @@ pub fn parse_exec_start(line: &str) -> Option<Vec<String>> {
 // $2 the unit, $3 the service, $4 its user, $5 its directory; the unit's text
 // on stdin. Exits 3 if the name is taken, 4 if the user or directory isn't
 // there, and 5, having removed the unit, with the journal's say on stderr,
-// if it didn't start. Enabled, then started apart: systemd 255's
+// if it didn't start. It enables, then starts, in two calls: systemd 255's
 // `enable --now` says a start failed, but exits 0.
 const ADD: &str = r#"d=$1 unit=$2 user=$4 dir=$5
 f=$d/$unit
