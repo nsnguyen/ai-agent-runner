@@ -275,7 +275,10 @@ fn a_guest_s_restore_is_staged_then_its_vm_rebooted() {
 fn a_guest_s_restore_is_refused_while_a_run_is_going() {
     let h = host();
     let run = runs::hold(&h.store, "dev").unwrap();
-    refused(&h.ask(&Call::Restore { id: 0 }), "run");
+    let answer = h.ask(&Call::Restore { id: 0 });
+    refused(&answer, "a restore would end it");
+    // Said to the agent, who can't run the host's commands.
+    assert!(!format!("{answer:?}").contains("runner "), "{answer:?}");
     drop(run);
     assert!(h.calls.close().is_none());
     assert_eq!(h.ctrl_alt_dels(), 0);
@@ -360,4 +363,138 @@ fn a_restore_firecracker_won_t_reboot_for_is_dropped() {
             .exists()
     );
     assert_eq!(h.ids("dev"), [0]);
+}
+
+// Postcard goes by position, and each VM's runner-guest is on its own disk,
+// so a host and the guests of older disks have to keep agreeing: calls and
+// answers are only ever added at the end, and what's here keeps its bytes.
+#[test]
+fn the_wire_keeps_its_shape() {
+    let bytes = |v: &dyn erased::Encode| v.encode();
+    assert_eq!(
+        bytes(&Call::Checkpoint {
+            comment: Some("x".into())
+        }),
+        [0, 1, 1, b'x']
+    );
+    assert_eq!(bytes(&Call::Checkpoint { comment: None }), [0, 0]);
+    assert_eq!(bytes(&Call::Checkpoints), [1]);
+    assert_eq!(bytes(&Call::Restore { id: 300 }), [2, 0xac, 0x02]);
+    let saved = calls::Saved {
+        id: 2,
+        time: "2026-11-01T00:00:00Z".parse().unwrap(),
+        comment: Some("c".into()),
+        auto: false,
+        agent: true,
+        bytes: 5,
+        current: true,
+    };
+    let mut made = vec![0, 2, 20];
+    made.extend(b"2026-11-01T00:00:00Z");
+    made.extend([1, 1, b'c', 0, 1, 5, 1]);
+    assert_eq!(bytes(&Answer::Made(saved.clone())), made);
+    let mut listed = vec![1, 1];
+    listed.extend(&made[1..]);
+    assert_eq!(bytes(&Answer::Listed(vec![saved])), listed);
+    assert_eq!(
+        bytes(&Answer::Restoring {
+            id: 3,
+            generation: 9
+        }),
+        [2, 3, 9]
+    );
+    assert_eq!(bytes(&Answer::Refused("no".into())), [3, 2, b'n', b'o']);
+}
+
+mod erased {
+    pub trait Encode {
+        fn encode(&self) -> Vec<u8>;
+    }
+    impl<T: serde::Serialize> Encode for T {
+        fn encode(&self) -> Vec<u8> {
+            postcard::to_allocvec(self).unwrap()
+        }
+    }
+}
+
+// More than a frame holds, from a long-lived VM or one huge comment the
+// owner gave: the newest that fit, each comment cut to what a call takes.
+#[test]
+fn a_list_too_long_for_a_frame_keeps_the_newest_that_fit() {
+    let h = host();
+    let gens = h.dir.path().join("vms/dev/gens");
+    let note = |comment: &str| {
+        json!({"time": "2026-11-01T00:00:00Z", "comment": comment, "auto": false}).to_string()
+    };
+    let total = 1200;
+    for id in 2..2 + total {
+        fs::write(gens.join(format!("{id}.ext4")), b"").unwrap();
+        fs::write(gens.join(format!("{id}.json")), note(&"c".repeat(1000))).unwrap();
+    }
+    let newest = 2 + total;
+    fs::write(gens.join(format!("{newest}.ext4")), b"").unwrap();
+    let huge = "h".repeat(2 << 20);
+    fs::write(gens.join(format!("{newest}.json")), note(&huge)).unwrap();
+
+    let Answer::Listed(listed) = h.ask(&Call::Checkpoints) else {
+        panic!("not listed")
+    };
+    assert_eq!(listed[0].id, newest);
+    assert_eq!(
+        listed[0].comment.as_ref().unwrap().len(),
+        calls::MAX_COMMENT
+    );
+    assert!(
+        listed.len() > 100 && listed.len() < total as usize,
+        "{}",
+        listed.len()
+    );
+    let ids: Vec<u64> = listed.iter().map(|c| c.id).collect();
+    let want: Vec<u64> = (0..listed.len() as u64).map(|i| newest - i).collect();
+    assert_eq!(ids, want);
+    let out = h.guest(&["checkpoints"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+// A Ctrl-Alt-Del that may have landed, Firecracker having hung up instead
+// of answering: the VM may go down, so the restore waits for boot, which
+// drops it at a shutdown that isn't clean.
+#[test]
+fn a_restore_whose_ctrl_alt_del_may_have_landed_is_kept() {
+    let h = host();
+    let api = h.dir.path().join("vms/dev/api.sock");
+    fs::remove_file(&api).unwrap();
+    let mute = std::os::unix::net::UnixListener::bind(&api).unwrap();
+    std::thread::spawn(move || {
+        for conn in mute.incoming() {
+            drop(conn);
+        }
+    });
+    let answer = h.ask(&Call::Restore { id: 0 });
+    assert!(matches!(answer, Answer::Restoring { .. }), "{answer:?}");
+    assert!(matches!(h.ask(&Call::Checkpoints), Answer::Listed(_)));
+    assert!(h.calls.close().is_some(), "the restore was dropped");
+}
+
+// A guest that takes its answer but never hangs up, still writing, gets
+// its reboot anyway.
+#[test]
+fn a_guest_that_never_hangs_up_is_rebooted_anyway() {
+    let h = host();
+    let mut conn = UnixStream::connect(&h.sock).unwrap();
+    proto::hello_with(&mut conn, calls::MAGIC, calls::VERSION).unwrap();
+    proto::check_hello_with(&mut conn, calls::MAGIC, calls::VERSION).unwrap();
+    proto::write_frame(&mut conn, &Call::Restore { id: 0 }).unwrap();
+    let answer: Answer = proto::read_frame(&mut conn).unwrap().unwrap();
+    assert!(matches!(answer, Answer::Restoring { .. }), "{answer:?}");
+    let chatty = std::thread::spawn(move || {
+        for _ in 0..100 {
+            if conn.write_all(b".").is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    wait_for("Ctrl-Alt-Del", || h.ctrl_alt_dels() == 1);
+    drop(chatty);
 }

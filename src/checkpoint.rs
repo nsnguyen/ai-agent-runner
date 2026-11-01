@@ -26,7 +26,8 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction
 use std::time::Duration;
 
 /// How many checkpoints the agent in a VM may make of it in any hour. gc
-/// keeps every checkpoint, so this is what bounds the disk an agent's take.
+/// keeps every checkpoint, so this bounds how fast the agent's add up, not
+/// how much space they take in all.
 pub const AGENT_PER_HOUR: usize = 10;
 
 // A guest flushing a lot of writes takes a while; one stuck longer than this

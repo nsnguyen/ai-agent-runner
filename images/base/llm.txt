@@ -31,12 +31,15 @@ you can go back.
 ## Checkpoints, from in here
 
 - `runner-guest checkpoint -m "before the migration"` freezes a copy of this
-  disk now and prints it. Your writes are synced first, the VM pauses for a
-  moment, and you carry on.
+  disk now and prints it. Your writes are synced first, then the VM pauses
+  while the copy is made: a moment on the owner's XFS or btrfs, the whole
+  copy elsewhere. Then you carry on.
 - `runner-guest checkpoints` lists them, newest first: id, when, kind, size,
   comment. Kind is `agent` for yours, `checkpoint` for the owner's, and
   `auto` for the generations boots, runs and restores made. `*` marks the
-  one the next boot starts from.
+  disk this boot started from. What you've written since is in none of
+  them until you checkpoint or the VM shuts down cleanly, so restoring `*`
+  throws it away.
 - `runner-guest restore <id>` reboots this VM onto a copy of checkpoint
   <id>. Everything written since that checkpoint is gone, your notes and
   Claude Code's own session history included, and every process here ends,

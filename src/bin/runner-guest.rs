@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand};
 use runner::calls::{self, Answer, Call};
 use runner::creds::{self, Keyring};
+use runner::store::Checkpoint;
 use runner::{guest, proto};
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -48,7 +49,8 @@ enum Cmd {
         comment: Option<String>,
     },
     /// List this VM's checkpoints, newest first, and the generations in its
-    /// history. `*` marks the one the next boot starts from.
+    /// history. `*` marks the disk this boot started from: what's been written
+    /// since is in none of them until a checkpoint or a clean shutdown.
     Checkpoints,
     /// Reboot this VM onto a copy of a checkpoint. Everything since it is
     /// gone, and every process in the VM ends, this command's caller too.
@@ -122,8 +124,12 @@ fn call(unix: Option<&Path>, cmd: Cmd) -> ExitCode {
             .and_then(|mut conn| calls::ask(&mut conn, &call)),
     };
     match answer {
-        Ok(Answer::Made(made)) => println!("{}", made.row()),
-        Ok(Answer::Listed(listed)) => listed.iter().for_each(|c| println!("{}", c.row())),
+        Ok(Answer::Made(made)) => println!("{}", Checkpoint::from(made).row()),
+        Ok(Answer::Listed(listed)) => {
+            for saved in listed {
+                println!("{}", Checkpoint::from(saved).row());
+            }
+        }
         Ok(Answer::Restoring { id, generation }) => {
             println!("restoring checkpoint {id} as generation {generation}: this VM reboots now")
         }

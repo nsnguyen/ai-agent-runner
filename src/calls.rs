@@ -15,6 +15,12 @@
 // call this host doesn't know is refused. Calls take turns: boot serves one
 // connection at a time, and one that's quiet past CALL_WAIT is dropped.
 //
+// Each VM's runner-guest is on its own disk, so a host has to keep talking to
+// the guests of every disk it ever booted, and postcard goes by position:
+// calls and answers are only added at the end, never changed, and a guest
+// that asks a host for one it doesn't have is refused. VERSION changes only
+// for a change that can't be made that way. tests/calls.rs pins the bytes.
+//
 // A restore is copied while the VM runs and answered, then boot asks the VM
 // to shut down once the guest has hung up. At the clean shutdown, boot
 // commits the disk the VM ran, puts the copy on top, and exits with
@@ -24,6 +30,7 @@ use crate::firecracker::{self, Api};
 use crate::proto;
 use crate::runs;
 use crate::store::{Checkpoint, Staged, Store};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, Permissions};
 use std::io::{self, Read, Write};
@@ -32,11 +39,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The host's vsock port the guest makes its calls on.
 pub const PORT: u32 = 10024;
-/// Bump on any change to Call, Answer or store::Checkpoint.
+/// Changes only when a call or an answer can't be added at the end (above).
 pub const VERSION: u32 = 1;
 /// Starts every hello, apart from proto::MAGIC, so a peer on the wrong port
 /// fails at once.
@@ -63,8 +70,9 @@ pub enum Call {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Answer {
-    Made(Checkpoint),
-    Listed(Vec<Checkpoint>),
+    Made(Saved),
+    /// Newest first: as many as fit in a frame.
+    Listed(Vec<Saved>),
     /// Checkpoint `id` is copied as `generation`, and the VM goes down once
     /// the guest hangs up, then boots again onto it.
     Restoring {
@@ -73,6 +81,47 @@ pub enum Answer {
     },
     /// Why not.
     Refused(String),
+}
+
+/// A checkpoint as a call answers with it: store::Checkpoint as of VERSION 1,
+/// kept apart so that one can grow without changing what guests read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub id: u64,
+    pub time: DateTime<Utc>,
+    pub comment: Option<String>,
+    pub auto: bool,
+    pub agent: bool,
+    pub bytes: u64,
+    pub current: bool,
+}
+
+impl From<Checkpoint> for Saved {
+    fn from(c: Checkpoint) -> Saved {
+        Saved {
+            id: c.id,
+            time: c.time,
+            comment: c.comment,
+            auto: c.auto,
+            agent: c.agent,
+            bytes: c.bytes,
+            current: c.current,
+        }
+    }
+}
+
+impl From<Saved> for Checkpoint {
+    fn from(s: Saved) -> Checkpoint {
+        Checkpoint {
+            id: s.id,
+            time: s.time,
+            comment: s.comment,
+            auto: s.auto,
+            agent: s.agent,
+            bytes: s.bytes,
+            current: s.current,
+        }
+    }
 }
 
 /// The guest's side of one call, on a connection to the host's PORT.
@@ -134,6 +183,9 @@ impl Calls {
                 let served = conn.map_err(proto::Error::from).and_then(|c| host.serve(c));
                 if let Err(e) = served {
                     note(format_args!("{}'s guest call: {e}", host.name));
+                    // A guest that fails call after call can't flood the
+                    // journal, where the VM's console goes too.
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
         };
@@ -186,7 +238,7 @@ impl Host {
         let answer = match call {
             Call::Checkpoint { comment } => self.checkpoint(comment.as_deref()),
             Call::Checkpoints => match self.store.checkpoints(&self.name) {
-                Ok(listed) => Answer::Listed(listed),
+                Ok(listed) => Answer::Listed(fit(listed)),
                 Err(e) => Answer::Refused(e.to_string()),
             },
             Call::Restore { id } => self.stage(id),
@@ -212,7 +264,7 @@ impl Host {
                     "{}'s guest made checkpoint {}",
                     self.name, made.id
                 ));
-                Answer::Made(made)
+                Answer::Made(made.into())
             }
             Err(e) => Answer::Refused(e.to_string()),
         }
@@ -235,13 +287,23 @@ impl Host {
                 ));
             }
         }
+        // Said to the agent, which may be in that run: no host commands.
         let no_run = match runs::hold(&self.store, &self.name) {
             Ok(lock) => lock,
-            Err(e) => {
+            Err(runs::Error::Busy { run, .. }) => {
                 return Answer::Refused(format!(
-                    "{e}. Restoring would end that run, so it's refused until the run is over"
+                    "run {run} is going in this VM, and a restore would end it: \
+                     restore once it's over"
                 ));
             }
+            Err(runs::Error::Starting(_)) => {
+                return Answer::Refused(
+                    "a run is starting in this VM, and a restore would end it: \
+                     restore once it's over"
+                        .into(),
+                );
+            }
+            Err(e) => return Answer::Refused(e.to_string()),
         };
         let staged = self
             .store
@@ -273,8 +335,7 @@ impl Host {
     // to shut down, as `runner stop` does. If it can't, the restore is
     // dropped: the VM carries on as it was.
     fn reboot(&self, conn: &mut UnixStream) {
-        let _ = conn.set_read_timeout(Some(HANG_UP_WAIT));
-        let _ = io::copy(conn, &mut io::sink());
+        hang_up(conn, HANG_UP_WAIT);
         let asked = match self.store.api_socket(&self.name) {
             Ok(sock) => Api::new(sock).ctrl_alt_del(),
             Err(e) => {
@@ -290,7 +351,14 @@ impl Host {
             // Firecracker is gone already, as after a `runner stop` that got
             // here first: the VM is down, and boot finishes the restore.
             Err(firecracker::Error::NotListening(_)) => {}
-            Err(e) => self.give_up(&e.to_string()),
+            Err(e @ firecracker::Error::Api { .. }) => self.give_up(&e.to_string()),
+            // It may have landed. If the VM goes down cleanly, boot finishes
+            // the restore; at any other shutdown, it drops it.
+            Err(e) => note(format_args!(
+                "{}'s restore waits for its next clean shutdown: Ctrl-Alt-Del may not \
+                 have reached it: {e}",
+                self.name
+            )),
         }
     }
 
@@ -313,6 +381,63 @@ impl Host {
                 self.name
             ));
         }
+    }
+}
+
+// Reads until the guest hangs up or `wait` has passed, whichever is first:
+// one that goes on writing can't hold the reboot off.
+fn hang_up(conn: &mut UnixStream, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    let mut buf = [0; 512];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match conn.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+// The newest checkpoints that fit in one frame, each comment cut to what a
+// call's checkpoint takes, since the owner's can be any length.
+fn fit(listed: Vec<Checkpoint>) -> Vec<Saved> {
+    let mut saved: Vec<Saved> = listed
+        .into_iter()
+        .map(|c| {
+            let mut s = Saved::from(c);
+            if let Some(comment) = &mut s.comment {
+                cut(comment, MAX_COMMENT);
+            }
+            s
+        })
+        .collect();
+    // An answer's tag and the list's length take at most 11 bytes.
+    let size = |s: &Saved| postcard::to_allocvec(s).map_or(usize::MAX, |b| b.len());
+    let mut total = 11;
+    let fits = saved
+        .iter()
+        .take_while(|s| {
+            total += size(s);
+            total <= proto::MAX_FRAME
+        })
+        .count();
+    saved.truncate(fits);
+    saved
+}
+
+// To at most `max` bytes, on a character's edge.
+fn cut(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
     }
 }
 

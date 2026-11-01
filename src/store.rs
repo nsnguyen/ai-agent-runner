@@ -103,10 +103,8 @@ pub struct Freed {
 }
 
 /// A disk generation `restore` can bring back: one `checkpoint` froze, or one
-/// in the VM's history, which runs, imports and restores make. It's also what
-/// the guest's calls answer with (src/calls.rs), in postcard, which is by
-/// field order: a change here changes that protocol, so bump calls::VERSION.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// in the VM's history, which runs, imports and restores make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct Checkpoint {
     /// Its generation; `restore` takes it.
     pub id: u64,

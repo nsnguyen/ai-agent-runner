@@ -252,7 +252,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         };
         note(format_args!(
             "{name} shut down cleanly to restore checkpoint {}: generation {from} is \
-             committed, generation {} is current, and the VM boots again",
+             committed, generation {} is current, and the unit boots it again unless \
+             it's being stopped",
             restore.staged.from, vm.generation
         ));
         return Ok(Ended::Restart);
