@@ -163,7 +163,7 @@ cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
 sudo images/base/build.sh
 ```
 
-It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image.
+It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, `/.runner/llm.txt` is there, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image. `/.runner/llm.txt` (`images/base/llm.txt`) tells the agent where it is: where to work, what persists, how to checkpoint and restore, and how its credentials arrive.
 
 Settings go after `sudo`, which drops your environment: `sudo SIZE=40G images/base/build.sh`. The others are `OUT`, `ENGINE` and `RUNNER_GUEST`, described at the top of `build.sh`.
 
@@ -254,6 +254,16 @@ runner restore dev 4                    # dev's disk is checkpoint 4's again
 ```
 
 A checkpoint is a copy of dev's disk, running or not. Of a running VM, it runs `sync` in the guest, pauses the VM, copies the disk it's running, and resumes it, so dev carries on. On XFS or btrfs the copy is a reflink and the pause takes milliseconds; on ext4 dev stays paused for a full copy of its disk. `checkpoints` lists the generations runs and restores made too, as `auto`. `restore` puts a copy of the checkpoint on top of dev's history, so `undo` goes back to what dev had before it, and the checkpoint stays to restore again. A running dev is stopped first, which commits its disk as any clean shutdown does, and started again after (one already stopping is waited out and stays stopped); that ends its sessions and anything else in it, so it's refused while a run is going. Checkpoints stay until dev is deleted: gc keeps every one. Over MCP: `checkpoint_vm`, `list_checkpoints` and `restore_vm`.
+
+The agent in dev can do the same from inside, and `/.runner/llm.txt` in the base image tells it how:
+
+```sh
+runner-guest checkpoint -m "before the migration"   # listed on the host as kind agent
+runner-guest checkpoints
+runner-guest restore 4                              # reboots dev onto checkpoint 4
+```
+
+Those calls reach dev's own boot over vsock, so a VM can only checkpoint itself. The agent gets 10 checkpoints an hour; yours aren't counted or capped. Its restore is copied first, then dev shuts down cleanly, which commits its disk, so `undo` goes back to it, and the unit boots dev again onto the copy. It's refused while a run is going. Both need a base built with this runner-guest, and the host's unit from `host/install.sh`.
 
 ### MCP clients
 
