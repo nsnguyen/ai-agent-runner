@@ -327,7 +327,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List the agent user's tmux sessions in a running VM: each one's name, the command its active pane runs, when it started, and whether a terminal is attached. A VM that isn't running has none, and isn't started to look."
+        description = "List the agent user's tmux sessions in a VM that's up: each one's name, the command its active pane runs, when it started, and whether a terminal is attached. A sleeping VM is woken to look; a stopped one has none, and isn't started to look."
     )]
     async fn list_sessions(
         &self,
@@ -340,7 +340,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Read the last `lines` (default 100, at most 2000) of a tmux session's active pane in a running VM, as plain text, reaching back into its history past the screen. Keeps at most the last 32 KiB, with truncated set if fewer lines fit."
+        description = "Read the last `lines` (default 100, at most 2000) of a tmux session's active pane in a VM that's up, waking it if it's sleeping, as plain text, reaching back into its history past the screen. Keeps at most the last 32 KiB, with truncated set if fewer lines fit."
     )]
     async fn read_session(
         &self,
@@ -351,7 +351,9 @@ impl Tools {
         blocking(move || sessions::read(&store, &args.name, &user, &args.session, lines)).await
     }
 
-    #[tool(description = "End a tmux session in a running VM, and everything running in it.")]
+    #[tool(
+        description = "End a tmux session in a VM that's up, waking it if it's sleeping, and everything running in it."
+    )]
     async fn kill_session(
         &self,
         Parameters(args): Parameters<SessionArgs>,

@@ -151,15 +151,17 @@ enum Cmd {
         #[arg(short, long, allow_hyphen_values = true)]
         session: Option<String>,
     },
-    /// List a running VM's tmux sessions: name, the command in its active
-    /// pane, when it started, and whether a terminal is on it.
+    /// List a VM's tmux sessions, waking it if it's sleeping: name, the
+    /// command in its active pane, when it started, and whether a terminal is
+    /// on it. A stopped VM has none, and isn't started to look.
     Sessions {
         name: String,
         /// Whose sessions.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
     },
-    /// Attach this terminal to a tmux session in a running VM.
+    /// Attach this terminal to a tmux session in a VM that's up, waking it if
+    /// it's sleeping.
     Attach {
         name: String,
         #[arg(allow_hyphen_values = true)]
