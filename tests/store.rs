@@ -1312,9 +1312,16 @@ fn a_vm_sleeps_once_its_snapshot_is_noted_and_not_once_it_s_cleared() {
     assert_eq!(store.sleeping("dev").unwrap(), None);
     let snap = store.snapshot("dev").unwrap();
     snap.make_room().unwrap();
+    // The memory holds the guest's credentials: only the runner user reads it.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = snap.mem().parent().unwrap().to_path_buf();
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     fs::write(snap.vmstate(), b"state").unwrap();
     fs::write(snap.mem(), b"memory").unwrap();
-    // Written, but not yet whole.
+    // Not noted: not sleeping.
     assert_eq!(store.sleeping("dev").unwrap(), None);
     let slept = Slept {
         generation: 1,

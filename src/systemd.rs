@@ -112,10 +112,9 @@ pub fn start(store: &Store, name: &str) -> Result<VmStatus> {
     store.get(name)?;
     systemctl(name, &["start", &unit_name(name)])?;
     let status = status(store, name)?;
-    if status.state != State::Sleeping {
+    if !awake(store, name, status.state)? {
         return Ok(status);
     }
-    crate::sleep::wake(store, name)?;
     self::status(store, name)
 }
 
@@ -144,8 +143,9 @@ pub fn sleep(store: &Store, name: &str) -> Result<VmStatus> {
 /// Wakes a sleeping VM. One awake already stays so.
 pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
     match status(store, name)?.state {
-        State::Sleeping => crate::sleep::wake(store, name)?,
-        State::Running => {}
+        state @ (State::Sleeping | State::Running) => {
+            awake(store, name, state)?;
+        }
         State::Stopped => {
             return Err(Error::NotNow(format!(
                 "{name} is stopped, not sleeping: `runner start {name}` boots it"
@@ -154,6 +154,21 @@ pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
         state => return Err(Error::NotNow(format!("{name} is {state}, not sleeping"))),
     }
     status(store, name)
+}
+
+// Asks the boot of a VM that's up to have it awake: done at once if it is,
+// and after a sleep under way if one is, so a VM that looked to be running
+// while it went to sleep is woken too. A boot from before sleep, which takes
+// no asks, can't have put it to sleep. True if the boot was asked.
+fn awake(store: &Store, name: &str, state: State) -> Result<bool> {
+    if !matches!(state, State::Running | State::Sleeping) {
+        return Ok(false);
+    }
+    match crate::sleep::wake(store, name) {
+        Ok(()) => Ok(true),
+        Err(crate::sleep::Error::NoBoot(_)) if state == State::Running => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn status(store: &Store, name: &str) -> Result<VmStatus> {

@@ -76,8 +76,8 @@ pub enum Error {
         kept: u64,
     },
     #[error(
-        "{name} couldn't wake to shut down ({why}), so its snapshot is dropped: it stays \
-         at generation {current}, and generation {kept} is kept for a look"
+        "{name} couldn't wake ({why}), so its snapshot is dropped: it stays at \
+         generation {current}, and generation {kept} is kept for a look"
     )]
     Unwoken {
         name: String,
@@ -356,8 +356,17 @@ enum Event {
 enum Over {
     /// The VM's Firecracker exited.
     Exited(io::Result<ExitStatus>),
-    /// It was asleep and couldn't wake for a halt, so its snapshot is gone.
+    /// It was asleep and couldn't wake, so its snapshot is gone.
     Dropped(String),
+}
+
+// Why a wake didn't happen.
+enum Unwoken {
+    /// Nothing was loaded: the snapshot is as it was, to wake from later.
+    Asleep(String),
+    /// A load that may have run the guest, which then wrote to its disk, so
+    /// the snapshot is of a moment before the disk: it can't be woken again.
+    Lost(String),
 }
 
 // What the boot's socket is asked goes to its loop, which answers once it's
@@ -392,12 +401,13 @@ struct Up<'a> {
     epoch: u32,
     /// A halt has begun: no more sleeps.
     halting: bool,
-    /// Why a halt dropped the snapshot it couldn't wake.
+    /// Why a snapshot that couldn't wake was dropped, which ends the boot.
     dropped: Option<String>,
 }
 
 impl Up<'_> {
-    // Until Firecracker exits on its own, or a halt drops the VM asleep.
+    // Until Firecracker exits on its own, or a snapshot that can't wake is
+    // dropped.
     fn serve(&mut self) -> Over {
         loop {
             // The loop holds a sender itself, so this never ends.
@@ -415,13 +425,15 @@ impl Up<'_> {
                 Event::Asked(ask, reply) => {
                     let done = match ask {
                         Ask::Sleep => self.sleep(),
-                        Ask::Wake => self.wake().map_err(|e| {
-                            format!(
+                        Ask::Wake => match self.wake() {
+                            Ok(()) => Ok(()),
+                            Err(Unwoken::Asleep(e)) => Err(format!(
                                 "{} couldn't wake, and sleeps on: {e}. `runner stop {}` \
                                  drops its snapshot and rolls its disk back",
                                 self.name, self.name
-                            )
-                        }),
+                            )),
+                            Err(Unwoken::Lost(why)) => Err(self.lose(why)),
+                        },
                         Ask::Halt => self.halt(),
                     };
                     let _ = reply.send(done.map_or_else(Reply::Refused, |()| Reply::Done));
@@ -475,8 +487,8 @@ impl Up<'_> {
                  sleep it once the run is over"
             ),
             runs::Error::Starting(_) => format!(
-                "a run is starting in {name}, and sleeping would cut it off: \
-                 sleep it once the run is over"
+                "a run is starting in {name}, or a restore its agent asked for is \
+                 under way: sleep it once that's over"
             ),
             e => e.to_string(),
         })?;
@@ -487,6 +499,14 @@ impl Up<'_> {
             .map_err(|e| e.to_string())?;
         let snap = self.run.snapshot();
         snap.make_room().map_err(|e| e.to_string())?;
+        // Noted first: from here status says sleeping, so a wake asked
+        // meanwhile waits behind this sleep, rather than looking for a guest
+        // that's going.
+        let slept = Slept {
+            generation: self.run.generation,
+            at: Utc::now(),
+        };
+        snap.note(&slept).map_err(|e| e.to_string())?;
         let began = Instant::now();
         let taken = self
             .api
@@ -510,16 +530,6 @@ impl Up<'_> {
         }
         // Firecracker leaves them, and the next one won't bind over them.
         let _ = remove_sockets(&[self.api_sock, self.vsock]);
-        let slept = Slept {
-            generation: self.run.generation,
-            at: Utc::now(),
-        };
-        if let Err(e) = snap.note(&slept) {
-            return Err(format!(
-                "{name} is asleep, but couldn't note its snapshot, so it's listed as \
-                 running: {e}. `runner wake {name}` wakes it"
-            ));
-        }
         note(format_args!(
             "{name} is asleep: generation {} and its memory are in {}, written in {:.1?}",
             self.run.generation,
@@ -533,37 +543,48 @@ impl Up<'_> {
 
     // Loads the snapshot into a fresh Firecracker on the same sockets, then
     // sets the guest's clock. The snapshot stays until the load has worked.
-    fn wake(&mut self) -> std::result::Result<(), String> {
+    fn wake(&mut self) -> std::result::Result<(), Unwoken> {
         let name = self.name;
         if self.fc.is_some() {
             return Ok(());
         }
+        let asleep = |e: &dyn std::fmt::Display| Unwoken::Asleep(e.to_string());
         let snap = self.run.snapshot();
         // Only this boot's own: one of the disk it runs.
         match snap.slept() {
             Ok(Some(slept)) if slept.generation != self.run.generation => {
-                return Err(format!(
+                return Err(Unwoken::Asleep(format!(
                     "its snapshot runs on generation {}, not this boot's {}",
                     slept.generation, self.run.generation
-                ));
+                )));
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(asleep(&e)),
             _ => {}
         }
+        // Firecracker may have been upgraded while the VM slept.
+        firecracker::check_version(self.bin).map_err(|e| asleep(&e))?;
         let began = Instant::now();
-        remove_sockets(&[self.api_sock, self.vsock]).map_err(|e| e.to_string())?;
-        let lock = self.run.hold().map_err(|e| e.to_string())?;
-        let mut child =
-            firecracker(self.bin, self.api_sock, name, lock).map_err(|e| e.to_string())?;
+        remove_sockets(&[self.api_sock, self.vsock]).map_err(|e| asleep(&e))?;
+        let lock = self.run.hold().map_err(|e| asleep(&e))?;
+        let mut child = firecracker(self.bin, self.api_sock, name, lock).map_err(|e| asleep(&e))?;
         self.epoch += 1;
-        let loaded = wait_for_api(&mut child, self.api_sock)
-            .and_then(|()| Ok(self.api.load(&snap.vmstate(), &snap.mem())?))
-            .and_then(|()| self.watch(&child));
+        let loaded = match wait_for_api(&mut child, self.api_sock) {
+            Err(e) => Err(asleep(&e)),
+            Ok(()) => match self.api.load(&snap.vmstate(), &snap.mem()) {
+                Ok(()) => self.watch(&child).map_err(|e| Unwoken::Lost(e.to_string())),
+                // Refused, so Firecracker never ran the guest.
+                Err(e @ (firecracker::Error::Api { .. } | firecracker::Error::NotListening(_))) => {
+                    Err(asleep(&e))
+                }
+                // No answer: it may have.
+                Err(e) => Err(Unwoken::Lost(e.to_string())),
+            },
+        };
         if let Err(e) = loaded {
             let _ = child.kill();
             let _ = child.wait();
             let _ = remove_sockets(&[self.api_sock, self.vsock]);
-            return Err(e.to_string());
+            return Err(e);
         }
         self.fc = Some(child);
         // Its memory file stays open in Firecracker, which reads pages from
@@ -581,6 +602,17 @@ impl Up<'_> {
         Ok(())
     }
 
+    // Drops a snapshot that can't wake, and with it the boot, as after a kill.
+    fn lose(&mut self, why: String) -> String {
+        let name = self.name;
+        let _ = self.run.snapshot().clear();
+        let lost = format!(
+            "{name} couldn't wake, so its snapshot is dropped and its disk rolls back: {why}"
+        );
+        self.dropped = Some(why);
+        lost
+    }
+
     // Wakes a sleeping VM, which can only shut down cleanly awake, then asks
     // it to shut down. If it can't wake, its snapshot goes, and so does the
     // boot, as after a kill.
@@ -588,15 +620,9 @@ impl Up<'_> {
         let name = self.name;
         self.halting = true;
         if self.fc.is_none()
-            && let Err(why) = self.wake()
+            && let Err(Unwoken::Asleep(why) | Unwoken::Lost(why)) = self.wake()
         {
-            let _ = self.run.snapshot().clear();
-            let dropped = format!(
-                "{name} couldn't wake to shut down, so its snapshot is dropped and its \
-                 disk rolls back: {why}"
-            );
-            self.dropped = Some(why);
-            return Err(dropped);
+            return Err(self.lose(why));
         }
         // A checkpoint under way finishes first (checkpoint.rs). A paused
         // guest can't take Ctrl-Alt-Del, and one whose checkpoint was killed

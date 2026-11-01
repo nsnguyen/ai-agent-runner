@@ -86,7 +86,8 @@ impl Api {
         }
     }
 
-    /// How long a call waits on Firecracker, a snapshot's aside.
+    /// How long each call waits on Firecracker. A snapshot waits at least
+    /// SNAPSHOT_TIMEOUT, however short this is.
     pub fn timeout(self, timeout: Duration) -> Api {
         Api { timeout, ..self }
     }

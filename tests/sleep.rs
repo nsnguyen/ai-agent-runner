@@ -87,13 +87,32 @@ fn sleep_and_wake_go_through_the_vm_s_boot() {
 }
 
 #[test]
-fn asleep_already_or_awake_already_asks_nothing() {
+fn asleep_already_asks_nothing() {
     let h = host();
     let boot = StandIn::serve(&h.store, "dev");
-    assert!(h.ok(&["wake", "dev"]).ends_with("  running\n"));
     h.asleep(1);
     assert!(h.ok(&["sleep", "dev"]).ends_with("  sleeping\n"));
     assert_eq!(boot.asked(), []);
+}
+
+// A VM that looks to be running may be on its way to sleep, which its boot
+// knows: it wakes it once the sleep is done, or says at once it's awake.
+#[test]
+fn wake_and_start_ask_the_boot_of_a_running_vm_too() {
+    let h = host();
+    let boot = StandIn::serve(&h.store, "dev");
+    assert!(h.ok(&["wake", "dev"]).ends_with("  running\n"));
+    assert!(h.ok(&["start", "dev"]).ends_with("  running\n"));
+    assert_eq!(boot.asked(), [Ask::Wake, Ask::Wake]);
+}
+
+// One booted by a runner from before sleep has no socket, and can't sleep.
+#[test]
+fn a_running_vm_s_older_boot_isn_t_asked() {
+    let h = host();
+    let _held = h.store.begin_run("dev").unwrap();
+    assert!(h.ok(&["wake", "dev"]).ends_with("  running\n"));
+    assert!(h.ok(&["start", "dev"]).ends_with("  running\n"));
 }
 
 #[test]
@@ -161,7 +180,9 @@ fn restore_drops_the_snapshot_and_starts_the_vm_again() {
     h.asleep(1);
     let restored = h.ok(&["restore", "dev", "0"]);
     assert_eq!(restored, "dev  gen 2  6 bytes\n");
-    assert_eq!(boot.asked(), [Ask::Halt]);
+    // The stop's halt, then the start's wake, which the next boot answers
+    // at once: the stand-in plays both boots.
+    assert_eq!(boot.asked(), [Ask::Halt, Ask::Wake]);
     assert_eq!(h.store.sleeping("dev").unwrap(), None);
     let verbs: Vec<String> =
         h.sd.calls()

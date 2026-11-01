@@ -470,9 +470,9 @@ impl Store {
         Ok(snapshot(&self.existing(name)?))
     }
 
-    /// The note of the VM's whole snapshot, if it has one: it's sleeping, if
-    /// its boot is up. A boot that was killed asleep leaves one until the
-    /// next boot clears it.
+    /// The note of the VM's snapshot, if it has one: it's sleeping, or on its
+    /// way, if its boot is up. A boot that was killed asleep leaves one until
+    /// the next boot clears it.
     pub fn sleeping(&self, name: &str) -> Result<Option<Slept>> {
         self.snapshot(name)?.slept()
     }
@@ -950,8 +950,10 @@ impl Freezer {
 }
 
 /// A sleeping VM's snapshot (src/sleep.rs): Firecracker's state of it and
-/// its guest's memory, and a note, written last, that makes it whole. Only
-/// the boot that took it can wake it: it runs on that boot's disk.
+/// its guest's memory, and a note, written first, that says the VM is asleep
+/// or on its way. Only the boot that took it can wake it: it runs on that
+/// boot's disk. The memory holds what the guest held, its credentials too,
+/// so only the runner user can read it.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     dir: PathBuf,
@@ -973,17 +975,19 @@ impl Snapshot {
     /// its pages from it (firecracker::Api::load).
     pub fn make_room(&self) -> Result<()> {
         self.clear()?;
-        fs::create_dir_all(&self.dir).map_err(at(&self.dir))
+        fs::create_dir_all(&self.dir)
+            .and_then(|()| fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700)))
+            .map_err(at(&self.dir))
     }
 
-    /// Notes the snapshot whole, once Firecracker has written it and is gone.
+    /// Notes the VM asleep, before Firecracker writes the snapshot.
     pub fn note(&self, slept: &Slept) -> Result<()> {
         let path = self.dir.join(SLEPT);
         let text = serde_json::to_string(slept).map_err(|e| at(&path)(e.into()))?;
         write_aside(&self.dir, SLEPT, &text)
     }
 
-    /// The note, if the snapshot is whole.
+    /// The note, if the VM is asleep or on its way.
     pub fn slept(&self) -> Result<Option<Slept>> {
         let path = self.dir.join(SLEPT);
         let text = match fs::read(&path) {
@@ -994,7 +998,7 @@ impl Snapshot {
         Ok(Some(slept))
     }
 
-    /// Deletes it, note first, so a snapshot cleared partway isn't whole.
+    /// Deletes it, note first, so a snapshot cleared partway isn't asleep.
     pub fn clear(&self) -> Result<()> {
         remove_if_there(&self.dir.join(SLEPT))?;
         remove_if_there(&self.vmstate())?;
@@ -1002,7 +1006,7 @@ impl Snapshot {
     }
 }
 
-/// A whole snapshot's note.
+/// A snapshot's note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slept {
     /// The disk generation its guest runs on: its boot's own (Booted).

@@ -1024,6 +1024,80 @@ fn wake_loads_the_snapshot_into_a_new_firecracker_and_sets_the_guest_s_clock() {
     assert_eq!(h.store.get("dev").unwrap().generation, 1);
 }
 
+// Asleep from the moment it starts to sleep, so a wake asked meanwhile waits
+// for the sleep and wakes it, rather than looking for a guest that's going.
+#[test]
+fn a_vm_is_listed_asleep_while_its_snapshot_is_written() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let store = h.store.clone();
+    let during = Arc::new(Mutex::new(None));
+    let seen = during.clone();
+    let writes = firecracker_that_sleeps(&h.fc);
+    let _up = next_firecracker(&h, move |req| {
+        if req.path == "/snapshot/create" {
+            *seen.lock().unwrap() = Some(store.sleeping("dev").unwrap().is_some());
+        }
+        writes(req)
+    });
+    assert_eq!(h.ready(), "READY=1");
+    guest_up(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    assert_eq!(*during.lock().unwrap(), Some(true));
+    let mut boot = boot;
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+// Upgraded while the VM slept: its snapshot is for the old Firecracker.
+#[test]
+fn a_wake_checks_firecracker_s_version_again() {
+    let h = Host::new();
+    let (mut boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    fs::write(h.fc.dir.join("version"), "v1.0.0").unwrap();
+    let err = sleep::wake(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("pinned to"), "{err}");
+    assert!(err.to_string().contains("sleeps on"), "{err}");
+    assert!(!h.fc.started(), "a firecracker started");
+    assert!(h.store.sleeping("dev").unwrap().is_some());
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+// A load that got no answer may have run the guest, which may have written
+// to its disk since the snapshot: waking it again could load old memory
+// over a newer disk, so the snapshot goes, and the boot with it.
+#[test]
+fn a_load_with_no_answer_drops_the_snapshot() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let store = h.store.clone();
+    let waking = std::thread::spawn(move || sleep::wake(&store, "dev"));
+    h.fc.next();
+    // Each request read, and its connection dropped without a reply.
+    let api = UnixListener::bind(h.vm_dir("dev").join("api.sock")).unwrap();
+    std::thread::spawn(move || {
+        for conn in api.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let _ = std::io::Read::read(&mut conn, &mut [0; 512]);
+        }
+    });
+    let began = std::time::Instant::now();
+    let err = waking.join().unwrap().unwrap_err();
+    assert!(err.to_string().contains("snapshot is dropped"), "{err}");
+    // Not a timeout: the answer never came.
+    assert!(began.elapsed() < Duration::from_secs(5), "{err}");
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{notes}");
+    assert!(notes.contains("generation 1 is kept for a look"), "{notes}");
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!h.vm_dir("dev").join("snapshot/mem").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+}
+
 #[test]
 fn halting_a_sleeping_vm_wakes_it_to_shut_down_cleanly() {
     let h = Host::new();

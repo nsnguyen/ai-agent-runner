@@ -142,7 +142,8 @@ fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     })
 }
 
-/// A `firecracker` that prints the version it's told to, records its argv
+/// A `firecracker` that prints the version it's told to (FAKE_FC_VERSION,
+/// or what's in its `version` file, as if upgraded), records its pid and argv
 /// and environment, writes a line of "console", then exits with whatever number is written
 /// to its `exit` fifo. The test serves its API socket.
 #[derive(Clone)]
@@ -157,7 +158,10 @@ impl FakeFirecracker {
         let bin = dir.join("firecracker");
         script(
             &bin,
-            r#"if [ "$1" = --version ]; then printf 'Firecracker %s\n\n' "$FAKE_FC_VERSION"; exit 0; fi
+            r#"if [ "$1" = --version ]; then
+  v=$FAKE_FC_VERSION; [ -f "$FAKE_FC/version" ] && v=$(cat "$FAKE_FC/version")
+  printf 'Firecracker %s\n\n' "$v"; exit 0
+fi
 grep '^CapAmb' /proc/$$/status > "$FAKE_FC/caps"
 env > "$FAKE_FC/env"
 echo $$ > "$FAKE_FC/pid"
