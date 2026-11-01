@@ -125,8 +125,12 @@ impl Guest for InVm<'_> {
     }
 
     fn run(&self, argv: &[String], stdin: &[u8]) -> exec::Result<Captured> {
-        let conn = exec::open(self.store, self.vm)?;
-        exec::capture(conn, &as_root(argv.to_vec()), stdin, TIMEOUT, CAP)
+        // In use until the command is done.
+        let exec::Conn {
+            stream,
+            in_use: _in_use,
+        } = exec::open(self.store, self.vm)?;
+        exec::capture(stream, &as_root(argv.to_vec()), stdin, TIMEOUT, CAP)
     }
 }
 
