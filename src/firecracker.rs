@@ -30,6 +30,9 @@ pub const GUEST_CID: u32 = 3;
 // Long enough for InstanceStart, short enough that a wedged Firecracker
 // fails the boot instead of hanging it.
 const TIMEOUT: Duration = Duration::from_secs(10);
+// A snapshot writes the guest's whole memory before it answers, which for a
+// big VM on a slow disk takes minutes.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -72,11 +75,20 @@ pub struct Guest<'a> {
 #[derive(Debug, Clone)]
 pub struct Api {
     sock: PathBuf,
+    timeout: Duration,
 }
 
 impl Api {
     pub fn new(sock: impl Into<PathBuf>) -> Api {
-        Api { sock: sock.into() }
+        Api {
+            sock: sock.into(),
+            timeout: TIMEOUT,
+        }
+    }
+
+    /// How long a call waits on Firecracker, a snapshot's aside.
+    pub fn timeout(self, timeout: Duration) -> Api {
+        Api { timeout, ..self }
     }
 
     /// Everything a guest needs before it can start.
@@ -123,19 +135,51 @@ impl Api {
         self.patch("/vm", &json!({"state": "Resumed"}))
     }
 
+    /// Writes a paused guest's whole state, for `load` in a fresh Firecracker
+    /// to carry on from: its vCPUs and devices to `vmstate`, its memory to
+    /// `mem`. Left in the page cache, not synced: a snapshot is only good to
+    /// the boot that took it, which a host crash ends anyway (src/sleep.rs).
+    pub fn snapshot(&self, vmstate: &Path, mem: &Path) -> Result<()> {
+        let body = json!({
+            "snapshot_type": "Full",
+            "snapshot_path": vmstate,
+            "mem_file_path": mem,
+            "sync_snapshot_files": false,
+        });
+        self.send(
+            "PUT",
+            "/snapshot/create",
+            &body,
+            SNAPSHOT_TIMEOUT.max(self.timeout),
+        )
+    }
+
+    /// Loads a snapshot into this Firecracker, which must be fresh, and
+    /// resumes the guest. Its memory is mapped from `mem`, which mustn't change
+    /// while it runs: a page is read from it the first time the guest touches
+    /// it. Firecracker exits if the load fails.
+    pub fn load(&self, vmstate: &Path, mem: &Path) -> Result<()> {
+        let body = json!({
+            "snapshot_path": vmstate,
+            "mem_backend": {"backend_type": "File", "backend_path": mem},
+            "resume_vm": true,
+        });
+        self.put("/snapshot/load", &body)
+    }
+
     fn action(&self, action: &str) -> Result<()> {
         self.put("/actions", &json!({"action_type": action}))
     }
 
     pub fn put(&self, path: &str, body: &Value) -> Result<()> {
-        self.send("PUT", path, body)
+        self.send("PUT", path, body, self.timeout)
     }
 
     pub fn patch(&self, path: &str, body: &Value) -> Result<()> {
-        self.send("PATCH", path, body)
+        self.send("PATCH", path, body, self.timeout)
     }
 
-    fn send(&self, method: &'static str, path: &str, body: &Value) -> Result<()> {
+    fn send(&self, method: &'static str, path: &str, body: &Value, wait: Duration) -> Result<()> {
         let io = |source| Error::Io {
             sock: self.sock.clone(),
             source,
@@ -147,8 +191,8 @@ impl Api {
             }
             _ => io(e),
         })?;
-        conn.set_read_timeout(Some(TIMEOUT)).map_err(io)?;
-        conn.set_write_timeout(Some(TIMEOUT)).map_err(io)?;
+        conn.set_read_timeout(Some(wait)).map_err(io)?;
+        conn.set_write_timeout(Some(wait)).map_err(io)?;
         let body = body.to_string();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
