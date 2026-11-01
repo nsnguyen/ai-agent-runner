@@ -115,6 +115,7 @@ fn lists_its_tools() {
     assert_eq!(
         names,
         [
+            "add_service",
             "cancel_run",
             "checkpoint_vm",
             "create_vm",
@@ -124,9 +125,11 @@ fn lists_its_tools() {
             "kill_session",
             "list_checkpoints",
             "list_runs",
+            "list_services",
             "list_sessions",
             "list_vms",
             "read_session",
+            "remove_service",
             "restore_vm",
             "run_agent",
             "run_output",
@@ -613,5 +616,31 @@ fn session_errors_are_tool_errors() {
         assert!(why(&got).contains("lines"), "{got}");
     }
     let got = s.call(8, "list_sessions", json!({"name": "nope"}));
+    assert_eq!(why(&got), "no VM named nope");
+}
+
+// The service tools' happy path needs the guest's systemd: tests/services.rs
+// runs their scripts, and tests/kvm.rs the real thing.
+#[test]
+fn service_errors_are_tool_errors() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let why = |got: &Value| got["content"][0]["text"].as_str().unwrap().to_string();
+    let add = |name: &str, service: &str, argv: Value| json!({"name": name, "service": service, "argv": argv});
+    let got = s.call(2, "add_service", add("dev", "a b", json!(["serve"])));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert!(why(&got).contains("isn't a service name"), "{got}");
+    let got = s.call(3, "add_service", add("dev", "web", json!([])));
+    assert_eq!(why(&got), "no command: give the program and its arguments");
+    let args = json!({"name": "dev", "service": "web", "argv": ["serve"], "dir": "work"});
+    let got = s.call(4, "add_service", args);
+    assert!(why(&got).contains("absolute"), "{got}");
+    let got = s.call(5, "remove_service", json!({"name": "dev", "service": "-x"}));
+    assert!(why(&got).contains("isn't a service name"), "{got}");
+    // None of that touched the VM.
+    assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
+    let got = s.call(6, "list_services", json!({"name": "nope"}));
+    assert_eq!(why(&got), "no VM named nope");
+    let got = s.call(7, "add_service", add("nope", "web", json!(["serve"])));
     assert_eq!(why(&got), "no VM named nope");
 }

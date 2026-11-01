@@ -147,6 +147,7 @@ fn llm_txt_says_how_to_checkpoint_and_restore_as_the_runner_does() {
         &format!("{} an hour", runner::checkpoint::AGENT_PER_HOUR),
         "CLAUDE_CODE_OAUTH_TOKEN",
         "GH_TOKEN",
+        &format!("{}<name>", runner::services::PREFIX),
     ] {
         assert!(llm.contains(said), "llm.txt doesn't say {said:?}");
     }

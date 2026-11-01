@@ -23,6 +23,7 @@
 // `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
 // `an_idle_vm_sleeps_and_exec_wakes_it`,
 // `a_session_outlives_a_dropped_connection`,
+// `a_service_answers_again_after_a_stop_and_start`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
@@ -400,6 +401,72 @@ fn a_session_outlives_a_dropped_connection() {
     ok(runner(&root, &detach));
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     ok(runner(&root, &["kill", &name, "work"]));
+}
+
+// What a GET of / at the address gets back first, if anything.
+fn http_status(address: &str, port: u16) -> Option<String> {
+    use std::io::{BufRead, Write};
+    let to = std::net::SocketAddr::new(address.parse().ok()?, port);
+    let mut conn = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(2)).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    conn.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(conn).read_line(&mut line).ok()?;
+    Some(line.trim_end().to_string())
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_service_answers_again_after_a_stop_and_start() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("service-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    let answers = || http_status(&address, 8080).is_some_and(|l| l.ends_with(" 200 OK"));
+
+    // Stopped, so add boots it.
+    let web = ["python3", "-m", "http.server", "8080"];
+    let mut add = vec!["service", "add", &name, "web", "--"];
+    add.extend(web);
+    let added = ok(runner(&root, &add));
+    let row = "web  active/running  /home/agent/work  python3 -m http.server 8080\n";
+    assert_eq!(added, row);
+    eventually("the service to answer", answers);
+
+    ok(runner(&root, &["stop", &name]));
+    assert!(!answers());
+    ok(runner(&root, &["start", &name]));
+    eventually("the service to answer after a stop and start", answers);
+    assert_eq!(ok(runner(&root, &["service", "list", &name])), row);
+    let logs = ok(runner(
+        &root,
+        &["service", "logs", &name, "web", "-n", "50"],
+    ));
+    assert!(logs.contains("\"GET / HTTP/1.0\" 200"), "{logs}");
+
+    // A program that isn't there fails add, and leaves no unit.
+    let missing = runner(
+        &root,
+        &["service", "add", &name, "nope", "--", "no-such-program"],
+    );
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(!missing.status.success());
+    assert!(err.contains("nope didn't start in"), "{err}");
+    assert!(err.contains("no-such-program"), "{err}");
+    let taken = runner(&root, &["service", "add", &name, "web", "--", "true"]);
+    let err = String::from_utf8_lossy(&taken.stderr);
+    assert!(err.contains("already has a service named web"), "{err}");
+
+    ok(runner(&root, &["service", "rm", &name, "web"]));
+    assert_eq!(
+        ok(runner(&root, &["service", "list", &name])),
+        "no services\n"
+    );
+    assert!(!answers());
 }
 
 // No token needed: a logged-out claude waits at its login screen.

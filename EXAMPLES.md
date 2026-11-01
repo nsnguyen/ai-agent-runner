@@ -37,7 +37,13 @@ runner delete demo     # remove it, checkpoints and all (stop it first)
 runner claude demo     # Claude Code running inside demo
 runner shell demo      # a terminal inside demo
 runner exec demo -- ls /home/agent/work    # run one command inside demo
+runner service add demo web -- python3 -m http.server 8080   # a server that's up whenever demo is
+runner service list demo    # its services, and whether each is running
+runner service logs demo web    # what web printed
+runner service rm demo web  # stop web for good
 ```
+
+A service starts again on its own: when it exits, and every time the VM starts.
 
 In `runner claude`, press **Ctrl-b**, then **d**, to leave Claude running in the VM. Run `runner claude demo` again to come back.
 
