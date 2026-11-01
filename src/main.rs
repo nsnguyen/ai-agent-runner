@@ -7,7 +7,7 @@ use runner::exec;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::sessions::{self, Session};
-use runner::store::{BASE, Checkpoint, Config, KEEP, Store, Vm, parse_mem};
+use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::io::IsTerminal;
@@ -465,13 +465,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         }
         Cmd::Checkpoint { name, comment } => {
             let made = checkpoint::checkpoint(&store, &name, comment.as_deref())?;
-            println!("{}", row(&made));
+            println!("{}", made.row());
         }
         Cmd::Checkpoints { name } => {
             store
                 .checkpoints(&name)?
                 .iter()
-                .for_each(|c| println!("{}", row(c)));
+                .for_each(|c| println!("{}", c.row()));
         }
         Cmd::Restore { name, id } => show(&checkpoint::restore(&store, &name, id)?),
         Cmd::Mcp { user } => return Ok(serve(store, user)),
@@ -479,7 +479,12 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             name,
             firecracker,
             ip,
-        } => runner::boot::boot(&store, &name, &firecracker, &ip)?,
+        } => {
+            let ended = runner::boot::boot(&store, &name, &firecracker, &ip)?;
+            if ended == runner::boot::Ended::Restart {
+                return Ok(ExitCode::from(runner::boot::RESTART));
+            }
+        }
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
     }
@@ -607,19 +612,6 @@ fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
         }
     }
     code
-}
-
-// The comment is quoted, so one with a newline in it still takes one line.
-fn row(c: &Checkpoint) -> String {
-    let mark = if c.current { '*' } else { ' ' };
-    let time = c.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let kind = if c.auto { "auto" } else { "checkpoint" };
-    let comment = c.comment.as_ref().map(|c| format!("  {c:?}"));
-    let comment = comment.unwrap_or_default();
-    format!(
-        "{mark} {}  {time}  {kind}  {} bytes{comment}",
-        c.id, c.bytes
-    )
 }
 
 // The prompt is quoted, so one with a newline in it still takes one line.

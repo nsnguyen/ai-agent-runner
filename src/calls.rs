@@ -1,0 +1,447 @@
+// The guest's calls to its host: the agent in a VM checkpoints, lists and
+// restores its own VM with `runner-guest checkpoint`, `checkpoints` and
+// `restore`, which `runner boot` serves for that VM alone.
+//
+// The guest connects to the host (CID 2) on vsock PORT, which Firecracker
+// passes on to `vsock.sock_<PORT>` in the VM's directory, where boot listens.
+// A connection makes one call, framed as src/proto.rs frames, with a hello of
+// its own:
+//
+//   both sides   hello: MAGIC then VERSION, as a u32 big-endian, 8 bytes
+//   guest        Call
+//   host         Answer
+//
+// Nothing in a call names a VM, so a guest can only reach its own, and a
+// call this host doesn't know is refused. Calls take turns: boot serves one
+// connection at a time, and one that's quiet past CALL_WAIT is dropped.
+//
+// Each VM's runner-guest is on its own disk, so a host has to keep talking to
+// the guests of every disk it ever booted, and postcard goes by position:
+// calls and answers are only added at the end, never changed, and a guest
+// that asks a host for one it doesn't have is refused. VERSION changes only
+// for a change that can't be made that way. tests/calls.rs pins the bytes.
+//
+// A restore is copied while the VM runs and answered, then boot asks the VM
+// to shut down once the guest has hung up. At the clean shutdown, boot
+// commits the disk the VM ran, puts the copy on top, and exits with
+// boot::RESTART, which the unit boots again (src/systemd.rs).
+use crate::checkpoint;
+use crate::firecracker::{self, Api};
+use crate::proto;
+use crate::runs;
+use crate::store::{Checkpoint, Staged, Store};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, Permissions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// The host's vsock port the guest makes its calls on.
+pub const PORT: u32 = 10024;
+/// Changes only when a call or an answer can't be added at the end (above).
+pub const VERSION: u32 = 1;
+/// Starts every hello, apart from proto::MAGIC, so a peer on the wrong port
+/// fails at once.
+pub const MAGIC: [u8; 4] = *b"rcal";
+/// The longest comment a call's checkpoint takes, in bytes.
+pub const MAX_COMMENT: usize = 1024;
+
+// A guest that connects says what it wants at once.
+const CALL_WAIT: Duration = Duration::from_secs(10);
+// How long a restore waits for the guest to take its answer and hang up
+// before the VM goes down anyway.
+const HANG_UP_WAIT: Duration = Duration::from_secs(2);
+
+/// What the guest asks for, of its own VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Call {
+    /// Freeze a copy of the VM's disk, which carries on.
+    Checkpoint { comment: Option<String> },
+    /// The VM's checkpoints, newest first, as `runner checkpoints` lists them.
+    Checkpoints,
+    /// Reboot the VM onto a copy of checkpoint `id`.
+    Restore { id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Answer {
+    Made(Saved),
+    /// Newest first: as many as fit in a frame.
+    Listed(Vec<Saved>),
+    /// Checkpoint `id` is copied as `generation`, and the VM goes down once
+    /// the guest hangs up, then boots again onto it.
+    Restoring {
+        id: u64,
+        generation: u64,
+    },
+    /// Why not.
+    Refused(String),
+}
+
+/// A checkpoint as a call answers with it: store::Checkpoint as of VERSION 1,
+/// kept apart so that one can grow without changing what guests read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub id: u64,
+    pub time: DateTime<Utc>,
+    pub comment: Option<String>,
+    pub auto: bool,
+    pub agent: bool,
+    pub bytes: u64,
+    pub current: bool,
+}
+
+impl From<Checkpoint> for Saved {
+    fn from(c: Checkpoint) -> Saved {
+        Saved {
+            id: c.id,
+            time: c.time,
+            comment: c.comment,
+            auto: c.auto,
+            agent: c.agent,
+            bytes: c.bytes,
+            current: c.current,
+        }
+    }
+}
+
+impl From<Saved> for Checkpoint {
+    fn from(s: Saved) -> Checkpoint {
+        Checkpoint {
+            id: s.id,
+            time: s.time,
+            comment: s.comment,
+            auto: s.auto,
+            agent: s.agent,
+            bytes: s.bytes,
+            current: s.current,
+        }
+    }
+}
+
+/// The guest's side of one call, on a connection to the host's PORT.
+pub fn ask<C: Read + Write>(conn: &mut C, call: &Call) -> proto::Result<Answer> {
+    proto::hello_with(conn, MAGIC, VERSION)?;
+    proto::check_hello_with(conn, MAGIC, VERSION)?;
+    proto::write_frame(conn, call)?;
+    proto::read_frame(conn)?.ok_or(proto::Error::Truncated)
+}
+
+/// A restore the guest asked for, waiting on its VM to go down. It holds the
+/// VM's run lock until dropped, so no run starts that the reboot would end.
+#[derive(Debug)]
+pub struct Restore {
+    pub staged: Staged,
+    _no_run: File,
+}
+
+// What the VM's boot hears from its server about a restore.
+#[derive(Default)]
+struct Asked {
+    restore: Option<Restore>,
+    // The VM is down: a restore staged now would be left to no one.
+    closed: bool,
+}
+
+/// The host's side, which `runner boot` runs for its VM while the VM runs.
+/// Dropping it stops it and removes its socket, without waiting out a call
+/// in flight: one whose VM is gone fails on its own.
+pub struct Calls {
+    sock: PathBuf,
+    stop: Arc<AtomicBool>,
+    asked: Arc<Mutex<Asked>>,
+}
+
+impl Calls {
+    /// Serves the guest's calls on `sock`, Firecracker's for PORT, for VM
+    /// `name` alone. Only the runner user can connect; Firecracker connects
+    /// for the guest.
+    pub fn start(store: &Store, name: &str, sock: &Path) -> io::Result<Calls> {
+        let listener = UnixListener::bind(sock)?;
+        fs::set_permissions(sock, Permissions::from_mode(0o600))?;
+        let calls = Calls {
+            sock: sock.to_path_buf(),
+            stop: Arc::new(AtomicBool::new(false)),
+            asked: Arc::default(),
+        };
+        let host = Host {
+            store: store.clone(),
+            name: name.to_string(),
+            asked: calls.asked.clone(),
+        };
+        let stopped = calls.stop.clone();
+        let serve = move || {
+            for conn in listener.incoming() {
+                if stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                let served = conn.map_err(proto::Error::from).and_then(|c| host.serve(c));
+                if let Err(e) = served {
+                    note(format_args!("{}'s guest call: {e}", host.name));
+                    // A guest that fails call after call can't flood the
+                    // journal, where the VM's console goes too.
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+        std::thread::Builder::new().spawn(serve)?;
+        Ok(calls)
+    }
+
+    /// The restore the guest asked for, if it did, for boot to finish once
+    /// the VM is down. A restore asked for after this is refused.
+    pub fn close(&self) -> Option<Restore> {
+        let mut asked = self.asked.lock().unwrap();
+        asked.closed = true;
+        asked.restore.take()
+    }
+}
+
+impl Drop for Calls {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wakes the thread if it's waiting for a call; one in a call sees
+        // the flag after.
+        let _ = UnixStream::connect(&self.sock);
+        let _ = fs::remove_file(&self.sock);
+    }
+}
+
+struct Host {
+    store: Store,
+    name: String,
+    asked: Arc<Mutex<Asked>>,
+}
+
+impl Host {
+    fn serve(&self, mut conn: UnixStream) -> proto::Result<()> {
+        conn.set_read_timeout(Some(CALL_WAIT))?;
+        conn.set_write_timeout(Some(CALL_WAIT))?;
+        proto::hello_with(&mut conn, MAGIC, VERSION)?;
+        proto::check_hello_with(&mut conn, MAGIC, VERSION)?;
+        let call = match proto::read_frame::<Call>(&mut conn) {
+            Ok(Some(call)) => call,
+            Ok(None) => return Ok(()),
+            // Framed right, but not a call this host has: a newer guest's.
+            Err(proto::Error::Decode(_)) => {
+                let why = "this runner host doesn't know that call: runner-guest is newer than \
+                           the runner, so ask for the runner to be updated";
+                return proto::write_frame(&mut conn, &Answer::Refused(why.into()));
+            }
+            Err(e) => return Err(e),
+        };
+        let answer = match call {
+            Call::Checkpoint { comment } => self.checkpoint(comment.as_deref()),
+            Call::Checkpoints => match self.store.checkpoints(&self.name) {
+                Ok(listed) => Answer::Listed(fit(listed)),
+                Err(e) => Answer::Refused(e.to_string()),
+            },
+            Call::Restore { id } => self.stage(id),
+        };
+        let restoring = matches!(answer, Answer::Restoring { .. });
+        let sent = proto::write_frame(&mut conn, &answer);
+        if restoring {
+            // Down even if the guest didn't hear: what it asked for is staged.
+            self.reboot(&mut conn);
+        }
+        sent
+    }
+
+    fn checkpoint(&self, comment: Option<&str>) -> Answer {
+        if comment.is_some_and(|c| c.len() > MAX_COMMENT) {
+            return Answer::Refused(format!(
+                "a checkpoint's comment can be up to {MAX_COMMENT} bytes"
+            ));
+        }
+        match checkpoint::for_agent(&self.store, &self.name, comment) {
+            Ok(made) => {
+                note(format_args!(
+                    "{}'s guest made checkpoint {}",
+                    self.name, made.id
+                ));
+                Answer::Made(made.into())
+            }
+            Err(e) => Answer::Refused(e.to_string()),
+        }
+    }
+
+    // Copies the checkpoint while the VM runs, so a wrong id reboots nothing,
+    // and leaves it for boot to finish.
+    fn stage(&self, id: u64) -> Answer {
+        let down = || Answer::Refused(format!("{} is shutting down", self.name));
+        {
+            let asked = self.asked.lock().unwrap();
+            if asked.closed {
+                return down();
+            }
+            if let Some(r) = &asked.restore {
+                let from = r.staged.from;
+                return Answer::Refused(format!(
+                    "{} is already rebooting to restore checkpoint {from}",
+                    self.name
+                ));
+            }
+        }
+        // Said to the agent, which may be in that run: no host commands.
+        let no_run = match runs::hold(&self.store, &self.name) {
+            Ok(lock) => lock,
+            Err(runs::Error::Busy { run, .. }) => {
+                return Answer::Refused(format!(
+                    "run {run} is going in this VM, and a restore would end it: \
+                     restore once it's over"
+                ));
+            }
+            Err(runs::Error::Starting(_)) => {
+                return Answer::Refused(
+                    "a run is starting in this VM, and a restore would end it: \
+                     restore once it's over"
+                        .into(),
+                );
+            }
+            Err(e) => return Answer::Refused(e.to_string()),
+        };
+        let staged = self
+            .store
+            .hold_checkpoints(&self.name)
+            .and_then(|freezer| freezer.stage_restore(id));
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(e) => return Answer::Refused(e.to_string()),
+        };
+        let generation = staged.generation;
+        let mut asked = self.asked.lock().unwrap();
+        if asked.closed {
+            drop(asked);
+            self.drop_staged(staged);
+            return down();
+        }
+        asked.restore = Some(Restore {
+            staged,
+            _no_run: no_run,
+        });
+        note(format_args!(
+            "{}'s guest asked to restore checkpoint {id}, copied as generation {generation}",
+            self.name
+        ));
+        Answer::Restoring { id, generation }
+    }
+
+    // Waits for the guest to hang up, so its answer is out, then asks the VM
+    // to shut down, as `runner stop` does. If it can't, the restore is
+    // dropped: the VM carries on as it was.
+    fn reboot(&self, conn: &mut UnixStream) {
+        hang_up(conn, HANG_UP_WAIT);
+        let asked = match self.store.api_socket(&self.name) {
+            Ok(sock) => Api::new(sock).ctrl_alt_del(),
+            Err(e) => {
+                self.give_up(&e.to_string());
+                return;
+            }
+        };
+        match asked {
+            Ok(()) => note(format_args!(
+                "sent Ctrl-Alt-Del to {} for its restore",
+                self.name
+            )),
+            // Firecracker is gone already, as after a `runner stop` that got
+            // here first: the VM is down, and boot finishes the restore.
+            Err(firecracker::Error::NotListening(_)) => {}
+            Err(e @ firecracker::Error::Api { .. }) => self.give_up(&e.to_string()),
+            // It may have landed. If the VM goes down cleanly, boot finishes
+            // the restore; at any other shutdown, it drops it.
+            Err(e) => note(format_args!(
+                "{}'s restore waits for its next clean shutdown: Ctrl-Alt-Del may not \
+                 have reached it: {e}",
+                self.name
+            )),
+        }
+    }
+
+    fn give_up(&self, e: &str) {
+        note(format_args!(
+            "couldn't shut {} down for its restore, so it's dropped: {e}",
+            self.name
+        ));
+        let restore = self.asked.lock().unwrap().restore.take();
+        if let Some(restore) = restore {
+            self.drop_staged(restore.staged);
+        }
+    }
+
+    fn drop_staged(&self, staged: Staged) {
+        let generation = staged.generation;
+        if let Err(e) = self.store.drop_restore(&self.name, staged) {
+            note(format_args!(
+                "couldn't remove {}'s generation {generation}: {e}",
+                self.name
+            ));
+        }
+    }
+}
+
+// Reads until the guest hangs up or `wait` has passed, whichever is first:
+// one that goes on writing can't hold the reboot off.
+fn hang_up(conn: &mut UnixStream, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    let mut buf = [0; 512];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match conn.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+// The newest checkpoints that fit in one frame, each comment cut to what a
+// call's checkpoint takes, since the owner's can be any length.
+fn fit(listed: Vec<Checkpoint>) -> Vec<Saved> {
+    let mut saved: Vec<Saved> = listed
+        .into_iter()
+        .map(|c| {
+            let mut s = Saved::from(c);
+            if let Some(comment) = &mut s.comment {
+                cut(comment, MAX_COMMENT);
+            }
+            s
+        })
+        .collect();
+    // An answer's tag and the list's length take at most 11 bytes.
+    let size = |s: &Saved| postcard::to_allocvec(s).map_or(usize::MAX, |b| b.len());
+    let mut total = 11;
+    let fits = saved
+        .iter()
+        .take_while(|s| {
+            total += size(s);
+            total <= proto::MAX_FRAME
+        })
+        .count();
+    saved.truncate(fits);
+    saved
+}
+
+// To at most `max` bytes, on a character's edge.
+fn cut(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
+// As boot's notes: Firecracker shares this stderr and makes it non-blocking.
+fn note(msg: std::fmt::Arguments) {
+    let _ = writeln!(io::stderr(), "runner: {msg}");
+}

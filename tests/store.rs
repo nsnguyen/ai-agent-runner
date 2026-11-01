@@ -862,6 +862,64 @@ fn a_running_vm_s_checkpoint_copies_the_disk_its_boot_runs() {
     assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"live");
 }
 
+// The agent in the VM checkpoints through its boot (src/calls.rs), and only
+// its own count toward its cap. gc keeps them as it keeps every checkpoint.
+#[test]
+fn an_agent_s_checkpoint_is_noted_as_its_own_and_counted_apart() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    let since = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
+    let freezer = store.hold_checkpoints("dev").unwrap();
+    let mine = freezer
+        .freeze_for_agent(Some("before the migration"))
+        .unwrap();
+    let host = freezer.freeze(Some("from the host")).unwrap();
+    assert!(mine.agent && !mine.auto);
+    assert!(!host.agent);
+    assert_eq!(freezer.agent_since(since).unwrap(), [mine.time]);
+    let later = chrono::Utc::now() + chrono::TimeDelta::seconds(2);
+    assert!(freezer.agent_since(later).unwrap().is_empty());
+    assert!(mine.row().contains("  agent  "), "{}", mine.row());
+    assert!(host.row().contains("  checkpoint  "), "{}", host.row());
+    drop(freezer);
+    drop(run);
+    store.clone().keeping(0).gc("dev", false).unwrap();
+    let listed = store.checkpoints("dev").unwrap();
+    let agent: Vec<_> = listed.iter().filter(|c| c.agent).map(|c| c.id).collect();
+    assert_eq!(agent, [mine.id]);
+}
+
+// A guest's own restore is staged while its VM runs, and goes into history
+// with the boot's commit, on top of it.
+#[test]
+fn a_commit_with_a_staged_restore_puts_the_copy_on_top() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("clean")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    fs::write(&run.disk, b"live").unwrap();
+    let staged = store
+        .hold_checkpoints("dev")
+        .unwrap()
+        .stage_restore(1)
+        .unwrap();
+    assert_eq!(run.commit_then(Some(&staged)).unwrap(), vm("dev", 3, 2));
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(
+        summary(&listed),
+        [
+            (3, true, Some("restore of 1"), true),
+            (2, true, Some("run"), false),
+            (1, false, Some("clean"), false),
+            (0, true, Some("import"), false),
+        ]
+    );
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"v0");
+    assert_eq!(store.undo("dev").unwrap().generation, 2);
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 2)).unwrap(), b"live");
+}
+
 #[test]
 fn a_running_checkpoint_killed_partway_is_never_listed_and_the_next_clears_it() {
     let (dir, store) = store();

@@ -57,3 +57,7 @@ RUN : > /etc/machine-id && rm -f /var/lib/dbus/machine-id \
 COPY runner-guest /usr/local/bin/runner-guest
 COPY runner-guest.service /etc/systemd/system/runner-guest.service
 RUN chmod 0755 /usr/local/bin/runner-guest && systemctl enable runner-guest.service
+
+# What the agent reads to know where it is, like a sprite's /.sprite/llm.txt.
+COPY llm.txt /.runner/llm.txt
+RUN chmod 0644 /.runner/llm.txt

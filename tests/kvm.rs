@@ -17,6 +17,8 @@
 // The tests under the unit (`start_logs_and_stop_under_systemd`,
 // `exec_starts_the_vm_and_runs_in_the_guest`,
 // `a_running_vm_s_checkpoint_brings_a_deleted_file_back`,
+// `an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints`,
+// `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
 // `a_session_outlives_a_dropped_connection`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
@@ -24,7 +26,8 @@
 // unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
 // root's owner. The unit boots them with the installed runner, so rerun
 // host/install.sh after a build. The headless run needs the host's Claude
-// Code token in /etc/credstore (docs/host.md, step 6).
+// Code token in /etc/credstore (docs/host.md, step 6). The agent's own
+// checkpoints need a base built with this runner-guest (images/base/build.sh).
 mod common;
 
 use std::fs::Permissions;
@@ -530,6 +533,114 @@ fn a_running_vm_s_checkpoint_brings_a_deleted_file_back() {
     // Says how long the whole checkpoint took, pause and all: on XFS, well
     // under a second of it is the pause.
     eprintln!("checkpoint of a running VM took {took:?}");
+}
+
+// The id a checkpoint row starts with, after the mark for the current one.
+fn row_id(row: &str) -> String {
+    let row = row.trim_start_matches('*');
+    row.split_whitespace().next().unwrap().to_string()
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("agent-checkpoint-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+
+    // As the agent user, the way Claude Code in the VM would run it.
+    let made = ok(runner(
+        &root,
+        &[
+            "exec",
+            &name,
+            "--",
+            "runner-guest",
+            "checkpoint",
+            "-m",
+            "test",
+        ],
+    ));
+    let id = row_id(&made);
+    let listed = ok(runner(&root, &["checkpoints", &name]));
+    let row = listed.lines().find(|l| row_id(l) == id);
+    let row = row.unwrap_or_else(|| panic!("no checkpoint {id}: {listed}"));
+    assert!(
+        row.contains("  agent  ") && row.ends_with("  \"test\""),
+        "{listed}"
+    );
+    let from_inside = ok(runner(
+        &root,
+        &["exec", &name, "--", "runner-guest", "checkpoints"],
+    ));
+    assert_eq!(from_inside, listed);
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.contains("  running"), "{status}");
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_agent_s_restore_reboots_its_vm_onto_its_checkpoint() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("agent-restore-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+
+    sh("echo kept > ~/checkpointed");
+    let made = ok(runner(
+        &root,
+        &[
+            "exec",
+            &name,
+            "--",
+            "runner-guest",
+            "checkpoint",
+            "-m",
+            "with the file",
+        ],
+    ));
+    let id = row_id(&made);
+    sh("rm ~/checkpointed; sync");
+    let gen_of = |status: &str| {
+        status
+            .split("  gen ")
+            .nth(1)
+            .map(|s| s.split(' ').next().unwrap().to_string())
+    };
+    let before = gen_of(&ok(runner(&root, &["status", &name])));
+
+    let said = runner(
+        &root,
+        &["exec", &name, "--", "runner-guest", "restore", &id],
+    );
+    let (out, err) = (
+        String::from_utf8_lossy(&said.stdout),
+        String::from_utf8_lossy(&said.stderr),
+    );
+    assert!(
+        out.contains(&format!("restoring checkpoint {id}")),
+        "{out}{err}"
+    );
+    // Down, then booted again by the unit, onto the restored disk.
+    eventually("the VM to boot again onto the restore", || {
+        let status = ok(runner(&root, &["status", &name]));
+        status.contains("  running") && gen_of(&status) != before
+    });
+    assert_eq!(sh("cat ~/checkpointed"), "kept\n");
+    let listed = ok(runner(&root, &["checkpoints", &name]));
+    let top = listed.lines().next().unwrap();
+    assert!(
+        top.starts_with("* ") && top.ends_with(&format!("\"restore of {id}\"")),
+        "{listed}"
+    );
 }
 
 // Booted by hand, so the token comes from this process's environment, the

@@ -282,7 +282,7 @@ fn checkpoint_list_and_restore() {
     let mut c = made["structuredContent"].clone();
     let time = c.as_object_mut().unwrap().remove("time").unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(time.as_str().unwrap()).is_ok());
-    let want = json!({"id": 1, "comment": "clean", "auto": false, "bytes": 6, "current": false});
+    let want = json!({"id": 1, "comment": "clean", "auto": false, "agent": false, "bytes": 6, "current": false});
     assert_eq!(c, want);
 
     let listed = s.call(3, "list_checkpoints", json!({"name": "dev"}));

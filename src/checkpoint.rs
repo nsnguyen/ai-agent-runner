@@ -12,14 +12,23 @@
 // commits its disk as any clean shutdown does, so `undo` goes back to it, puts
 // the copy on top of history, and starts the VM again. A VM already being
 // stopped is restored the same way once it's down, and left stopped.
+//
+// The agent in a VM checkpoints it too, through its boot (src/calls.rs), as
+// often as AGENT_PER_HOUR allows.
 use crate::exec;
 use crate::firecracker::{self, Api};
 use crate::proto::Request;
 use crate::runs;
-use crate::store::{self, Checkpoint, Store, Vm};
+use crate::store::{self, Checkpoint, Freezer, Store, Vm};
 use crate::systemd::{self, State};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use std::time::Duration;
+
+/// How many checkpoints the agent in a VM may make of it in any hour. gc
+/// keeps every checkpoint, so this bounds how fast the agent's add up, not
+/// how much space they take in all.
+pub const AGENT_PER_HOUR: usize = 10;
 
 // A guest flushing a lot of writes takes a while; one stuck longer than this
 // fails the checkpoint rather than hang it.
@@ -58,6 +67,11 @@ pub enum Error {
         generation: u64,
         source: systemd::Error,
     },
+    #[error(
+        "the agent's checkpoints of {vm} are capped at {AGENT_PER_HOUR} an hour: \
+         the next can be made at {}", next.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )]
+    Capped { vm: String, next: DateTime<Utc> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -79,18 +93,46 @@ pub fn checkpoint(store: &Store, name: &str, comment: Option<&str>) -> Result<Ch
     }
 }
 
-// From the pause to the resume, every way out resumes the VM. `runner halt`
-// waits on the freezer, then resumes the VM too, for one whose checkpoint was
-// killed with it paused.
+/// The agent's own checkpoint of the running VM it's in, which its boot
+/// makes for it (src/calls.rs): as a running VM's checkpoint is made, noted
+/// as the agent's, and refused past AGENT_PER_HOUR in the last hour.
+pub fn for_agent(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+    let freezer = store.hold_checkpoints(name)?;
+    let hour = TimeDelta::hours(1);
+    let made = freezer.agent_since(Utc::now() - hour)?;
+    if made.len() >= AGENT_PER_HOUR {
+        // The one that drops out of the hour first makes room.
+        let next = made[made.len() - AGENT_PER_HOUR] + hour;
+        return Err(Error::Capped {
+            vm: name.to_string(),
+            next,
+        });
+    }
+    paused(store, name, &freezer, |f| f.freeze_for_agent(comment))
+}
+
 fn running(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
     let freezer = store.hold_checkpoints(name)?;
+    paused(store, name, &freezer, |f| f.freeze(comment))
+}
+
+// Syncs the guest, then freezes its disk with the VM paused. From the pause
+// to the resume, every way out resumes the VM. `runner halt` waits on the
+// freezer, then resumes the VM too, for one whose checkpoint was killed with
+// it paused.
+fn paused(
+    store: &Store,
+    name: &str,
+    freezer: &Freezer,
+    freeze: impl FnOnce(&Freezer) -> store::Result<Checkpoint>,
+) -> Result<Checkpoint> {
     sync(store, name)?;
     let api = Api::new(store.api_socket(name)?);
     let _held = HoldSignals::new();
     let frozen = match api.pause() {
         // A refusal can come after the pause took, as a timeout can.
         Err(e) => Err(Error::from(e)),
-        Ok(()) => freezer.freeze(comment).map_err(Error::from),
+        Ok(()) => freeze(freezer).map_err(Error::from),
     };
     match api.resume() {
         Err(source) if frozen.is_ok() => Err(Error::StillPaused {
