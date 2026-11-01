@@ -265,6 +265,15 @@ runner-guest restore 4                              # reboots dev onto checkpoin
 
 Those calls reach dev's own boot over vsock, so a VM can only checkpoint itself. The agent gets 10 checkpoints an hour; yours aren't counted or capped. Its restore is copied first, then dev shuts down cleanly, which commits its disk, so `undo` goes back to it, and the unit boots dev again onto the copy. It's refused while a run is going. Both need a base built with this runner-guest, and the host's unit from `host/install.sh`.
 
+### Sleep and wake
+
+```sh
+runner sleep dev    # dev's memory goes to disk, and its Firecracker stops
+runner wake dev     # back where it was, in about a second
+```
+
+A sleeping VM takes no CPU or RAM on the host: its memory and devices are in a Firecracker snapshot in its directory, about the size of its memory, while its boot waits to wake it. `wake` loads the snapshot into a fresh Firecracker, so every process, tmux session and Claude Code carries on where it was, and sets the guest's clock, which stood still while it slept. `start`, `exec`, `shell`, `claude`, `checkpoint` and `run` wake a sleeping VM first; `sessions` and `attach` don't yet (#27). Shells and execs open at the sleep end, since Firecracker closes vsock connections across a snapshot; tmux sessions live on. `sleep` is refused while a run is going, and until the guest's runner-guest is up. `stop` wakes it to shut down cleanly, which commits its disk as any stop does; `restore` stops it the same way and starts it again awake. `undo` and `gc` refuse a sleeping VM, as a running one. A snapshot belongs to its boot, so a host crash or a killed boot loses a sleeping VM's memory, and the next boot starts from its last committed disk. The snapshot is the guest's memory, credentials included, so only the runner user can read it, and it goes at the wake (or at the next boot or a delete, after a killed boot). Over MCP: `sleep_vm` and `wake_vm`, and `vm_status` says `sleeping`.
+
 ### MCP clients
 
 `runner mcp` is `ssh -T -o BatchMode=yes runner@kvm-host runner mcp`: no terminal, so stdout carries only JSON-RPC, and no prompts, so the SSH key has to load without one (from the agent, or with no passphrase). Run `runner list` once from a terminal first, so ssh can ask you to accept the host's key.

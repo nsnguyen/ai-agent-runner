@@ -285,6 +285,11 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
     let boots = match systemd::status(store, s.vm)?.state {
         VmState::Stopped => true,
         VmState::Booting | VmState::Running => false,
+        // Joined awake, as a running VM is.
+        VmState::Sleeping => {
+            systemd::wake(store, s.vm)?;
+            false
+        }
         VmState::Stopping => return Err(Error::Stopping(s.vm.to_string())),
     };
     // Under the lock, so no other run takes the number.

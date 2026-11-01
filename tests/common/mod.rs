@@ -142,7 +142,8 @@ fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     })
 }
 
-/// A `firecracker` that prints the version it's told to, records its argv
+/// A `firecracker` that prints the version it's told to (FAKE_FC_VERSION,
+/// or what's in its `version` file, as if upgraded), records its pid and argv
 /// and environment, writes a line of "console", then exits with whatever number is written
 /// to its `exit` fifo. The test serves its API socket.
 #[derive(Clone)]
@@ -157,9 +158,13 @@ impl FakeFirecracker {
         let bin = dir.join("firecracker");
         script(
             &bin,
-            r#"if [ "$1" = --version ]; then printf 'Firecracker %s\n\n' "$FAKE_FC_VERSION"; exit 0; fi
+            r#"if [ "$1" = --version ]; then
+  v=$FAKE_FC_VERSION; [ -f "$FAKE_FC/version" ] && v=$(cat "$FAKE_FC/version")
+  printf 'Firecracker %s\n\n' "$v"; exit 0
+fi
 grep '^CapAmb' /proc/$$/status > "$FAKE_FC/caps"
 env > "$FAKE_FC/env"
+echo $$ > "$FAKE_FC/pid"
 printf '%s\n' "$@" > "$FAKE_FC/argv.tmp" && mv "$FAKE_FC/argv.tmp" "$FAKE_FC/argv"
 echo "fake console: Linux version 6.1"
 read -r code < "$FAKE_FC/exit"
@@ -188,6 +193,20 @@ exit "$code"
 
     pub fn started(&self) -> bool {
         self.dir.join("argv").exists()
+    }
+
+    /// The pid of the latest one started.
+    pub fn pid(&self) -> u32 {
+        let pid = fs::read_to_string(self.dir.join("pid")).unwrap();
+        pid.trim().parse().unwrap()
+    }
+
+    /// Waits for the next one to start, and forgets it started, so the one
+    /// after can be waited for too.
+    pub fn next(&self) -> Vec<String> {
+        let argv = self.argv();
+        fs::remove_file(self.dir.join("argv")).unwrap();
+        argv
     }
 
     /// Makes it exit with `code`, from another thread so a reply isn't held up.
@@ -478,4 +497,60 @@ pub fn debugfs(disk: &Path, requests: &str) {
         .arg("-w")
         .arg("-f")
         .args([&script, disk]));
+}
+
+/// A VM's boot as src/sleep.rs asks it, standing in for `runner boot`: it
+/// holds the VM as a boot does, notes a snapshot when asked to sleep and
+/// clears it when asked to wake, and at a halt clears it and commits its run,
+/// as waking and shutting down cleanly would. It records each ask, and
+/// refuses with the text in `refuse` while there is one.
+pub struct StandIn {
+    asked: Arc<Mutex<Vec<runner::sleep::Ask>>>,
+    pub refuse: Arc<Mutex<Option<String>>>,
+    _asks: runner::sleep::Asks,
+}
+
+impl StandIn {
+    pub fn serve(store: &runner::store::Store, name: &str) -> StandIn {
+        use runner::sleep::{Ask, Asks, Reply};
+        let run = store.begin_run(name).unwrap();
+        let generation = run.generation;
+        let run = Mutex::new(Some(run));
+        let snap = store.snapshot(name).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let refuse = Arc::new(Mutex::new(None::<String>));
+        let (seen, refusing) = (asked.clone(), refuse.clone());
+        let answer = move |ask| {
+            seen.lock().unwrap().push(ask);
+            if let Some(why) = refusing.lock().unwrap().clone() {
+                return Reply::Refused(why);
+            }
+            match ask {
+                Ask::Sleep => {
+                    snap.make_room().unwrap();
+                    let at = chrono::Utc::now();
+                    snap.note(&runner::store::Slept { generation, at }).unwrap();
+                }
+                Ask::Wake => snap.clear().unwrap(),
+                Ask::Halt => {
+                    snap.clear().unwrap();
+                    if let Some(run) = run.lock().unwrap().take() {
+                        run.commit().unwrap();
+                    }
+                }
+            }
+            Reply::Done
+        };
+        let sock = store.boot_socket(name).unwrap();
+        let asks = Asks::serve(&sock, answer).unwrap();
+        StandIn {
+            asked,
+            refuse,
+            _asks: asks,
+        }
+    }
+
+    pub fn asked(&self) -> Vec<runner::sleep::Ask> {
+        self.asked.lock().unwrap().clone()
+    }
 }
