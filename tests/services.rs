@@ -231,7 +231,8 @@ fn refuses_what_systemd_would_read_otherwise() {
 
 // The guest, here: a unit directory of its own, and systemctl and journalctl
 // that keep what's asked of them in a log. systemctl keeps each unit's state
-// in a file of its own; `fail` makes the next start fail.
+// in a file of its own; `fail` makes the next start fail. Like systemd 255's,
+// `enable --now` says a start failed but exits 0; only `start` exits 1.
 struct Here {
     dir: TempDir,
 }
@@ -250,8 +251,13 @@ case "$1" in
   show)
     if [ -f "$STATE/$unit" ]; then cat "$STATE/$unit"
     else printf 'ActiveState=inactive\nSubState=dead\n'; fi ;;
-  enable)
-    if [ -e "$STATE/fail" ]; then echo "Job for $unit failed." >&2; exit 1; fi
+  start|enable)
+    [ "$1" = enable ] && [ "$2" != --now ] && exit 0
+    if [ -e "$STATE/fail" ]; then
+      echo "Job for $unit failed." >&2
+      [ "$1" = start ] && exit 1
+      exit 0
+    fi
     printf 'ActiveState=active\nSubState=running\n' > "$STATE/$unit" ;;
   disable) rm -f "$STATE/$unit" ;;
 esac
@@ -349,7 +355,8 @@ fn add_writes_the_unit_starts_it_and_lists_it() {
         here.calls(),
         [
             "systemctl daemon-reload".to_string(),
-            format!("systemctl enable --now {unit}"),
+            format!("systemctl enable {unit}"),
+            format!("systemctl start {unit}"),
             format!("systemctl show -p ActiveState -p SubState {unit}"),
         ]
     );
@@ -484,11 +491,12 @@ fn list_gives_each_service_s_state_by_name() {
 fn rm_stops_the_service_and_removes_its_unit() {
     let here = Here::new();
     services::add(&here, &here.spec("web", &["serve"])).unwrap();
+    let added = here.calls().len();
     services::remove(&here, "web").unwrap();
     assert!(!unit_file(&here, "web").exists());
     let unit = "runner-svc-web.service";
     assert_eq!(
-        here.calls()[3..],
+        here.calls()[added..],
         [
             format!("systemctl disable --now {unit}"),
             "systemctl daemon-reload".to_string(),

@@ -386,7 +386,8 @@ pub fn parse_exec_start(line: &str) -> Option<Vec<String>> {
 // $2 the unit, $3 the service, $4 its user, $5 its directory; the unit's text
 // on stdin. Exits 3 if the name is taken, 4 if the user or directory isn't
 // there, and 5, having removed the unit, with the journal's say on stderr,
-// if it didn't start.
+// if it didn't start. Enabled, then started apart: systemd 255's
+// `enable --now` says a start failed, but exits 0.
 const ADD: &str = r#"d=$1 unit=$2 user=$4 dir=$5
 f=$d/$unit
 [ -e "$f" ] && exit 3
@@ -395,7 +396,7 @@ id -u -- "$user" >/dev/null 2>&1 || { echo "no user $user" >&2; exit 4; }
 since=$(date +%s)
 (set -C; cat > "$f") || exit 1
 systemctl daemon-reload || { rm -f -- "$f"; exit 1; }
-said=$(systemctl enable --now "$unit" 2>&1) && exit 0
+said=$(systemctl enable "$unit" 2>&1) && said=$(systemctl start "$unit" 2>&1) && exit 0
 journalctl --sync >/dev/null 2>&1
 log=$(journalctl -u "$unit" --since "@$since" -n 20 --no-pager -o cat 2>/dev/null)
 systemctl disable --now "$unit" >/dev/null 2>&1
