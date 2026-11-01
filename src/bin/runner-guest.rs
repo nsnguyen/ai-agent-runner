@@ -66,8 +66,11 @@ fn main() -> ExitCode {
     let keyring = Arc::new(take_creds(&args));
     let served = match args.unix {
         Some(path) => UnixListener::bind(path).map(|l| guest::serve(l.incoming(), keyring)),
-        None => VsockListener::bind_with_cid_port(VMADDR_CID_ANY, proto::PORT)
-            .map(|l| guest::serve(std::iter::repeat_with(|| guest::accept_vsock(&l)), keyring)),
+        // Listening again if it has to, after a wake (guest::relisten).
+        None => {
+            let bind = || VsockListener::bind_with_cid_port(VMADDR_CID_ANY, proto::PORT);
+            bind().map(|l| guest::serve(guest::relisten(l, bind, guest::accept_vsock), keyring))
+        }
     };
     match served {
         Ok(()) => ExitCode::SUCCESS,

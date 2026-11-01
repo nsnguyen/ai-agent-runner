@@ -79,6 +79,28 @@ pub fn accept_vsock(listener: &vsock::VsockListener) -> io::Result<vsock::VsockS
     Ok(unsafe { vsock::VsockStream::from_raw_fd(fd) })
 }
 
+/// Connections from `first`, and if accepting ever fails, from a listener
+/// `bind` makes anew in its place. Firecracker resets the vsock device across
+/// a sleep and says the guest's listeners carry on; this is for one that
+/// doesn't. The failure comes through, for `serve` to note, and the old
+/// listener is closed before the next is bound, so the port is free for it.
+pub fn relisten<L, C>(
+    first: L,
+    mut bind: impl FnMut() -> io::Result<L>,
+    accept: impl Fn(&L) -> io::Result<C>,
+) -> impl Iterator<Item = io::Result<C>> {
+    let mut listener = Some(first);
+    std::iter::repeat_with(move || {
+        let l = match listener.take() {
+            Some(l) => l,
+            None => bind()?,
+        };
+        let conn = accept(&l)?;
+        listener = Some(l);
+        Ok(conn)
+    })
+}
+
 /// Serves each connection on its own thread, for as long as they come. Every
 /// command gets `keyring`'s credentials.
 pub fn serve<C: Conn>(conns: impl Iterator<Item = io::Result<C>>, keyring: Arc<Keyring>) {

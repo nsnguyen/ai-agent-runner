@@ -643,3 +643,34 @@ fn a_guest_the_host_hands_nothing_runs_without_credentials() {
     let empty = guest_holding(keyring(&[]));
     assert_eq!(empty.run(sh(script), &[]).0, "unset|unset");
 }
+
+// After a wake, Firecracker says the guest's vsock listener carries on. If
+// one ever fails to accept anyway, runner-guest listens again, so the host
+// can still reach it.
+#[test]
+fn a_listener_that_fails_to_accept_is_made_again() {
+    use std::cell::Cell;
+    let binds = Cell::new(0);
+    let failed = Cell::new(false);
+    // Listeners are numbers here, and each connection is its listener's.
+    let bind = || {
+        binds.set(binds.get() + 1);
+        Ok(binds.get())
+    };
+    let accept = |l: &u32| {
+        if *l == 0 && !failed.replace(true) {
+            return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        }
+        Ok(*l)
+    };
+    let mut conns = runner::guest::relisten(0, bind, accept);
+    let got: Vec<String> = (0..3)
+        .map(|_| match conns.next().unwrap() {
+            Ok(n) => n.to_string(),
+            Err(e) => e.kind().to_string(),
+        })
+        .collect();
+    assert_eq!(got, ["connection reset", "1", "1"]);
+    drop(conns);
+    assert_eq!(binds.get(), 1);
+}
