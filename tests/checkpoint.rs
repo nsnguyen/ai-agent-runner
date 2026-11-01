@@ -288,6 +288,22 @@ fn restoring_a_stopping_vm_waits_for_the_stop_and_leaves_it_stopped() {
     assert_eq!(out, "dev  gen 1  20 bytes\n");
 }
 
+// As for a running VM, the copy is made before the wait: the commit of the
+// stop under way can't gc what's restored, and a missing id waits for nothing.
+#[test]
+fn restoring_a_stopping_vm_copies_the_checkpoint_before_the_stop_s_gc() {
+    let vm = running();
+    vm.sd.set_state("deactivating");
+    let why = vm.fails(&["restore", "dev", "9"]);
+    assert!(why.contains("dev has no checkpoint 9"), "{why}");
+    assert!(vm.stops_and_starts().is_empty());
+    let out = vm.ok(&["restore", "dev", "0"]);
+    assert_eq!(out, "dev  gen 2  9 bytes\n");
+    assert_eq!(vm.disk(2), b"at import");
+    assert!(!vm.dir.path().join("vms/dev/gens/0.ext4").exists());
+    assert_eq!(vm.stops_and_starts(), ["stop"]);
+}
+
 // The stop's commit runs gc, which can drop an old generation from history:
 // the restore copies it before anything stops.
 #[test]

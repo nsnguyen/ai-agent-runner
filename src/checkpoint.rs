@@ -10,7 +10,8 @@
 //
 // Restoring a running VM copies the checkpoint first, then stops the VM, which
 // commits its disk as any clean shutdown does, so `undo` goes back to it, puts
-// the copy on top of history, and starts the VM again.
+// the copy on top of history, and starts the VM again. A VM already being
+// stopped is restored the same way once it's down, and left stopped.
 use crate::exec;
 use crate::firecracker::{self, Api};
 use crate::proto::Request;
@@ -173,39 +174,38 @@ pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
 
 /// `restore`, for a caller holding the VM's run lock: a run rolling back.
 pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
-    match systemd::status(store, name)?.state {
-        State::Stopped => Ok(store.restore(name, id)?),
-        State::Running => {
-            // The freezer goes before the stop, whose halt waits on it.
-            let staged = store.hold_checkpoints(name)?.stage_restore(id)?;
-            if let Err(e) = systemd::stop(store, name) {
-                drop_staged(store, name, staged);
-                return Err(e.into());
-            }
-            // Started again either way: it was running when asked. A restore
-            // that fails here found it started by someone else since.
-            let restored = store.finish_restore(name, &staged);
-            if restored.is_err() {
-                drop_staged(store, name, staged);
-            }
-            let started = systemd::start(store, name);
-            let vm = restored?;
-            started.map_err(|source| Error::NotStarted {
-                vm: name.to_string(),
-                generation: vm.generation,
-                source,
-            })?;
-            Ok(vm)
-        }
-        // Being stopped, as `runner stop` during a joined run does, which
-        // ends the run. `systemctl stop` waits for that stop, whose commit
-        // the restore goes on top of. It was asked to stop, so it stays down.
-        State::Stopping => {
-            systemd::stop(store, name)?;
-            Ok(store.restore(name, id)?)
-        }
-        state => Err(not_now(name, state)),
+    let state = systemd::status(store, name)?.state;
+    match state {
+        State::Stopped => return Ok(store.restore(name, id)?),
+        State::Running | State::Stopping => {}
+        state => return Err(not_now(name, state)),
     }
+    // The freezer goes before the stop, whose halt waits on it.
+    let staged = store.hold_checkpoints(name)?.stage_restore(id)?;
+    // On a VM being stopped, as `runner stop` during a joined run leaves it,
+    // `systemctl stop` waits for that stop instead.
+    if let Err(e) = systemd::stop(store, name) {
+        drop_staged(store, name, staged);
+        return Err(e.into());
+    }
+    // A restore that fails here found it started by someone else since.
+    let restored = store.finish_restore(name, &staged);
+    if restored.is_err() {
+        drop_staged(store, name, staged);
+    }
+    // One that was stopping was asked to stop, so it stays down.
+    if state == State::Stopping {
+        return Ok(restored?);
+    }
+    // Started again either way: it was running when asked.
+    let started = systemd::start(store, name);
+    let vm = restored?;
+    started.map_err(|source| Error::NotStarted {
+        vm: name.to_string(),
+        generation: vm.generation,
+        source,
+    })?;
+    Ok(vm)
 }
 
 // A copy left would be listed as a checkpoint: harmless, so only noted.
