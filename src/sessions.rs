@@ -12,12 +12,21 @@ use crate::store::Store;
 use chrono::{DateTime, Utc};
 use rmcp::schemars;
 use serde::Serialize;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 /// What `tmux list-sessions -F` prints for each session. tmux keeps `:` and
 /// `.` out of names, so the name goes last and the command can hold anything.
 pub const LIST_FORMAT: &str =
     "#{session_created}:#{session_attached}:#{pane_current_command}:#{session_name}";
+/// What prints a line for each terminal attached to a tmux session on any
+/// user's tmux server in the guest, run as root, who can reach them all:
+/// what a VM's boot asks before it sleeps the VM for want of use.
+pub const ATTACHED: [&str; 3] = [
+    "sh",
+    "-c",
+    r#"for s in "${TMUX_TMPDIR:-/tmp}"/tmux-*/*; do [ -S "$s" ] && tmux -S "$s" list-clients -F x 2>/dev/null; done; exit 0"#,
+];
 /// How many of a pane's last lines read_session returns unless told.
 pub const DEFAULT_LINES: u32 = 100;
 /// tmux keeps 2000 lines of history unless its config says otherwise.
@@ -25,6 +34,8 @@ pub const MAX_LINES: u32 = 2000;
 
 // A tmux command that doesn't attach is quick; one that hangs is a stuck VM.
 const TIMEOUT: Duration = Duration::from_secs(30);
+// A boot holds off every command on its VM while it asks, so it asks briefly.
+const ASK_WAIT: Duration = Duration::from_secs(5);
 // Lines no wider than the pane, so 2000 of them stay well under this.
 const CAPTURE_CAP: usize = 4 << 20;
 
@@ -145,6 +156,33 @@ pub fn list(store: &Store, vm: &str, user: &str) -> Result<Vec<Session>> {
     Ok(listed.map_or_else(Vec::new, |out| parse_list(&out)))
 }
 
+/// Whether a terminal is attached to any session in the guest at the other
+/// end of `conn`, of any user's.
+pub fn attached(conn: UnixStream) -> Result<bool> {
+    let req = Request {
+        argv: ATTACHED.map(String::from).to_vec(),
+        env: Vec::new(),
+        cwd: None,
+        user: None,
+        tty: None,
+    };
+    let got = exec::capture(conn, &req, b"", ASK_WAIT, 64 << 10)?;
+    match (got.timed_out, got.exit_code) {
+        (false, Some(0)) => Ok(!got.stdout.is_empty()),
+        _ => Err(Error::Tmux {
+            vm: "the guest".to_string(),
+            why: format!(
+                "asking whether a terminal is attached: {}",
+                if got.timed_out {
+                    format!("no answer in {}s", ASK_WAIT.as_secs())
+                } else {
+                    got.stderr.trim().to_string()
+                }
+            ),
+        }),
+    }
+}
+
 /// Ends the session and everything running in it.
 pub fn kill(store: &Store, vm: &str, user: &str, session: &str) -> Result<()> {
     check_name(session)?;
@@ -229,6 +267,11 @@ fn tmux(store: &Store, vm: &str, user: &str, args: &[&str], cap: usize) -> Resul
     let Some(conn) = exec::open_running(store, vm)? else {
         return Ok(None);
     };
+    // In use until tmux is done.
+    let exec::Conn {
+        stream: conn,
+        in_use: _in_use,
+    } = conn;
     let req = Request {
         argv: ["tmux"].iter().chain(args).map(|s| s.to_string()).collect(),
         env: Vec::new(),

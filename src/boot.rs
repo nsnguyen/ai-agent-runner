@@ -18,13 +18,18 @@
 // run several Firecrackers in turn, and only the last one's exit ends it.
 // halt goes through boot too, so a sleeping VM is woken to shut down cleanly,
 // and nothing puts the VM to sleep once it's shutting down.
+//
+// And it puts the VM to sleep once it has gone unused for its idle time: every
+// few seconds it looks at whether anything is using it (src/idle.rs).
 use crate::calls::{Calls, Restore};
 use crate::creds::{Cred, Keyring, Source};
 use crate::exec;
 use crate::firecracker::{self, Api, Guest};
+use crate::idle::{self, Idle, Look, Quiet, Timer, Uses};
 use crate::net::{self, HOST_RESOLV_CONFS, Tap};
 use crate::proto::{self, Request};
 use crate::runs;
+use crate::sessions;
 use crate::sleep::{self, Ask, Asks, Reply};
 use crate::store::{self, Handed, Run, Slept, Store};
 use crate::systemd;
@@ -40,6 +45,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +56,12 @@ const API_WAIT: Duration = Duration::from_secs(5);
 const HANDOFF_WAIT: Duration = Duration::from_secs(5);
 // A guest just woken was listening when it slept, so it answers at once.
 const CLOCK_WAIT: Duration = Duration::from_secs(5);
+// How often boot looks at whether its VM is in use, at most: a shorter idle
+// time is looked at as often as it is.
+const LOOK: Duration = Duration::from_secs(10);
+// A guest that's up takes a connection at once. Every command on the VM waits
+// while boot asks, so it doesn't wait long.
+const ASK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -162,6 +174,14 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     // Bound before the guest can boot, so they're there when the guest asks.
     // An ask that comes while the VM boots waits for it to be up.
     let (events, inbox) = mpsc::channel();
+    let uses = match Uses::open(store, name) {
+        Ok(uses) => uses,
+        Err(e) => {
+            drop(tap);
+            run.discard();
+            return Err(e.into());
+        }
+    };
     let served = Offer::start(name, &creds_sock, keyring, handed.clone()).and_then(|offer| {
         let calls = Calls::start(store, name, &calls_sock)
             .map_err(io_err(format!("serving calls on {}", calls_sock.display())))?;
@@ -204,6 +224,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         epoch: 0,
         halting: false,
         dropped: None,
+        uses,
+        timer: Timer::new(Instant::now()),
     };
     let started = wait_for_api(&mut child, &api_sock)
         .and_then(|()| Ok(up.api.configure(&guest)?))
@@ -403,17 +425,33 @@ struct Up<'a> {
     halting: bool,
     /// Why a snapshot that couldn't wake was dropped, which ends the boot.
     dropped: Option<String>,
+    /// The VM's use lock, which commands using it hold (src/idle.rs).
+    uses: Uses,
+    /// Since the VM was last seen in use, or last woke.
+    timer: Timer,
 }
 
 impl Up<'_> {
     // Until Firecracker exits on its own, or a snapshot that can't wake is
     // dropped.
     fn serve(&mut self) -> Over {
+        let mut look_at = Instant::now() + LOOK;
         loop {
-            // The loop holds a sender itself, so this never ends.
-            let Ok(event) = self.inbox.recv() else {
-                return Over::Exited(Err(io::ErrorKind::BrokenPipe.into()));
+            let event = match self
+                .inbox
+                .recv_timeout(look_at.saturating_duration_since(Instant::now()))
+            {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                // The loop holds a sender itself, so this never happens.
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Over::Exited(Err(io::ErrorKind::BrokenPipe.into()));
+                }
             };
+            if Instant::now() >= look_at {
+                look_at = Instant::now() + self.look();
+            }
+            let Some(event) = event else { continue };
             match event {
                 Event::Exited(epoch) if epoch == self.epoch => {
                     if let Some(mut fc) = self.fc.take() {
@@ -426,7 +464,11 @@ impl Up<'_> {
                     let done = match ask {
                         Ask::Sleep => self.sleep(),
                         Ask::Wake => match self.wake() {
-                            Ok(()) => Ok(()),
+                            // A whole idle time from now: it was woken to be used.
+                            Ok(()) => {
+                                self.timer.used(Instant::now());
+                                Ok(())
+                            }
                             Err(Unwoken::Asleep(e)) => Err(format!(
                                 "{} couldn't wake, and sleeps on: {e}. `runner stop {}` \
                                  drops its snapshot and rolls its disk back",
@@ -458,6 +500,52 @@ impl Up<'_> {
             .spawn(wait)
             .map(drop)
             .map_err(io_err("starting a thread"))
+    }
+
+    // Puts the VM to sleep if nothing has used it for its idle time, which
+    // it reads each time, so a change counts at once. Returns how long until
+    // the next look.
+    fn look(&mut self) -> Duration {
+        let name = self.name;
+        let idle = match self.store.idle(name) {
+            Ok(idle) => idle,
+            Err(e) => {
+                note(format_args!("{name} stays awake: {e}"));
+                return LOOK;
+            }
+        };
+        let every = idle.after().map_or(LOOK, |after| after.min(LOOK));
+        // Asleep, or going down: nothing to look at.
+        if self.fc.is_none() || self.halting {
+            return every;
+        }
+        let now = Instant::now();
+        let mut probe = Probe {
+            uses: &mut self.uses,
+            store: self.store,
+            name,
+            vsock: self.vsock,
+            quiet: None,
+        };
+        let look = idle::look(&mut self.timer, idle, now, &mut probe);
+        // Held through the sleep, so no command starts on the VM meanwhile.
+        let _quiet = probe.quiet.take();
+        if look == Look::Sleep {
+            self.idle_sleep(idle);
+        }
+        every
+    }
+
+    fn idle_sleep(&mut self, idle: Idle) {
+        let name = self.name;
+        note(format_args!(
+            "{name} went unused for {idle}: putting it to sleep"
+        ));
+        if let Err(why) = self.sleep() {
+            // Tried again after another idle time, not at every look.
+            self.timer.used(Instant::now());
+            note(format_args!("{name} stays awake: {why}"));
+        }
     }
 
     fn sleep(&mut self) -> std::result::Result<(), String> {
@@ -645,6 +733,59 @@ impl Up<'_> {
             // and the stop timeout ends it if not.
             Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+// What a look asks about this boot's VM (src/idle.rs).
+struct Probe<'a> {
+    uses: &'a mut Uses,
+    store: &'a Store,
+    name: &'a str,
+    vsock: &'a Path,
+    /// The use lock, from a look that found it quiet.
+    quiet: Option<Quiet>,
+}
+
+impl idle::Probe for Probe<'_> {
+    fn used(&mut self) -> bool {
+        match self.uses.quiet() {
+            Ok(quiet) => {
+                let used = quiet.is_none();
+                self.quiet = quiet;
+                used
+            }
+            Err(e) => {
+                note(format_args!("{} stays awake: {e}", self.name));
+                true
+            }
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        match runs::hold(self.store, self.name) {
+            Ok(_lock) => false,
+            Err(runs::Error::Busy { .. } | runs::Error::Starting(_)) => true,
+            Err(e) => {
+                note(format_args!("{} stays awake: {e}", self.name));
+                true
+            }
+        }
+    }
+
+    // A guest that can't say is taken to have none, and the sleep decides:
+    // it's refused for a guest that isn't up.
+    fn attached(&mut self) -> bool {
+        let asked = exec::connect(self.vsock, proto::PORT, ASK_WAIT)
+            .map_err(|e| sessions::Error::from(exec::Error::from(e)))
+            .and_then(sessions::attached);
+        asked.unwrap_or_else(|e| {
+            note(format_args!(
+                "couldn't ask {}'s guest whether a terminal is on a session, so none \
+                 counts: {e}",
+                self.name
+            ));
+            false
+        })
     }
 }
 

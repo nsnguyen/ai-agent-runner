@@ -137,6 +137,11 @@ impl Vms for Host<'_> {
     }
 
     fn attach(&self, vm: &str, req: &Request) -> Result<Exit> {
-        Ok(exec::attach(exec::open(self.0, vm)?, req)?)
+        // In use until claude's terminal is let go.
+        let exec::Conn {
+            stream,
+            in_use: _in_use,
+        } = exec::open(self.0, vm)?;
+        Ok(exec::attach(stream, req)?)
     }
 }

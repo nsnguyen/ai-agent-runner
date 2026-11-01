@@ -6,6 +6,7 @@
 //
 // Firecracker ends a connection both ways once the host closes its side,
 // even only for writing, so the host only does that to hang up.
+use crate::idle::InUse;
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use crate::store::Store;
 use crate::systemd::{self, State};
@@ -78,21 +79,39 @@ fn io_err(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Io { what, source }
 }
 
-/// Starts the VM unless it's running, then connects to its runner-guest.
-pub fn open(store: &Store, name: &str) -> Result<UnixStream> {
+/// A connection to a VM's runner-guest, from a command using the VM: its
+/// boot won't put it to sleep for want of use until both are dropped.
+#[derive(Debug)]
+pub struct Conn {
+    pub stream: UnixStream,
+    pub in_use: InUse,
+}
+
+/// Starts the VM unless it's running, waking it if it's sleeping, then
+/// connects to its runner-guest.
+pub fn open(store: &Store, name: &str) -> Result<Conn> {
+    // Before the look, so the VM can't go to sleep between it and the connect.
+    let in_use = InUse::take(store, name)?;
     if systemd::status(store, name)?.state != State::Running {
         systemd::start(store, name)?;
     }
-    reach(store, name)
+    let stream = reach(store, name)?;
+    Ok(Conn { stream, in_use })
 }
 
-/// Connects to the VM's runner-guest if the VM is running; None if it isn't,
-/// and it stays that way.
-pub fn open_running(store: &Store, name: &str) -> Result<Option<UnixStream>> {
-    if systemd::status(store, name)?.state != State::Running {
-        return Ok(None);
+/// Connects to the VM's runner-guest if the VM is up, waking it if it's
+/// sleeping; None if it's stopped, and it stays that way.
+pub fn open_running(store: &Store, name: &str) -> Result<Option<Conn>> {
+    let in_use = InUse::take(store, name)?;
+    match systemd::status(store, name)?.state {
+        State::Running => {}
+        State::Sleeping => {
+            systemd::wake(store, name)?;
+        }
+        _ => return Ok(None),
     }
-    reach(store, name).map(Some)
+    let stream = reach(store, name)?;
+    Ok(Some(Conn { stream, in_use }))
 }
 
 /// Connects to the VM's runner-guest, waiting for one that's booting.

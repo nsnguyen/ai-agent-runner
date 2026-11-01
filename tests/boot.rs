@@ -7,8 +7,10 @@ use runner::boot;
 use runner::calls::{self, Answer, Call};
 use runner::creds::{self, Cred, Keyring};
 use runner::firecracker::{self, BOOT_ARGS};
+use runner::idle::{Idle, InUse};
 use runner::net::{self, HOST_RESOLV_CONFS};
 use runner::proto;
+use runner::sessions;
 use runner::sleep;
 use runner::store::{Config, Error, Store};
 use serde_json::{Value, json};
@@ -1289,4 +1291,76 @@ fn a_stopped_vm_has_no_boot_to_ask() {
     let err = sleep::sleep(&h.store, "dev").unwrap_err();
     assert!(matches!(err, sleep::Error::NoBoot(_)), "{err}");
     assert!(err.to_string().contains("dev has no boot to ask"), "{err}");
+}
+
+// Sleep when idle (src/idle.rs). Boot looks as often as the VM's idle time,
+// and at least every 10 seconds, so these give it a second.
+
+fn slept(h: &Host, up: &Up) -> bool {
+    h.store.sleeping("dev").unwrap().is_some()
+        && up.api.calls().iter().any(|c| c.0 == "PUT /snapshot/create")
+}
+
+#[test]
+fn an_idle_vm_sleeps_on_its_own_once_no_terminal_is_on_it() {
+    let h = Host::new();
+    h.store.set_idle("dev", Idle::After(1)).unwrap();
+    let (mut boot, up) = booted(&h);
+    let fc = h.fc.pid();
+    wait_for("dev to sleep", || slept(&h, &up));
+    wait_for("its firecracker to stop", || !alive(fc));
+    // The guest was asked, as root, whether a terminal is on a session.
+    let asked = up.asked.lock().unwrap().clone();
+    let attached = |r: &proto::Request| r.argv == sessions::ATTACHED && r.user.is_none();
+    assert!(asked.iter().any(attached), "{asked:?}");
+    assert!(boot.try_wait().unwrap().is_none(), "boot ended");
+    boot.kill().unwrap();
+    let out = boot.wait_with_output().unwrap();
+    let notes = text(&out.stderr);
+    assert!(notes.contains("dev went unused for 1s"), "{notes}");
+}
+
+// A command holds the VM from before it looks at it until it's done, however
+// long that is.
+#[test]
+fn a_vm_in_use_stays_awake_until_it_is_let_go() {
+    let h = Host::new();
+    h.store.set_idle("dev", Idle::After(1)).unwrap();
+    let used = InUse::take(&h.store, "dev").unwrap();
+    let (mut boot, up) = booted(&h);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!slept(&h, &up), "slept while in use");
+    drop(used);
+    wait_for("dev to sleep", || slept(&h, &up));
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+#[test]
+fn a_vm_that_never_idles_stays_awake() {
+    let h = Host::new();
+    h.store.set_idle("dev", Idle::Never).unwrap();
+    let (mut boot, up) = booted(&h);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!slept(&h, &up), "slept");
+    // Read at each look, so a new idle time counts at once.
+    h.store.set_idle("dev", Idle::After(1)).unwrap();
+    wait_for("dev to sleep", || slept(&h, &up));
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+// The sleep a look starts is refused while a run goes; the run is use too.
+#[test]
+fn a_run_keeps_the_vm_awake() {
+    let h = Host::new();
+    h.store.set_idle("dev", Idle::After(1)).unwrap();
+    let (mut boot, up) = booted(&h);
+    let run = runner::runs::hold(&h.store, "dev").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!slept(&h, &up), "slept while a run held it");
+    drop(run);
+    wait_for("dev to sleep", || slept(&h, &up));
+    boot.kill().unwrap();
+    boot.wait().unwrap();
 }

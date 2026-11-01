@@ -4,12 +4,13 @@
 // server, so each names its sessions apart and kills them when it's done.
 mod common;
 
-use common::{FakeSystemd, FakeVsock, Guest, me, pty, text, wait_for};
+use common::{FakeSystemd, FakeVsock, Guest, StandIn, me, pty, text, wait_for};
 use proptest::prelude::*;
 use runner::exec;
 use runner::proto::{self, Request};
 use runner::sessions::{self, Session};
-use runner::store::Store;
+use runner::sleep::Ask;
+use runner::store::{Slept, Store};
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -408,6 +409,100 @@ fn bad_session_names_are_refused_before_anything_runs() {
         assert!(sessions::check_name(good).is_ok(), "{good:?}");
     }
     assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
+}
+
+// Its boot's snapshot, as a sleep leaves it: `runner status` says sleeping.
+fn asleep(store: &Store) {
+    let snap = store.snapshot("dev").unwrap();
+    snap.make_room().unwrap();
+    let generation = store.booted("dev").unwrap().unwrap().generation;
+    let at = chrono::Utc::now();
+    snap.note(&Slept { generation, at }).unwrap();
+}
+
+// A sleeping VM's sessions are there in its memory, so looking at one wakes
+// it (src/idle.rs), and only that: a VM awake isn't asked again.
+#[test]
+fn a_sleeping_vm_is_woken_to_list_attach_and_kill_its_sessions() {
+    let vm = vm();
+    let store = Store::new(vm.dir.path());
+    let boot = StandIn::serve(&store, "dev");
+    let s = vm.name("asleep");
+    let made = vm.tmux(&["new-session", "-d", "-s", &s, "sleep 300"]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+
+    asleep(&store);
+    let cols = vm.row(&s).unwrap_or_else(|| panic!("{}", vm.sessions()));
+    assert_eq!(cols[3], "detached");
+    assert_eq!(boot.asked(), [Ask::Wake]);
+
+    asleep(&store);
+    let t = pty(24, 80);
+    let mut on = t.spawn(vm.runner(&["attach", "dev", &s]));
+    vm.wait_for_row(&s, "sleep", "attached");
+    vm.detach(&s);
+    assert_eq!(on.wait().unwrap().code(), Some(0), "{}", t.seen());
+    assert_eq!(boot.asked(), [Ask::Wake, Ask::Wake]);
+
+    asleep(&store);
+    let out = vm.run(&["kill", "dev", &s]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(vm.row(&s), None);
+    assert_eq!(boot.asked(), [Ask::Wake, Ask::Wake, Ask::Wake]);
+    assert!(!vm.started(), "{:?}", vm.sd.calls());
+}
+
+// What a VM's boot asks before it sleeps the VM for want of use: is a
+// terminal on any session, of any user's? Through the guest, as root.
+#[test]
+fn the_guest_says_a_terminal_is_on_a_session() {
+    let vm = vm();
+    let s = vm.name("probe");
+    let t = pty(24, 80);
+    let mut on = t.spawn(vm.runner(&["shell", "dev", "--session", &s]));
+    vm.wait_for_row(&s, &login_shell(), "attached");
+    let vsock = vm.dir.path().join("vms/dev/vsock.sock");
+    let conn = exec::connect(&vsock, proto::PORT, Duration::from_secs(10)).unwrap();
+    assert!(sessions::attached(conn).unwrap());
+    vm.detach(&s);
+    assert_eq!(on.wait().unwrap().code(), Some(0), "{}", t.seen());
+}
+
+// The same question on a tmux server of the test's own, where no other test's
+// terminal can be: none with no server or only detached sessions, and yes
+// with a terminal on one.
+#[test]
+fn attached_counts_terminals_not_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("tmux-1000");
+    fs::create_dir(&dir).unwrap();
+    let sock = dir.join("default");
+    let sock = sock.to_str().unwrap();
+    let asked = || {
+        let out = Command::new(sessions::ATTACHED[0])
+            .args(&sessions::ATTACHED[1..])
+            .env("TMUX_TMPDIR", tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        !out.stdout.is_empty()
+    };
+    let tmux = |args: &[&str]| {
+        let out = Command::new("tmux").args(["-S", sock]).args(args).output();
+        let out = out.unwrap();
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+    };
+    assert!(!asked(), "no server");
+    tmux(&["new-session", "-d", "-s", "work", "sleep 60"]);
+    assert!(!asked(), "detached");
+    let t = pty(24, 80);
+    let mut client = Command::new("tmux");
+    client.args(["-S", sock, "attach-session", "-t", "=work"]);
+    client.env("TERM", "xterm");
+    let mut on = t.spawn(client);
+    wait_for("a terminal on work", asked);
+    tmux(&["kill-server"]);
+    let _ = on.wait();
 }
 
 // What `tmux list-sessions -F` prints, and what comes back from it. tmux

@@ -534,3 +534,34 @@ fn ip_prints_a_vm_s_address() {
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("no VM named nope"));
 }
+
+#[test]
+fn idle_shows_and_sets_how_long_a_vm_goes_unused_before_it_sleeps() {
+    let dir = with_base();
+    let ok = |args: &[&str]| {
+        let out = runner(dir.path(), args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    ok(&["create", "dev"]);
+    assert_eq!(ok(&["idle", "dev"]), "dev  idle 10m\n");
+    assert_eq!(ok(&["idle", "dev", "30"]), "dev  idle 30m\n");
+    assert_eq!(ok(&["idle", "dev"]), "dev  idle 30m\n");
+    assert_eq!(ok(&["idle", "dev", "never"]), "dev  idle never\n");
+    // A fork keeps it, unless told otherwise.
+    ok(&["create", "dev-2", "--from", "dev"]);
+    assert_eq!(ok(&["idle", "dev-2"]), "dev-2  idle never\n");
+    ok(&["create", "quick", "--idle", "90s"]);
+    assert_eq!(ok(&["idle", "quick"]), "quick  idle 90s\n");
+
+    let out = runner(dir.path(), &["idle", "dev", "0"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("isn't an idle time"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = runner(dir.path(), &["idle", "nope", "5"]);
+    assert!(!out.status.success());
+    assert_eq!(ok(&["idle", "dev"]), "dev  idle never\n");
+}

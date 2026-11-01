@@ -12,7 +12,6 @@ use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::io::IsTerminal;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -529,8 +528,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
 
 // The command's exit code, or 128 plus the signal that killed it, as a
 // shell has it. 255 is the runner's own failure, as with ssh.
-fn attach(open: impl FnOnce() -> Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
-    exit_code(open().and_then(|conn| Ok(exec::attach(conn, req)?)))
+fn attach(open: impl FnOnce() -> Result<exec::Conn, Box<dyn Error>>, req: &Request) -> ExitCode {
+    // In use until the command is done.
+    let attached = |exec::Conn {
+                        stream,
+                        in_use: _in_use,
+                    }| Ok(exec::attach(stream, req)?);
+    exit_code(open().and_then(attached))
 }
 
 fn exit_code(done: Result<Exit, Box<dyn Error>>) -> ExitCode {
@@ -547,7 +551,7 @@ fn exit_code(done: Result<Exit, Box<dyn Error>>) -> ExitCode {
 // This terminal on a tmux session, made first if `create`. Only that boots a
 // stopped VM, which has no sessions to attach to.
 fn on_session(store: &Store, name: &str, session: &str, user: &str, create: bool) -> ExitCode {
-    let open = || -> Result<UnixStream, Box<dyn Error>> {
+    let open = || -> Result<exec::Conn, Box<dyn Error>> {
         sessions::check_name(session)?;
         if !std::io::stdin().is_terminal() {
             return Err("a session needs a terminal: run this from one, or over ssh -t".into());

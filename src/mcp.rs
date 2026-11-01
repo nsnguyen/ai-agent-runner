@@ -316,8 +316,12 @@ impl Tools {
         let stdin = args.stdin.unwrap_or_default();
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(EXEC_TIMEOUT_SECS));
         blocking(move || {
-            let conn = exec::open(&store, &args.name)?;
-            exec::capture(conn, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
+            // In use until the command is done.
+            let exec::Conn {
+                stream,
+                in_use: _in_use,
+            } = exec::open(&store, &args.name)?;
+            exec::capture(stream, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
         })
         .await
     }
