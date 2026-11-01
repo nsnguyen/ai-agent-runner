@@ -17,6 +17,7 @@
 // often as AGENT_PER_HOUR allows.
 use crate::exec;
 use crate::firecracker::{self, Api};
+use crate::idle::InUse;
 use crate::proto::Request;
 use crate::runs;
 use crate::store::{self, Checkpoint, Freezer, Store, Vm};
@@ -80,6 +81,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// to bring back: its current disk if it's stopped, or the one it runs if it's
 /// running, which carries on.
 pub fn checkpoint(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+    // Before the look, so an idle sleep can't start between it and the sync.
+    let _in_use = InUse::take(store, name)?;
     // A stopped VM needs no systemd, so this works on any machine.
     match store.checkpoint(name, comment) {
         Err(store::Error::Busy(_)) => {}
@@ -213,6 +216,8 @@ fn sync(store: &Store, name: &str) -> Result<()> {
 /// shut down, and it starts again awake. Refused while a run is going, which
 /// stopping the VM would end.
 pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
+    // An idle sleep holds the run lock while it lasts: wait it out.
+    let _in_use = InUse::take(store, name)?;
     match store.restore(name, id) {
         Err(store::Error::Busy(_)) => {}
         done => return Ok(done?),

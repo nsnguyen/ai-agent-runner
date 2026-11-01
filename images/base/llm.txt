@@ -22,9 +22,12 @@ you can go back.
   once the VM shuts down cleanly. A crash or a kill throws away what this
   boot wrote, back to how the disk was when this boot started.
 - Not memory: processes and tmux sessions end when the VM shuts down.
-  The owner can put the VM to sleep instead, which keeps memory and every
-  process: you won't notice it, apart from the clock jumping ahead at the
-  wake, and open network connections may have been dropped.
+  The VM sleeps instead when nobody on the host has used it for a while
+  (10 minutes unless the owner set otherwise), and the owner can put it to
+  sleep too. Sleep keeps memory and every process: you won't notice it,
+  apart from the clock jumping ahead at the wake, and open network
+  connections may have been dropped. Working in a detached tmux session
+  doesn't keep the VM awake; a headless run does.
 - A headless run on a VM it booted keeps what it wrote only if it exits 0. A
   run that joined a running VM checkpoints it first, and restores that
   checkpoint unless it exits 0.

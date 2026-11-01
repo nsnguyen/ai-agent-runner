@@ -4,6 +4,7 @@ use runner::claude::{self, Claude};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
 use runner::exec;
+use runner::idle::Idle;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
@@ -12,7 +13,6 @@ use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
 use std::error::Error;
 use std::io::IsTerminal;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -51,6 +51,10 @@ enum Cmd {
         /// A kernel for this VM, in place of the host's <root>/kernel/vmlinux.
         #[arg(long)]
         kernel: Option<PathBuf>,
+        /// How long it goes unused before it sleeps: minutes, or with s, m
+        /// or h, like 90s or 2h, or never. Defaults to that VM's, else 10.
+        #[arg(long)]
+        idle: Option<Idle>,
     },
     /// List VMs, their current disk generation and the space their disks use.
     List,
@@ -70,6 +74,16 @@ enum Cmd {
     Sleep { name: String },
     /// Bring a sleeping VM back where it was, and set its clock.
     Wake { name: String },
+    /// Show or set how long a VM goes unused before it sleeps. Use is a
+    /// shell, exec, attached session, run or MCP call on it; a detached tmux
+    /// session doesn't count, and sleeps with the VM. Anything that needs the
+    /// VM wakes it. A running VM counts from the next look, every 10 seconds.
+    Idle {
+        name: String,
+        /// Minutes, or with s, m or h, like 90s or 2h, or never. Ten minutes
+        /// until set.
+        idle: Option<Idle>,
+    },
     /// Show a VM's serial console and boot notes, from journald.
     Logs {
         name: String,
@@ -138,15 +152,17 @@ enum Cmd {
         #[arg(short, long, allow_hyphen_values = true)]
         session: Option<String>,
     },
-    /// List a running VM's tmux sessions: name, the command in its active
-    /// pane, when it started, and whether a terminal is on it.
+    /// List a VM's tmux sessions, waking it if it's sleeping: name, the
+    /// command in its active pane, when it started, and whether a terminal is
+    /// on it. A stopped VM has none, and isn't started to look.
     Sessions {
         name: String,
         /// Whose sessions.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
     },
-    /// Attach this terminal to a tmux session in a running VM.
+    /// Attach this terminal to a tmux session in a VM that's up, waking it if
+    /// it's sleeping.
     Attach {
         name: String,
         #[arg(allow_hyphen_values = true)]
@@ -346,11 +362,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             cpus,
             mem,
             kernel,
+            idle,
         } => {
             let config = Config {
                 cpus,
                 mem_mib: mem.as_deref().map(parse_mem).transpose()?,
                 kernel: kernel.map(absolute_kernel).transpose()?,
+                idle,
             };
             show(&store.fork_with(&from, &name, &config)?);
         }
@@ -368,6 +386,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Status { name } => show_status(&systemd::status(&store, &name)?),
         Cmd::Sleep { name } => show_status(&systemd::sleep(&store, &name)?),
         Cmd::Wake { name } => show_status(&systemd::wake(&store, &name)?),
+        Cmd::Idle { name, idle } => {
+            let idle = match idle {
+                Some(idle) => store.set_idle(&name, idle)?,
+                None => store.idle(&name)?,
+            };
+            println!("{name}  idle {idle}");
+        }
         Cmd::Logs {
             name,
             follow,
@@ -594,8 +619,13 @@ fn service(store: &Store, cmd: ServiceCmd) -> Result<ExitCode, Box<dyn Error>> {
 
 // The command's exit code, or 128 plus the signal that killed it, as a
 // shell has it. 255 is the runner's own failure, as with ssh.
-fn attach(open: impl FnOnce() -> Result<UnixStream, Box<dyn Error>>, req: &Request) -> ExitCode {
-    exit_code(open().and_then(|conn| Ok(exec::attach(conn, req)?)))
+fn attach(open: impl FnOnce() -> Result<exec::Conn, Box<dyn Error>>, req: &Request) -> ExitCode {
+    // In use until the command is done.
+    let attached = |exec::Conn {
+                        stream,
+                        in_use: _in_use,
+                    }| Ok(exec::attach(stream, req)?);
+    exit_code(open().and_then(attached))
 }
 
 fn exit_code(done: Result<Exit, Box<dyn Error>>) -> ExitCode {
@@ -612,7 +642,7 @@ fn exit_code(done: Result<Exit, Box<dyn Error>>) -> ExitCode {
 // This terminal on a tmux session, made first if `create`. Only that boots a
 // stopped VM, which has no sessions to attach to.
 fn on_session(store: &Store, name: &str, session: &str, user: &str, create: bool) -> ExitCode {
-    let open = || -> Result<UnixStream, Box<dyn Error>> {
+    let open = || -> Result<exec::Conn, Box<dyn Error>> {
         sessions::check_name(session)?;
         if !std::io::stdin().is_terminal() {
             return Err("a session needs a terminal: run this from one, or over ssh -t".into());

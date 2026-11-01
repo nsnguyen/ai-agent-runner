@@ -35,6 +35,7 @@ pub trait Vms {
     fn exists(&self, vm: &str) -> Result<bool>;
     /// Makes `vm` a fork of `from`.
     fn create(&self, vm: &str, from: &str) -> Result<()>;
+    /// Up, awake or asleep: it may have sessions.
     fn running(&self, vm: &str) -> Result<bool>;
     fn start(&self, vm: &str) -> Result<()>;
     fn has_session(&self, vm: &str, user: &str, session: &str) -> Result<bool>;
@@ -123,8 +124,10 @@ impl Vms for Host<'_> {
         }
     }
 
+    // A sleeping VM has its sessions too, and looking for one wakes it.
     fn running(&self, vm: &str) -> Result<bool> {
-        Ok(systemd::status(self.0, vm)?.state == State::Running)
+        let state = systemd::status(self.0, vm)?.state;
+        Ok(matches!(state, State::Running | State::Sleeping))
     }
 
     fn start(&self, vm: &str) -> Result<()> {
@@ -137,6 +140,11 @@ impl Vms for Host<'_> {
     }
 
     fn attach(&self, vm: &str, req: &Request) -> Result<Exit> {
-        Ok(exec::attach(exec::open(self.0, vm)?, req)?)
+        // In use until claude's terminal is let go.
+        let exec::Conn {
+            stream,
+            in_use: _in_use,
+        } = exec::open(self.0, vm)?;
+        Ok(exec::attach(stream, req)?)
     }
 }

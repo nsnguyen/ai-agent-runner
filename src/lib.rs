@@ -11,6 +11,7 @@ pub mod exec;
 pub mod firecracker;
 pub mod guest;
 pub mod host;
+pub mod idle;
 pub mod mcp;
 pub mod net;
 pub mod proto;

@@ -278,6 +278,24 @@ fn create_vm_takes_sizes() {
 }
 
 #[test]
+fn create_vm_takes_an_idle_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+
+    let mut s = start(dir.path());
+    let made = s.call(2, "create_vm", json!({"name": "dev", "idle": "never"}));
+    assert_eq!(made["isError"], json!(false), "{made}");
+    assert_eq!(store.idle("dev").unwrap(), runner::idle::Idle::Never);
+    let bad = s.call(3, "create_vm", json!({"name": "x", "idle": "soon"}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+    assert!(bad.to_string().contains("isn't an idle time"), "{bad}");
+    assert!(store.get("x").is_err());
+}
+
+#[test]
 fn doctor_reports_every_check() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = start(dir.path());

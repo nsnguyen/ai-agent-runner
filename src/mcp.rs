@@ -36,6 +36,10 @@ pub struct CreateArgs {
     mem: Option<String>,
     /// An absolute path to a kernel for this VM, in place of the host's.
     kernel: Option<std::path::PathBuf>,
+    /// How long it goes unused before it sleeps: minutes, like "10", or
+    /// "90s", "10m", "2h", or "never". Defaults to the source VM's, else 10
+    /// minutes.
+    idle: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -205,7 +209,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes unless told others."
+        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others. It sleeps once unused for its idle time, and any tool that needs its guest wakes it."
     )]
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
         let from = args.from.as_deref().unwrap_or(BASE);
@@ -214,6 +218,7 @@ impl Tools {
             cpus: args.cpus,
             mem_mib: mem_mib.map_err(|e| e.to_string())?,
             kernel: args.kernel,
+            idle: args.idle.as_deref().map(str::parse).transpose()?,
         };
         self.store
             .fork_with(from, &args.name, &config)
@@ -345,14 +350,18 @@ impl Tools {
         let stdin = args.stdin.unwrap_or_default();
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(EXEC_TIMEOUT_SECS));
         blocking(move || {
-            let conn = exec::open(&store, &args.name)?;
-            exec::capture(conn, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
+            // In use until the command is done.
+            let exec::Conn {
+                stream,
+                in_use: _in_use,
+            } = exec::open(&store, &args.name)?;
+            exec::capture(stream, &req, stdin.as_bytes(), timeout, exec::OUTPUT_CAP)
         })
         .await
     }
 
     #[tool(
-        description = "List the agent user's tmux sessions in a running VM: each one's name, the command its active pane runs, when it started, and whether a terminal is attached. A VM that isn't running has none, and isn't started to look."
+        description = "List the agent user's tmux sessions in a VM that's up: each one's name, the command its active pane runs, when it started, and whether a terminal is attached. A sleeping VM is woken to look; a stopped one has none, and isn't started to look."
     )]
     async fn list_sessions(
         &self,
@@ -365,7 +374,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Read the last `lines` (default 100, at most 2000) of a tmux session's active pane in a running VM, as plain text, reaching back into its history past the screen. Keeps at most the last 32 KiB, with truncated set if fewer lines fit."
+        description = "Read the last `lines` (default 100, at most 2000) of a tmux session's active pane in a VM that's up, waking it if it's sleeping, as plain text, reaching back into its history past the screen. Keeps at most the last 32 KiB, with truncated set if fewer lines fit."
     )]
     async fn read_session(
         &self,
@@ -376,7 +385,9 @@ impl Tools {
         blocking(move || sessions::read(&store, &args.name, &user, &args.session, lines)).await
     }
 
-    #[tool(description = "End a tmux session in a running VM, and everything running in it.")]
+    #[tool(
+        description = "End a tmux session in a VM that's up, waking it if it's sleeping, and everything running in it."
+    )]
     async fn kill_session(
         &self,
         Parameters(args): Parameters<SessionArgs>,

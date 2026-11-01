@@ -6,7 +6,8 @@
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
-//   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
+//   <root>/vms/<name>/use.lock       flock'd shared by each command using the VM, and touched; exclusive by its boot as it sleeps it (idle.rs)
+//   <root>/vms/<name>/config.json    sizes, kernel and idle time, only where they differ from the defaults
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
@@ -26,6 +27,7 @@
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
 use crate::calls;
 use crate::creds::{self, Cred, DEFAULT};
+use crate::idle::Idle;
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use chrono::{DateTime, SubsecRound, Utc};
 use rmcp::schemars;
@@ -77,7 +79,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn at(path: &Path) -> impl FnOnce(io::Error) -> Error + use<> {
+pub(crate) fn at(path: &Path) -> impl FnOnce(io::Error) -> Error + use<> {
     let path = path.to_path_buf();
     move |source| Error::Io { path, source }
 }
@@ -145,7 +147,8 @@ impl Checkpoint {
     }
 }
 
-/// A VM's sizes and kernel as stored: each one left out is the host's default.
+/// A VM's sizes, kernel and idle time as stored: each one left out is the
+/// default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -155,6 +158,9 @@ pub struct Config {
     pub mem_mib: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<PathBuf>,
+    /// How long it goes unused before it sleeps (idle.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<Idle>,
 }
 
 impl Config {
@@ -164,6 +170,7 @@ impl Config {
             cpus: over.cpus.or(self.cpus),
             mem_mib: over.mem_mib.or(self.mem_mib),
             kernel: over.kernel.clone().or(self.kernel),
+            idle: over.idle.or(self.idle),
         }
     }
 
@@ -179,6 +186,9 @@ impl Config {
             && mib < 128
         {
             return bad(format!("a VM needs at least 128 MiB of memory, not {mib}"));
+        }
+        if self.idle == Some(Idle::After(0)) {
+            return bad("a VM's idle time is at least a second, or never".to_string());
         }
         if let Some(kernel) = &self.kernel {
             if !kernel.is_absolute() {
@@ -443,6 +453,39 @@ impl Store {
             mem_mib: config.mem_mib.unwrap_or(DEFAULT_MEM_MIB),
             kernel: config.kernel.unwrap_or_else(|| self.default_kernel()),
         })
+    }
+
+    /// How long the VM goes unused before its boot puts it to sleep.
+    pub fn idle(&self, name: &str) -> Result<Idle> {
+        Ok(self.config(name)?.idle.unwrap_or_default())
+    }
+
+    /// Sets how long the VM goes unused before it sleeps. A running VM's boot
+    /// reads it at each look, so it counts from now on.
+    pub fn set_idle(&self, name: &str, idle: Idle) -> Result<Idle> {
+        let dir = self.existing(name)?;
+        let config = Config {
+            idle: Some(idle),
+            ..read_config(&dir)?
+        };
+        config.check()?;
+        let path = dir.join(CONFIG);
+        let mut text =
+            serde_json::to_string(&config).map_err(|e| at(&path)(io::Error::other(e)))?;
+        text.push('\n');
+        write_aside(&dir, CONFIG, &text).map_err(|e| match e {
+            // Deleted between the check and the write.
+            Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                Error::NoVm(name.to_string())
+            }
+            e => e,
+        })?;
+        Ok(idle)
+    }
+
+    /// The lock each command using the VM holds (idle.rs).
+    pub fn use_lock(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.existing(name)?.join("use.lock"))
     }
 
     /// The host's kernel, for every VM that doesn't name its own.
@@ -1239,8 +1282,10 @@ fn read_slot(dir: &Path) -> Result<Option<u32>> {
 }
 
 // No file means every default, which is what an imported VM has.
+const CONFIG: &str = "config.json";
+
 fn read_config(dir: &Path) -> Result<Config> {
-    let path = dir.join("config.json");
+    let path = dir.join(CONFIG);
     match fs::read(&path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(at(&path)(e)),
@@ -1254,7 +1299,7 @@ fn write_config(dir: &Path, config: &Config) -> Result<()> {
     if *config == Config::default() {
         return Ok(());
     }
-    let path = dir.join("config.json");
+    let path = dir.join(CONFIG);
     let mut text = serde_json::to_string(config).map_err(|e| at(&path)(io::Error::other(e)))?;
     text.push('\n');
     let mut f = File::create(&path).map_err(at(&path))?;

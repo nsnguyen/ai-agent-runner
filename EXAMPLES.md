@@ -86,7 +86,13 @@ runner status demo     # sleeping
 runner wake demo       # back in about a second, every program where it was
 ```
 
-`runner start`, `exec`, `shell` and `claude` wake it too. `runner stop` wakes it first, so it still shuts down cleanly and saves its disk.
+`runner start`, `exec`, `shell`, `claude`, `sessions`, `attach`, `kill`, `run` and `checkpoint` wake it too. `runner stop` wakes it first, so it still shuts down cleanly and saves its disk.
+
+You don't have to: a VM nobody has used for 10 minutes goes to sleep by itself, and the next command wakes it. A terminal attached to a tmux session keeps it awake; a detached one doesn't.
+
+```sh
+runner idle demo 30      # after 30 minutes instead; or 90s, 2h, never
+```
 
 ## 7. Let Claude do it
 

@@ -44,6 +44,7 @@ use crate::changes;
 use crate::checkpoint;
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
+use crate::idle::InUse;
 use crate::proto::{Exit, Request};
 use crate::result::{AgentSays, Changed, Outcome, RunResult};
 use crate::store::{self, Booted, Store};
@@ -281,6 +282,9 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
         return Err(Error::NoPrompt);
     }
     let runs = store.runs(s.vm)?;
+    // An idle sleep holds the run lock while it lasts: wait it out, then
+    // wake the VM.
+    let _in_use = InUse::take(store, s.vm)?;
     let lock = hold(store, s.vm)?;
     let boots = match systemd::status(store, s.vm)?.state {
         VmState::Stopped => true,

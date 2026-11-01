@@ -21,6 +21,7 @@
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
 // `a_process_lives_through_sleep_and_wake`,
 // `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
+// `an_idle_vm_sleeps_and_exec_wakes_it`,
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
 // `claude_keeps_running_after_a_detach` and
@@ -621,15 +622,15 @@ fn a_process_lives_through_sleep_and_wake() {
     let pid = sh("setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!");
     let pid = pid.trim().to_string();
     let slept = ok(runner(&root, &["sleep", &name]));
-    assert!(slept.ends_with("  sleeping\n"), "{slept}");
-    assert!(status().ends_with("  sleeping\n"), "{}", status());
+    assert!(slept.contains("  sleeping"), "{slept}");
+    assert!(status().contains("  sleeping"), "{}", status());
     // Long enough asleep for a clock that stood still to show.
     std::thread::sleep(Duration::from_secs(5));
 
     let began = Instant::now();
     let woke = ok(runner(&root, &["wake", &name]));
     let took = began.elapsed();
-    assert!(woke.ends_with("  running\n"), "{woke}");
+    assert!(woke.contains("  running"), "{woke}");
     assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
     // Set to the host's at the wake.
     let guest: i64 = sh("date +%s").trim().parse().unwrap();
@@ -671,6 +672,41 @@ fn a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote() {
     assert!(status.ends_with("  stopped\n"), "{status}");
     assert!(status.contains("  gen 1  "), "{status}");
     assert_eq!(sh("cat ~/before-sleep"), "kept\n");
+}
+
+// Sleep when idle: a minute unused and its boot puts it to sleep; an exec
+// wakes it and runs.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_idle_vm_sleeps_and_exec_wakes_it() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("idle-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name, "--idle", "1"]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let status = || ok(runner(&root, &["status", &name]));
+    // Boots it. A detached process doesn't keep it awake, and lives on.
+    let pid = sh("setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!");
+    let pid = pid.trim().to_string();
+    let unused = Instant::now();
+    assert!(status().contains("  running"), "{}", status());
+    // A minute, and up to a look's 10 seconds and the sleep itself.
+    let deadline = unused + Duration::from_secs(120);
+    while !status().contains("  sleeping") {
+        assert!(Instant::now() < deadline, "still awake: {}", status());
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let slept = unused.elapsed();
+    assert!(slept >= Duration::from_secs(60), "slept after {slept:?}");
+
+    assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
+    assert!(status().contains("  running"), "{}", status());
+    let logs = ok(runner(&root, &["logs", &name]));
+    assert!(logs.contains("went unused for 1m"), "{logs}");
+    eprintln!("slept after {slept:?} unused");
 }
 
 // The id a checkpoint row starts with, after the mark for the current one.
