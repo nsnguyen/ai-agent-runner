@@ -7,6 +7,7 @@ use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::proto::Request;
 use crate::runs::{self, AgentRun, Events};
+use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
 use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
@@ -112,6 +113,39 @@ pub struct ReadArgs {
     session: String,
     /// How many of the pane's last lines: 1 to 2000, default 100.
     lines: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddServiceArgs {
+    /// The VM's name. If it's stopped, it's started first.
+    name: String,
+    /// The service's name: up to 32 of A-Z, a-z, 0-9, _ and -.
+    service: String,
+    /// The program and its arguments, run as they are, not through a shell:
+    /// ["sh", "-c", "..."] for shell syntax. A relative program with a / in
+    /// it, like ./serve, is taken from dir.
+    argv: Vec<String>,
+    /// The directory it runs in: absolute, and there in the VM. Defaults to
+    /// /home/agent/work.
+    dir: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ServiceArgs {
+    /// The VM's name. If it's stopped, it's started first.
+    name: String,
+    /// The service's name.
+    service: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ServiceList {
+    services: Vec<Service>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct Removed {
+    removed: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -351,6 +385,73 @@ impl Tools {
         let session = args.session.clone();
         blocking(move || sessions::kill(&store, &args.name, &user, &args.session)).await?;
         Ok(Json(Killed { killed: session }))
+    }
+
+    #[tool(
+        description = "Run a command in a VM as a service: a systemd unit that runs it as the agent user, starts it now and at every boot, and starts it again a second after it exits; sleep keeps it running as it was. Starts a stopped VM, or wakes a sleeping one, first. Returns the service once its program has started; one that can't start fails, leaving nothing behind, with the journal's last lines. A service gets no credentials. Fails if the VM has a service by that name: remove_service it first."
+    )]
+    async fn add_service(
+        &self,
+        Parameters(args): Parameters<AddServiceArgs>,
+    ) -> Result<Json<Service>, String> {
+        let user = self.user.clone();
+        let store = self.store.clone();
+        blocking(move || {
+            let spec = services::Spec {
+                name: args.service,
+                argv: args.argv,
+                dir: args.dir.unwrap_or_else(|| claude::DIR.to_string()),
+                user,
+            };
+            services::add(
+                &InVm {
+                    store: &store,
+                    vm: &args.name,
+                },
+                &spec,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List a VM's services, by name: the command, directory and user each runs as, its systemd unit, and systemd's state (active, activating, failed, inactive) and sub-state (running, auto-restart, dead, ...). Starts a stopped VM, or wakes a sleeping one, first. For a service's log, exec [\"sudo\", \"journalctl\", \"-u\", unit, \"-n\", \"50\", \"--no-pager\"]."
+    )]
+    async fn list_services(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<ServiceList>, String> {
+        let store = self.store.clone();
+        let listed = move || {
+            services::list(&InVm {
+                store: &store,
+                vm: &name,
+            })
+        };
+        let Json(services) = blocking(listed).await?;
+        Ok(Json(ServiceList { services }))
+    }
+
+    #[tool(
+        description = "Stop a VM's service and remove its unit, so no boot starts it again. Starts a stopped VM, or wakes a sleeping one, first."
+    )]
+    async fn remove_service(
+        &self,
+        Parameters(args): Parameters<ServiceArgs>,
+    ) -> Result<Json<Removed>, String> {
+        let store = self.store.clone();
+        let service = args.service.clone();
+        blocking(move || {
+            services::remove(
+                &InVm {
+                    store: &store,
+                    vm: &args.name,
+                },
+                &args.service,
+            )
+        })
+        .await?;
+        Ok(Json(Removed { removed: service }))
     }
 
     #[tool(

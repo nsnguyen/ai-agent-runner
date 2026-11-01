@@ -16,6 +16,7 @@ pub mod net;
 pub mod proto;
 pub mod result;
 pub mod runs;
+pub mod services;
 pub mod sessions;
 pub mod sleep;
 pub mod store;
