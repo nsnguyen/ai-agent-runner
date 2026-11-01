@@ -6,6 +6,7 @@ use runner::doctor::{self, System};
 use runner::exec;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
+use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
 use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
@@ -151,6 +152,11 @@ enum Cmd {
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
     },
+    /// Services: commands systemd keeps running in a VM, from every boot on.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// Claude Code in a VM, on this terminal. Makes the VM from base if it's
     /// new and starts it if it's stopped, then attaches to its tmux session
     /// named claude, starting claude there if it isn't running. Detach with
@@ -270,6 +276,45 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Run a command in a VM as a service: systemd starts it now and at
+    /// every boot, and again a second after it exits. Starts a stopped VM
+    /// first. Returns once the program has started, or fails, leaving
+    /// nothing behind, with the journal's say if it can't start.
+    Add {
+        name: String,
+        /// The service's name.
+        service: String,
+        /// The directory it runs in, and a relative program is taken from.
+        #[arg(short, long, default_value = claude::DIR)]
+        dir: String,
+        /// The user it runs as.
+        #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
+        user: String,
+        /// The program and its arguments, after `--`, run as they are, not
+        /// through a shell: sh -c '...' for shell syntax.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// List a VM's services: name, systemd's state, directory and command.
+    /// Starts a stopped VM first.
+    List { name: String },
+    /// Show a service's log, from the VM's journal.
+    Logs {
+        name: String,
+        service: String,
+        /// Keep printing as lines come.
+        #[arg(short, long)]
+        follow: bool,
+        /// Only the last N lines.
+        #[arg(short = 'n', long)]
+        lines: Option<u32>,
+    },
+    /// Stop a service and remove it, so no boot starts it again.
+    Rm { name: String, service: String },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let store = Store::new(&cli.root).keeping(cli.keep);
@@ -368,6 +413,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             sessions::kill(&store, &name, &user, &session)?;
             println!("killed {session}");
         }
+        Cmd::Service { cmd } => return service(&store, cmd),
         Cmd::Claude {
             name,
             from,
@@ -487,6 +533,49 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         }
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn service(store: &Store, cmd: ServiceCmd) -> Result<ExitCode, Box<dyn Error>> {
+    match cmd {
+        ServiceCmd::Add {
+            name,
+            service,
+            dir,
+            user,
+            argv,
+        } => {
+            let spec = services::Spec {
+                name: service,
+                argv,
+                dir,
+                user,
+            };
+            let added = services::add(&InVm { store, vm: &name }, &spec)?;
+            println!("{}", services::row(&added));
+        }
+        ServiceCmd::List { name } => {
+            let all = services::list(&InVm { store, vm: &name })?;
+            if all.is_empty() {
+                println!("no services");
+            }
+            all.iter().for_each(|s| println!("{}", services::row(s)));
+        }
+        ServiceCmd::Logs {
+            name,
+            service,
+            follow,
+            lines,
+        } => {
+            let argv = services::logs_argv(services::UNIT_DIR, &name, &service, follow, lines)?;
+            let req = services::as_root(argv);
+            return Ok(attach(|| Ok(exec::open(store, &name)?), &req));
+        }
+        ServiceCmd::Rm { name, service } => {
+            services::remove(&InVm { store, vm: &name }, &service)?;
+            println!("removed {service}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
