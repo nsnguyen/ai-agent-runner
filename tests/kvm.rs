@@ -19,6 +19,8 @@
 // `a_running_vm_s_checkpoint_brings_a_deleted_file_back`,
 // `an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints`,
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
+// `a_process_lives_through_sleep_and_wake`,
+// `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
 // `a_session_outlives_a_dropped_connection`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
@@ -533,6 +535,75 @@ fn a_running_vm_s_checkpoint_brings_a_deleted_file_back() {
     // Says how long the whole checkpoint took, pause and all: on XFS, well
     // under a second of it is the pause.
     eprintln!("checkpoint of a running VM took {took:?}");
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_process_lives_through_sleep_and_wake() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("sleep-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let status = || ok(runner(&root, &["status", &name]));
+
+    // Boots it. In a session of its own, so the exec's end doesn't end it.
+    let pid = sh("setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!");
+    let pid = pid.trim().to_string();
+    let slept = ok(runner(&root, &["sleep", &name]));
+    assert!(slept.ends_with("  sleeping\n"), "{slept}");
+    assert!(status().ends_with("  sleeping\n"), "{}", status());
+    // Long enough asleep for a clock that stood still to show.
+    std::thread::sleep(Duration::from_secs(5));
+
+    let began = Instant::now();
+    let woke = ok(runner(&root, &["wake", &name]));
+    let took = began.elapsed();
+    assert!(woke.ends_with("  running\n"), "{woke}");
+    assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
+    // Set to the host's at the wake.
+    let guest: i64 = sh("date +%s").trim().parse().unwrap();
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (host - guest).abs() <= 2,
+        "guest clock {guest}, host {host}"
+    );
+
+    // Asleep again, exec wakes it first, as start does.
+    ok(runner(&root, &["sleep", &name]));
+    assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
+    let logs = ok(runner(&root, &["logs", &name]));
+    let notes: Vec<&str> = logs.lines().filter(|l| l.contains(" woke in ")).collect();
+    // Says how long the wake took, from the CLI and as boot measured it.
+    eprintln!("runner wake took {took:?}; boot's notes: {notes:?}");
+}
+
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("sleep-stop-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    // Written, never synced: it's in the guest's memory when it sleeps.
+    sh("echo kept > ~/before-sleep");
+    ok(runner(&root, &["sleep", &name]));
+    // Woken to shut down, so the shutdown is clean and commits.
+    ok(runner(&root, &["stop", &name]));
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.ends_with("  stopped\n"), "{status}");
+    assert!(status.contains("  gen 1  "), "{status}");
+    assert_eq!(sh("cat ~/before-sleep"), "kept\n");
 }
 
 // The id a checkpoint row starts with, after the mark for the current one.

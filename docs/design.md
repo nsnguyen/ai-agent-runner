@@ -19,6 +19,7 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 - **Runs are detached.** `run` starts `claude -p` in the VM and returns a run id at once; `output` reads its log by offset. A process of its own drives each run, in a session of its own, holding the VM's run lock, so a closed laptop or a dropped SSH connection can't kill a run, and the log is on the host, in the VM's directory. A run on a stopped VM boots it and shuts it down at the end, committing only a clean exit; one on a running VM checkpoints it and joins it, and restores that checkpoint, restarting the VM, unless the run exits cleanly. Once the VM is down, the run's own process measures what changed between the generation it booted and the one it booted from, reading both disks in userspace, and writes that result before it says the run is over.
 - **A fixed address per VM.** A slot picked at create gives each VM a /30 of the host's range (`/etc/runner/net`, which `host/install.sh` writes and NATs; default 172.16.0.0/16) and a tap named for it. The guest gets its address, gateway and DNS from the kernel's `ip=` argument; the DNS servers are the host's, and the image links `/etc/resolv.conf` to `/proc/net/pnp` to use them. The runner only adds and removes taps.
 - **Into the VM over vsock.** The host reaches a small guest agent through Firecracker's vsock socket, so the guest needs no sshd and no keys. `runner shell <vm>` is SSH to the host, then a terminal over vsock.
+- **Sleep keeps the boot.** `runner sleep` has the VM's boot pause it, write a Firecracker snapshot of its memory and devices into its directory, and stop Firecracker; the boot stays up, holding the VM's lock, tap and guest sockets, so `wake` only starts a fresh Firecracker to load the snapshot, then sets the guest's clock (`src/sleep.rs`). The snapshot runs on the boot's own uncommitted disk, so only that boot can wake it: a stop wakes the VM to shut down cleanly, and a restore stops it first.
 - **Out of the VM, to its own boot.** The agent checkpoints, lists and restores its own VM with `runner-guest checkpoint`, `checkpoints` and `restore`, calls over vsock that the VM's `runner boot` serves (`src/calls.rs`). No call names a VM, so a guest can't reach another. Its checkpoints are capped at 10 an hour, since gc keeps them all. A restore reboots the VM onto the copy: boot commits at the clean shutdown, then exits with a status the unit restarts on. `/.runner/llm.txt` in the base image tells the agent all this.
 
 ## Milestones
@@ -28,7 +29,8 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 | M1 (this PR) | The VM store (import, create, fork, generations, undo, delete), the CLI, and MCP over stdio. No VM boots. | Checks pass here, and local Claude Code lists VMs through `ssh kvm-host runner mcp` |
 | M2 | Boot: systemd unit, tap networking with NAT, `start`, `stop`, `logs`, the guest agent, `shell` | `runner shell dev` lands you in a VM |
 | M3 | Agent runs: `run` and `output`, credentials per boot, a result of exit code and changed paths | Local Claude Code runs Claude Code in a VM and reads what it did |
-| Later | Snapshots for sleep and wake, best-of-N forks, taking over a run, more hosts | Each when it hurts |
+| M5 | Sleep and wake: Firecracker snapshots, then sleep when idle and wake on use | An idle VM sleeps, and `runner shell dev` wakes it in under a second with its processes running |
+| Later | Best-of-N forks, taking over a run, more hosts | Each when it hurts |
 
 ## Guards
 
