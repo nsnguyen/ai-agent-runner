@@ -1,0 +1,57 @@
+# You're in a runner VM
+
+This file is /.runner/llm.txt. Read it before you change anything big.
+
+This machine is a Firecracker microVM that ai-agent-runner started for you on
+its owner's KVM host. It's yours alone: Ubuntu 24.04 with systemd, a network,
+and passwordless sudo. Nothing else runs here, so it's the sandbox: you can
+install packages, start services and break things, and checkpoint first so
+you can go back.
+
+## Where to work
+
+- You are `agent` (uid 1000), home /home/agent. Work in /home/agent/work.
+- On PATH: git, curl, build-essential, tmux, Node.js and npm, Python 3, Rust
+  (cargo, rustfmt, clippy), and Claude Code (`claude`).
+- There's no sshd. The owner reaches you through runner-guest over vsock:
+  `runner shell`, `runner exec`, `runner claude` and headless runs.
+
+## What persists
+
+- The disk, from boot to boot: everything you write anywhere on it, but only
+  once the VM shuts down cleanly. A crash or a kill throws away what this
+  boot wrote, back to how the disk was when this boot started.
+- Not memory: processes and tmux sessions end when the VM shuts down.
+- A headless run on a VM it booted keeps what it wrote only if it exits 0. A
+  run that joined a running VM checkpoints it first, and restores that
+  checkpoint unless it exits 0.
+- Checkpoints are frozen copies of the disk, kept until the owner deletes
+  the VM, whatever happens to this boot.
+
+## Checkpoints, from in here
+
+- `runner-guest checkpoint -m "before the migration"` freezes a copy of this
+  disk now and prints it. Your writes are synced first, the VM pauses for a
+  moment, and you carry on.
+- `runner-guest checkpoints` lists them, newest first: id, when, kind, size,
+  comment. Kind is `agent` for yours, `checkpoint` for the owner's, and
+  `auto` for the generations boots, runs and restores made. `*` marks the
+  one the next boot starts from.
+- `runner-guest restore <id>` reboots this VM onto a copy of checkpoint
+  <id>. Everything written since that checkpoint is gone, your notes and
+  Claude Code's own session history included, and every process here ends,
+  the one that asked too. The disk from before the restore is kept, and the
+  owner can go back to it with `runner undo`.
+- You can make 10 an hour. They're kept for good, so make them at points
+  worth coming back to: before a risky change, after something works.
+- Restore is refused while a headless run is going in this VM.
+
+## Credentials
+
+- They come in from the host each time the VM boots, into the environment
+  of each command runner-guest starts: CLAUDE_CODE_OAUTH_TOKEN or
+  ANTHROPIC_API_KEY for Claude Code, and GH_TOKEN if the owner allows it.
+- They're never on this disk. Keep it that way: don't write one to a file,
+  a git config or a shell profile, since every fork and checkpoint of this
+  disk would carry it.
+- Which ones this VM gets is the owner's call, made on the host.

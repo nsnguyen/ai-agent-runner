@@ -8,6 +8,7 @@ use tempfile::TempDir;
 
 const UNIT: &str = "etc/systemd/system/runner-guest.service";
 const WANTS: &str = "etc/systemd/system/multi-user.target.wants/runner-guest.service";
+const LLM_TXT: &str = ".runner/llm.txt";
 
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,6 +39,8 @@ fn clean_tree() -> TempDir {
     symlink("/etc/systemd/system/runner-guest.service", root.join(WANTS)).unwrap();
     fs::create_dir_all(root.join("home/agent/.local/bin")).unwrap();
     fs::create_dir_all(root.join("root")).unwrap();
+    fs::create_dir_all(root.join(".runner")).unwrap();
+    fs::write(root.join(LLM_TXT), b"# You're in a runner VM\n").unwrap();
     tree
 }
 
@@ -122,6 +125,47 @@ fn check_allows_an_empty_claude_dir() {
     let tree = clean_tree();
     fs::create_dir_all(tree.path().join("root/.claude")).unwrap();
     passes(&check(tree.path()));
+}
+
+#[test]
+fn check_fails_without_the_agent_s_llm_txt() {
+    let tree = clean_tree();
+    fs::remove_file(tree.path().join(LLM_TXT)).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  /.runner/llm.txt is missing");
+}
+
+// What the agent reads to know where it is: the commands it names are the
+// ones runner-guest has, and the numbers are the runner's own.
+#[test]
+fn llm_txt_says_how_to_checkpoint_and_restore_as_the_runner_does() {
+    let llm = fs::read_to_string(script("llm.txt")).unwrap();
+    for said in [
+        "runner-guest checkpoint -m",
+        "runner-guest checkpoints",
+        "runner-guest restore <id>",
+        runner::claude::DIR,
+        &format!("{} an hour", runner::checkpoint::AGENT_PER_HOUR),
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GH_TOKEN",
+    ] {
+        assert!(llm.contains(said), "llm.txt doesn't say {said:?}");
+    }
+    for call in ["checkpoint", "checkpoints", "restore"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_runner-guest"))
+            .args([call, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success(), "runner-guest has no {call}");
+    }
+    // Dockerfile puts it where llm.txt itself says it is.
+    let dockerfile = fs::read_to_string(script("Dockerfile")).unwrap();
+    assert!(dockerfile.contains("COPY llm.txt /.runner/llm.txt"));
+    assert!(llm.contains("/.runner/llm.txt"));
+    let build = fs::read_to_string(script("build.sh")).unwrap();
+    assert!(
+        build.contains("\"$here/llm.txt\""),
+        "build.sh doesn't copy llm.txt"
+    );
 }
 
 /// Boots the built image in Firecracker: run on the KVM host with
