@@ -5,7 +5,8 @@
 #
 #   client/aws.sh up        launch the host, or say where it is
 #   client/aws.sh ip        print its public address
-#   client/aws.sh ssh ...   log in as ubuntu, or run a command there
+#   client/aws.sh ssh ...   log in as ubuntu, or run a command there (over the
+#                           tailnet once close has shut SSH to the internet)
 #   client/aws.sh open      let this laptop's address in over SSH (up does)
 #   client/aws.sh close     let nothing in, once the host is on the tailnet
 #   client/aws.sh stop      stop it: then only its disks cost
@@ -16,7 +17,8 @@
 # root disk and a 50 GiB one for /var/lib/runner (README.md, On AWS).
 #
 # RUNNER_AWS_NAME names the instance, its key pair and its security group
-# (kvm-host). RUNNER_AWS_TYPE picks another type that has nested
+# (kvm-host), and is the tailnet name ssh dials once SSH is closed: the host
+# joins Tailscale under it (`tailscale up --hostname`). RUNNER_AWS_TYPE picks another type that has nested
 # virtualization. RUNNER_AWS_KEY is where the key pair's private key is kept
 # (~/.ssh/<name>.pem).
 set -eu
@@ -40,7 +42,7 @@ die() {
 }
 
 usage() {
-  sed -n '6,12s/^# *//p' "$0" >&2
+  sed -n '6,13s/^# //p' "$0" >&2
   exit 2
 }
 
@@ -174,9 +176,16 @@ ip)
   ;;
 ssh)
   address
+  # Once `close` lets nothing in from the internet, the host is reached as
+  # $name over the tailnet (README.md, On AWS); until then, at its address.
+  # A group that can't be read leaves the address.
+  target=$addr
+  perms=$(aws ec2 describe-security-groups --group-names "$name" \
+    --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null) || true
+  [ "$perms" != "[]" ] || target=$name
   # IdentitiesOnly: an agent offering six other keys first would use up
   # sshd's tries.
-  exec ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "ubuntu@$addr" "$@"
+  exec ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "ubuntu@$target" "$@"
   ;;
 open) open_ssh ;;
 close) close_ssh ;;
