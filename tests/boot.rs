@@ -19,7 +19,7 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Host {
@@ -1343,14 +1343,20 @@ fn a_vm_that_never_idles_stays_awake() {
     let (mut boot, up) = booted(&h);
     std::thread::sleep(Duration::from_secs(3));
     assert!(!slept(&h, &up), "slept");
-    // Read at each look, so a new idle time counts at once.
+    // Read at each look, so a new idle time counts from the next, which
+    // never puts 10 seconds off.
     h.store.set_idle("dev", Idle::After(1)).unwrap();
-    wait_for("dev to sleep", || slept(&h, &up));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !slept(&h, &up) {
+        assert!(Instant::now() < deadline, "still awake");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     boot.kill().unwrap();
     boot.wait().unwrap();
 }
 
-// The sleep a look starts is refused while a run goes; the run is use too.
+// A run is use, and a sleep is refused while one goes besides: either way,
+// the VM stays awake until it's over.
 #[test]
 fn a_run_keeps_the_vm_awake() {
     let h = Host::new();

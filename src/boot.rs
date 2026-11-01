@@ -435,7 +435,8 @@ impl Up<'_> {
     // Until Firecracker exits on its own, or a snapshot that can't wake is
     // dropped.
     fn serve(&mut self) -> Over {
-        let mut look_at = Instant::now() + LOOK;
+        // The first at once: it finds the VM just booted, and says when next.
+        let mut look_at = Instant::now();
         loop {
             let event = match self
                 .inbox
@@ -514,7 +515,10 @@ impl Up<'_> {
                 return LOOK;
             }
         };
-        let every = idle.after().map_or(LOOK, |after| after.min(LOOK));
+        // A config edited by hand to 0 doesn't spin.
+        let every = idle
+            .after()
+            .map_or(LOOK, |after| after.clamp(Duration::from_secs(1), LOOK));
         // Asleep, or going down: nothing to look at.
         if self.fc.is_none() || self.halting {
             return every;

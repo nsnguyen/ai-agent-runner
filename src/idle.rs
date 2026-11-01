@@ -200,15 +200,14 @@ impl Uses {
     /// The lock, exclusive, if no command holds it and none has touched it
     /// since the last look; None if one has. Held until dropped.
     pub fn quiet(&mut self) -> io::Result<Option<Quiet>> {
-        match self.file.try_lock() {
+        let file = self.file.try_clone().map_err(|e| self.err(e))?;
+        match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(e)) => return Err(self.err(e)),
         }
         // From here, dropping it lets go.
-        let quiet = Quiet {
-            file: self.file.try_clone().map_err(|e| self.err(e))?,
-        };
+        let quiet = Quiet { file };
         let now = mtime(&self.file);
         if now != self.seen {
             self.seen = now;

@@ -187,6 +187,9 @@ impl Config {
         {
             return bad(format!("a VM needs at least 128 MiB of memory, not {mib}"));
         }
+        if self.idle == Some(Idle::After(0)) {
+            return bad("a VM's idle time is at least a second, or never".to_string());
+        }
         if let Some(kernel) = &self.kernel {
             if !kernel.is_absolute() {
                 return bad(format!(
@@ -465,6 +468,7 @@ impl Store {
             idle: Some(idle),
             ..read_config(&dir)?
         };
+        config.check()?;
         let path = dir.join(CONFIG);
         let mut text =
             serde_json::to_string(&config).map_err(|e| at(&path)(io::Error::other(e)))?;

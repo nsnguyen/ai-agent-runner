@@ -212,6 +212,9 @@ fn a_vm_s_idle_time_is_set_per_vm_and_forks_keep_it() {
     assert_eq!(store.machine("big").unwrap().cpus, 4);
     assert_eq!(store.idle("big").unwrap(), Idle::After(120));
     assert!(store.set_idle("nope", Idle::Never).is_err());
+    // Only by hand, since it doesn't parse: refused, and nothing changes.
+    assert!(store.set_idle("big", Idle::After(0)).is_err());
+    assert_eq!(store.idle("big").unwrap(), Idle::After(120));
 }
 
 // The boot's view of the use lock: held, touched since its last look, or
@@ -282,4 +285,45 @@ fn uses_share_the_lock() {
 fn a_missing_vm_has_no_use_to_take() {
     let (_dir, store) = store_with_dev();
     assert!(InUse::take(&store, "nope").is_err());
+}
+
+// checkpoint, restore and run need the guest awake, or would hold the VM as
+// a sleep does, so they too wait out a sleep under way, then see the VM as
+// it left it. Stopped VMs here, which none of them needs systemd for once
+// let through.
+#[test]
+fn checkpoint_restore_and_run_wait_for_a_sleep_under_way() {
+    type Op = fn(&Store) -> String;
+    let ops: [(&str, Op); 3] = [
+        ("checkpoint", |s| {
+            format!("{:?}", runner::checkpoint::checkpoint(s, "dev", None))
+        }),
+        ("restore", |s| {
+            format!("{:?}", runner::checkpoint::restore(s, "dev", 0))
+        }),
+        ("run", |s| {
+            let start = runner::runs::Start {
+                vm: "dev",
+                prompt: "hi",
+                dir: "/",
+                resume: None,
+                user: "agent",
+            };
+            let bin = std::path::Path::new("/bin/true");
+            format!("{:?}", runner::runs::start(s, bin, &start).map(|r| r.id))
+        }),
+    ];
+    for (what, op) in ops {
+        let (_dir, store) = store_with_dev();
+        let mut uses = Uses::open(&store, "dev").unwrap();
+        let quiet = uses.quiet().unwrap().expect("not quiet");
+        let (done, finished) = mpsc::channel();
+        let store2 = store.clone();
+        let doing = std::thread::spawn(move || done.send(op(&store2)).unwrap());
+        let early = finished.recv_timeout(Duration::from_millis(300));
+        assert!(early.is_err(), "{what} went ahead mid-sleep: {early:?}");
+        drop(quiet);
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        doing.join().unwrap();
+    }
 }
