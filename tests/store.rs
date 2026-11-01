@@ -1,6 +1,9 @@
 // The VM store on a temp directory: no KVM needed.
+use chrono::SubsecRound;
 use runner::creds::{Cred, DEFAULT};
-use runner::store::{Booted, Checkpoint, Config, Error, Machine, Store, Vm, check_name, parse_mem};
+use runner::store::{
+    Booted, Checkpoint, Config, Error, Machine, Slept, Store, Vm, check_name, parse_mem,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -1298,4 +1301,50 @@ mod slot_props {
             }
         }
     }
+}
+
+// A sleeping VM (src/sleep.rs) is one with a whole snapshot: Firecracker's
+// two files, then the note naming the generation they run on.
+#[test]
+fn a_vm_sleeps_once_its_snapshot_is_noted_and_not_once_it_s_cleared() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    assert_eq!(store.sleeping("dev").unwrap(), None);
+    let snap = store.snapshot("dev").unwrap();
+    snap.make_room().unwrap();
+    fs::write(snap.vmstate(), b"state").unwrap();
+    fs::write(snap.mem(), b"memory").unwrap();
+    // Written, but not yet whole.
+    assert_eq!(store.sleeping("dev").unwrap(), None);
+    let slept = Slept {
+        generation: 1,
+        at: chrono::Utc::now().trunc_subsecs(0),
+    };
+    snap.note(&slept).unwrap();
+    assert_eq!(store.sleeping("dev").unwrap(), Some(slept));
+
+    snap.clear().unwrap();
+    assert_eq!(store.sleeping("dev").unwrap(), None);
+    assert!(!snap.vmstate().exists() && !snap.mem().exists());
+    // Clearing nothing is fine, and so is making room over a cleared one.
+    snap.clear().unwrap();
+    snap.make_room().unwrap();
+}
+
+// Firecracker maps the memory file into a guest it woke, so a new snapshot
+// mustn't write into that file: it gets a new one.
+#[test]
+fn making_room_for_a_snapshot_unlinks_the_last_one() {
+    use std::os::unix::fs::MetadataExt;
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    let snap = store.snapshot("dev").unwrap();
+    snap.make_room().unwrap();
+    fs::write(snap.mem(), b"memory").unwrap();
+    let mapped = fs::File::open(snap.mem()).unwrap();
+    snap.make_room().unwrap();
+    assert!(!snap.mem().exists());
+    // The open file is still what it was.
+    assert_eq!(mapped.metadata().unwrap().len(), 6);
+    assert_eq!(mapped.metadata().unwrap().nlink(), 0);
 }

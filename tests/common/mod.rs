@@ -160,6 +160,7 @@ impl FakeFirecracker {
             r#"if [ "$1" = --version ]; then printf 'Firecracker %s\n\n' "$FAKE_FC_VERSION"; exit 0; fi
 grep '^CapAmb' /proc/$$/status > "$FAKE_FC/caps"
 env > "$FAKE_FC/env"
+echo $$ > "$FAKE_FC/pid"
 printf '%s\n' "$@" > "$FAKE_FC/argv.tmp" && mv "$FAKE_FC/argv.tmp" "$FAKE_FC/argv"
 echo "fake console: Linux version 6.1"
 read -r code < "$FAKE_FC/exit"
@@ -188,6 +189,20 @@ exit "$code"
 
     pub fn started(&self) -> bool {
         self.dir.join("argv").exists()
+    }
+
+    /// The pid of the latest one started.
+    pub fn pid(&self) -> u32 {
+        let pid = fs::read_to_string(self.dir.join("pid")).unwrap();
+        pid.trim().parse().unwrap()
+    }
+
+    /// Waits for the next one to start, and forgets it started, so the one
+    /// after can be waited for too.
+    pub fn next(&self) -> Vec<String> {
+        let argv = self.argv();
+        fs::remove_file(self.dir.join("argv")).unwrap();
+        argv
     }
 
     /// Makes it exit with `code`, from another thread so a reply isn't held up.

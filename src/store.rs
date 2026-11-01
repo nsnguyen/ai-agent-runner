@@ -10,6 +10,8 @@
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
+//   <root>/vms/<name>/boot.sock      where its boot takes sleep, wake and halt (sleep.rs), while it's up
+//   <root>/vms/<name>/snapshot/      while it sleeps: Firecracker's vmstate and mem, then slept.json, the generation they run on
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
 //   <root>/vms/<name>/slot           its network slot, unique among live VMs (net.rs)
@@ -53,7 +55,7 @@ pub enum Error {
     NoVm(String),
     #[error("a VM named {0} already exists")]
     Exists(String),
-    #[error("{0} is busy: it's running, or another runner command holds it")]
+    #[error("{0} is busy: it's running or sleeping, or another runner command holds it")]
     Busy(String),
     #[error("{0} has no earlier generation to go back to")]
     NothingToUndo(String),
@@ -458,6 +460,23 @@ impl Store {
         Ok(vsock(&self.existing(name)?))
     }
 
+    /// Where the VM's boot takes sleep, wake and halt (src/sleep.rs).
+    pub fn boot_socket(&self, name: &str) -> Result<PathBuf> {
+        Ok(boot_socket(&self.existing(name)?))
+    }
+
+    /// Where the VM's snapshot goes when it sleeps.
+    pub fn snapshot(&self, name: &str) -> Result<Snapshot> {
+        Ok(snapshot(&self.existing(name)?))
+    }
+
+    /// The note of the VM's whole snapshot, if it has one: it's sleeping, if
+    /// its boot is up. A boot that was killed asleep leaves one until the
+    /// next boot clears it.
+    pub fn sleeping(&self, name: &str) -> Result<Option<Slept>> {
+        self.snapshot(name)?.slept()
+    }
+
     /// Blocks until nothing holds the VM: what a stop waits on.
     pub fn wait_idle(&self, name: &str) -> Result<()> {
         let dir = self.existing(name)?;
@@ -816,6 +835,16 @@ impl Run {
         port_socket(&self.dir, calls::PORT)
     }
 
+    /// Where this boot takes sleep, wake and halt.
+    pub fn boot_socket(&self) -> PathBuf {
+        boot_socket(&self.dir)
+    }
+
+    /// Where this boot's VM sleeps.
+    pub fn snapshot(&self) -> Snapshot {
+        snapshot(&self.dir)
+    }
+
     /// Where this boot notes which credentials its guest took.
     pub fn handed(&self) -> Handed {
         Handed {
@@ -920,6 +949,70 @@ impl Freezer {
     }
 }
 
+/// A sleeping VM's snapshot (src/sleep.rs): Firecracker's state of it and
+/// its guest's memory, and a note, written last, that makes it whole. Only
+/// the boot that took it can wake it: it runs on that boot's disk.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    dir: PathBuf,
+}
+
+impl Snapshot {
+    /// The VM's vCPUs and devices.
+    pub fn vmstate(&self) -> PathBuf {
+        self.dir.join("vmstate")
+    }
+
+    /// The guest's memory, as big as the VM's.
+    pub fn mem(&self) -> PathBuf {
+        self.dir.join("mem")
+    }
+
+    /// Clears the last snapshot, if one is left, for a new one. Its memory
+    /// file is unlinked, not written over: a guest woken from it still reads
+    /// its pages from it (firecracker::Api::load).
+    pub fn make_room(&self) -> Result<()> {
+        self.clear()?;
+        fs::create_dir_all(&self.dir).map_err(at(&self.dir))
+    }
+
+    /// Notes the snapshot whole, once Firecracker has written it and is gone.
+    pub fn note(&self, slept: &Slept) -> Result<()> {
+        let path = self.dir.join(SLEPT);
+        let text = serde_json::to_string(slept).map_err(|e| at(&path)(e.into()))?;
+        write_aside(&self.dir, SLEPT, &text)
+    }
+
+    /// The note, if the snapshot is whole.
+    pub fn slept(&self) -> Result<Option<Slept>> {
+        let path = self.dir.join(SLEPT);
+        let text = match fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r.map_err(at(&path))?,
+        };
+        let slept = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
+        Ok(Some(slept))
+    }
+
+    /// Deletes it, note first, so a snapshot cleared partway isn't whole.
+    pub fn clear(&self) -> Result<()> {
+        remove_if_there(&self.dir.join(SLEPT))?;
+        remove_if_there(&self.vmstate())?;
+        remove_if_there(&self.mem())
+    }
+}
+
+/// A whole snapshot's note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slept {
+    /// The disk generation its guest runs on: its boot's own (Booted).
+    pub generation: u64,
+    /// When it went to sleep.
+    pub at: DateTime<Utc>,
+}
+
+const SLEPT: &str = "slept.json";
+
 /// A restore's copy of a checkpoint, made while the VM still ran
 /// (Freezer::stage_restore).
 #[derive(Debug)]
@@ -1004,6 +1097,16 @@ fn api_socket(dir: &Path) -> PathBuf {
 
 fn vsock(dir: &Path) -> PathBuf {
     dir.join("vsock.sock")
+}
+
+fn boot_socket(dir: &Path) -> PathBuf {
+    dir.join("boot.sock")
+}
+
+fn snapshot(dir: &Path) -> Snapshot {
+    Snapshot {
+        dir: dir.join("snapshot"),
+    }
 }
 
 fn port_socket(dir: &Path, port: u32) -> PathBuf {
