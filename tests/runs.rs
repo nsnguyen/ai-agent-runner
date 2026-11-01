@@ -20,7 +20,8 @@ use tempfile::TempDir;
 
 // A VM named dev on a small ext4 disk, stopped or running as far as
 // systemctl says, whose guest is up either way, and a `claude` for it to
-// run. The fake writes what it was given into `ctl`, prints an init event,
+// run. A running one has a stand-in for its boot (joined), as runs that join
+// it checkpoint it, and roll back by stopping it. The fake writes what it was given into `ctl`, prints an init event,
 // waits for `ctl/go`, then prints `ctl/events` more (3 unless set), a result
 // event saying `ctl/says` if there is one, and exits with `ctl/exit` (0
 // unless set).
@@ -32,6 +33,7 @@ struct Vm {
     work: PathBuf,
     _vsock: FakeVsock,
     _guest: Guest,
+    _joined: Option<FakeApi>,
 }
 
 fn vm(running: bool) -> Vm {
@@ -79,6 +81,7 @@ exit "$(cat "$c/exit" 2>/dev/null || echo 0)"
             ctl.display()
         ),
     );
+    let joined = running.then(|| joined(&store, dir.path(), &sd));
     Vm {
         dir,
         store,
@@ -87,7 +90,28 @@ exit "$(cat "$c/exit" 2>/dev/null || echo 0)"
         work,
         _vsock: vsock,
         _guest: guest,
+        _joined: joined,
     }
+}
+
+// Stands in for `runner boot` of a VM that was running before the run: it
+// holds generation 1, a copy of generation 0, answers a pause and a resume,
+// and commits at Ctrl-Alt-Del, which `systemctl stop` sends through `runner
+// halt`, as the unit's ExecStop does.
+fn joined(store: &Store, dir: &Path, sd: &FakeSystemd) -> FakeApi {
+    script(
+        &sd.bin.join("on-stop"),
+        &format!("exec '{}' halt dev\n", env!("CARGO_BIN_EXE_runner")),
+    );
+    let run = Mutex::new(Some(store.begin_run("dev").unwrap()));
+    FakeApi::serve(&dir.join("vms/dev/api.sock"), move |req| {
+        if req.body == json!({"action_type": "SendCtrlAltDel"})
+            && let Some(run) = run.lock().unwrap().take()
+        {
+            run.commit().unwrap();
+        }
+        (204, None)
+    })
 }
 
 impl Vm {
@@ -147,8 +171,9 @@ impl Vm {
     }
 
     fn wait_until_ended(&self, id: &str) -> String {
+        // The third column; an error further on can say "running" too.
         wait_for(&format!("{id} to end"), || {
-            !self.row(id).contains("running")
+            !self.row(id).contains("Z  running  ")
         });
         self.row(id)
     }
@@ -332,7 +357,8 @@ fn follow_prints_until_the_run_ends_and_says_how() {
     let out = follow.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout).lines().count(), 3);
-    assert_eq!(text(&out.stderr), "runner: dev.1 exited 4, joined\n");
+    // Joined, and failed, so it restored the checkpoint it took first.
+    assert_eq!(text(&out.stderr), "runner: dev.1 exited 4, rolled back\n");
 }
 
 #[test]
@@ -418,6 +444,113 @@ fn a_non_zero_exit_rolls_back_what_the_run_booted() {
     assert_eq!(result["from_generation"], json!(0));
     assert_eq!(result["generation"], json!(1));
     assert_eq!(result["changed"], json!({"paths": [], "more": 0}));
+}
+
+// A run that joins a running VM checkpoints it first, and one that exits 0
+// leaves it running on.
+#[test]
+fn a_joined_run_checkpoints_its_vm_first() {
+    let vm = vm(true);
+    let id = vm.start("careful now");
+    wait_for("claude to start", || vm.started());
+    let listed = vm.ok(&["checkpoints", "dev"]);
+    let first = listed.lines().next().unwrap();
+    assert!(first.starts_with("  2  "), "{listed}");
+    assert!(first.contains("  checkpoint  "), "{listed}");
+    assert!(first.ends_with("  \"before run dev.1\""), "{listed}");
+    vm.go(0, 0);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 0, joined  "), "{row}");
+    let result = vm.result(&id);
+    assert_eq!(result["checkpoint"], json!(2), "{result}");
+    assert_eq!(result["outcome"], json!(null));
+    assert!(
+        !vm.sd
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("systemctl stop"))
+    );
+}
+
+// As one that booted its VM rolls back, a joined run that fails restores the
+// checkpoint it took, which restarts the VM.
+#[test]
+fn a_joined_run_that_fails_restores_its_checkpoint() {
+    let vm = vm(true);
+    let id = vm.start("break it");
+    wait_for("claude to start", || vm.started());
+    let disk = |g: u64| vm.dir.path().join(format!("vms/dev/gens/{g}.ext4"));
+    let before = fs::read(disk(1)).unwrap();
+    fs::write(disk(1), b"broken").unwrap();
+    vm.go(0, 3);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 3, rolled back  "), "{row}");
+    // Stopping it committed the broken disk, and the checkpoint's copy is on
+    // top, so `undo` would bring the run's work back.
+    assert_eq!(vm.generation(), 3);
+    assert_eq!(fs::read(disk(3)).unwrap(), before);
+    let verbs: Vec<String> = vm
+        .sd
+        .calls()
+        .iter()
+        .filter_map(|c| c.split(' ').nth(1).map(String::from))
+        .filter(|v| v == "stop" || v == "start")
+        .collect();
+    assert_eq!(verbs, ["stop", "start"]);
+    let result = vm.result(&id);
+    assert_eq!(result["outcome"], json!("rolled_back"), "{result}");
+    assert_eq!(result["checkpoint"], json!(2));
+}
+
+// `runner stop` during a joined run ends Claude Code with the guest. The
+// rollback waits for the stop, which commits what the run wrote, then puts
+// the checkpoint on top, and leaves the VM stopped, as it was asked to be.
+// `systemctl stop` on a unit already stopping waits for that stop; here it
+// runs the stop's halt, as the stop already under way would.
+#[test]
+fn a_joined_run_whose_vm_is_stopped_under_it_still_rolls_back() {
+    let vm = vm(true);
+    let id = vm.start("break it");
+    wait_for("claude to start", || vm.started());
+    let disk = |g: u64| vm.dir.path().join(format!("vms/dev/gens/{g}.ext4"));
+    let before = fs::read(disk(1)).unwrap();
+    fs::write(disk(1), b"broken").unwrap();
+    vm.sd.set_state("deactivating");
+    vm.go(0, 143);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 143, rolled back  "), "{row}");
+    assert_eq!(vm.generation(), 3);
+    assert_eq!(fs::read(disk(3)).unwrap(), before);
+    assert_eq!(fs::read(disk(1)).unwrap(), b"broken");
+    let verbs: Vec<String> = vm
+        .sd
+        .calls()
+        .iter()
+        .filter_map(|c| c.split(' ').nth(1).map(String::from))
+        .filter(|v| v == "stop" || v == "start")
+        .collect();
+    assert_eq!(verbs, ["stop"]);
+    let result = vm.result(&id);
+    assert_eq!(result["outcome"], json!("rolled_back"), "{result}");
+    assert_eq!(result["error"], json!(null), "{result}");
+}
+
+// Nothing ran, so there's nothing to roll back, and the VM's sessions live on.
+#[test]
+fn a_joined_run_whose_claude_never_started_leaves_its_vm_running() {
+    let vm = vm(true);
+    let missing = vm.dir.path().join("no-such-dir");
+    let id = returns_at_once(vm.runner(&["run", "dev", "hi", "--dir", missing.to_str().unwrap()]));
+    let id = text(&id.stdout).trim().to_string();
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  failed, joined: "), "{row}");
+    assert!(
+        !vm.sd
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("systemctl stop"))
+    );
+    assert_eq!(vm.result(&id)["checkpoint"], json!(2));
 }
 
 // A running VM's disk has nothing from before the run to measure against.

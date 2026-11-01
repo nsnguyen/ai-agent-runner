@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use runner::checkpoint;
 use runner::claude::{self, Claude};
 use runner::creds::Cred;
 use runner::doctor::{self, System};
@@ -81,7 +82,8 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Freeze a copy of a VM's disk to restore later. The VM must be stopped.
+    /// Freeze a copy of a VM's disk to restore later. A running VM is synced
+    /// and paused for the copy, and carries on.
     Checkpoint {
         name: String,
         /// A note to know it by.
@@ -92,6 +94,8 @@ enum Cmd {
     /// `*` marks the current one.
     Checkpoints { name: String },
     /// Make a copy of a checkpoint the VM's current disk. `undo` reverses it.
+    /// A running VM is stopped first and started again after; a stopping one
+    /// is waited out and stays stopped.
     Restore { name: String, id: u64 },
     /// Print the firecracker@.service unit for this binary and root.
     Unit {
@@ -190,8 +194,9 @@ enum Cmd {
     /// Start Claude Code on a prompt in a VM, headless and detached, and
     /// print the run's id at once. A stopped VM is booted for the run and
     /// shut down after it: exit 0 commits what it wrote to its disk, and
-    /// anything else rolls that back. A running VM is joined as it is. One
-    /// run per VM at a time.
+    /// anything else rolls that back. A running VM is checkpointed and joined
+    /// as it is: exit 0 leaves it running, and anything else restores that
+    /// checkpoint, which restarts the VM. One run per VM at a time.
     Run {
         name: String,
         /// What to ask Claude Code. It reaches claude on its stdin.
@@ -229,7 +234,8 @@ enum Cmd {
     /// did is kept apart, marked untrusted.
     Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
-    /// booted rolls back and shuts down. A run whose Claude Code is done
+    /// booted rolls back and shuts down, while one it joined running gets the
+    /// checkpoint it took back, which restarts it. A run whose Claude Code is done
     /// stops measuring its disk. Returns once the run has ended, or after two
     /// minutes.
     Cancel { run: String },
@@ -458,7 +464,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             });
         }
         Cmd::Checkpoint { name, comment } => {
-            println!("{}", row(&store.checkpoint(&name, comment.as_deref())?));
+            let made = checkpoint::checkpoint(&store, &name, comment.as_deref())?;
+            println!("{}", row(&made));
         }
         Cmd::Checkpoints { name } => {
             store
@@ -466,7 +473,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 .iter()
                 .for_each(|c| println!("{}", row(c)));
         }
-        Cmd::Restore { name, id } => show(&store.restore(&name, id)?),
+        Cmd::Restore { name, id } => show(&checkpoint::restore(&store, &name, id)?),
         Cmd::Mcp { user } => return Ok(serve(store, user)),
         Cmd::Boot {
             name,

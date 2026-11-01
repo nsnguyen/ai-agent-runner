@@ -489,6 +489,42 @@ fn firecracker_holds_the_vm_even_if_boot_dies() {
     assert_eq!(h.store.get("dev").unwrap().generation, 0);
 }
 
+// A checkpoint under way when the VM stops finishes first, and one whose
+// process died with the VM paused left it paused: halt resumes it, or the
+// guest couldn't take Ctrl-Alt-Del.
+#[test]
+fn halt_waits_out_a_checkpoint_and_resumes_the_vm_first() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let freezer = h.store.hold_checkpoints("dev").unwrap();
+    let booted = api.calls().len();
+    let mut halt = h
+        .runner(&["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(halt.try_wait().unwrap().is_none(), "halt didn't wait");
+    assert_eq!(api.calls().len(), booted);
+    drop(freezer);
+    let out = halt.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        api.calls()[booted..],
+        [
+            ("PATCH /vm".to_string(), json!({"state": "Resumed"})),
+            (
+                "PUT /actions".to_string(),
+                json!({"action_type": "SendCtrlAltDel"})
+            ),
+        ]
+    );
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
 #[test]
 fn halt_waits_even_when_ctrl_alt_del_fails() {
     let h = Host::new();

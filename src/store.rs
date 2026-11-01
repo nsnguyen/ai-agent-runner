@@ -2,8 +2,10 @@
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, and whether it's a checkpoint
+//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
+//   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
 //   <root>/vms/<name>/config.json    sizes and kernel, only where they differ from the host's
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
@@ -56,6 +58,8 @@ pub enum Error {
     NothingToUndo(String),
     #[error("{0} has no checkpoint {1}")]
     NoCheckpoint(String, u64),
+    #[error("{0} has never booted, so it has no running disk to checkpoint")]
+    NeverBooted(String),
     #[error("{0}")]
     BadConfig(String),
     #[error(
@@ -466,13 +470,7 @@ impl Store {
     /// process to know which disk its boot runs; the disk may be gone since,
     /// if that boot never got going. None if the VM never booted.
     pub fn booted(&self, name: &str) -> Result<Option<Booted>> {
-        let path = self.existing(name)?.join(BOOTED);
-        let text = match fs::read(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            r => r.map_err(at(&path))?,
-        };
-        let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
-        Ok(Some(booted))
+        read_booted(&self.existing(name)?)
     }
 
     /// The disk of one of the VM's generations, whether or not it's still
@@ -580,6 +578,22 @@ impl Store {
         read_checkpoint(&dir, id, Some(note), false)
     }
 
+    /// Waits until no other checkpoint of a running VM is being made, then
+    /// holds off the rest until the Freezer is dropped. A running VM's boot
+    /// holds the VM's own lock, so its checkpoints take turns on this one.
+    pub fn hold_checkpoints(&self, name: &str) -> Result<Freezer> {
+        let dir = self.existing(name)?;
+        let path = dir.join(FREEZE_LOCK);
+        let lock = open_lock(&path, name)?;
+        lock.lock().map_err(at(&path))?;
+        let name = name.to_string();
+        Ok(Freezer {
+            name,
+            dir,
+            _lock: lock,
+        })
+    }
+
     /// Every checkpoint and every generation in history, newest first.
     pub fn checkpoints(&self, name: &str) -> Result<Vec<Checkpoint>> {
         let dir = self.existing(name)?;
@@ -603,16 +617,34 @@ impl Store {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
         let mut gens = history(&dir)?;
-        let frozen = read_note(&dir, id)?.is_some_and(|n| !n.auto);
-        if !(gens.contains(&id) || frozen) || !disk_of(&dir, id).is_file() {
-            return Err(Error::NoCheckpoint(name.to_string(), id));
-        }
+        check_restorable(name, &dir, id)?;
         let generation = next_generation(&dir)?;
         clone(&disk_of(&dir, id), &disk_of(&dir, generation))?;
         write_note(&dir, generation, &Note::auto(&format!("restore of {id}")))?;
         gens.push(generation);
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
+    }
+
+    /// Puts a restore staged by Freezer::stage_restore on top of history, as
+    /// `restore` would have: `undo` goes back to the disk from before it.
+    /// Needs the VM stopped.
+    pub fn finish_restore(&self, name: &str, staged: &Staged) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        let note = Note::auto(&format!("restore of {}", staged.from));
+        write_note(&dir, staged.generation, &note)?;
+        let mut gens = history(&dir)?;
+        gens.push(staged.generation);
+        write_history(&dir, &gens)?;
+        read_vm(name, &dir)
+    }
+
+    /// Deletes a staged restore that didn't go ahead.
+    pub fn drop_restore(&self, name: &str, staged: Staged) -> Result<()> {
+        let dir = self.existing(name)?;
+        remove_if_there(&disk_of(&dir, staged.generation))?;
+        remove_if_there(&note_of(&dir, staged.generation))
     }
 
     /// The credentials the VM gets at boot: what its allowlist names, or
@@ -756,9 +788,107 @@ impl Run {
     }
 }
 
+/// A running VM's checkpoints, one at a time (Store::hold_checkpoints).
+#[derive(Debug)]
+pub struct Freezer {
+    name: String,
+    dir: PathBuf,
+    _lock: File,
+}
+
+impl Freezer {
+    /// Freezes a copy of the disk the VM's latest boot runs (Store::booted),
+    /// for `restore` to bring back: a running VM's checkpoint, as
+    /// Store::checkpoint is a stopped one's. Pause the VM first, so the copy
+    /// is of one moment. The VM carries on from its own disk, which it
+    /// commits or rolls back at shutdown as it would have.
+    ///
+    /// The note goes first, which takes the generation's number, so a boot
+    /// that starts while the copy goes on, Firecracker having been killed,
+    /// can't take it too. The copy is made aside and renamed into place, so
+    /// nothing lists a half-made one, and the next checkpoint clears what one
+    /// killed partway left.
+    pub fn freeze(&self, comment: Option<&str>) -> Result<Checkpoint> {
+        let booted = read_booted(&self.dir)?;
+        let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
+        let note = Note {
+            time: now(),
+            comment: comment.map(str::to_string),
+            auto: false,
+        };
+        let id = self.copy(booted.generation, &note)?;
+        read_checkpoint(&self.dir, id, Some(note), false)
+    }
+
+    /// Copies checkpoint `id` aside for a restore that has to stop the VM
+    /// first, before anything stops: a mistyped id stops nothing, and the
+    /// stop's commit, whose gc may drop `id`, can't take it from the restore.
+    /// The copy is noted as a checkpoint, which gc keeps, until
+    /// Store::finish_restore puts it in history; drop_restore deletes it.
+    pub fn stage_restore(&self, id: u64) -> Result<Staged> {
+        check_restorable(&self.name, &self.dir, id)?;
+        let note = Note {
+            time: now(),
+            comment: Some(format!("restore of {id}")),
+            auto: false,
+        };
+        let generation = self.copy(id, &note)?;
+        Ok(Staged {
+            from: id,
+            generation,
+        })
+    }
+
+    // A copy of generation `from` under a new number, with its note.
+    fn copy(&self, from: u64, note: &Note) -> Result<u64> {
+        let gens = self.dir.join("gens");
+        for left in numbered(&self.dir, PART)? {
+            let part = part_of(&self.dir, left);
+            fs::remove_file(&part).map_err(at(&part))?;
+            if !disk_of(&self.dir, left).exists() {
+                remove_if_there(&note_of(&self.dir, left))?;
+            }
+        }
+        let id = next_generation(&self.dir)?;
+        write_note(&self.dir, id, note)?;
+        let (part, disk) = (part_of(&self.dir, id), disk_of(&self.dir, id));
+        let made = clone(&disk_of(&self.dir, from), &part)
+            .and_then(|()| fs::rename(&part, &disk).map_err(at(&disk)))
+            .and_then(|()| sync_dir(&gens));
+        if let Err(e) = made {
+            let _ = fs::remove_file(&part);
+            let _ = fs::remove_file(note_of(&self.dir, id));
+            return Err(e);
+        }
+        Ok(id)
+    }
+}
+
+/// A restore's copy of a checkpoint, made while the VM still ran
+/// (Freezer::stage_restore).
+#[derive(Debug)]
+pub struct Staged {
+    /// The checkpoint it's a copy of.
+    pub from: u64,
+    /// The copy's own generation.
+    pub generation: u64,
+}
+
+// What `restore` takes: a checkpoint, or a generation in history, whose disk
+// is there.
+fn check_restorable(name: &str, dir: &Path, id: u64) -> Result<()> {
+    let frozen = read_note(dir, id)?.is_some_and(|n| !n.auto);
+    if !(history(dir)?.contains(&id) || frozen) || !disk_of(dir, id).is_file() {
+        return Err(Error::NoCheckpoint(name.to_string(), id));
+    }
+    Ok(())
+}
+
 const HANDED: &str = "handed";
 const ROLLBACK: &str = "rollback";
 const BOOTED: &str = "booted";
+const FREEZE_LOCK: &str = "freeze.lock";
+const PART: &str = ".part";
 
 /// A boot's generations (Store::booted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,6 +1130,20 @@ fn note_of(dir: &Path, generation: u64) -> PathBuf {
     dir.join("gens").join(format!("{generation}.json"))
 }
 
+fn part_of(dir: &Path, generation: u64) -> PathBuf {
+    dir.join("gens").join(format!("{generation}{PART}"))
+}
+
+fn read_booted(dir: &Path) -> Result<Option<Booted>> {
+    let path = dir.join(BOOTED);
+    let text = match fs::read(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        r => r.map_err(at(&path))?,
+    };
+    let booted = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
+    Ok(Some(booted))
+}
+
 #[derive(Serialize, Deserialize)]
 struct Note {
     time: DateTime<Utc>,
@@ -1125,6 +1269,7 @@ fn sweep_staging(vms: &Path) {
 fn next_generation(dir: &Path) -> Result<u64> {
     let mut all = numbered(dir, ".ext4")?;
     all.extend(numbered(dir, ".json")?);
+    all.extend(numbered(dir, PART)?);
     Ok(all.into_iter().max().unwrap_or(0) + 1)
 }
 

@@ -828,6 +828,123 @@ fn checkpoint_and_restore_refuse_a_busy_vm() {
     drop(run);
 }
 
+// A running VM's boot holds its lock and runs a generation of its own, so
+// its checkpoint is a copy of that one, made with the boot still holding it.
+#[test]
+fn a_running_vm_s_checkpoint_copies_the_disk_its_boot_runs() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    fs::write(&run.disk, b"live").unwrap();
+    let c = store
+        .hold_checkpoints("dev")
+        .unwrap()
+        .freeze(Some("mid-run"))
+        .unwrap();
+    assert_eq!(
+        summary(std::slice::from_ref(&c)),
+        [(2, false, Some("mid-run"), false)]
+    );
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 2)).unwrap(), b"live");
+    // The boot's own generation goes on as it would have, and commits.
+    fs::write(&run.disk, b"later").unwrap();
+    assert_eq!(run.commit().unwrap(), vm("dev", 1, 5));
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(
+        summary(&listed),
+        [
+            (2, false, Some("mid-run"), false),
+            (1, true, Some("run"), true),
+            (0, true, Some("import"), false),
+        ]
+    );
+    store.restore("dev", 2).unwrap();
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"live");
+}
+
+#[test]
+fn a_running_checkpoint_killed_partway_is_never_listed_and_the_next_clears_it() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    // What one killed mid-copy leaves: its note, and its copy under its
+    // working name.
+    let gens = dir.path().join("root/vms/dev/gens");
+    fs::write(gens.join("2.json"), fs::read(gens.join("0.json")).unwrap()).unwrap();
+    fs::write(gens.join("2.part"), b"li").unwrap();
+    let ids = |store: &Store| -> Vec<u64> {
+        let listed = store.checkpoints("dev").unwrap();
+        listed.iter().map(|c| c.id).collect()
+    };
+    assert_eq!(ids(&store), [0]);
+    // Nor does a boot take its number.
+    drop(run);
+    let run = store.begin_run("dev").unwrap();
+    assert_eq!(run.generation, 3);
+    let c = store.hold_checkpoints("dev").unwrap().freeze(None).unwrap();
+    assert_eq!(c.id, 4);
+    assert!(!gens.join("2.part").exists());
+    assert!(!gens.join("2.json").exists());
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 4)).unwrap(), b"v0");
+    assert_eq!(ids(&store), [4, 0]);
+    drop(run);
+}
+
+// A running VM's restore copies the checkpoint while the VM still runs, and
+// puts the copy in history only once it's stopped.
+#[test]
+fn a_staged_restore_goes_into_history_only_once_finished() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    store.checkpoint("dev", Some("clean")).unwrap();
+    let run = store.begin_run("dev").unwrap();
+    let freezer = store.hold_checkpoints("dev").unwrap();
+    assert!(matches!(
+        freezer.stage_restore(9),
+        Err(Error::NoCheckpoint(n, 9)) if n == "dev"
+    ));
+    let staged = freezer.stage_restore(1).unwrap();
+    assert_eq!((staged.from, staged.generation), (1, 3));
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"v0");
+    assert!(matches!(
+        store.finish_restore("dev", &staged),
+        Err(Error::Busy(_))
+    ));
+    run.commit().unwrap();
+    assert_eq!(
+        store.finish_restore("dev", &staged).unwrap(),
+        vm("dev", 3, 2)
+    );
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(summary(&listed)[0], (3, true, Some("restore of 1"), true));
+    assert_eq!(store.undo("dev").unwrap().generation, 2);
+
+    // One that didn't go ahead leaves nothing behind.
+    let staged = freezer.stage_restore(1).unwrap();
+    let generation = staged.generation;
+    store.drop_restore("dev", staged).unwrap();
+    assert!(!gen_disk(dir.path(), "dev", generation).exists());
+    assert!(
+        store
+            .checkpoints("dev")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != generation)
+    );
+}
+
+#[test]
+fn a_vm_that_never_booted_has_no_running_disk_to_checkpoint() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let froze = store.hold_checkpoints("dev").unwrap().freeze(None);
+    assert!(matches!(froze, Err(Error::NeverBooted(n)) if n == "dev"));
+    assert!(matches!(
+        store.hold_checkpoints("nope"),
+        Err(Error::NoVm(_))
+    ));
+}
+
 #[test]
 fn generations_without_notes_still_list() {
     let (dir, store) = store();

@@ -40,6 +40,33 @@ fn a_fault_comes_back_with_firecrackers_message() {
     assert!(err.to_string().contains("PUT /boot-source"), "{err}");
 }
 
+// A checkpoint of a running VM holds it still while its disk is copied.
+#[test]
+fn pause_and_resume_patch_the_vm_s_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("api.sock");
+    let api = FakeApi::serve(&sock, |_| (204, None));
+    Api::new(&sock).pause().unwrap();
+    Api::new(&sock).resume().unwrap();
+    assert_eq!(
+        api.calls(),
+        [
+            ("PATCH /vm".to_string(), json!({"state": "Paused"})),
+            ("PATCH /vm".to_string(), json!({"state": "Resumed"})),
+        ]
+    );
+}
+
+#[test]
+fn a_refused_patch_names_its_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("api.sock");
+    let fault = json!({"fault_message": "not running"}).to_string();
+    let _api = FakeApi::serve(&sock, move |_| (400, Some(fault.clone())));
+    let err = Api::new(&sock).pause().unwrap_err();
+    assert!(err.to_string().contains("PATCH /vm"), "{err}");
+}
+
 #[test]
 fn a_reply_with_a_body_is_read_to_its_end() {
     let dir = tempfile::tempdir().unwrap();

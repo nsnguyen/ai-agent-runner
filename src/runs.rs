@@ -26,8 +26,10 @@
 // run asks boot for it once the guest is up (Store::ask_rollback) and takes
 // the ask back only when Claude Code has exited 0, so a VM shut down under
 // the run, by a host reboot, `runner stop` or the agent itself, rolls back
-// too. A run on a running VM joins it as it is, and commits or rolls back
-// nothing.
+// too. A run on a running VM joins it as it is, and commits nothing, but
+// takes a checkpoint of it first (checkpoint.rs). A clean exit leaves the VM
+// running on; anything else restores that checkpoint, which stops the VM and
+// starts it again, ending whatever else ran in it.
 //
 // Once Claude Code is done, and a VM the run booted is down, the process
 // driving the run measures what the run changed on its disk (changes.rs), in
@@ -39,6 +41,7 @@
 // cancel stops the measuring. A cancel that stopped Claude Code doesn't: a
 // cancelled run is measured too.
 use crate::changes;
+use crate::checkpoint;
 use crate::exec::{self, Streamed};
 use crate::firecracker::{self, Api};
 use crate::proto::{Exit, Request};
@@ -118,6 +121,8 @@ pub enum Error {
     Stopping(String),
     #[error("{0} stopped before the run could join it")]
     Gone(String),
+    #[error("checkpointing {vm} before the run: {why}")]
+    Checkpoint { vm: String, why: String },
     #[error("{id} has already ended: {how}")]
     Ended { id: String, how: String },
     #[error("{0} is still running: its result comes once it ends")]
@@ -185,7 +190,8 @@ pub struct AgentRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
     /// For a run that booted its VM, once the VM is down: whether the disk
-    /// generation it ran was committed or rolled back.
+    /// generation it ran was committed or rolled back. For one that joined
+    /// it running: rolled back if it restored the checkpoint it took.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
     /// What went wrong, if anything did.
@@ -275,19 +281,7 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
         return Err(Error::NoPrompt);
     }
     let runs = store.runs(s.vm)?;
-    fs::create_dir_all(&runs).map_err(io_err(format!("making {}", runs.display())))?;
-    let Some(lock) = lock(&runs)? else {
-        // Unless it's the newest, the run holding the lock is one starting.
-        let newest = match newest(&runs)? {
-            Some(n) => Some(load(store, s.vm, n)?),
-            None => None,
-        };
-        let vm = s.vm.to_string();
-        return Err(match newest {
-            Some(run) if run.state == State::Running => Error::Busy { vm, run: run.id },
-            _ => Error::Starting(vm),
-        });
-    };
+    let lock = hold(store, s.vm)?;
     let boots = match systemd::status(store, s.vm)?.state {
         VmState::Stopped => true,
         VmState::Booting | VmState::Running => false,
@@ -321,6 +315,26 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
         return Err(io_err("starting runner drive")(e));
     }
     load(store, s.vm, n)
+}
+
+/// The VM's run lock, for as long as the file is open: no run starts on the
+/// VM meanwhile. Refused while a run holds it.
+pub fn hold(store: &Store, vm: &str) -> Result<File> {
+    let runs = store.runs(vm)?;
+    fs::create_dir_all(&runs).map_err(io_err(format!("making {}", runs.display())))?;
+    if let Some(lock) = lock(&runs)? {
+        return Ok(lock);
+    }
+    // Unless it's the newest, the run holding the lock is one starting.
+    let newest = match newest(&runs)? {
+        Some(n) => Some(load(store, vm, n)?),
+        None => None,
+    };
+    let vm = vm.to_string();
+    Err(match newest {
+        Some(run) if run.state == State::Running => Error::Busy { vm, run: run.id },
+        _ => Error::Starting(vm),
+    })
 }
 
 // `runner drive` for run `n`, holding the run lock as its stdin, in a
@@ -415,6 +429,23 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
             }
             None => {}
         }
+    } else if let Some(id) = gens.checkpoint
+        && gens.ran
+        && !(end.exit_code == Some(0) && !end.cancelled && end.error.is_none())
+    {
+        // Under the run lock this process holds, so no run starts on the VM
+        // while it's down.
+        match checkpoint::restore_held(store, vm, id) {
+            Ok(_) => end.outcome = Some(Outcome::RolledBack),
+            Err(e) => {
+                let why = format!("restoring checkpoint {id} failed: {e}");
+                eprintln!("runner: {why}");
+                end.error = Some(match end.error.take() {
+                    Some(was) => format!("{was}; {why}"),
+                    None => why,
+                });
+            }
+        }
     }
     end.ended = now();
     let took = began.elapsed();
@@ -424,6 +455,7 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         outcome: end.outcome,
         from_generation: gens.booted.map(|b| b.from).or(gens.from),
         generation: gens.booted.map(|b| b.generation),
+        checkpoint: gens.checkpoint,
         changed: changed(store, vm, &ask, &gens, down, &|| cancel.exists()),
         agent_says: agent_says(&dir.join(STREAM)),
     };
@@ -434,13 +466,19 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
     write_json(&dir, END, &end)
 }
 
-// The generations of a run that boots its VM, as far as it got.
+// The generations of a run that boots its VM, as far as it got, or the
+// checkpoint one that joined it took.
 #[derive(Default)]
 struct Gens {
     // Current once the VM started, and so unless boot commits the run's.
     from: Option<u64>,
     // What boot noted once its guest answered: what it cloned, and its own.
     booted: Option<Booted>,
+    // Taken of a running VM before the run, to restore if the run fails.
+    checkpoint: Option<u64>,
+    // Whether claude started: a run cancelled or failed before then restores
+    // nothing, since stopping the VM would end its sessions for nothing.
+    ran: bool,
 }
 
 // What the run changed on its disk, measured from the disks, unless `stop`
@@ -530,7 +568,19 @@ fn run_claude(
     // A guest that answers means boot is past begin_run, which drops any
     // ask from before it and notes this boot's generations, and holds the VM
     // until it has shut down.
-    let conn = exec::reach(store, vm)?;
+    let mut conn = exec::reach(store, vm)?;
+    // Once the guest answers, a VM that was booting when the run joined it is
+    // up, so it can be checkpointed. Then a fresh connection: the VM was
+    // paused under this one.
+    if !ask.boots {
+        let made = checkpoint::checkpoint(store, vm, Some(&format!("before run {run}")));
+        let made = made.map_err(|e| Error::Checkpoint {
+            vm: vm.to_string(),
+            why: e.to_string(),
+        })?;
+        gens.checkpoint = Some(made.id);
+        conn = exec::reach(store, vm)?;
+    }
     if ask.boots {
         gens.booted = store.booted(vm)?;
         store.ask_rollback(vm, &format!("run {run}"))?;
@@ -557,7 +607,13 @@ fn run_claude(
     };
     let (mut out, mut err) = (append(STREAM)?, append(STDERR)?);
     let prompt = ask.prompt.as_bytes();
-    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, cancelled, GRACE)?;
+    gens.ran = true;
+    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, cancelled, GRACE);
+    // The guest couldn't start claude, so nothing ran.
+    if let Err(exec::Error::Guest(_)) = &streamed {
+        gens.ran = false;
+    }
+    let streamed = streamed?;
     // So a host crash after the end is written can't lose the stream's tail.
     out.sync_all().map_err(io_err("syncing the stream"))?;
     Ok(streamed)
