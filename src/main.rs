@@ -289,8 +289,8 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ServiceCmd {
     /// Run a command in a VM as a service: systemd starts it now and at
-    /// every boot, and again a second after it exits. Starts a stopped VM
-    /// first. Returns once the program has started, or fails, leaving
+    /// every boot, and again a second after it exits. Starts a stopped VM,
+    /// or wakes a sleeping one, first. Returns once the program has started, or fails, leaving
     /// nothing behind, with the journal's say if it can't start.
     Add {
         name: String,
@@ -308,7 +308,7 @@ enum ServiceCmd {
         argv: Vec<String>,
     },
     /// List a VM's services: name, systemd's state, directory and command.
-    /// Starts a stopped VM first.
+    /// Starts a stopped VM, or wakes a sleeping one, first.
     List { name: String },
     /// Show a service's log, from the VM's journal.
     Logs {

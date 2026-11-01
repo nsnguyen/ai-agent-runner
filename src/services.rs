@@ -107,8 +107,9 @@ pub trait Guest {
     fn run(&self, argv: &[String], stdin: &[u8]) -> exec::Result<Captured>;
 }
 
-/// A VM's guest, which is started first if the VM is stopped: its services
-/// are on its disk, and only the running VM can read or change them.
+/// A VM's guest, started first if the VM is stopped, or woken if it sleeps:
+/// its services are on its disk, and only the running VM can read or change
+/// them.
 pub struct InVm<'a> {
     pub store: &'a Store,
     pub vm: &'a str,
