@@ -439,6 +439,10 @@ fn a_sleeping_vm_is_woken_to_list_attach_and_kill_its_sessions() {
     asleep(&store);
     let t = pty(24, 80);
     let mut on = t.spawn(vm.runner(&["attach", "dev", &s]));
+    // Woken by the attach, before a look of the test's own could ask too.
+    wait_for("the attach to wake dev", || {
+        store.sleeping("dev").unwrap().is_none()
+    });
     vm.wait_for_row(&s, "sleep", "attached");
     vm.detach(&s);
     assert_eq!(on.wait().unwrap().code(), Some(0), "{}", t.seen());
