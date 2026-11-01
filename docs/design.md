@@ -20,6 +20,7 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 - **A fixed address per VM.** A slot picked at create gives each VM a /30 of the host's range (`/etc/runner/net`, which `host/install.sh` writes and NATs; default 172.16.0.0/16) and a tap named for it. The guest gets its address, gateway and DNS from the kernel's `ip=` argument; the DNS servers are the host's, and the image links `/etc/resolv.conf` to `/proc/net/pnp` to use them. The runner only adds and removes taps.
 - **Into the VM over vsock.** The host reaches a small guest agent through Firecracker's vsock socket, so the guest needs no sshd and no keys. `runner shell <vm>` is SSH to the host, then a terminal over vsock.
 - **Services are systemd units in the guest.** `runner service add` writes `/etc/systemd/system/runner-svc-<name>.service` over the guest protocol, as root, and enables it, so it runs from every boot with `Restart=always`. The disk keeps the unit; no state about it is on the host.
+- **Sleep keeps the boot.** `runner sleep` has the VM's boot pause it, write a Firecracker snapshot of its memory and devices into its directory, and stop Firecracker; the boot stays up, holding the VM's lock, tap and guest sockets, so `wake` only starts a fresh Firecracker to load the snapshot, then sets the guest's clock (`src/sleep.rs`). The snapshot runs on the boot's own uncommitted disk, so only that boot can wake it: a stop wakes the VM to shut down cleanly, and a restore stops it first.
 - **Out of the VM, to its own boot.** The agent checkpoints, lists and restores its own VM with `runner-guest checkpoint`, `checkpoints` and `restore`, calls over vsock that the VM's `runner boot` serves (`src/calls.rs`). No call names a VM, so a guest can't reach another. Its checkpoints are capped at 10 an hour, since gc keeps them all. A restore reboots the VM onto the copy: boot commits at the clean shutdown, then exits with a status the unit restarts on. `/.runner/llm.txt` in the base image tells the agent all this.
 
 ## Milestones
@@ -29,7 +30,8 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 | M1 (this PR) | The VM store (import, create, fork, generations, undo, delete), the CLI, and MCP over stdio. No VM boots. | Checks pass here, and local Claude Code lists VMs through `ssh kvm-host runner mcp` |
 | M2 | Boot: systemd unit, tap networking with NAT, `start`, `stop`, `logs`, the guest agent, `shell` | `runner shell dev` lands you in a VM |
 | M3 | Agent runs: `run` and `output`, credentials per boot, a result of exit code and changed paths | Local Claude Code runs Claude Code in a VM and reads what it did |
-| Later | Snapshots for sleep and wake, best-of-N forks, taking over a run, more hosts | Each when it hurts |
+| M5 | Sleep and wake: Firecracker snapshots, then sleep when idle and wake on use | An idle VM sleeps, and `runner shell dev` wakes it in under a second with its processes running |
+| Later | Best-of-N forks, taking over a run, more hosts | Each when it hurts |
 
 ## Guards
 
@@ -43,6 +45,7 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
 - Each VM has an allowlist of credential names in its directory: `claude` by default, `github` only when `runner creds <vm> claude github` adds it. A fork starts from the default. No MCP tool sets it.
 - `runner-guest` asks for them each time it starts, before it takes a command: it connects to the host (CID 2) on vsock port 10023, which Firecracker passes on to `vsock.sock_10023` in the VM's directory, where `runner boot` hands it the allowed ones (`creds::Keyring`). So no command runs without them, and a restarted guest gets them again. A guest the host can't answer runs without.
 - The guest keeps them in memory, takes only those variables, and sets exactly them in each command's environment, sessions and runs included (`Keyring::apply`), last, so a request can't add or change one. Its unit sets `LimitCORE=0`, so no core dump writes one to the disk, and the base image sets up no swap.
+- A sleeping VM's snapshot is its memory, so it holds them: in `<vm>/snapshot/`, which only the runner user can read, until the VM wakes, or, if its boot was killed asleep, until it next boots or is deleted. It's no disk's, so forks and checkpoints still hold none.
 - Boot notes which ones the guest took in `<vm>/handed`, names only, and `runner status` shows them while the VM is up: `running  creds claude`.
 
 ## Assumptions (correct these)

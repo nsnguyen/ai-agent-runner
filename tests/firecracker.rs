@@ -198,3 +198,63 @@ fn only_the_pinned_version_passes() {
     let err = firecracker::check_version(&dir.path().join("missing")).unwrap_err();
     assert!(matches!(err, Error::Run { .. }), "{err}");
 }
+
+// `runner sleep`: a paused VM's whole state, written next to its disk.
+#[test]
+fn a_snapshot_is_full_and_left_to_the_page_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("api.sock");
+    let api = FakeApi::serve(&sock, |_| (204, None));
+    let (vmstate, mem) = (
+        Path::new("/vms/dev/snapshot/vmstate"),
+        Path::new("/vms/dev/snapshot/mem"),
+    );
+    Api::new(&sock).snapshot(vmstate, mem).unwrap();
+    assert_eq!(
+        api.calls(),
+        [(
+            "PUT /snapshot/create".to_string(),
+            json!({"snapshot_type": "Full", "snapshot_path": "/vms/dev/snapshot/vmstate",
+                   "mem_file_path": "/vms/dev/snapshot/mem", "sync_snapshot_files": false})
+        )]
+    );
+}
+
+// `runner wake`: a fresh Firecracker takes the snapshot, its memory mapped
+// from the file, and runs it at once.
+#[test]
+fn a_load_maps_the_memory_file_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("api.sock");
+    let api = FakeApi::serve(&sock, |_| (204, None));
+    let (vmstate, mem) = (
+        Path::new("/vms/dev/snapshot/vmstate"),
+        Path::new("/vms/dev/snapshot/mem"),
+    );
+    Api::new(&sock).load(vmstate, mem).unwrap();
+    assert_eq!(
+        api.calls(),
+        [(
+            "PUT /snapshot/load".to_string(),
+            json!({"snapshot_path": "/vms/dev/snapshot/vmstate",
+                   "mem_backend": {"backend_type": "File", "backend_path": "/vms/dev/snapshot/mem"},
+                   "resume_vm": true})
+        )]
+    );
+}
+
+// Writing a big VM's memory takes longer than any other call may.
+#[test]
+fn a_snapshot_waits_longer_than_other_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("api.sock");
+    let _api = FakeApi::serve(&sock, |req| {
+        if req.path == "/snapshot/create" {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        (204, None)
+    });
+    let api = Api::new(&sock).timeout(std::time::Duration::from_millis(100));
+    let slow = Path::new("/x");
+    api.snapshot(slow, slow).unwrap();
+}

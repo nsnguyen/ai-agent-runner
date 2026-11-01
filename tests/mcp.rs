@@ -2,7 +2,7 @@
 // through `ssh -T host runner mcp`.
 mod common;
 
-use common::{FakeSystemd, FakeVsock, Guest, me};
+use common::{FakeSystemd, FakeVsock, Guest, StandIn, me};
 use runner::exec::OUTPUT_CAP;
 use runner::store::Store;
 use serde_json::{Value, json};
@@ -133,10 +133,12 @@ fn lists_its_tools() {
             "restore_vm",
             "run_agent",
             "run_output",
+            "sleep_vm",
             "start_vm",
             "stop_vm",
             "undo_vm",
-            "vm_status"
+            "vm_status",
+            "wake_vm"
         ]
     );
 }
@@ -217,6 +219,41 @@ fn start_status_and_stop_through_systemd() {
         why.contains("Job for firecracker@base.service failed."),
         "{why}"
     );
+}
+
+// Through the VM's boot (src/sleep.rs), which a stand-in plays here.
+#[test]
+fn sleep_and_wake_through_the_vm_s_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("dev", &disk).unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    sd.set_state("active");
+    let boot = StandIn::serve(&store, "dev");
+    let mut s = start_with_path(dir.path(), &sd.path());
+    let got = s.call(2, "sleep_vm", json!({"name": "dev"}));
+    assert_eq!(
+        got["structuredContent"]["state"],
+        json!("sleeping"),
+        "{got}"
+    );
+    let got = s.call(3, "vm_status", json!({"name": "dev"}));
+    assert_eq!(
+        got["structuredContent"]["state"],
+        json!("sleeping"),
+        "{got}"
+    );
+    let got = s.call(4, "wake_vm", json!({"name": "dev"}));
+    assert_eq!(got["structuredContent"]["state"], json!("running"), "{got}");
+    assert_eq!(
+        boot.asked(),
+        [runner::sleep::Ask::Sleep, runner::sleep::Ask::Wake]
+    );
+    sd.set_state("inactive");
+    let got = s.call(5, "wake_vm", json!({"name": "dev"}));
+    assert_eq!(got["isError"], json!(true), "{got}");
 }
 
 #[test]

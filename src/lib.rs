@@ -18,5 +18,6 @@ pub mod result;
 pub mod runs;
 pub mod services;
 pub mod sessions;
+pub mod sleep;
 pub mod store;
 pub mod systemd;

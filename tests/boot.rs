@@ -2,18 +2,21 @@
 // Firecracker whose API socket this test serves. No KVM needed.
 mod common;
 
-use common::{FakeApi, FakeFirecracker, Reply, Request, script, text, wait_for};
+use common::{FakeApi, FakeFirecracker, FakeVsock, Reply, Request, script, text, wait_for};
 use runner::boot;
 use runner::calls::{self, Answer, Call};
 use runner::creds::{self, Cred, Keyring};
 use runner::firecracker::{self, BOOT_ARGS};
 use runner::net::{self, HOST_RESOLV_CONFS};
+use runner::proto;
+use runner::sleep;
 use runner::store::{Config, Error, Store};
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -838,4 +841,451 @@ fn a_guest_s_restore_is_dropped_if_its_vm_crashes() {
         .map(|c| c.id)
         .collect();
     assert_eq!(ids, [1, 0]);
+}
+
+// Sleep and wake (src/sleep.rs), which boot does for its VM when asked on its
+// socket. Each wake starts a fresh Firecracker, whose API socket the test
+// serves once it has started.
+
+// Firecracker's answers while the VM is up: a snapshot writes its two files,
+// as the real one does, and Ctrl-Alt-Del shuts the guest down.
+fn firecracker_that_sleeps(fc: &FakeFirecracker) -> impl Fn(&Request) -> Reply + Send + 'static {
+    let fc = fc.clone();
+    move |req| {
+        if req.path == "/snapshot/create" {
+            for file in ["snapshot_path", "mem_file_path"] {
+                fs::write(req.body[file].as_str().unwrap(), file).unwrap();
+            }
+        }
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            fc.exit_with(0);
+        }
+        (204, None)
+    }
+}
+
+// The next Firecracker boot starts, once it has: its API on the test's
+// `respond`, and the guest behind its vsock socket, which records what it's
+// asked to run and runs nothing.
+fn next_firecracker(h: &Host, respond: impl Fn(&Request) -> Reply + Send + 'static) -> Up {
+    let argv = h.fc.next();
+    let dev = h.vm_dir("dev");
+    let guest = h.dir.path().join(format!("guest-{}.sock", h.fc.pid()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let listener = UnixListener::bind(&guest).unwrap();
+    let seen = asked.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let _ = proto::hello(&mut conn);
+            if proto::check_hello(&mut conn).is_err() {
+                continue;
+            }
+            if let Ok(Some(req)) = proto::read_frame::<proto::Request>(&mut conn) {
+                seen.lock().unwrap().push(req);
+                let _ =
+                    proto::write_frame(&mut conn, &proto::FromGuest::Exit(proto::Exit::Code(0)));
+            }
+        }
+    });
+    // Firecracker binds the vsock socket as it loads, before its API answers.
+    let vsock = FakeVsock::serve(&dev.join("vsock.sock"), &guest);
+    let api = FakeApi::serve(&dev.join("api.sock"), respond);
+    Up {
+        argv,
+        api,
+        asked,
+        _vsock: vsock,
+    }
+}
+
+struct Up {
+    argv: Vec<String>,
+    api: FakeApi,
+    /// What the host asked the guest to run.
+    asked: Arc<Mutex<Vec<proto::Request>>>,
+    _vsock: FakeVsock,
+}
+
+// dev booted, its guest up: it has asked for its credentials.
+fn booted(h: &Host) -> (Child, Up) {
+    let boot = h.boot("dev");
+    let up = next_firecracker(h, firecracker_that_sleeps(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    guest_up(h);
+    (boot, up)
+}
+
+// Boot notes the handoff just after it.
+fn guest_up(h: &Host) {
+    guest_asks(h, "dev");
+    wait_for("the handoff's note", || {
+        h.store.handed("dev").unwrap().is_some()
+    });
+}
+
+fn alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn after(up: &Up, n: usize) -> Vec<(String, Value)> {
+    up.api.calls()[n..].to_vec()
+}
+
+#[test]
+fn sleep_snapshots_the_vm_and_stops_firecracker_but_not_boot() {
+    let h = Host::new();
+    let (mut boot, up) = booted(&h);
+    let booted = up.api.calls().len();
+    let fc = h.fc.pid();
+    let dev = h.vm_dir("dev");
+
+    sleep::sleep(&h.store, "dev").unwrap();
+    let snap = dev.join("snapshot");
+    assert_eq!(
+        after(&up, booted),
+        [
+            ("PATCH /vm".to_string(), json!({"state": "Paused"})),
+            (
+                "PUT /snapshot/create".to_string(),
+                json!({"snapshot_type": "Full", "snapshot_path": snap.join("vmstate"),
+                       "mem_file_path": snap.join("mem"), "sync_snapshot_files": false})
+            ),
+        ]
+    );
+    assert!(!alive(fc), "firecracker still running");
+    assert!(!dev.join("api.sock").exists() && !dev.join("vsock.sock").exists());
+    // Pinned to the disk its boot runs, which stays uncommitted and held.
+    let slept = h.store.sleeping("dev").unwrap().expect("not sleeping");
+    assert_eq!(slept.generation, 1);
+    assert!(boot.try_wait().unwrap().is_none(), "boot ended");
+    assert!(matches!(h.store.undo("dev"), Err(Error::Busy(_))));
+    assert!(matches!(h.store.gc("dev", false), Err(Error::Busy(_))));
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    // The guest's own sockets stay up for when it wakes.
+    assert!(dev.join(format!("vsock.sock_{}", creds::PORT)).exists());
+    assert!(calls_socket(&h).exists());
+
+    // Asleep already: nothing to do.
+    sleep::sleep(&h.store, "dev").unwrap();
+    assert_eq!(up.api.calls().len(), booted + 2);
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+#[test]
+fn wake_loads_the_snapshot_into_a_new_firecracker_and_sets_the_guest_s_clock() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let dev = h.vm_dir("dev");
+    let snap = dev.join("snapshot");
+
+    let store = h.store.clone();
+    let waking = std::thread::spawn(move || sleep::wake(&store, "dev"));
+    let api_sock = dev.join("api.sock");
+    // The same command, so the same sockets, as the boot's first.
+    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    waking.join().unwrap().unwrap();
+    let woke = chrono::Utc::now();
+    assert_eq!(
+        up.argv,
+        ["--api-sock", api_sock.to_str().unwrap(), "--id", "dev"]
+    );
+    assert_eq!(
+        up.api.calls(),
+        [(
+            "PUT /snapshot/load".to_string(),
+            json!({"snapshot_path": snap.join("vmstate"),
+                   "mem_backend": {"backend_type": "File", "backend_path": snap.join("mem")},
+                   "resume_vm": true})
+        )]
+    );
+    // Its clock stood still while it slept: the host sets it, as root.
+    let asked = up.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let argv = &asked[0].argv;
+    assert_eq!(argv[..3], ["date", "-u", "-s"], "{argv:?}");
+    assert_eq!(asked[0].user, None);
+    let secs: f64 = argv[3].strip_prefix('@').unwrap().parse().unwrap();
+    assert!((woke.timestamp() as f64 - secs).abs() < 5.0, "{argv:?}");
+    // Awake, with nothing left of the snapshot.
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!snap.join("vmstate").exists() && !snap.join("mem").exists());
+    // Awake already: nothing to do.
+    sleep::wake(&h.store, "dev").unwrap();
+    assert_eq!(up.api.calls().len(), 1);
+
+    // It shuts down as any VM does, committing the disk it ran all along.
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
+// Asleep from the moment it starts to sleep, so a wake asked meanwhile waits
+// for the sleep and wakes it, rather than looking for a guest that's going.
+#[test]
+fn a_vm_is_listed_asleep_while_its_snapshot_is_written() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let store = h.store.clone();
+    let during = Arc::new(Mutex::new(None));
+    let seen = during.clone();
+    let writes = firecracker_that_sleeps(&h.fc);
+    let _up = next_firecracker(&h, move |req| {
+        if req.path == "/snapshot/create" {
+            *seen.lock().unwrap() = Some(store.sleeping("dev").unwrap().is_some());
+        }
+        writes(req)
+    });
+    assert_eq!(h.ready(), "READY=1");
+    guest_up(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    assert_eq!(*during.lock().unwrap(), Some(true));
+    let mut boot = boot;
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+// Upgraded while the VM slept: its snapshot is for the old Firecracker.
+#[test]
+fn a_wake_checks_firecracker_s_version_again() {
+    let h = Host::new();
+    let (mut boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    fs::write(h.fc.dir.join("version"), "v1.0.0").unwrap();
+    let err = sleep::wake(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("pinned to"), "{err}");
+    assert!(err.to_string().contains("sleeps on"), "{err}");
+    assert!(!h.fc.started(), "a firecracker started");
+    assert!(h.store.sleeping("dev").unwrap().is_some());
+    boot.kill().unwrap();
+    boot.wait().unwrap();
+}
+
+// A load that got no answer may have run the guest, which may have written
+// to its disk since the snapshot: waking it again could load old memory
+// over a newer disk, so the snapshot goes, and the boot with it.
+#[test]
+fn a_load_with_no_answer_drops_the_snapshot() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let store = h.store.clone();
+    let waking = std::thread::spawn(move || sleep::wake(&store, "dev"));
+    h.fc.next();
+    // Each request read, and its connection dropped without a reply.
+    let api = UnixListener::bind(h.vm_dir("dev").join("api.sock")).unwrap();
+    std::thread::spawn(move || {
+        for conn in api.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let _ = std::io::Read::read(&mut conn, &mut [0; 512]);
+        }
+    });
+    let began = std::time::Instant::now();
+    let err = waking.join().unwrap().unwrap_err();
+    assert!(err.to_string().contains("snapshot is dropped"), "{err}");
+    // Not a timeout: the answer never came.
+    assert!(began.elapsed() < Duration::from_secs(5), "{err}");
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{notes}");
+    assert!(notes.contains("generation 1 is kept for a look"), "{notes}");
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!h.vm_dir("dev").join("snapshot/mem").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+}
+
+#[test]
+fn halting_a_sleeping_vm_wakes_it_to_shut_down_cleanly() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let halt = h
+        .runner(&["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    let out = halt.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let calls: Vec<String> = up.api.calls().into_iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["PUT /snapshot/load", "PATCH /vm", "PUT /actions"]);
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+}
+
+// A snapshot Firecracker won't load: the VM sleeps on, and a halt, which
+// can't wake it either, drops it, and its disk rolls back as after a kill.
+#[test]
+fn a_snapshot_that_won_t_load_sleeps_on_until_a_halt_drops_it() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let refuse = |req: &Request| {
+        if req.path == "/snapshot/load" {
+            let fault = json!({"fault_message": "Cannot restore microvm state"});
+            return (400, Some(fault.to_string()));
+        }
+        (204, None)
+    };
+    let store = h.store.clone();
+    let waking = std::thread::spawn(move || sleep::wake(&store, "dev"));
+    let _up = next_firecracker(&h, refuse);
+    let err = waking.join().unwrap().unwrap_err();
+    assert!(
+        err.to_string().contains("Cannot restore microvm state"),
+        "{err}"
+    );
+    assert!(
+        !alive(h.fc.pid()),
+        "the failed firecracker is still running"
+    );
+    assert!(
+        h.store.sleeping("dev").unwrap().is_some(),
+        "not sleeping on"
+    );
+
+    let halt = h
+        .runner(&["halt", "dev"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _up = next_firecracker(&h, refuse);
+    let halted = halt.wait_with_output().unwrap();
+    assert!(halted.status.success(), "{}", text(&halted.stderr));
+    assert!(
+        text(&halted.stderr).contains("dropped"),
+        "{}",
+        text(&halted.stderr)
+    );
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{notes}");
+    assert!(notes.contains("generation 1 is kept for a look"), "{notes}");
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+}
+
+#[test]
+fn a_failed_snapshot_leaves_the_vm_running() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let fc = h.fc.clone();
+    let up = next_firecracker(&h, move |req| {
+        if req.path == "/snapshot/create" {
+            return (
+                400,
+                Some(json!({"fault_message": "No space left"}).to_string()),
+            );
+        }
+        if req.body == json!({"action_type": "SendCtrlAltDel"}) {
+            fc.exit_with(0);
+        }
+        (204, None)
+    });
+    assert_eq!(h.ready(), "READY=1");
+    guest_up(&h);
+    let booted = up.api.calls().len();
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("No space left"), "{err}");
+    let calls: Vec<Value> = after(&up, booted).into_iter().map(|c| c.1).collect();
+    assert_eq!(calls[0], json!({"state": "Paused"}));
+    assert_eq!(calls[2], json!({"state": "Resumed"}));
+    assert!(alive(h.fc.pid()));
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+}
+
+// Before its guest is up, a snapshot could catch the kernel booting, which
+// Firecracker says may not resume.
+#[test]
+fn sleep_waits_for_the_guest_to_be_up() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let booted = up.api.calls().len();
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("isn't up yet"), "{err}");
+    assert_eq!(up.api.calls().len(), booted);
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+// A run streams over vsock, which a sleep would cut.
+#[test]
+fn sleep_is_refused_while_a_run_holds_the_vm() {
+    let h = Host::new();
+    let (boot, up) = booted(&h);
+    let booted = up.api.calls().len();
+    let run = runner::runs::hold(&h.store, "dev").unwrap();
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(
+        err.to_string().contains("a run is starting in dev"),
+        "{err}"
+    );
+    assert_eq!(up.api.calls().len(), booted);
+    drop(run);
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+#[test]
+fn sleep_is_refused_once_a_halt_has_begun() {
+    let h = Host::new();
+    let boot = h.boot("dev");
+    // A guest slow to shut down.
+    let up = next_firecracker(&h, |_| (204, None));
+    assert_eq!(h.ready(), "READY=1");
+    guest_up(&h);
+    let halt = h.runner(&["halt", "dev"]).spawn().unwrap();
+    wait_for("Ctrl-Alt-Del", || {
+        up.api
+            .calls()
+            .iter()
+            .any(|c| c.1 == json!({"action_type": "SendCtrlAltDel"}))
+    });
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("dev is shutting down"), "{err}");
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+    let halt = halt.wait_with_output().unwrap();
+    assert!(halt.status.success());
+}
+
+// A boot killed while its VM slept left a snapshot of a disk that was
+// never committed: no later boot can wake it.
+#[test]
+fn a_boot_clears_a_snapshot_an_earlier_one_left() {
+    let h = Host::new();
+    let snap = h.store.snapshot("dev").unwrap();
+    snap.make_room().unwrap();
+    fs::write(snap.vmstate(), "state").unwrap();
+    fs::write(snap.mem(), "memory").unwrap();
+    let at = chrono::Utc::now();
+    snap.note(&runner::store::Slept { generation: 1, at })
+        .unwrap();
+    let boot = h.boot("dev");
+    let _up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!snap.mem().exists());
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+#[test]
+fn a_stopped_vm_has_no_boot_to_ask() {
+    let h = Host::new();
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(matches!(err, sleep::Error::NoBoot(_)), "{err}");
+    assert!(err.to_string().contains("dev has no boot to ask"), "{err}");
 }

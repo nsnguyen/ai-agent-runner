@@ -10,6 +10,7 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 - **VM:** a small virtual machine on the server, one per agent, with its own Linux. You give each a name, like `dev`.
 - **base:** the VM every new VM is copied from: Ubuntu with Claude Code.
 - **Checkpoint:** a saved copy of a VM's disk that you can go back to.
+- **Sleep:** a VM's memory saved to disk and the VM paused, so it costs nothing until it wakes.
 
 ## 1. Turn the server on and off
 
@@ -77,7 +78,17 @@ runner restore demo 2
 runner exec demo -- ls /home/agent/work                # notes.txt is back
 ```
 
-## 6. Let Claude do it
+## 6. Sleep: pause a VM, programs and all
+
+```sh
+runner sleep demo      # demo's memory goes to disk: it uses no CPU or RAM
+runner status demo     # sleeping
+runner wake demo       # back in about a second, every program where it was
+```
+
+`runner start`, `exec`, `shell` and `claude` wake it too. `runner stop` wakes it first, so it still shuts down cleanly and saves its disk.
+
+## 7. Let Claude do it
 
 **Claude inside the VM.** In `runner claude demo`, ask in plain words:
 
@@ -97,7 +108,7 @@ Then in `claude` on your laptop:
 
 > Use the runner MCP: checkpoint demo as "safe point", run an agent in demo to clean up /home/agent/work, show me the result, and restore "safe point" if anything looks wrong.
 
-## 7. When you're done
+## 8. When you're done
 
 ```sh
 runner stop demo       # saves its disk
@@ -112,7 +123,7 @@ client/aws.sh stop     # turn the server off
 | `AWS won't take this laptop's credentials` | `aws login --profile runner` |
 | `runner list` hangs, or can't find `kvm-host` | Connect Tailscale, and check the server is on (`client/aws.sh start`) |
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
-| `demo is busy` | It's running: `runner stop demo` first |
+| `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |
 
 More detail: README.md.

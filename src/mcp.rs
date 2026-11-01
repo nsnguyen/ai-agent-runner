@@ -222,7 +222,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Boot a VM from its current disk. Returns once the guest has started. The VM can't be deleted or undone while it runs."
+        description = "Boot a VM from its current disk, or wake it if it's sleeping. Returns once the guest has started. The VM can't be deleted or undone while it runs or sleeps."
     )]
     async fn start_vm(
         &self,
@@ -233,7 +233,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Shut a VM down with Ctrl-Alt-Del, killing it after 30 seconds. A clean shutdown keeps what the VM wrote to its disk; a kill rolls the disk back."
+        description = "Shut a VM down with Ctrl-Alt-Del, killing it after 30 seconds. A clean shutdown keeps what the VM wrote to its disk; a kill rolls the disk back. A sleeping VM is woken first, so it shuts down cleanly."
     )]
     async fn stop_vm(
         &self,
@@ -244,7 +244,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Say whether a VM is stopped, booting, running or stopping, and while it's up, which credentials its guest took, by name."
+        description = "Say whether a VM is stopped, booting, running, sleeping or stopping, and while it's up, which credentials its guest took, by name."
     )]
     fn vm_status(
         &self,
@@ -253,6 +253,28 @@ impl Tools {
         systemd::status(&self.store, &name)
             .map(Json)
             .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Put a running VM to sleep: its memory and devices go to a snapshot on the host and its Firecracker stops, so it takes no CPU or RAM. wake_vm, start_vm or exec brings it back in about a second with every process as it was. Open shells and execs end; tmux sessions live on. Fails while a run is going, and before the guest is up."
+    )]
+    async fn sleep_vm(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<VmStatus>, String> {
+        let store = self.store.clone();
+        blocking(move || systemd::sleep(&store, &name)).await
+    }
+
+    #[tool(
+        description = "Wake a sleeping VM where it was, and set its clock, which stood still while it slept. A VM awake already stays so."
+    )]
+    async fn wake_vm(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<VmStatus>, String> {
+        let store = self.store.clone();
+        blocking(move || systemd::wake(&store, &name)).await
     }
 
     #[tool(
@@ -284,7 +306,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Freeze a copy of a VM's disk, with an optional comment, for restore_vm to bring back. A running VM is synced and paused for the copy, then carries on."
+        description = "Freeze a copy of a VM's disk, with an optional comment, for restore_vm to bring back. A running VM is synced and paused for the copy, then carries on; a sleeping one is woken first."
     )]
     async fn checkpoint_vm(
         &self,
@@ -490,7 +512,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running VM is stopped first, ending what runs in it, and started again after; one stopping is waited out and stays stopped. Fails while a run is going."
+        description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running or sleeping VM is stopped first, ending what runs in it, and started again after, awake; one stopping is waited out and stays stopped. Fails while a run is going."
     )]
     async fn restore_vm(
         &self,

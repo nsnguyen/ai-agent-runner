@@ -54,12 +54,22 @@ enum Cmd {
     },
     /// List VMs, their current disk generation and the space their disks use.
     List,
-    /// Boot a VM under systemd. Returns once its guest has started.
+    /// Boot a VM under systemd, or wake it if it's sleeping. Returns once its
+    /// guest has started.
     Start { name: String },
-    /// Shut a VM down: Ctrl-Alt-Del, and a kill after 30 seconds.
+    /// Shut a VM down: Ctrl-Alt-Del, and a kill after 30 seconds. A sleeping
+    /// VM is woken first, so it shuts down cleanly.
     Stop { name: String },
-    /// Say whether a VM is stopped, booting, running or stopping.
+    /// Say whether a VM is stopped, booting, running, sleeping or stopping.
     Status { name: String },
+    /// Put a running VM to sleep: its memory goes to a snapshot on the host
+    /// and its Firecracker stops, so it takes no CPU or RAM. `wake`, `start`
+    /// or `exec` brings it back in about a second, every process as it was.
+    /// Open shells and execs end; tmux sessions live on. Refused while a run
+    /// is going.
+    Sleep { name: String },
+    /// Bring a sleeping VM back where it was, and set its clock.
+    Wake { name: String },
     /// Show a VM's serial console and boot notes, from journald.
     Logs {
         name: String,
@@ -84,7 +94,7 @@ enum Cmd {
         dry_run: bool,
     },
     /// Freeze a copy of a VM's disk to restore later. A running VM is synced
-    /// and paused for the copy, and carries on.
+    /// and paused for the copy, and carries on; a sleeping one is woken first.
     Checkpoint {
         name: String,
         /// A note to know it by.
@@ -95,8 +105,8 @@ enum Cmd {
     /// `*` marks the current one.
     Checkpoints { name: String },
     /// Make a copy of a checkpoint the VM's current disk. `undo` reverses it.
-    /// A running VM is stopped first and started again after; a stopping one
-    /// is waited out and stays stopped.
+    /// A running or sleeping VM is stopped first and started again after,
+    /// awake; a stopping one is waited out and stays stopped.
     Restore { name: String, id: u64 },
     /// Print the firecracker@.service unit for this binary and root.
     Unit {
@@ -356,6 +366,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Start { name } => show_status(&systemd::start(&store, &name)?),
         Cmd::Stop { name } => show_status(&systemd::stop(&store, &name)?),
         Cmd::Status { name } => show_status(&systemd::status(&store, &name)?),
+        Cmd::Sleep { name } => show_status(&systemd::sleep(&store, &name)?),
+        Cmd::Wake { name } => show_status(&systemd::wake(&store, &name)?),
         Cmd::Logs {
             name,
             follow,
