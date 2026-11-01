@@ -28,6 +28,13 @@ you can go back.
 - Checkpoints are frozen copies of the disk, kept until the owner deletes
   the VM, whatever happens to this boot.
 
+## Services
+
+- The owner's services are systemd units named runner-svc-<name>, which
+  start at every boot and again a second after they exit. After you change
+  what one runs, `sudo systemctl restart runner-svc-<name>`; `journalctl -u
+  runner-svc-<name>` shows its output. They get no credentials.
+
 ## Checkpoints, from in here
 
 - `runner-guest checkpoint -m "before the migration"` freezes a copy of this

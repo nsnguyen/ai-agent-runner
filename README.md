@@ -209,6 +209,10 @@ lands you in Claude Code running in dev, logged in with the host's token (docs/h
 
 `runner shell dev --session work` (or `-s work`) lands you in tmux session `work` in dev, making it if it's new. Detach with tmux's `Ctrl-b d`, or just close the laptop: a dropped connection detaches the session and never kills it. `runner attach dev work` gets back in, `runner sessions dev` lists each session's name, the command in its active pane, when it started and whether anyone is attached, and `runner kill dev work` ends one. They're `agent`'s own tmux sessions, so `tmux ls` inside the VM shows the same ones. Only `shell --session` starts a stopped VM; a stopped one has no sessions.
 
+### Services
+
+`runner service add dev web -- python3 -m http.server 8080` keeps a dev server up whenever dev is: a systemd unit in the VM, `runner-svc-web`, runs it as `agent` in `/home/agent/work` (`--dir` picks another, and a relative program like `./serve` is taken from there), now and at every boot, and starts it again a second after it exits. It runs as given, not through a shell: `-- sh -c 'npm i && npm run dev'` for shell syntax. `add` returns once the program has started; one that can't start fails with the journal's reason and leaves nothing behind. `runner service list dev` shows each one's systemd state, like `active/running`, or `activating/auto-restart` while it crash-loops; `runner service logs dev web` its output (`-f`, `-n 50`); and `runner service rm dev web` stops it for good. Each starts a stopped VM first. A service gets no credentials. From the host it answers at `runner ip dev`'s address. MCP has `add_service`, `list_services` and `remove_service`.
+
 ### Headless runs
 
 ```sh
