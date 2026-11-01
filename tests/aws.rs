@@ -393,6 +393,42 @@ fn ssh_logs_in_as_ubuntu_with_the_key() {
 }
 
 #[test]
+fn ssh_goes_over_the_tailnet_once_ssh_is_closed() {
+    // `close` let nothing in from the internet: the host is kvm-host there.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+        aws.has("has-sg", "");
+        ok(&aws.run(shell, &["ssh", "uptime"]));
+        let argv = aws.ssh_argv();
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["ubuntu@kvm-host", "uptime"],
+            "{argv:?}"
+        );
+        assert_eq!(after(&argv, "-i"), aws.key().display().to_string());
+    }
+}
+
+#[test]
+fn ssh_goes_to_the_public_address_while_ssh_is_open() {
+    let perms = r#"[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "198.51.100.4/32"}]}]"#;
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+        aws.has("has-sg", "");
+        aws.has("perms", &format!("{perms}\n"));
+        ok(&aws.run(shell, &["ssh", "uptime"]));
+        let argv = aws.ssh_argv();
+        assert_eq!(
+            argv[argv.len() - 2..],
+            [format!("ubuntu@{HOST_IP}"), "uptime".into()],
+            "{argv:?}"
+        );
+    }
+}
+
+#[test]
 fn ip_prints_the_address() {
     for shell in SHELLS {
         let aws = Aws::new();

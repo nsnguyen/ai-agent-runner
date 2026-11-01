@@ -64,7 +64,7 @@ The host runs whatever was last copied to it. Copy and install again:
 ```sh
 git checkout main && git pull
 rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ ubuntu@kvm-host:ai-agent-runner/
-ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host 'cd ai-agent-runner && . ~/.cargo/env && cargo build --release && sudo host/install.sh'
+client/aws.sh ssh 'cd ai-agent-runner && . ~/.cargo/env && cargo build --release && sudo host/install.sh'
 ```
 
 The install ends with `runner doctor`: every line should be `ok`. The boot tests, at each milestone, are in docs/host.md (Boot tests): run them on the host, in `~/ai-agent-runner`.
@@ -74,7 +74,7 @@ The install ends with `runner doctor`: every line should be `ok`. The boot tests
 - `aws.sh: AWS won't take this laptop's credentials`: run `aws login --profile runner`, and check `AWS_PROFILE=runner` is set.
 - `runner@kvm-host: Permission denied (publickey)`: the laptop's key line in the host's `~runner/.ssh/authorized_keys` must read `from="…",restrict,pty ssh-ed25519 AAAA…`, with nothing between `pty` and the key.
 - `runner list` hangs or can't resolve `kvm-host`: Tailscale isn't connected on the laptop, or the host is stopped (`client/aws.sh ip` says).
-- `client/aws.sh ssh` times out: SSH from the internet is closed (`client/aws.sh close`). Use `ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host` over the tailnet, or `client/aws.sh open` to let this laptop's address in again.
+- `client/aws.sh ssh` times out: after `close` it goes over the tailnet, as `kvm-host`, so Tailscale has to be connected on the laptop. Before `close`, it goes to the public address, which lets in only the laptop's address from when `up` or `open` last ran: run `client/aws.sh open` again.
 - A VM won't start or stop: `runner logs dev` shows its console and boot notes.
 
 ## Set up a host
@@ -149,7 +149,7 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname
 ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
 ```
 
-Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` dials the public address, so it stops working too; `ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host` reaches the host over the tailnet, and the rsync above, to `ubuntu@kvm-host:ai-agent-runner/`, upgrades it. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
+Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` then goes over the tailnet, as `kvm-host`, and the rsync above, to `ubuntu@kvm-host:ai-agent-runner/`, upgrades the host. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
 
 ## Build the base image
 
