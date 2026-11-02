@@ -11,6 +11,8 @@ use crate::idle::InUse;
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use crate::store::Store;
 use crate::systemd::{self, State};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::termios::{self, SetArg, Termios};
 use rmcp::schemars;
@@ -18,6 +20,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -117,6 +120,34 @@ pub fn open_running(store: &Store, name: &str) -> Result<Option<Conn>> {
     }
     let stream = reach(store, name)?;
     Ok(Some(Conn { stream, in_use }))
+}
+
+/// Holds the VM in use, starting it first unless it's running, until
+/// `conn`'s far end closes: what the laptop's `runner proxy` runs on the host
+/// beside its tunnel, so the VM doesn't idle-sleep under the proxy. Over SSH,
+/// `conn` is stdout, a pipe sshd closes once the connection goes. It reads
+/// nothing, so stdin closing isn't it. A signal ends it too, and the lock goes
+/// with the process.
+pub fn hold(store: &Store, name: &str, conn: impl AsFd) -> Result<()> {
+    let _in_use = InUse::take(store, name)?;
+    if systemd::status(store, name)?.state != State::Running {
+        systemd::start(store, name)?;
+    }
+    hung_up(conn.as_fd()).map_err(io_err("waiting for the connection to close"))
+}
+
+// Returns once `fd`'s far end has closed. It asks poll for no events, so
+// only a hang-up or an error ends the wait: POLLERR for a pipe, POLLHUP for
+// a socket or a terminal.
+fn hung_up(fd: BorrowedFd) -> io::Result<()> {
+    let mut fds = [PollFd::new(fd, PollFlags::empty())];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Connects to the VM's runner-guest, waiting for one that's booting.

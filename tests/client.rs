@@ -3,13 +3,20 @@
 // sshd does for the runner user, where a fake host `runner` records what
 // arrived. No network and no host.
 use nix::pty::{OpenptyResult, openpty};
+use nix::sys::signal::{Signal, kill, killpg};
+use nix::unistd::Pid;
 use proptest::prelude::*;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 use tempfile::TempDir;
+
+mod common;
+use common::wait_for;
 
 // Linux's sh, and bash in POSIX mode, which is what macOS's /bin/sh is.
 const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
@@ -59,25 +66,35 @@ impl Laptop {
         let bin = dir.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(dir.path().join("home")).unwrap();
-        // Every call goes in SSH_LOG too, one record each. A tunnel (-N) runs
-        // nothing on the host: it notes the VM's state as it opens, and ends.
+        // Every call goes in SSH_LOG too, one record each. A tunnel (-L)
+        // notes the VM's state as it opens, then runs its command as sshd
+        // does: in a session of its own, as if on another machine, with its
+        // stdout read here, so that end closes when this process dies.
         script(
             &bin.join("ssh"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$SSH_ARGV"
 { for arg; do printf '%s\0' "$arg"; done; printf '\036'; } >>"$SSH_LOG"
+for cmd; do :; done
 for arg; do
-  if [ "$arg" = -N ]; then
+  if [ "$arg" = -L ]; then
     cat "$VM_STATE" >"$TUNNEL_SAW" 2>/dev/null
-    exit "${TUNNEL_EXIT:-0}"
+    [ -z "${TUNNEL_EXIT-}" ] || exit "$TUNNEL_EXIT"
+    rm -f "$CONN" && mkfifo "$CONN" || exit 255
+    setsid -w bash -c "$cmd" >"$CONN" </dev/null &
+    while read -r _; do :; done <"$CONN"
+    wait $!
+    exit
   fi
 done
-for cmd; do :; done
 exec bash -c "$cmd"
 "#,
         );
         // Reads stdin only when asked, since a terminal's would never end.
         // `start` brings the VM up and `ip` prints its address, as the real
-        // ones do; HOST_LOG has every call, a line each.
+        // ones do; HOST_LOG has every call, a line each. `hold` ends at once
+        // unless HOLD_ON is set: then it holds until its stdout's far end
+        // closes, which a write finds, noting both in HELD. HOLD_OLD makes
+        // it a host runner from before `hold`.
         script(
             &bin.join("runner"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$HOST_ARGV"
@@ -87,6 +104,14 @@ printf '%s\n' "$*" >>"$HOST_LOG"
 case $1 in
 start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
 ip) printf '%s\n' "${HOST_IP-172.16.0.6}" ;;
+hold)
+  [ -z "${HOLD_OLD-}" ] || { echo "error: unrecognized subcommand 'hold'" >&2; exit 2; }
+  [ -n "${HOLD_ON-}" ] || exit 0
+  echo holding >>"$HELD"
+  trap '' PIPE
+  while echo; do sleep 0.05; done 2>/dev/null
+  echo "let go" >>"$HELD"
+  ;;
 esac
 "#,
         );
@@ -121,6 +146,10 @@ esac
             .env("HOST_LOG", self.path("host-log"))
             .env("VM_STATE", self.path("vm-state"))
             .env("TUNNEL_SAW", self.path("tunnel-saw"))
+            .env("CONN", self.path("conn"))
+            .env("HELD", self.path("held"))
+            .env_remove("HOLD_ON")
+            .env_remove("HOLD_OLD")
             .env_remove("HOST_STDIN")
             .env_remove("HOST_EXIT")
             .env_remove("HOST_IP")
@@ -162,6 +191,12 @@ esac
     fn tunnel_saw(&self) -> Option<String> {
         let saw = fs::read_to_string(self.path("tunnel-saw")).ok()?;
         Some(saw.trim().to_string())
+    }
+
+    /// What the host's hold has noted: holding, then let go.
+    fn held(&self) -> Vec<String> {
+        let held = fs::read_to_string(self.path("held")).unwrap_or_default();
+        held.lines().map(str::to_string).collect()
     }
 }
 
@@ -434,8 +469,10 @@ fn install_puts_runner_in_local_bin_and_saves_the_host() {
 }
 
 // `runner proxy`: the host starts the VM and says its address, then ssh
-// forwards each laptop port to it, through the host.
+// forwards each laptop port to it, through the host, while the host's
+// `runner hold` holds the VM in use, so it doesn't idle-sleep under the proxy.
 const ASK: &str = "runner start dev >/dev/null && runner ip dev";
+const HOLD: &str = "runner hold dev";
 
 // No stdin and no tty: keys typed while the VM boots stay in the terminal,
 // and the address comes back without a \r.
@@ -443,12 +480,17 @@ fn ask(cmd: &str) -> Vec<String> {
     ["-n", "-T", HOST, cmd].map(str::to_string).to_vec()
 }
 
+// The hold reads nothing, so keys typed while it's up go nowhere either.
 fn tunnel(forwards: &[&str]) -> Vec<String> {
-    let mut argv = vec!["-N", "-o", "ExitOnForwardFailure=yes"];
+    tunnel_for(HOLD, forwards)
+}
+
+fn tunnel_for(hold: &str, forwards: &[&str]) -> Vec<String> {
+    let mut argv = vec!["-n", "-T", "-o", "ExitOnForwardFailure=yes"];
     for f in forwards {
         argv.extend(["-L", f]);
     }
-    argv.push(HOST);
+    argv.extend([HOST, hold]);
     argv.into_iter().map(str::to_string).collect()
 }
 
@@ -467,7 +509,11 @@ fn proxy_forwards_one_port_to_the_same_port_on_the_vm() {
             [ask(ASK), tunnel(&["localhost:3000:172.16.0.6:3000"])],
             "{shell:?}"
         );
-        assert_eq!(laptop.host_calls(), ["start dev", "ip dev"], "{shell:?}");
+        assert_eq!(
+            laptop.host_calls(),
+            ["start dev", "ip dev", "hold dev"],
+            "{shell:?}"
+        );
         let err = text(&out.stderr);
         assert!(err.contains("localhost:3000 is dev's port 3000"), "{err}");
     }
@@ -527,7 +573,11 @@ fn proxy_starts_or_wakes_a_vm_that_isnt_running_before_the_tunnel_opens() {
                 .output()
                 .unwrap();
             ok(&out);
-            assert_eq!(laptop.host_calls(), ["start dev", "ip dev"], "{shell:?}");
+            assert_eq!(
+                laptop.host_calls(),
+                ["start dev", "ip dev", "hold dev"],
+                "{shell:?}"
+            );
             assert_eq!(
                 laptop.tunnel_saw().as_deref(),
                 Some("running"),
@@ -586,11 +636,19 @@ fn proxy_quotes_the_vm_name_for_the_host() {
         .output()
         .unwrap();
     ok(&out);
+    let calls = laptop.ssh_calls();
     assert_eq!(
-        laptop.ssh_calls()[0],
+        calls[0],
         ask(r#"runner start 'it'\''s' >/dev/null && runner ip 'it'\''s'"#)
     );
-    assert_eq!(laptop.host_argv(), ["ip", "it's"]);
+    assert_eq!(
+        calls[1],
+        tunnel_for(
+            r#"runner hold 'it'\''s'"#,
+            &["localhost:3000:172.16.0.6:3000"]
+        )
+    );
+    assert_eq!(laptop.host_argv(), ["hold", "it's"]);
 }
 
 #[test]
@@ -647,5 +705,82 @@ fn the_tunnels_exit_code_is_the_proxys() {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(255), "{shell:?}");
+    }
+}
+
+// The proxy as typed at a terminal, in a process group of its own as a
+// terminal's job is, once the host's hold has the VM: the hold lasts while the
+// tunnel does, which `end` then ends.
+fn hold_then(shell: &[&str], end: impl FnOnce(&std::process::Child)) -> Laptop {
+    let laptop = Laptop::new();
+    let mut proxy = Running(
+        laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("HOLD_ON", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    wait_for("the hold", || !laptop.held().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        proxy.0.try_wait().unwrap().is_none(),
+        "{shell:?}: proxy ended"
+    );
+    assert_eq!(laptop.held(), ["holding"], "{shell:?}");
+    end(&proxy.0);
+    proxy.0.wait().unwrap();
+    wait_for("the hold to let go", || laptop.held().len() == 2);
+    assert_eq!(laptop.held(), ["holding", "let go"], "{shell:?}");
+    laptop
+}
+
+// A proxy a failed assert left running still ends, and with its ssh the hold.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = killpg(Pid::from_raw(self.0.id() as i32), Signal::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn an_open_proxy_holds_its_vm_until_ctrl_c() {
+    for shell in SHELLS {
+        hold_then(shell, |proxy| {
+            let group = Pid::from_raw(proxy.id() as i32);
+            killpg(group, Signal::SIGINT).unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_proxy_whose_ssh_dies_lets_its_vm_go() {
+    for shell in SHELLS {
+        hold_then(shell, |proxy| {
+            kill(Pid::from_raw(proxy.id() as i32), Signal::SIGKILL).unwrap();
+        });
+    }
+}
+
+// A host whose runner is older than `hold` ends the proxy at once, saying so.
+#[test]
+fn a_host_without_hold_ends_the_proxy_and_says_why() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("HOLD_OLD", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("unrecognized subcommand 'hold'"), "{err}");
     }
 }
