@@ -125,8 +125,8 @@ pub struct Checkpoint {
     pub auto: bool,
     /// Made by the agent in the VM, with `runner-guest checkpoint`.
     pub agent: bool,
-    /// Taken by a run before it joined the running VM, to restore if the run
-    /// fails.
+    /// Taken by a run before it joined the running VM, which the run's
+    /// result names for a restore by hand.
     pub run: bool,
     /// Size of its disk.
     pub bytes: u64,
@@ -1236,7 +1236,7 @@ fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> 
     }
     made.sort_unstable_by(|a, b| b.cmp(a));
     // A run going on the VM took the newest run checkpoint before it joined,
-    // and restores it if it fails. Asked after the disks were listed, so a
+    // and its result names it for a restore by hand. Asked after the disks were listed, so a
     // run that took one since holds the lock now, or took one this gc never
     // saw. Whatever else holds the run lock keeps one more for the moment.
     let over = made.len() > KEEP_CHECKPOINTS;

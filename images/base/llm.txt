@@ -29,8 +29,8 @@ you can go back.
   connections may have been dropped. Working in a detached tmux session
   doesn't keep the VM awake; a headless run does.
 - A headless run on a VM it booted keeps what it wrote only if it exits 0. A
-  run that joined a running VM checkpoints it first, and restores that
-  checkpoint unless it exits 0.
+  run that joined a running VM checkpoints it first, and keeps what it wrote
+  however it ends: the owner restores that checkpoint to undo it.
 - Checkpoints are frozen copies of the disk, whatever happens to this boot.
   The owner's are kept until the VM is deleted; yours and runs' are kept
   while they're among the newest 20 (Checkpoints, below).

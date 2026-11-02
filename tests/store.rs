@@ -742,9 +742,9 @@ fn gc_keeps_the_newest_runs_and_agent_checkpoints_and_every_one_of_mine() {
     }
 }
 
-// A run that joined a running VM restores the checkpoint it took if it
-// fails, so gc keeps that one while a run holds the VM, however many newer
-// ones there are.
+// A run that joined a running VM names the checkpoint it took in its
+// result, for a restore by hand, so gc keeps that one while a run holds the
+// VM, however many newer ones there are.
 #[test]
 fn gc_keeps_the_checkpoint_of_a_run_going_on_the_vm() {
     let (dir, store) = store();

@@ -239,8 +239,8 @@ pub fn restore(store: &Store, name: &str, id: u64) -> Result<Vm> {
     restore_held(store, name, id)
 }
 
-/// `restore`, for a caller holding the VM's run lock: a run rolling back.
-pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
+// `restore`, once it holds the VM's run lock.
+fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
     let state = systemd::status(store, name)?.state;
     match state {
         State::Stopped => return Ok(store.restore(name, id)?),
@@ -249,8 +249,7 @@ pub fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
     }
     // The freezer goes before the stop, whose halt waits on it.
     let staged = store.hold_checkpoints(name)?.stage_restore(id)?;
-    // On a VM being stopped, as `runner stop` during a joined run leaves it,
-    // `systemctl stop` waits for that stop instead.
+    // On a VM being stopped, `systemctl stop` waits for that stop instead.
     if let Err(e) = systemd::stop(store, name) {
         drop_staged(store, name, staged);
         return Err(e.into());
