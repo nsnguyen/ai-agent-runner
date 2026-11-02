@@ -437,6 +437,12 @@ fn install_puts_runner_in_local_bin_and_saves_the_host() {
 // forwards each laptop port to it, through the host.
 const ASK: &str = "runner start dev >/dev/null && runner ip dev";
 
+// No stdin and no tty: keys typed while the VM boots stay in the terminal,
+// and the address comes back without a \r.
+fn ask(cmd: &str) -> Vec<String> {
+    ["-n", "-T", HOST, cmd].map(str::to_string).to_vec()
+}
+
 fn tunnel(forwards: &[&str]) -> Vec<String> {
     let mut argv = vec!["-N", "-o", "ExitOnForwardFailure=yes"];
     for f in forwards {
@@ -458,10 +464,7 @@ fn proxy_forwards_one_port_to_the_same_port_on_the_vm() {
         ok(&out);
         assert_eq!(
             laptop.ssh_calls(),
-            [
-                vec![HOST.to_string(), ASK.to_string()],
-                tunnel(&["3000:172.16.0.6:3000"])
-            ],
+            [ask(ASK), tunnel(&["localhost:3000:172.16.0.6:3000"])],
             "{shell:?}"
         );
         assert_eq!(laptop.host_calls(), ["start dev", "ip dev"], "{shell:?}");
@@ -484,9 +487,9 @@ fn proxy_forwards_several_ports_at_once() {
         assert_eq!(
             laptop.ssh_argv(),
             tunnel(&[
-                "3000:172.16.0.6:3000",
-                "5173:172.16.0.6:5173",
-                "8080:172.16.0.6:80"
+                "localhost:3000:172.16.0.6:3000",
+                "localhost:5173:172.16.0.6:5173",
+                "localhost:8080:172.16.0.6:80"
             ]),
             "{shell:?}"
         );
@@ -505,7 +508,7 @@ fn proxy_takes_local_colon_remote() {
         ok(&out);
         assert_eq!(
             laptop.ssh_argv(),
-            tunnel(&["8080:172.16.0.6:3000"]),
+            tunnel(&["localhost:8080:172.16.0.6:3000"]),
             "{shell:?}"
         );
         let err = text(&out.stderr);
@@ -585,10 +588,7 @@ fn proxy_quotes_the_vm_name_for_the_host() {
     ok(&out);
     assert_eq!(
         laptop.ssh_calls()[0],
-        [
-            HOST,
-            r#"runner start 'it'\''s' >/dev/null && runner ip 'it'\''s'"#
-        ]
+        ask(r#"runner start 'it'\''s' >/dev/null && runner ip 'it'\''s'"#)
     );
     assert_eq!(laptop.host_argv(), ["ip", "it's"]);
 }

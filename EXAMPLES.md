@@ -1,6 +1,6 @@
 # Examples
 
-Every command here runs on your laptop, in this repo's folder. The `runner` on your laptop is a small wrapper: each command runs on the server over SSH (`ssh runner@kvm-host runner ...`), through Tailscale.
+Every command here runs on your laptop, in this repo's folder. The `runner` on your laptop is a small wrapper: each command but `proxy` runs on the server over SSH (`ssh runner@kvm-host runner ...`), through Tailscale.
 
 **Before you start:** the server is set up (README.md, "Set up a host" and "On AWS"), Tailscale is connected on your laptop, and `AWS_PROFILE=runner` is set (`aws login --profile runner` if it's been more than 12 hours).
 

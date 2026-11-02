@@ -108,7 +108,7 @@ ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict
 - `from=` takes this key only from Tailscale's IPv4 and IPv6 ranges: the tailnet-only rule, held per key.
 - `restrict` turns off port, agent and X11 forwarding.
 - `pty` gives back the terminal `restrict` takes away, so `ssh -t` works for `runner shell`.
-- `port-forwarding` gives back `ssh -L`, for `runner proxy`. sshd can't limit it to the VMs' range (`permitopen` takes only exact addresses), so the key can reach, through the host, anything the host reaches. A key line from before `runner proxy` lacks it: edit the line in `~runner/.ssh/authorized_keys` to add it.
+- `port-forwarding` gives back `ssh -L`, for `runner proxy`, and with it `-R` and socket forwarding. It reaches nothing new: the key already runs any command on the host as runner. A key line from before `runner proxy` lacks it: edit the line in `~runner/.ssh/authorized_keys` to add it.
 
 ### Tailnet only
 
@@ -223,7 +223,7 @@ runner proxy dev 3000              # localhost:3000 on the laptop is port 3000 i
 runner proxy dev 3000 5173 8080:80 # several at once; 8080:80 puts dev's port 80 at localhost:8080
 ```
 
-It starts dev if it's stopped, or wakes it if it's sleeping, asks the host for `runner ip dev`, then runs `ssh -N -L 3000:<dev's address>:3000` to the host, which reaches dev's address, until Ctrl-C. Only the laptop's own localhost gets the port. A local port that's taken ends it at once (`cannot listen to port`). The program in dev has to listen on dev's address, not just its 127.0.0.1: `vite --host`, `next dev -H 0.0.0.0`; `python3 -m http.server` does already. Traffic through the proxy doesn't count as use, so dev still sleeps when idle, and the proxy gets no answer until something wakes it: `runner idle dev never` for a VM you browse. It needs `port-forwarding` in the laptop's key line (Add the laptop's key). `proxy` runs on the laptop, so the host's own `runner` has no such command.
+It starts dev if it's stopped, or wakes it if it's sleeping, asks the host for `runner ip dev`, then runs `ssh -N -L localhost:3000:<dev's address>:3000` to the host, which reaches dev's address, until Ctrl-C. Only the laptop's own localhost gets the port. A local port that's taken ends it at once (`cannot listen to port`), unless only one of 127.0.0.1 and ::1 is. The program in dev has to listen on dev's address, not just its 127.0.0.1: `vite --host`, `next dev -H 0.0.0.0`; `python3 -m http.server` does already. Traffic through the proxy doesn't count as use, so dev still sleeps when idle, and the proxy gets no answer until something wakes it: `runner idle dev never` for a VM you browse. It needs `port-forwarding` in the laptop's key line (Add the laptop's key). `proxy` runs on the laptop, so the host's own `runner` has no such command.
 
 ### Headless runs
 
