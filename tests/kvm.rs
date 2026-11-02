@@ -25,6 +25,7 @@
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
+// `a_vm_reaches_the_internet_but_not_the_host`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
@@ -527,18 +528,20 @@ fn a_service_answers_through_its_url_after_the_vm_slept() {
     assert!(logs.contains(&format!("{name}'s URL is {url}")), "{logs}");
     eprintln!("a GET to the sleeping VM's URL was answered in {took:?}");
 
-    // A VM reaches the host's tailnet address, but the URL won't take it: no
-    // VM gets into another, or its own, through a URL.
+    // No VM gets into another, or its own, through a URL: the host drops what
+    // a VM opens to it, its tailnet address too, before the URL sees it.
+    // curl's 28 is a timeout; one the URL refused would end sooner.
     let address = ok(runner(&root, &["ip", &name])).trim().to_string();
     let inside = runner(&root, &["exec", &name, "--", "curl", "-s", "-m", "5", &url]);
-    assert!(
-        !inside.status.success(),
+    assert_eq!(
+        inside.status.code(),
+        Some(28),
         "{}",
         String::from_utf8_lossy(&inside.stdout)
     );
     let logs = ok(runner(&root, &["logs", &name]));
     assert!(
-        logs.contains(&format!("{name}'s URL refused {address}:")),
+        !logs.contains(&format!("{name}'s URL refused {address}:")),
         "{logs}"
     );
 
@@ -547,6 +550,52 @@ fn a_service_answers_through_its_url_after_the_vm_slept() {
     eventually("the URL to stop answering", || !answers());
     ok(runner(&root, &["url", &name, "on"]));
     eventually("the URL to answer again", answers);
+}
+
+// The host drops what a VM opens to it, but the VM still has the internet,
+// DNS included, through the host.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
+fn a_vm_reaches_the_internet_but_not_the_host() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("host-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let address = ok(runner(&root, &["ip", &name]));
+    let address: std::net::Ipv4Addr = address.trim().parse().unwrap();
+    // The host's end of the VM's /30.
+    let gateway = std::net::Ipv4Addr::from(u32::from(address) - 1).to_string();
+    // Dropped, so it times out: sshd would answer at once, and a closed port
+    // refuse at once.
+    let probe = "import socket, sys
+try:
+    socket.create_connection((sys.argv[1], 22), 5)
+    print('connected')
+except TimeoutError:
+    print('timed out')
+except OSError as e:
+    print(e)
+";
+    let ssh = ok(runner(
+        &root,
+        &["exec", &name, "--", "python3", "-c", probe, &gateway],
+    ));
+    assert_eq!(ssh, "timed out\n", "{gateway}:22");
+    let web = [
+        "curl",
+        "-fsS",
+        "-m",
+        "20",
+        "-o",
+        "/dev/null",
+        "https://example.com",
+    ];
+    let mut exec = vec!["exec", &name, "--"];
+    exec.extend(web);
+    ok(runner(&root, &exec));
 }
 
 // No token needed: a logged-out claude waits at its login screen.

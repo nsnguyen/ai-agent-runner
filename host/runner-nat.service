@@ -1,6 +1,7 @@
-# NAT from the VMs' range to the internet, and nowhere private, with the rules
-# host/install.sh writes to /etc/runner/nat.nft. It follows nftables.service,
-# whose start and reload flush the whole ruleset, ours included.
+# NAT from the VMs' range to the internet, and nowhere private, the host
+# included, with the rules host/install.sh writes to /etc/runner/nat.nft. It
+# follows nftables.service, whose start and reload flush the whole ruleset,
+# ours included.
 [Unit]
 Description=runner: NAT for VMs
 After=nftables.service

@@ -32,7 +32,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
    sudo systemctl daemon-reload
    ```
 4. That user in the `kvm` and `systemd-journal` groups, and allowed to start and stop `firecracker@*` units: a polkit rule, which #14 adds.
-5. NAT for the VMs' range, and `iproute2`. `host/install.sh` does both.
+5. NAT for the VMs' range, with a filter that drops what they open to the host itself (`host/nat.nft`), and `iproute2`. `host/install.sh` does both.
 6. Claude Code's token, for the VMs. Make it with `claude setup-token` on any machine with a browser, then on the host:
    ```
    sudo install -d -m 0700 /etc/credstore
@@ -66,6 +66,6 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
 RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux cargo test --test kvm -- --ignored --test-threads=1
 ```
 
-The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so after a change run `cargo build --release && sudo host/install.sh` first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. The URL's test reaches the VM through the host's tailnet address, so it needs Tailscale up. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
+The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so after a change run `cargo build --release && sudo host/install.sh` first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. The URL's test reaches the VM through the host's tailnet address, so it needs Tailscale up. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, that a real tap comes and goes, and, in two network namespaces of its own, that `host/nat.nft` drops a VM's connection to the host's port 22 but lets the host's own connection to a VM get its replies.
 
 The rootfs's init must take Ctrl-Alt-Del (systemd does) and print a login prompt on the serial console.
