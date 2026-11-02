@@ -17,9 +17,10 @@ esac
 
 # ssh hands the remote shell one string, so each argument is quoted for it:
 # bare when it's only safe characters, else in single quotes, with ' as '\''.
+# quote ARG sets $arg to ARG quoted.
 q="'"
-cmd=runner
-for arg; do
+quote() {
+  arg=$1
   case $arg in
   '' | *[![:alnum:]@%+=:,./_-]*)
     quoted=
@@ -36,6 +37,63 @@ for arg; do
     arg=$q$quoted$arg$q
     ;;
   esac
+}
+
+# proxy runs here, not on the host: localhost:PORT on the laptop becomes PORT
+# in the VM, through an ssh tunnel to the host, which reaches the VM's address.
+usage="usage: runner proxy <vm> <port>|<local>:<remote>...
+  runner proxy dev 3000         localhost:3000 here is dev's port 3000
+  runner proxy dev 8080:3000    localhost:8080 here is dev's port 3000"
+
+# port P: whether P is 1 to 65535, written without leading zeros.
+port() {
+  case $1 in '' | 0* | *[!0-9]* | ??????*) return 1 ;; esac
+  [ "$1" -le 65535 ]
+}
+
+if [ "${1-}" = proxy ]; then
+  case ${2-} in -h | --help)
+    echo "$usage"
+    exit 0
+    ;;
+  esac
+  if [ $# -lt 3 ] || [ -z "$2" ]; then
+    echo "$usage" >&2
+    exit 2
+  fi
+  vm=$2
+  shift 2
+  for spec; do
+    if ! port "${spec%%:*}" || ! port "${spec#*:}"; then
+      printf "runner: '%s' isn't a port or local:remote\n%s\n" "$spec" "$usage" >&2
+      exit 2
+    fi
+  done
+
+  # start boots a stopped VM, wakes a sleeping one, and leaves a running one be.
+  quote "$vm"
+  # shellcheck disable=SC2029 # $arg is quoted for the host's shell, here.
+  addr=$(ssh "$host" "runner start $arg >/dev/null && runner ip $arg") || exit
+  case $addr in '' | *[!0-9.]*)
+    echo "runner: the host gave $vm's address as '$addr', which isn't one" >&2
+    exit 1
+    ;;
+  esac
+  said=
+  for spec; do
+    shift
+    lport=${spec%%:*}
+    rport=${spec#*:}
+    set -- "$@" -L "$lport:$addr:$rport"
+    said="$said, localhost:$lport is $vm's port $rport"
+  done
+  echo "runner: ${said#, }. Ctrl-C ends it." >&2
+  exec ssh -N -o ExitOnForwardFailure=yes "$@" "$host"
+fi
+
+cmd=runner
+for a; do
+  quote "$a"
   cmd="$cmd $arg"
 done
 
