@@ -640,6 +640,29 @@ fn a_headless_run_edits_a_file_and_commits_it() {
     let added = serde_json::json!({"path": "/home/agent/work/hello.txt", "change": "added"});
     let paths = result["changed"]["paths"].as_array();
     assert!(paths.is_some_and(|p| p.contains(&added)), "{result}");
+    // And none of the boot's: it wrote its journal at least, which is only
+    // counted. The agent writes without root only in its home and the temp
+    // directories, so a path anywhere else is the boot's, and belongs on
+    // changes::BOOT_ONLY.
+    assert!(
+        result["changed"]["boot_only"].as_u64() > Some(0),
+        "{result}"
+    );
+    let agents = |p: &&str| {
+        ["/home/", "/tmp/", "/var/tmp/"]
+            .iter()
+            .any(|d| p.starts_with(d))
+    };
+    let boots: Vec<&str> = paths
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["path"].as_str())
+        .filter(|p| !agents(p))
+        .collect();
+    assert!(
+        boots.is_empty(),
+        "the boot's, not on BOOT_ONLY: {boots:?}\n{result}"
+    );
     assert_eq!(result["agent_says"]["untrusted"], true);
     let status = ok(runner(&root, &["status", &name]));
     assert!(status.ends_with("  stopped\n"), "{status}");

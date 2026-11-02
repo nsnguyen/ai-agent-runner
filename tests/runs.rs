@@ -40,6 +40,7 @@ struct Vm {
 fn vm(running: bool) -> Vm {
     let dir = tempfile::tempdir().unwrap();
     let files = [
+        ("etc/machine-id", ""),
         ("home/agent/work/main.rs", "fn main() {}"),
         ("home/agent/work/old.rs", "// unused"),
     ];
@@ -400,6 +401,9 @@ fn a_run_s_result_has_what_it_changed_on_its_disk() {
     debugfs(&disk, "rm /home/agent/work/main.rs");
     debugfs(&disk, &write("main.rs"));
     debugfs(&disk, &write("new.rs"));
+    // And what its boot writes on its own, left out.
+    debugfs(&disk, "rm /etc/machine-id");
+    debugfs(&disk, &format!("write {} /etc/machine-id", new.display()));
 
     let id = vm.start("fix main.rs");
     wait_for("claude to start", || vm.started());
@@ -420,7 +424,8 @@ fn a_run_s_result_has_what_it_changed_on_its_disk() {
                 {"path": "/home/agent/work/new.rs", "change": "added"},
                 {"path": "/home/agent/work/old.rs", "change": "deleted"}
             ],
-            "more": 0
+            "more": 0,
+            "boot_only": 1
         })
     );
     assert_eq!(
@@ -448,7 +453,10 @@ fn a_non_zero_exit_rolls_back_what_the_run_booted() {
     assert_eq!(result["outcome"], json!("rolled_back"));
     assert_eq!(result["from_generation"], json!(0));
     assert_eq!(result["generation"], json!(1));
-    assert_eq!(result["changed"], json!({"paths": [], "more": 0}));
+    assert_eq!(
+        result["changed"],
+        json!({"paths": [], "more": 0, "boot_only": 0})
+    );
 }
 
 // A run that joins a running VM checkpoints it first, and one that exits 0
@@ -637,7 +645,8 @@ fn cancel_ends_the_run_and_rolls_back_what_it_booted() {
         result["changed"],
         json!({
             "paths": [{"path": "/home/agent/work/old.rs", "change": "deleted"}],
-            "more": 0
+            "more": 0,
+            "boot_only": 0
         })
     );
     // It's over, so there's nothing to cancel.

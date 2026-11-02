@@ -281,8 +281,9 @@ enum Cmd {
     /// Print a run's result as JSON once it has ended. It has the exit code,
     /// the duration, whether the disk generation the run booted was
     /// committed or rolled back, and the paths that changed on that disk,
-    /// which the runner reads from the disks itself. What the agent says it
-    /// did is kept apart, marked untrusted.
+    /// which the runner reads from the disks itself, leaving out and counting
+    /// those only the VM's boot writes. What the agent says it did is kept
+    /// apart, marked untrusted.
     Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
     /// booted rolls back and shuts down, while one it joined running is left
