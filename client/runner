@@ -97,7 +97,7 @@ if [ "${1-}" = proxy ]; then
   # The hold reads nothing, so no stdin, and keys typed here go nowhere. Ctrl-C
   # or a dropped connection ends ssh, and with it the hold, so the VM's idle
   # time starts again.
-  # shellcheck disable=SC2029
+  # shellcheck disable=SC2029 # $vmq is quoted for the host's shell, here.
   exec ssh -n -T -o ExitOnForwardFailure=yes "$@" "$host" "runner hold $vmq"
 fi
 

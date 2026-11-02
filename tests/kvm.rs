@@ -858,7 +858,8 @@ exec sh -c "$cmd"
     laptop
 }
 
-// Forwards each connection `listener` takes to `to`, as ssh's -L does.
+// Forwards each connection `listener` takes to `to`: the test's stand-in for
+// the -L the proxy asked ssh for, since the stand-in ssh forwards nothing.
 fn forward(listener: std::net::TcpListener, to: std::net::SocketAddr) {
     use std::net::{Shutdown, TcpStream};
     let pipe = |mut from: TcpStream, mut to: TcpStream| {
@@ -877,17 +878,22 @@ fn forward(listener: std::net::TcpListener, to: std::net::SocketAddr) {
     });
 }
 
-// A proxy a failed test left open still ends, before Cleanup's stop.
-struct EndProxy(nix::unistd::Pid);
+// A proxy a failed test left open still ends, before Cleanup's stop. One
+// that has ended is left be: its group's id may be another's by then.
+struct Proxy(Child);
 
-impl Drop for EndProxy {
+impl Drop for Proxy {
     fn drop(&mut self) {
-        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::SIGKILL);
+        if let Ok(None) = self.0.try_wait() {
+            let group = nix::unistd::Pid::from_raw(self.0.id() as i32);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::SIGKILL);
+        }
     }
 }
 
-// An open proxy keeps its VM awake past its idle time, and answers through
-// it; once Ctrl-C ends it, the idle time starts again and the VM sleeps.
+// An open proxy keeps its VM awake past its idle time, and the VM answers
+// at the forward the proxy asked for; once Ctrl-C ends the proxy, the idle
+// time starts again and the VM sleeps.
 #[test]
 #[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
 fn an_open_proxy_keeps_its_vm_awake() {
@@ -920,19 +926,20 @@ fn an_open_proxy_keeps_its_vm_awake() {
         std::env::var("PATH").unwrap()
     );
     let client = Path::new(env!("CARGO_MANIFEST_DIR")).join("client/runner");
-    let mut proxy = Command::new("sh")
-        .arg(client)
-        .args(["proxy", &name, &format!("{local}:8080")])
-        .env("PATH", path)
-        .env("RUNNER_HOST", "runner@this-host")
-        .env("FORWARDS", &forwards)
-        .env("CONN", laptop.path().join("conn"))
-        .stdin(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let group = nix::unistd::Pid::from_raw(proxy.id() as i32);
-    let _end = EndProxy(group);
+    let mut proxy = Proxy(
+        Command::new("sh")
+            .arg(client)
+            .args(["proxy", &name, &format!("{local}:8080")])
+            .env("PATH", path)
+            .env("RUNNER_HOST", "runner@this-host")
+            .env("FORWARDS", &forwards)
+            .env("CONN", laptop.path().join("conn"))
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let group = nix::unistd::Pid::from_raw(proxy.0.id() as i32);
     eventually("the proxy's forward", || {
         std::fs::read_to_string(&forwards).is_ok_and(|f| !f.is_empty())
     });
@@ -943,7 +950,7 @@ fn an_open_proxy_keeps_its_vm_awake() {
     // Its idle time, a look's 10 seconds and then some, still running.
     let opened = Instant::now();
     while opened.elapsed() < Duration::from_secs(120) {
-        assert!(proxy.try_wait().unwrap().is_none(), "the proxy ended");
+        assert!(proxy.0.try_wait().unwrap().is_none(), "the proxy ended");
         let now = status();
         assert!(
             now.contains("  running"),
@@ -960,7 +967,7 @@ fn an_open_proxy_keeps_its_vm_awake() {
 
     // Ctrl-C, as a terminal sends it to its job.
     nix::sys::signal::killpg(group, nix::sys::signal::SIGINT).unwrap();
-    proxy.wait().unwrap();
+    proxy.0.wait().unwrap();
     let ended = Instant::now();
     while !status().contains("  sleeping") {
         assert!(

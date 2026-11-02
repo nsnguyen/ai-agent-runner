@@ -561,6 +561,30 @@ fn hold_holds_the_vm_in_use_until_its_connection_closes() {
     assert!(!held(&lock));
 }
 
+// One that's running is held as it is: nothing starts it again.
+#[test]
+fn hold_leaves_a_running_vm_be() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    runner(dir.path(), &["create", "dev"]);
+    sd.set_state("active");
+    let lock = dir.path().join("vms/dev/use.lock");
+    let mut hold = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .args(["hold", "dev"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    common::wait_for("the hold to take dev", || {
+        lock.exists() && held(&lock) || hold.try_wait().unwrap().is_some()
+    });
+    drop(hold.stdout.take());
+    assert!(hold.wait().unwrap().success());
+    let show = "systemctl show --property=ActiveState --value firecracker@dev.service";
+    assert_eq!(sd.calls(), [show]);
+}
+
 #[test]
 fn hold_on_a_missing_vm_fails_at_once() {
     let dir = with_base();

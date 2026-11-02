@@ -12,8 +12,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
+
+mod common;
+use common::wait_for;
 
 // Linux's sh, and bash in POSIX mode, which is what macOS's /bin/sh is.
 const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
@@ -90,7 +93,8 @@ exec bash -c "$cmd"
         // `start` brings the VM up and `ip` prints its address, as the real
         // ones do; HOST_LOG has every call, a line each. `hold` ends at once
         // unless HOLD_ON is set: then it holds until its stdout's far end
-        // closes, which a write finds, noting both in HELD.
+        // closes, which a write finds, noting both in HELD. HOLD_OLD makes
+        // it a host runner from before `hold`.
         script(
             &bin.join("runner"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$HOST_ARGV"
@@ -101,6 +105,7 @@ case $1 in
 start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
 ip) printf '%s\n' "${HOST_IP-172.16.0.6}" ;;
 hold)
+  [ -z "${HOLD_OLD-}" ] || { echo "error: unrecognized subcommand 'hold'" >&2; exit 2; }
   [ -n "${HOLD_ON-}" ] || exit 0
   echo holding >>"$HELD"
   trap '' PIPE
@@ -144,6 +149,7 @@ esac
             .env("CONN", self.path("conn"))
             .env("HELD", self.path("held"))
             .env_remove("HOLD_ON")
+            .env_remove("HOLD_OLD")
             .env_remove("HOST_STDIN")
             .env_remove("HOST_EXIT")
             .env_remove("HOST_IP")
@@ -707,27 +713,40 @@ fn the_tunnels_exit_code_is_the_proxys() {
 // tunnel does, which `end` then ends.
 fn hold_then(shell: &[&str], end: impl FnOnce(&std::process::Child)) -> Laptop {
     let laptop = Laptop::new();
-    let mut proxy = laptop
-        .vm("running")
-        .runner(shell, &["proxy", "dev", "3000"])
-        .env("HOLD_ON", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut proxy = Running(
+        laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("HOLD_ON", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
     wait_for("the hold", || !laptop.held().is_empty());
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        proxy.try_wait().unwrap().is_none(),
+        proxy.0.try_wait().unwrap().is_none(),
         "{shell:?}: proxy ended"
     );
     assert_eq!(laptop.held(), ["holding"], "{shell:?}");
-    end(&proxy);
-    proxy.wait().unwrap();
+    end(&proxy.0);
+    proxy.0.wait().unwrap();
     wait_for("the hold to let go", || laptop.held().len() == 2);
     assert_eq!(laptop.held(), ["holding", "let go"], "{shell:?}");
     laptop
+}
+
+// A proxy a failed assert left running still ends, and with its ssh the hold.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = killpg(Pid::from_raw(self.0.id() as i32), Signal::SIGKILL);
+        }
+    }
 }
 
 #[test]
@@ -749,10 +768,19 @@ fn a_proxy_whose_ssh_dies_lets_its_vm_go() {
     }
 }
 
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
+// A host whose runner is older than `hold` ends the proxy at once, saying so.
+#[test]
+fn a_host_without_hold_ends_the_proxy_and_says_why() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("HOLD_OLD", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("unrecognized subcommand 'hold'"), "{err}");
     }
 }
