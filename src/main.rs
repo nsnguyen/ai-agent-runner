@@ -80,8 +80,8 @@ enum Cmd {
     /// Bring a sleeping VM back where it was, and set its clock.
     Wake { name: String },
     /// Show or set how long a VM goes unused before it sleeps. Use is a
-    /// shell, exec, attached session, run or MCP call on it; a detached tmux
-    /// session doesn't count, and sleeps with the VM. Anything that needs the
+    /// shell, exec, attached session, run, MCP call or open `runner proxy` on
+    /// it; a detached tmux session doesn't count, and sleeps with the VM. Anything that needs the
     /// VM wakes it. A running VM counts from the next look, every 10 seconds.
     Idle {
         name: String,
