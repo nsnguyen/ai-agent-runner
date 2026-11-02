@@ -9,6 +9,7 @@ use tempfile::TempDir;
 const UNIT: &str = "etc/systemd/system/runner-guest.service";
 const WANTS: &str = "etc/systemd/system/multi-user.target.wants/runner-guest.service";
 const LLM_TXT: &str = ".runner/llm.txt";
+const SETTINGS: &str = "etc/claude-code/managed-settings.json";
 
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,6 +42,11 @@ fn clean_tree() -> TempDir {
     fs::create_dir_all(root.join("root")).unwrap();
     fs::create_dir_all(root.join(".runner")).unwrap();
     fs::write(root.join(LLM_TXT), b"# You're in a runner VM\n").unwrap();
+    // The image's own, as the Dockerfile installs it.
+    let settings = root.join(SETTINGS);
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::copy(script("managed-settings.json"), &settings).unwrap();
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).unwrap();
     tree
 }
 
@@ -132,6 +138,75 @@ fn check_fails_without_the_agent_s_llm_txt() {
     let tree = clean_tree();
     fs::remove_file(tree.path().join(LLM_TXT)).unwrap();
     fails_mentioning(&check(tree.path()), "FAIL  /.runner/llm.txt is missing");
+}
+
+#[test]
+fn check_fails_without_claude_code_s_managed_settings() {
+    let tree = clean_tree();
+    fs::remove_file(tree.path().join(SETTINGS)).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /etc/claude-code/managed-settings.json is missing",
+    );
+}
+
+#[test]
+fn check_fails_when_the_settings_leave_the_updater_on() {
+    let tree = clean_tree();
+    let on = br#"{"env": {"DISABLE_AUTOUPDATER": "0"}}"#;
+    fs::write(tree.path().join(SETTINGS), on).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  Claude Code's updater is on");
+}
+
+// Claude Code reads the variable only from the settings' env.
+#[test]
+fn check_fails_when_the_setting_is_outside_env() {
+    let tree = clean_tree();
+    let outside = br#"{"DISABLE_AUTOUPDATER": "1", "env": {}}"#;
+    fs::write(tree.path().join(SETTINGS), outside).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  Claude Code's updater is on");
+}
+
+#[test]
+fn check_fails_when_the_agent_can_t_reach_the_settings() {
+    let tree = clean_tree();
+    let dir = tree.path().join(SETTINGS);
+    let dir = dir.parent().unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /etc/claude-code/managed-settings.json isn't readable",
+    );
+}
+
+#[test]
+fn check_fails_when_the_agent_can_t_read_the_settings() {
+    let tree = clean_tree();
+    let settings = tree.path().join(SETTINGS);
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /etc/claude-code/managed-settings.json isn't readable",
+    );
+}
+
+// Every claude in a VM reads its managed settings, however it starts, and
+// these turn its updater off: a new version comes only from rebuilding base.
+#[test]
+fn the_image_turns_claude_code_s_updater_off() {
+    let json = fs::read_to_string(script("managed-settings.json")).unwrap();
+    let settings: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(settings["env"]["DISABLE_AUTOUPDATER"], "1", "{json}");
+    let dockerfile = fs::read_to_string(script("Dockerfile")).unwrap();
+    assert!(
+        dockerfile.contains("COPY managed-settings.json /etc/claude-code/managed-settings.json"),
+        "the Dockerfile doesn't install managed-settings.json"
+    );
+    let build = fs::read_to_string(script("build.sh")).unwrap();
+    assert!(
+        build.contains("\"$here/managed-settings.json\""),
+        "build.sh doesn't copy managed-settings.json"
+    );
 }
 
 // What the agent reads to know where it is: the commands it names are the

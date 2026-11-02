@@ -26,14 +26,16 @@
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
-// `claude_keeps_running_after_a_detach` and
+// `claude_keeps_running_after_a_detach`,
+// `claude_code_in_a_vm_has_its_updater_off` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
 // unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
 // root's owner. The unit boots them with the installed runner, so rerun
 // host/install.sh after a build. The headless run needs the host's Claude
 // Code token in /etc/credstore (docs/host.md, step 6). The agent's own
-// checkpoints need a base built with this runner-guest (images/base/build.sh).
+// checkpoints need a base built with this runner-guest, and the updater test
+// needs a base built from this images/base (images/base/build.sh).
 mod common;
 
 use std::fs::Permissions;
@@ -610,6 +612,56 @@ fn claude_keeps_running_after_a_detach() {
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     assert_eq!(claude_sessions(), 1);
     assert_eq!(in_vm(pane), before);
+}
+
+// Claude Code keeps the version base was built with: the image's managed
+// settings turn its updater off, and `claude doctor` says what it sees. No
+// token needed: doctor doesn't log in.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn claude_code_in_a_vm_has_its_updater_off() {
+    const OFF: &str = "Auto-updates: disabled";
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("updater-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let in_vm = |argv: &[&str]| {
+        let exec = ["exec", name.as_str(), "--"];
+        let all: Vec<&str> = exec.iter().chain(argv).copied().collect();
+        ok(runner(&root, &all))
+    };
+
+    // As a run starts it: from runner-guest, with no terminal and systemd's
+    // environment, as exec does.
+    let doctor = in_vm(&["claude", "doctor"]);
+    assert!(doctor.contains(OFF), "{doctor}");
+
+    // As `runner claude` does, in its tmux session. That closes when doctor
+    // exits, unless the agent's tmux server keeps a pane past its command.
+    let keep = "tmux new-session -d -s keep && tmux set -g remain-on-exit on";
+    in_vm(&["sh", "-c", keep]);
+    let t = common::pty(50, 120);
+    let mut cmd = cli(&root);
+    cmd.env_remove("TERM")
+        .args(["claude", &name, "--", "doctor"]);
+    let mut claude = t.spawn(cmd);
+    // Empty until `runner claude` has made the session.
+    let capture = ["exec", &name, "--", "tmux", "capture-pane", "-p", "-S", "-"];
+    let screen = || {
+        let out = runner(&root, &[&capture[..], &["-t", "=claude:"]].concat());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    eventually("claude doctor's report", || {
+        screen().contains("Auto-updates:")
+    });
+    let shown = screen();
+    assert!(shown.contains(OFF), "{shown}");
+    in_vm(&["tmux", "detach-client", "-s", "=claude"]);
+    assert_eq!(claude.wait().unwrap().code(), Some(0), "{}", t.seen());
+    in_vm(&["tmux", "kill-server"]);
 }
 
 // A real `claude -p` under the unit: the run boots the VM, Claude Code edits

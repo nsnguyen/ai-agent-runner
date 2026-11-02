@@ -58,6 +58,12 @@ COPY runner-guest /usr/local/bin/runner-guest
 COPY runner-guest.service /etc/systemd/system/runner-guest.service
 RUN chmod 0755 /usr/local/bin/runner-guest && systemctl enable runner-guest.service
 
+# Claude Code stays at the version installed above: its managed settings,
+# which every claude here reads however it starts, turn its updater off. Not
+# under /home/agent/.claude, which forks start with empty.
+COPY managed-settings.json /etc/claude-code/managed-settings.json
+RUN chmod 0755 /etc/claude-code && chmod 0644 /etc/claude-code/managed-settings.json
+
 # What the agent reads to know where it is, like a sprite's /.sprite/llm.txt.
 COPY llm.txt /.runner/llm.txt
 RUN chmod 0644 /.runner/llm.txt

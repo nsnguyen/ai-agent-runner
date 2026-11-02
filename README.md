@@ -166,7 +166,7 @@ cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
 sudo images/base/build.sh
 ```
 
-It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, `/.runner/llm.txt` is there, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image. `/.runner/llm.txt` (`images/base/llm.txt`) tells the agent where it is: where to work, what persists, how to checkpoint and restore, and how its credentials arrive.
+It writes `images/base/out/base.ext4`, a sparse 20 GiB ext4 disk, and `images/base/out/vmlinux`, Firecracker's pinned CI guest kernel. It runs as root so the disk keeps every file's owner. Before it replaces an older disk, it checks the new one with `images/base/check.sh` (runner-guest is enabled, Claude Code's updater is off, `/.runner/llm.txt` is there, and nothing is under `/home/agent/.claude` or `/root/.claude`) and runs `claude --version` in the image. `/.runner/llm.txt` (`images/base/llm.txt`) tells the agent where it is: where to work, what persists, how to checkpoint and restore, and how its credentials arrive.
 
 Settings go after `sudo`, which drops your environment: `sudo SIZE=40G images/base/build.sh`. The others are `OUT`, `ENGINE` and `RUNNER_GUEST`, described at the top of `build.sh`.
 
@@ -183,7 +183,7 @@ The boot test needs `/dev/kvm` and `firecracker` on PATH. It boots a copy of the
 RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
 ```
 
-To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`.
+To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`. Claude Code doesn't update itself in a VM: `images/base/managed-settings.json`, which the image installs as `/etc/claude-code/managed-settings.json`, sets `DISABLE_AUTOUPDATER`, so every VM made from a `base` runs the version it was built with, and a newer one comes from rebuilding `base`. A VM forked from an older base keeps updating itself.
 
 ## Use it from the laptop
 
