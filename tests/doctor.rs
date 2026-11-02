@@ -3,6 +3,7 @@
 // filesystem.
 use runner::doctor::{self, Host, Ran, Report, Status};
 use runner::host;
+use runner::net::DEFAULT_SUBNET;
 use runner::store::Store;
 use std::collections::HashMap;
 use std::fs;
@@ -17,8 +18,51 @@ const NAT: &str = "table ip runner {
 \t\ttype nat hook postrouting priority srcnat; policy accept;
 \t\tip saddr 172.16.0.0/16 ip daddr != 172.16.0.0/16 masquerade
 \t}
+
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tip saddr 172.16.0.0/16 ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
+\t\tip saddr 172.16.0.0/16 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+\t}
+
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tip saddr 172.16.0.0/16 ct state established,related accept
+\t\tip saddr 172.16.0.0/16 drop
+\t}
 }
 ";
+
+// What `nft list table ip6 runner` prints for them: VMs get no IPv6 through
+// the host, and can't reach it over IPv6 either.
+const NAT6: &str = "table ip6 runner {
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tiifname \"fc*\" drop
+\t}
+
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tiifname \"fc*\" drop
+\t}
+}
+";
+
+// Rules as an install.sh from before the input chain wrote them, which
+// let VMs reach the host's own services.
+fn without_input(rules: &str) -> String {
+    let start = rules.find("\tchain input {").unwrap();
+    let end = start + rules[start..].find("\t}\n").unwrap() + "\t}\n".len();
+    format!("{}{}", &rules[..start], &rules[end..])
+}
+
+// The file install.sh writes, without its ip6 table: VMs reach the host over
+// IPv6, its link-local address on their tap.
+fn without_ip6(rules: &str) -> String {
+    let start = rules.find("table ip6 runner\n").unwrap();
+    let end = start + rules[start..].find("\n}\n").unwrap() + "\n}\n".len();
+    format!("{}{}", &rules[..start], &rules[end..])
+}
 
 const NAMES: [&str; 7] = [
     "kvm",
@@ -45,6 +89,10 @@ fn list_nat() -> String {
     format!("{} list table ip runner", host::NFT)
 }
 
+fn list_nat6() -> String {
+    format!("{} list table ip6 runner", host::NFT)
+}
+
 fn ran(ok: bool, stdout: &str, stderr: &str) -> Result<Ran, ErrorKind> {
     Ok(Ran {
         ok,
@@ -62,6 +110,7 @@ impl Fake {
             (host::kernel(root), Ok("\x7fELF".to_string())),
             (host::IP_FORWARD.into(), Ok("1\n".to_string())),
             (host::UNIT_PATH.into(), Ok(host::UNIT.to_string())),
+            (host::NAT_RULES.into(), Ok(host::nat_rules(&DEFAULT_SUBNET))),
         ];
         let runs = [
             (version(), ran(true, &pinned, "")),
@@ -70,6 +119,7 @@ impl Fake {
                 ran(true, "active\n", ""),
             ),
             (list_nat(), ran(true, NAT, "")),
+            (list_nat6(), ran(true, NAT6, "")),
         ];
         Fake {
             files: files.into_iter().collect(),
@@ -160,7 +210,9 @@ fn a_healthy_host_passes_every_check_in_order() {
     }
     assert!(report.ok);
     assert!(verdict(&report, "base").1.contains("gen 0"));
-    assert!(verdict(&report, "nat").1.contains("172.16.0.0/16"));
+    let nat = verdict(&report, "nat").1;
+    assert!(nat.contains("172.16.0.0/16"), "{nat}");
+    assert!(nat.contains("VMs kept off the host"), "{nat}");
     let pinned = host::firecracker_version();
     assert!(verdict(&report, "firecracker").1.contains(pinned));
 }
@@ -243,7 +295,60 @@ fn nat_needs_forwarding_the_service_and_the_rules() {
     // As the runner user, nft can't list rules, so the unit has to do.
     let why = "Operation not permitted (you must be root)";
     let unprivileged = fake().cmd(list, ran(false, "", why));
-    assert_verdict(unprivileged, &store, "nat", Status::Ok, "root");
+    let report = assert_verdict(unprivileged, &store, "nat", Status::Ok, "root");
+    assert!(verdict(&report, "nat").1.contains("VMs kept off the host"));
+}
+
+// An install.sh from before the input chain left VMs able to reach the
+// host's sshd: VMs still run, so it's a warning, read from the loaded rules
+// as root and from the file the unit loads as the runner user.
+#[test]
+fn nat_warns_when_nothing_keeps_vms_off_the_host() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let list = &list_nat();
+    let old = fake().cmd(list, ran(true, &without_input(NAT), ""));
+    let report = assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    assert!(verdict(&report, "nat").1.contains("rerun host/install.sh"));
+
+    let why = "Operation not permitted (you must be root)";
+    let unprivileged = || fake().cmd(list, ran(false, "", why));
+    let file = without_input(&host::nat_rules(&DEFAULT_SUBNET));
+    let old = unprivileged().file(host::NAT_RULES, Ok(&file));
+    let report = assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    assert!(verdict(&report, "nat").1.contains(host::NAT_RULES));
+    // No file to read: the active unit is all there is to go on.
+    let unread = unprivileged().file(host::NAT_RULES, Err(ErrorKind::PermissionDenied));
+    assert_verdict(unread, &store, "nat", Status::Ok, "root");
+
+    // Without the ip6 table, a VM reaches the host over IPv6.
+    let list6 = &list_nat6();
+    let gone = "Error: No such file or directory";
+    let no_ip6 = fake().cmd(list6, ran(false, "", gone));
+    assert_verdict(no_ip6, &store, "nat", Status::Warn, "off the host");
+    let file = without_ip6(&host::nat_rules(&DEFAULT_SUBNET));
+    assert!(!file.contains("table ip6"), "{file}");
+    let old = unprivileged().file(host::NAT_RULES, Ok(&file));
+    assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    let open6 = NAT6.replace("hook input", "hook output");
+    let open6 = fake().cmd(list6, ran(true, &open6, ""));
+    assert_verdict(open6, &store, "nat", Status::Warn, "off the host");
+
+    // A drop in another chain, or an input chain that only accepts, isn't it.
+    let accepts = NAT.replace("\t\tip saddr 172.16.0.0/16 drop\n", "");
+    let open = fake().cmd(list, ran(true, &accepts, ""));
+    assert_verdict(open, &store, "nat", Status::Warn, "off the host");
+    let forward = NAT.replace("hook input", "hook forward");
+    let elsewhere = fake().cmd(list, ran(true, &forward, ""));
+    assert_verdict(elsewhere, &store, "nat", Status::Warn, "off the host");
+
+    // Along with a firewall that drops forwarded traffic, it says both.
+    let docker = "systemctl is-active docker.service";
+    let both = fake()
+        .cmd(list, ran(true, &without_input(NAT), ""))
+        .cmd(docker, ran(true, "active\n", ""));
+    let report = assert_verdict(both, &store, "nat", Status::Warn, "off the host");
+    assert!(verdict(&report, "nat").1.contains("docker.service"));
 }
 
 // Both set forwarding to drop by default, so the VMs lose the internet while

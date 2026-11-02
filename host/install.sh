@@ -130,26 +130,9 @@ net.ipv4.ip_forward = 1
 EOF
 install -m 0644 "$tmp/90-runner.conf" /etc/sysctl.d/90-runner.conf
 sysctl -q -p /etc/sysctl.d/90-runner.conf
-# The first two lines make reapplying replace the table instead of adding to it.
-# VMs get the internet, but not the tailnet, the LAN, cloud metadata or each
-# other: an agent that's been talked into something can't reach my machines.
-# DNS is the exception: a guest uses the host's resolvers, which usually sit
-# on the LAN, the tailnet or the cloud's private network.
-cat >"$tmp/nat.nft" <<EOF
-table ip runner
-delete table ip runner
-table ip runner {
-	chain postrouting {
-		type nat hook postrouting priority srcnat; policy accept;
-		ip saddr $net ip daddr != $net masquerade
-	}
-	chain forward {
-		type filter hook forward priority filter; policy accept;
-		ip saddr $net ip daddr != $net meta l4proto { tcp, udp } th dport 53 accept
-		ip saddr $net ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
-	}
-}
-EOF
+# host/nat.nft says what the rules do. $net passed the check above, so it
+# holds nothing sed would read as part of the expression.
+sed "s|@NET@|$net|g" "$here/nat.nft" >"$tmp/nat.nft"
 nft -c -f "$tmp/nat.nft"
 install -d -m 0755 /etc/runner
 install -m 0644 "$tmp/nat.nft" /etc/runner/nat.nft

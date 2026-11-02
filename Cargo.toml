@@ -31,5 +31,7 @@ tokio = { version = "1", features = ["rt", "io-std"] }
 vsock = "0.5"
 
 [dev-dependencies]
+# sched, for the tests that step into a network namespace.
+nix = { version = "0.31", features = ["sched"] }
 proptest = "1"
 tempfile = "3"

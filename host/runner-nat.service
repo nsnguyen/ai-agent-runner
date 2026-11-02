@@ -1,6 +1,7 @@
-# NAT from the VMs' range to the internet, and nowhere private, with the rules
-# host/install.sh writes to /etc/runner/nat.nft. It follows nftables.service,
-# whose start and reload flush the whole ruleset, ours included.
+# NAT from the VMs' range to the internet, and nowhere private, the host
+# included, with the rules host/install.sh writes to /etc/runner/nat.nft. It
+# follows nftables.service, whose start and reload flush the whole ruleset,
+# ours included.
 [Unit]
 Description=runner: NAT for VMs
 After=nftables.service
@@ -12,7 +13,10 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/runner/nat.nft
 ExecReload=/usr/sbin/nft -f /etc/runner/nat.nft
-ExecStop=/usr/sbin/nft delete table ip runner
+# Two commands, not one transaction: a missing ip6 table would roll back
+# the ip one's delete too. "-" lets stop go on when one is already gone.
+ExecStop=-/usr/sbin/nft delete table ip runner
+ExecStop=-/usr/sbin/nft delete table ip6 runner
 
 [Install]
 WantedBy=multi-user.target
