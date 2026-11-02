@@ -270,6 +270,11 @@ fn the_rules_name_the_range_everywhere_install_sh_would() {
         rules.contains("ip saddr 10.20.0.0/16 ip daddr != 10.20.0.0/16 masquerade"),
         "{rules}"
     );
+    // The ip6 table goes by the taps' names, so every tap has to match it.
+    assert!(rules.contains("iifname \"fc*\" drop"), "{rules}");
+    for slot in [0, 1, 16383] {
+        assert!(DEFAULT_SUBNET.net(slot).unwrap().tap.starts_with("fc"));
+    }
 }
 
 // `ip` with these arguments, which has to work.

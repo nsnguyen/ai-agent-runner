@@ -14,8 +14,9 @@
 //
 // Tailnet only: it binds only an IPv4 address in Tailscale's 100.64.0.0/10
 // that's on one of Tailscale's interfaces, never 0.0.0.0, and takes
-// connections only from that range. A VM reaches the host's own addresses, so
-// without the second rule one VM could reach another through its URL.
+// connections only from that range. The host's rules (host/nat.nft) already
+// drop what a VM opens to the host's own addresses; the second rule still
+// keeps one VM from reaching another through its URL if they're missing.
 use crate::idle::InUse;
 use crate::store::{self, Store};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};

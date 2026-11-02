@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 pub const UNIT: &str = include_str!("../host/firecracker@.service");
 pub const UNIT_PATH: &str = "/etc/systemd/system/firecracker@.service";
 
-/// The unit that loads the VMs' NAT rules into the nftables table `ip runner`.
+/// The unit that loads the VMs' NAT rules into the nftables table `ip runner`,
+/// and the rules that keep their IPv6 off the host into `ip6 runner`.
 pub const NAT_UNIT: &str = "runner-nat.service";
 pub const NAT_TABLE: [&str; 2] = ["ip", "runner"];
+pub const NAT6_TABLE: [&str; 2] = ["ip6", "runner"];
 pub const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 /// Where host/install.sh writes those rules, for the unit to load.
 pub const NAT_RULES: &str = "/etc/runner/nat.nft";

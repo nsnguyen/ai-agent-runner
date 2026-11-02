@@ -234,8 +234,8 @@ fn boot_and_halt_by_hand() {
     assert!(ok(runner(root, &["list"])).starts_with("dev  gen 1  "));
 }
 
-// The guest's side (pinging its gateway, resolving a name, fetching a page)
-// waits for `runner exec`. From the host: the guest kernel took its address
+// The guest's side (resolving a name, fetching a page, and not reaching its
+// gateway) is `a_vm_reaches_the_internet_but_not_the_host`. From the host: the guest kernel took its address
 // and DNS from the boot argument, it answers there, and its tap goes with it.
 #[test]
 #[ignore = "boots a VM: needs /dev/kvm, Firecracker, a kernel, a rootfs and root"]
@@ -584,6 +584,30 @@ except OSError as e:
         &["exec", &name, "--", "python3", "-c", probe, &gateway],
     ));
     assert_eq!(ssh, "timed out\n", "{gateway}:22");
+    // Nor over IPv6, at the host's link-local address on the VM's tap, which
+    // the VM could work out from its gateway's MAC. The tap is named for the
+    // VM's /30. A host without IPv6 has no such address.
+    let tap = format!("fc{:08x}", u32::from(address) - 2);
+    let shown = Command::new("ip")
+        .args(["-6", "-o", "addr", "show", "dev", &tap, "scope", "link"])
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    match shown
+        .split_whitespace()
+        .skip_while(|w| *w != "inet6")
+        .nth(1)
+    {
+        Some(cidr) => {
+            let link_local = format!("{}%eth0", cidr.split('/').next().unwrap());
+            let ssh6 = ok(runner(
+                &root,
+                &["exec", &name, "--", "python3", "-c", probe, &link_local],
+            ));
+            assert_eq!(ssh6, "timed out\n", "[{link_local}]:22");
+        }
+        None => eprintln!("no IPv6 on {tap}, so no IPv6 to try"),
+    }
     let web = [
         "curl",
         "-fsS",

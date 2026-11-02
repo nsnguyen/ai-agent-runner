@@ -259,7 +259,12 @@ fn nat(host: &impl Host) -> Verdict {
         Ok(r) if r.ok && r.stdout.contains("masquerade") => {
             let mut words = r.stdout.split_whitespace();
             let range = words.find(|w| *w == "saddr").and(words.next());
-            (range.map(str::to_string), Some(guards_host(&r.stdout)))
+            // An install.sh from before the ip6 table left none to list.
+            let [family6, table6] = host::NAT6_TABLE;
+            let ip6 = host.run(host::NFT, &["list", "table", family6, table6]);
+            let ip6 = ip6.ok().filter(|r| r.ok).map(|r| r.stdout);
+            let rules = format!("{}{}", r.stdout, ip6.unwrap_or_default());
+            (range.map(str::to_string), Some(guards_host(&rules)))
         }
         Ok(r) if r.ok => {
             return fail(format!(
@@ -324,28 +329,36 @@ fn nat(host: &impl Host) -> Verdict {
 }
 
 /// Whether nftables rules, as `nft list` prints them or as host/nat.nft has
-/// them, keep the VMs off the host: an input chain that lets in replies from
-/// a range, then drops the rest from it.
+/// them, keep the VMs off the host: an ip input chain that lets in replies
+/// from a range, then drops the rest from it, and an ip6 one that drops all
+/// that comes in on a tap.
 fn guards_host(rules: &str) -> bool {
+    let (mut v4, mut v6) = (false, false);
+    let mut family = "";
     let mut input = false;
     let mut replies = None;
     for line in rules.lines().map(str::trim) {
-        if line.starts_with("chain ") {
+        if let Some(table) = line.strip_prefix("table ") {
+            family = table.split_whitespace().next().unwrap_or("");
+            (input, replies) = (false, None);
+        } else if line.starts_with("chain ") {
             (input, replies) = (false, None);
         } else if line.starts_with("type filter hook input ") {
             input = true;
-        } else if input {
+        } else if input && family == "ip6" {
+            v6 |= line == r#"iifname "fc*" drop"#;
+        } else if input && family == "ip" {
             let Some(from) = line.strip_prefix("ip saddr ") else {
                 continue;
             };
             if let Some(range) = from.strip_suffix(" ct state established,related accept") {
                 replies = Some(range);
             } else if replies.is_some_and(|range| from.strip_prefix(range) == Some(" drop")) {
-                return true;
+                v4 = true;
             }
         }
     }
-    false
+    v4 && v6
 }
 
 fn unit(host: &impl Host) -> Verdict {

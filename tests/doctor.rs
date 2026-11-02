@@ -33,11 +33,34 @@ const NAT: &str = "table ip runner {
 }
 ";
 
+// What `nft list table ip6 runner` prints for them: VMs get no IPv6 through
+// the host, and can't reach it over IPv6 either.
+const NAT6: &str = "table ip6 runner {
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tiifname \"fc*\" drop
+\t}
+
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tiifname \"fc*\" drop
+\t}
+}
+";
+
 // Rules as an install.sh from before the input chain wrote them, which
 // let VMs reach the host's own services.
 fn without_input(rules: &str) -> String {
     let start = rules.find("\tchain input {").unwrap();
     let end = start + rules[start..].find("\t}\n").unwrap() + "\t}\n".len();
+    format!("{}{}", &rules[..start], &rules[end..])
+}
+
+// The file install.sh writes, without its ip6 table: VMs reach the host over
+// IPv6, its link-local address on their tap.
+fn without_ip6(rules: &str) -> String {
+    let start = rules.find("table ip6 runner\n").unwrap();
+    let end = start + rules[start..].find("\n}\n").unwrap() + "\n}\n".len();
     format!("{}{}", &rules[..start], &rules[end..])
 }
 
@@ -66,6 +89,10 @@ fn list_nat() -> String {
     format!("{} list table ip runner", host::NFT)
 }
 
+fn list_nat6() -> String {
+    format!("{} list table ip6 runner", host::NFT)
+}
+
 fn ran(ok: bool, stdout: &str, stderr: &str) -> Result<Ran, ErrorKind> {
     Ok(Ran {
         ok,
@@ -92,6 +119,7 @@ impl Fake {
                 ran(true, "active\n", ""),
             ),
             (list_nat(), ran(true, NAT, "")),
+            (list_nat6(), ran(true, NAT6, "")),
         ];
         Fake {
             files: files.into_iter().collect(),
@@ -292,6 +320,19 @@ fn nat_warns_when_nothing_keeps_vms_off_the_host() {
     // No file to read: the active unit is all there is to go on.
     let unread = unprivileged().file(host::NAT_RULES, Err(ErrorKind::PermissionDenied));
     assert_verdict(unread, &store, "nat", Status::Ok, "root");
+
+    // Without the ip6 table, a VM reaches the host over IPv6.
+    let list6 = &list_nat6();
+    let gone = "Error: No such file or directory";
+    let no_ip6 = fake().cmd(list6, ran(false, "", gone));
+    assert_verdict(no_ip6, &store, "nat", Status::Warn, "off the host");
+    let file = without_ip6(&host::nat_rules(&DEFAULT_SUBNET));
+    assert!(!file.contains("table ip6"), "{file}");
+    let old = unprivileged().file(host::NAT_RULES, Ok(&file));
+    assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    let open6 = NAT6.replace("hook input", "hook output");
+    let open6 = fake().cmd(list6, ran(true, &open6, ""));
+    assert_verdict(open6, &store, "nat", Status::Warn, "off the host");
 
     // A drop in another chain, or an input chain that only accepts, isn't it.
     let accepts = NAT.replace("\t\tip saddr 172.16.0.0/16 drop\n", "");
