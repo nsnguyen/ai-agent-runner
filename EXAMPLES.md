@@ -94,6 +94,13 @@ You don't have to: a VM nobody has used for 10 minutes goes to sleep by itself, 
 runner idle demo 30      # after 30 minutes instead; or 90s, 2h, never
 ```
 
+A web app in a VM gets a link on your tailnet, and opening it wakes the VM if it's asleep:
+
+```sh
+runner service add demo web -- python3 -m http.server 8080
+runner url demo          # http://100.x.y.z:10001: open it in the laptop's browser
+```
+
 ## 7. Let Claude do it
 
 **Claude inside the VM.** In `runner claude demo`, ask in plain words:
