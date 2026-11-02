@@ -141,6 +141,16 @@ fn lists_its_tools() {
             "wake_vm"
         ]
     );
+    // It says how many of runs' and the agent's checkpoints gc keeps.
+    let listing = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "list_checkpoints")
+        .unwrap();
+    let said = listing["description"].as_str().unwrap();
+    let keep = format!("newest {}", runner::store::KEEP_CHECKPOINTS);
+    assert!(said.contains(&keep), "{said}");
 }
 
 #[test]
@@ -340,7 +350,7 @@ fn checkpoint_list_and_restore() {
     let mut c = made["structuredContent"].clone();
     let time = c.as_object_mut().unwrap().remove("time").unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(time.as_str().unwrap()).is_ok());
-    let want = json!({"id": 1, "comment": "clean", "auto": false, "agent": false, "bytes": 6, "current": false});
+    let want = json!({"id": 1, "comment": "clean", "auto": false, "agent": false, "run": false, "bytes": 6, "current": false});
     assert_eq!(c, want);
 
     let listed = s.call(3, "list_checkpoints", json!({"name": "dev"}));

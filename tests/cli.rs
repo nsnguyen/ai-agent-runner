@@ -169,12 +169,14 @@ fn gc_sweeps_every_vm_and_keeps_five_by_default() {
     );
 }
 
+// Held with its unit stopped: another runner command has it for a moment.
 #[test]
 fn gc_reports_a_busy_vm_and_still_sweeps_the_rest() {
     let dir = with_history();
+    let sd = FakeSystemd::new(dir.path());
     let store = Store::new(dir.path());
     let run = store.begin_run("dev").unwrap();
-    let out = runner(dir.path(), &["gc", "--keep", "0"]);
+    let out = runner_on(dir.path(), &sd, &["gc", "--keep", "0"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         text(&out.stderr).contains("dev is busy"),
@@ -189,6 +191,56 @@ fn gc_reports_a_busy_vm_and_still_sweeps_the_rest() {
         "{}",
         text(&out.stdout)
     );
+}
+
+// A VM that's up is its boot's to gc, at its next commit, so a sweep of
+// every VM passes over it and still succeeds. Named, it's refused.
+#[test]
+fn gc_skips_a_vm_that_is_up_and_cleans_the_rest() {
+    let dir = with_history();
+    let sd = FakeSystemd::new(dir.path());
+    let store = Store::new(dir.path());
+    store.fork("base", "web").unwrap();
+    let boot = store.begin_run("web").unwrap();
+    for (active, state) in [("active", "running"), ("activating", "booting")] {
+        sd.set_state(active);
+        let out = runner_on(dir.path(), &sd, &["gc", "--dry-run", "--keep", "0"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let got = text(&out.stdout);
+        assert!(got.starts_with("base  nothing to free\ndev  would free gen 0 1 2 3 4 5  up to "));
+        assert!(
+            got.ends_with(&format!("\nweb  skipped: {state}\n")),
+            "{got}"
+        );
+    }
+    // Sleeping, its boot is up with a snapshot noted.
+    sd.set_state("active");
+    let snapshot = dir.path().join("vms/web/snapshot");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(
+        snapshot.join("slept.json"),
+        r#"{"generation":1,"at":"2026-11-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let out = runner_on(dir.path(), &sd, &["gc", "--keep", "0"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let got = text(&out.stdout);
+    assert!(
+        got.contains("\ndev  freed gen 0 1 2 3 4 5  up to "),
+        "{got}"
+    );
+    assert!(got.ends_with("\nweb  skipped: sleeping\n"), "{got}");
+    assert!(!dir.path().join("vms/dev/gens/0.ext4").exists());
+
+    let out = runner_on(dir.path(), &sd, &["gc", "web"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("web is busy"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(text(&out.stdout), "");
+    drop(boot);
 }
 
 #[test]

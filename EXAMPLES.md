@@ -79,6 +79,8 @@ runner restore demo 2
 runner exec demo -- ls /home/agent/work                # notes.txt is back
 ```
 
+Your checkpoints stay until you delete the VM. The ones the runner makes for itself, before a run on a running VM and when the agent inside asks, are cleaned up: it keeps the newest 20 of those.
+
 ## 6. Sleep: pause a VM, programs and all
 
 ```sh

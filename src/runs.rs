@@ -484,6 +484,7 @@ struct Gens {
     // What boot noted once its guest answered: what it cloned, and its own.
     booted: Option<Booted>,
     // Taken of a running VM before the run, to restore if the run fails.
+    // gc keeps it while this process holds the run lock (store.rs, collect).
     checkpoint: Option<u64>,
     // Whether claude started: a run cancelled or failed before then restores
     // nothing, since stopping the VM would end its sessions for nothing.
@@ -582,7 +583,7 @@ fn run_claude(
     // up, so it can be checkpointed. Then a fresh connection: the VM was
     // paused under this one.
     if !ask.boots {
-        let made = checkpoint::checkpoint(store, vm, Some(&format!("before run {run}")));
+        let made = checkpoint::for_run(store, vm, Some(&format!("before run {run}")));
         let made = made.map_err(|e| Error::Checkpoint {
             vm: vm.to_string(),
             why: e.to_string(),
