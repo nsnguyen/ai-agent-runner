@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use runner::checkpoint;
 use runner::claude::{self, Claude};
-use runner::creds::Cred;
+use runner::creds::{self, Cred};
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::idle::Idle;
@@ -228,7 +228,8 @@ enum Cmd {
         /// Run it on a terminal of its own, as `ssh -t` does.
         #[arg(short, long)]
         tty: bool,
-        /// Set a variable for it. Repeat for more.
+        /// Set a variable for it. Repeat for more. A credential's is
+        /// refused: those reach a VM only through `runner creds`.
         #[arg(short, long = "env", value_name = "K=V", value_parser = parse_env)]
         env: Vec<(String, String)>,
         /// The directory to run it in. Defaults to the user's home.
@@ -729,9 +730,14 @@ fn term() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+// Refused here, a credential's variable stops the command before the VM is
+// looked at.
 fn parse_env(kv: &str) -> Result<(String, String), String> {
     match kv.split_once('=') {
-        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        Some((k, v)) if !k.is_empty() => {
+            creds::refuse([k]).map_err(|e| e.to_string())?;
+            Ok((k.to_string(), v.to_string()))
+        }
         _ => Err(format!("{kv:?} isn't K=V")),
     }
 }

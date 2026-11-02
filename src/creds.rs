@@ -61,6 +61,21 @@ impl Cred {
     }
 }
 
+/// A request that sets a credential's variable itself.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0} is a credential: credentials reach a VM only through `runner creds`")]
+pub struct Refused(pub &'static str);
+
+/// Refuses a request's variables if any is one a credential arrives as. A VM
+/// gets those only from the host, as its allowlist says; the guest would
+/// drop them anyway (`Keyring::apply`), so this says so instead.
+pub fn refuse<'a>(vars: impl IntoIterator<Item = &'a str>) -> Result<(), Refused> {
+    match vars.into_iter().find_map(Cred::of_var) {
+        Some((_, var)) => Err(Refused(var)),
+        None => Ok(()),
+    }
+}
+
 impl FromStr for Cred {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {

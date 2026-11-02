@@ -6,6 +6,7 @@
 //
 // Firecracker ends a connection both ways once the host closes its side,
 // even only for writing, so the host only does that to hang up.
+use crate::creds;
 use crate::idle::InUse;
 use crate::proto::{self, Exit, FromGuest, Request, ToGuest, WinSize};
 use crate::store::Store;
@@ -14,6 +15,7 @@ use nix::sys::signal::{SigSet, Signal};
 use nix::sys::termios::{self, SetArg, Termios};
 use rmcp::schemars;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -27,7 +29,8 @@ use std::time::{Duration, Instant};
 pub const USER: &str = "agent";
 /// How long a VM's runner-guest gets to answer, for a VM that has just booted.
 pub const GUEST_WAIT: Duration = Duration::from_secs(60);
-/// The most of each stream MCP's exec gives back.
+/// How much of each stream MCP's exec gives back whole; past it, the first
+/// and last half of that.
 pub const OUTPUT_CAP: usize = 32 * 1024;
 /// `runner shell`: the user's own shell, as a login shell.
 pub const LOGIN: [&str; 3] = ["/bin/sh", "-c", r#"exec "${SHELL:-/bin/sh}" -l"#];
@@ -59,6 +62,8 @@ pub enum Error {
     Store(#[from] crate::store::Error),
     #[error(transparent)]
     Proto(#[from] proto::Error),
+    #[error(transparent)]
+    Refused(#[from] creds::Refused),
     #[error("runner-guest in {name} didn't answer ({last}): `runner logs {name}` says more")]
     NoGuest { name: String, last: io::Error },
     /// Why the guest couldn't run the command.
@@ -183,6 +188,13 @@ fn clone(conn: &UnixStream) -> Result<UnixStream> {
 // The host's frames go out from several threads, a whole frame at a time.
 type Writer = Arc<Mutex<UnixStream>>;
 
+// Every request leaves the host here, so none sets a credential's variable,
+// whichever command built it.
+fn send_request(writer: &Mutex<UnixStream>, req: &Request) -> Result<()> {
+    creds::refuse(req.env.iter().map(|(k, _)| k.as_str()))?;
+    Ok(proto::write_frame(&mut *writer.lock().unwrap(), req)?)
+}
+
 fn send(writer: &Mutex<UnixStream>, msg: &ToGuest) -> proto::Result<()> {
     proto::write_frame(&mut *writer.lock().unwrap(), msg)
 }
@@ -227,7 +239,7 @@ struct Begun {
 fn begin(conn: &UnixStream, req: &Request, stdin: &[u8]) -> Result<Begun> {
     let cut = Cut(clone(conn)?);
     let writer: Writer = Arc::new(Mutex::new(clone(conn)?));
-    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
+    send_request(&writer, req)?;
     let (tx, frames) = mpsc::channel();
     let mut reader = clone(conn)?;
     thread::spawn(move || {
@@ -263,9 +275,11 @@ pub struct Captured {
     pub exit_code: Option<i32>,
     /// The signal that ended it, if one did.
     pub signal: Option<i32>,
-    /// The start of its stdout, as UTF-8 with bad bytes replaced.
+    /// Its stdout, as UTF-8 with bad bytes replaced: whole up to the cap,
+    /// and past it the first and last half of that, with a line between
+    /// saying how many bytes were cut.
     pub stdout: String,
-    /// True if stdout went on past what's here.
+    /// True if stdout went on past the cap, so some of it was cut.
     pub stdout_truncated: bool,
     pub stderr: String,
     pub stderr_truncated: bool,
@@ -274,7 +288,7 @@ pub struct Captured {
 }
 
 /// Runs `req` on `conn` to its end, with `stdin` as its input, then closed,
-/// and keeps the first `cap` bytes of each stream. Past `timeout`, the
+/// and keeps each stream as `Kept` does with `cap`. Past `timeout`, the
 /// command's process group gets SIGKILL.
 pub fn capture(
     conn: UnixStream,
@@ -324,9 +338,9 @@ pub fn capture(
             _ => None,
         },
         stdout: stdout.text(),
-        stdout_truncated: stdout.cut,
+        stdout_truncated: stdout.cut(),
         stderr: stderr.text(),
-        stderr_truncated: stderr.cut,
+        stderr_truncated: stderr.cut(),
         timed_out,
     })
 }
@@ -425,38 +439,71 @@ fn kill(writer: &Mutex<UnixStream>, conn: &UnixStream) -> bool {
     false
 }
 
-// The start of an output stream.
-struct Kept {
-    bytes: Vec<u8>,
-    cap: usize,
-    cut: bool,
+/// An output stream kept to `cap` bytes: whole up to there, and past it its
+/// first and last half (the first gets an odd byte), so the error a long
+/// command prints last isn't lost.
+pub struct Kept {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    head_cap: usize,
+    tail_cap: usize,
+    /// Every byte pushed.
+    seen: u64,
 }
 
 impl Kept {
-    fn new(cap: usize) -> Kept {
+    pub fn new(cap: usize) -> Kept {
         Kept {
-            bytes: Vec::new(),
-            cap,
-            cut: false,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            head_cap: cap - cap / 2,
+            tail_cap: cap / 2,
+            seen: 0,
         }
     }
 
-    fn push(&mut self, b: &[u8]) {
-        let room = self.cap - self.bytes.len();
-        self.cut |= b.len() > room;
-        self.bytes.extend_from_slice(&b[..b.len().min(room)]);
+    pub fn push(&mut self, b: &[u8]) {
+        self.seen += b.len() as u64;
+        let (head, rest) = b.split_at(b.len().min(self.head_cap - self.head.len()));
+        self.head.extend_from_slice(head);
+        let rest = &rest[rest.len().saturating_sub(self.tail_cap)..];
+        let over = (self.tail.len() + rest.len()).saturating_sub(self.tail_cap);
+        self.tail.drain(..over);
+        self.tail.extend(rest);
     }
 
-    // A character the cap cut in two goes, rather than ending in U+FFFD.
-    fn text(&self) -> String {
-        let mut bytes = &self.bytes[..];
-        if self.cut
-            && let Err(e) = std::str::from_utf8(bytes)
+    /// True if bytes between the two ends were dropped.
+    pub fn cut(&self) -> bool {
+        self.seen > (self.head.len() + self.tail.len()) as u64
+    }
+
+    /// The stream as text. Cut, a line between its ends says how many bytes
+    /// went, and a character the cut splits goes whole, rather than leaving
+    /// U+FFFD; it's counted in those bytes.
+    pub fn text(&self) -> String {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        if !self.cut() {
+            return String::from_utf8_lossy(&[&self.head[..], &tail].concat()).into_owned();
+        }
+        let mut head = &self.head[..];
+        if let Err(e) = std::str::from_utf8(head)
             && e.error_len().is_none()
         {
-            bytes = &bytes[..e.valid_up_to()];
+            head = &head[..e.valid_up_to()];
         }
-        String::from_utf8_lossy(bytes).into_owned()
+        // A UTF-8 character has at most three continuation bytes.
+        let split = tail
+            .iter()
+            .take(3)
+            .take_while(|b| *b & 0xC0 == 0x80)
+            .count();
+        let tail = &tail[split..];
+        let gone = self.seen - (head.len() + tail.len()) as u64;
+        format!(
+            "{}\n[runner cut {gone} bytes here]\n{}",
+            String::from_utf8_lossy(head),
+            String::from_utf8_lossy(tail),
+        )
     }
 }
 
@@ -487,7 +534,7 @@ pub fn terminal_size() -> WinSize {
 pub fn attach(conn: UnixStream, req: &Request) -> Result<Exit> {
     let tty = req.tty.is_some();
     let writer: Writer = Arc::new(Mutex::new(clone(&conn)?));
-    proto::write_frame(&mut *writer.lock().unwrap(), req)?;
+    send_request(&writer, req)?;
     let hang_up = Arc::new(HangUp {
         conn: clone(&conn)?,
         by: AtomicI32::new(0),
