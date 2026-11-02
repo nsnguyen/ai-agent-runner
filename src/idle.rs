@@ -6,8 +6,9 @@
 // Use is what the host can see. A command holds the VM's use lock, shared,
 // from before it looks at the VM until its connection to the guest closes,
 // and touches the lock's file as it takes it and as it lets go, so a use too
-// short for the boot to catch still leaves its mark. Every few seconds the
-// boot looks: the lock held or touched since its last look, a headless run
+// short for the boot to catch still leaves its mark. An open `runner proxy`
+// holds it through `runner hold` on the host (exec::hold). Every few seconds
+// the boot looks: the lock held or touched since its last look, a headless run
 // going, or, once the time is otherwise up, a terminal attached to a tmux
 // session in the guest each count as use. A detached session doesn't: it
 // sleeps with the rest of the VM's memory and is there on waking. Once none

@@ -3,7 +3,8 @@ use runner::store::Store;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn runner(root: &Path, args: &[&str]) -> Output {
@@ -504,7 +505,7 @@ fn unit_prints_the_template_for_this_binary_and_root() {
 }
 
 #[test]
-fn boot_and_halt_stay_out_of_the_help() {
+fn boot_halt_and_hold_stay_out_of_the_help() {
     let dir = tempfile::tempdir().unwrap();
     let help = text(&runner(dir.path(), &["--help"]).stdout);
     for cmd in ["start", "stop", "status", "logs", "unit"] {
@@ -512,6 +513,86 @@ fn boot_and_halt_stay_out_of_the_help() {
     }
     assert!(!help.contains("  boot "), "{help}");
     assert!(!help.contains("  halt "), "{help}");
+    assert!(!help.contains("  hold "), "{help}");
+}
+
+// Whether a command holds the VM's use lock, which it holds shared.
+fn held(lock: &Path) -> bool {
+    let file = fs::File::open(lock).unwrap();
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+}
+
+// What the laptop's `runner proxy` runs on the host beside its tunnel: it
+// starts the VM unless it's running, then holds it in use until its stdout's
+// far end closes, as sshd's does when the connection goes.
+#[test]
+fn hold_holds_the_vm_in_use_until_its_connection_closes() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    runner(dir.path(), &["create", "dev"]);
+    let lock = dir.path().join("vms/dev/use.lock");
+    let mut hold = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .args(["hold", "dev"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    common::wait_for("the hold to take dev", || {
+        lock.exists() && held(&lock) || hold.try_wait().unwrap().is_some()
+    });
+    // A while later, still held: stdin closed at once, and that isn't it.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(hold.try_wait().unwrap().is_none(), "the hold ended early");
+    assert!(held(&lock));
+    assert!(
+        sd.calls()
+            .contains(&"systemctl start firecracker@dev.service".to_string()),
+        "{:?}",
+        sd.calls()
+    );
+
+    drop(hold.stdout.take());
+    common::wait_for("the hold to end", || hold.try_wait().unwrap().is_some());
+    let out = hold.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!held(&lock));
+}
+
+// One that's running is held as it is: nothing starts it again.
+#[test]
+fn hold_leaves_a_running_vm_be() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    runner(dir.path(), &["create", "dev"]);
+    sd.set_state("active");
+    let lock = dir.path().join("vms/dev/use.lock");
+    let mut hold = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .args(["hold", "dev"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    common::wait_for("the hold to take dev", || {
+        lock.exists() && held(&lock) || hold.try_wait().unwrap().is_some()
+    });
+    drop(hold.stdout.take());
+    assert!(hold.wait().unwrap().success());
+    let show = "systemctl show --property=ActiveState --value firecracker@dev.service";
+    assert_eq!(sd.calls(), [show]);
+}
+
+#[test]
+fn hold_on_a_missing_vm_fails_at_once() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    let out = runner_on(dir.path(), &sd, &["hold", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("nope"), "{}", text(&out.stderr));
+    assert!(sd.calls().is_empty(), "{:?}", sd.calls());
 }
 
 #[test]

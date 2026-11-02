@@ -49,7 +49,8 @@ trap cleanup EXIT
 
 echo "== image ($engine)"
 mkdir "$work/context"
-cp "$here/Dockerfile" "$here/runner-guest.service" "$here/llm.txt" "$work/context/"
+cp "$here/Dockerfile" "$here/runner-guest.service" "$here/llm.txt" \
+  "$here/managed-settings.json" "$work/context/"
 cp "$guest" "$work/context/runner-guest"
 "$engine" build -t "$tag" "$work/context"
 

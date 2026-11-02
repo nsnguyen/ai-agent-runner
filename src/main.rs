@@ -80,9 +80,10 @@ enum Cmd {
     /// Bring a sleeping VM back where it was, and set its clock.
     Wake { name: String },
     /// Show or set how long a VM goes unused before it sleeps. Use is a
-    /// shell, exec, attached session, run or MCP call on it; a detached tmux
-    /// session doesn't count, and sleeps with the VM. Anything that needs the
-    /// VM wakes it. A running VM counts from the next look, every 10 seconds.
+    /// shell, exec, attached session, run, MCP call or open `runner proxy` on
+    /// it; a detached tmux session doesn't count, and sleeps with the VM.
+    /// Anything that needs the VM wakes it. A running VM counts from the next
+    /// look, every 10 seconds.
     Idle {
         name: String,
         /// Minutes, or with s, m or h, like 90s or 2h, or never. Ten minutes
@@ -311,6 +312,11 @@ enum Cmd {
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
     Halt { name: String },
+    /// Hold a VM in use, starting it unless it's running, until stdout's far
+    /// end closes: what the laptop's `runner proxy` runs here beside its
+    /// tunnel, so the VM doesn't idle-sleep under it.
+    #[command(hide = true)]
+    Hold { name: String },
     /// Drive a run to its end: what `runner run` starts.
     #[command(hide = true)]
     Drive {
@@ -615,6 +621,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             }
         }
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
+        Cmd::Hold { name } => exec::hold(&store, &name, std::io::stdout())?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
     }
     Ok(ExitCode::SUCCESS)

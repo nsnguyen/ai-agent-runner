@@ -13,6 +13,9 @@ you can go back.
 - You are `agent` (uid 1000), home /home/agent. Work in /home/agent/work.
 - On PATH: git, curl, build-essential, tmux, Node.js and npm, Python 3, Rust
   (cargo, rustfmt, clippy), and Claude Code (`claude`).
+- Claude Code stays at the version this image was built with: its updater
+  is off, in /etc/claude-code/managed-settings.json. VMs made from a
+  rebuilt base image get a newer one.
 - There's no sshd. The owner reaches you through runner-guest over vsock:
   `runner shell`, `runner exec`, `runner claude` and headless runs.
 
