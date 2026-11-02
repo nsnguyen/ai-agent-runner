@@ -41,6 +41,8 @@ quote() {
 
 # proxy runs here, not on the host: localhost:PORT on the laptop becomes PORT
 # in the VM, through an ssh tunnel to the host, which reaches the VM's address.
+# The tunnel's command is the host's `runner hold`, which holds the VM in use
+# until the connection closes, so the VM doesn't idle-sleep under the proxy.
 usage="usage: runner proxy <vm> <port>|<local>:<remote>...
   runner proxy dev 3000         localhost:3000 here is dev's port 3000
   runner proxy dev 8080:3000    localhost:8080 here is dev's port 3000"
@@ -72,10 +74,11 @@ if [ "${1-}" = proxy ]; then
 
   # start boots a stopped VM, wakes a sleeping one, and leaves a running one be.
   quote "$vm"
+  vmq=$arg
   # No stdin, so keys typed while the VM boots stay in the terminal, and no
   # tty, whose \r would spoil the address.
-  # shellcheck disable=SC2029 # $arg is quoted for the host's shell, here.
-  addr=$(ssh -n -T "$host" "runner start $arg >/dev/null && runner ip $arg") || exit
+  # shellcheck disable=SC2029 # $vmq is quoted for the host's shell, here.
+  addr=$(ssh -n -T "$host" "runner start $vmq >/dev/null && runner ip $vmq") || exit
   case $addr in '' | *[!0-9.]*)
     echo "runner: the host gave $vm's address as '$addr', which isn't one" >&2
     exit 1
@@ -91,7 +94,11 @@ if [ "${1-}" = proxy ]; then
     said="$said, localhost:$lport is $vm's port $rport"
   done
   echo "runner: ${said#, }. Ctrl-C ends it." >&2
-  exec ssh -N -o ExitOnForwardFailure=yes "$@" "$host"
+  # The hold reads nothing, so no stdin, and keys typed here go nowhere. Ctrl-C
+  # or a dropped connection ends ssh, and with it the hold, so the VM's idle
+  # time starts again.
+  # shellcheck disable=SC2029
+  exec ssh -n -T -o ExitOnForwardFailure=yes "$@" "$host" "runner hold $vmq"
 fi
 
 cmd=runner

@@ -310,6 +310,11 @@ enum Cmd {
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
     Halt { name: String },
+    /// Hold a VM in use, starting it unless it's running, until stdout's far
+    /// end closes: what the laptop's `runner proxy` runs here beside its
+    /// tunnel, so the VM doesn't idle-sleep under it.
+    #[command(hide = true)]
+    Hold { name: String },
     /// Drive a run to its end: what `runner run` starts.
     #[command(hide = true)]
     Drive {
@@ -614,6 +619,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             }
         }
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
+        Cmd::Hold { name } => exec::hold(&store, &name, std::io::stdout())?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
     }
     Ok(ExitCode::SUCCESS)

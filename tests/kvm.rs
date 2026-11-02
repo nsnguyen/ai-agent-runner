@@ -22,6 +22,7 @@
 // `a_process_lives_through_sleep_and_wake`,
 // `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
 // `an_idle_vm_sleeps_and_exec_wakes_it`,
+// `an_open_proxy_keeps_its_vm_awake`,
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
@@ -787,6 +788,167 @@ fn an_idle_vm_sleeps_and_exec_wakes_it() {
     let logs = ok(runner(&root, &["logs", &name]));
     assert!(logs.contains("went unused for 1m"), "{logs}");
     eprintln!("slept after {slept:?} unused");
+}
+
+// The laptop's `runner proxy` (client/runner), run on this host: its ssh runs
+// each command here as the root's owner, as the host's sshd runs it for the
+// runner user. A tunnel's command gets a session of its own, with its stdout
+// read by ssh, so that end closes when ssh dies, as sshd's does when the
+// connection goes. The forwards ssh is asked for go in FORWARDS, for the test
+// to make.
+fn proxy_laptop(root: &Path) -> tempfile::TempDir {
+    let laptop = tempfile::tempdir().unwrap();
+    let bin = laptop.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    common::script(
+        &bin.join("ssh"),
+        r#"for cmd; do :; done
+for arg; do
+  case $arg in localhost:*) printf '%s\n' "${arg#localhost:}" >>"$FORWARDS" ;; esac
+done
+for arg; do
+  if [ "$arg" = -L ]; then
+    rm -f "$CONN" && mkfifo "$CONN" || exit 255
+    setsid -w sh -c "$cmd" >"$CONN" </dev/null &
+    while read -r _; do :; done <"$CONN"
+    wait $!
+    exit
+  fi
+done
+exec sh -c "$cmd"
+"#,
+    );
+    let cmd = cli(root);
+    let quote = |arg: &std::ffi::OsStr| {
+        let arg = arg.to_str().unwrap();
+        assert!(!arg.contains('\''), "{arg}");
+        format!("'{arg}'")
+    };
+    let mut line = format!("cd / || exit\nRUNNER_ROOT={} exec", quote(root.as_os_str()));
+    for arg in std::iter::once(cmd.get_program()).chain(cmd.get_args()) {
+        line = format!("{line} {}", quote(arg));
+    }
+    common::script(&bin.join("runner"), &format!("{line} \"$@\"\n"));
+    laptop
+}
+
+// Forwards each connection `listener` takes to `to`, as ssh's -L does.
+fn forward(listener: std::net::TcpListener, to: std::net::SocketAddr) {
+    use std::net::{Shutdown, TcpStream};
+    let pipe = |mut from: TcpStream, mut to: TcpStream| {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut from, &mut to);
+            let _ = to.shutdown(Shutdown::Write);
+        });
+    };
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            if let Ok(back) = TcpStream::connect(to) {
+                pipe(conn.try_clone().unwrap(), back.try_clone().unwrap());
+                pipe(back, conn);
+            }
+        }
+    });
+}
+
+// A proxy a failed test left open still ends, before Cleanup's stop.
+struct EndProxy(nix::unistd::Pid);
+
+impl Drop for EndProxy {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::SIGKILL);
+    }
+}
+
+// An open proxy keeps its VM awake past its idle time, and answers through
+// it; once Ctrl-C ends it, the idle time starts again and the VM sleeps.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_open_proxy_keeps_its_vm_awake() {
+    use std::os::unix::process::CommandExt;
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("proxy-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name, "--idle", "90s"]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let status = || ok(runner(&root, &["status", &name]));
+    // A service alone lets the VM sleep, so what keeps it up is the proxy.
+    let web = ["python3", "-m", "http.server", "8080"];
+    let mut add = vec!["service", "add", &name, "web", "--"];
+    add.extend(web);
+    ok(runner(&root, &add));
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    eventually("the service to answer", || {
+        http_status(&address, 8080).is_some_and(|l| l.ends_with(" 200 OK"))
+    });
+
+    let laptop = proxy_laptop(&root);
+    let forwards = laptop.path().join("forwards");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let path = format!(
+        "{}:{}",
+        laptop.path().join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let client = Path::new(env!("CARGO_MANIFEST_DIR")).join("client/runner");
+    let mut proxy = Command::new("sh")
+        .arg(client)
+        .args(["proxy", &name, &format!("{local}:8080")])
+        .env("PATH", path)
+        .env("RUNNER_HOST", "runner@this-host")
+        .env("FORWARDS", &forwards)
+        .env("CONN", laptop.path().join("conn"))
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = nix::unistd::Pid::from_raw(proxy.id() as i32);
+    let _end = EndProxy(group);
+    eventually("the proxy's forward", || {
+        std::fs::read_to_string(&forwards).is_ok_and(|f| !f.is_empty())
+    });
+    let asked = std::fs::read_to_string(&forwards).unwrap();
+    assert_eq!(asked, format!("{local}:{address}:8080\n"));
+    forward(listener, format!("{address}:8080").parse().unwrap());
+
+    // Its idle time, a look's 10 seconds and then some, still running.
+    let opened = Instant::now();
+    while opened.elapsed() < Duration::from_secs(120) {
+        assert!(proxy.try_wait().unwrap().is_none(), "the proxy ended");
+        let now = status();
+        assert!(
+            now.contains("  running"),
+            "slept under the proxy after {:?}: {now}",
+            opened.elapsed()
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    let through = http_status("127.0.0.1", local);
+    assert!(
+        through.as_deref().is_some_and(|l| l.ends_with(" 200 OK")),
+        "{through:?}"
+    );
+
+    // Ctrl-C, as a terminal sends it to its job.
+    nix::sys::signal::killpg(group, nix::sys::signal::SIGINT).unwrap();
+    proxy.wait().unwrap();
+    let ended = Instant::now();
+    while !status().contains("  sleeping") {
+        assert!(
+            ended.elapsed() < Duration::from_secs(120),
+            "still awake {:?} after the proxy ended: {}",
+            ended.elapsed(),
+            status()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let slept = ended.elapsed();
+    // Its idle time started again as the proxy ended, not when it opened.
+    assert!(slept >= Duration::from_secs(85), "slept after {slept:?}");
+    eprintln!("slept {slept:?} after the proxy ended");
 }
 
 // The id a checkpoint row starts with, after the mark for the current one.
