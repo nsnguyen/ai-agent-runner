@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Check a built base disk without mounting it (debugfs, no root): the guest
-# agent is installed and enabled at boot, Claude Code is on PATH, the agent's
-# /.runner/llm.txt is there, and no Claude Code login or state is baked in for
-# any fork to inherit.
+# agent is installed and enabled at boot, Claude Code is on PATH with its
+# updater off, the agent's /.runner/llm.txt is there, and no Claude Code login
+# or state is baked in for any fork to inherit.
 #
 #   images/base/check.sh images/base/out/base.ext4
 set -euo pipefail
@@ -40,6 +40,21 @@ if [[ $(type_of /usr/local/bin/claude) == symlink || $(type_of /usr/local/bin/cl
   ok "claude is on PATH"
 else
   bad "/usr/local/bin/claude is missing"
+fi
+
+# Every claude reads its managed settings, however it starts, and these keep
+# it at the version the image installed.
+settings=/etc/claude-code/managed-settings.json
+settings_mode=$(stat_of "$settings" | sed -n 's/.*Mode: *0*\([0-7]*\) .*/\1/p')
+if [[ $(type_of "$settings") != regular ]]; then
+  bad "$settings is missing, so Claude Code updates itself"
+elif (( (8#${settings_mode:-0} & 8#004) == 0 )); then
+  bad "$settings isn't readable by agent"
+elif ! debugfs -R "cat $settings" "$disk" 2>/dev/null | tr -d ' \t\r\n' |
+    grep -q '"DISABLE_AUTOUPDATER":"1"'; then
+  bad "Claude Code's updater is on: $settings doesn't set DISABLE_AUTOUPDATER to \"1\""
+else
+  ok "Claude Code's updater is off"
 fi
 
 if [[ $(type_of /.runner/llm.txt) == regular ]]; then
