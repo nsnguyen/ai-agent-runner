@@ -158,6 +158,27 @@ fn check_fails_when_the_settings_leave_the_updater_on() {
     fails_mentioning(&check(tree.path()), "FAIL  Claude Code's updater is on");
 }
 
+// Claude Code reads the variable only from the settings' env.
+#[test]
+fn check_fails_when_the_setting_is_outside_env() {
+    let tree = clean_tree();
+    let outside = br#"{"DISABLE_AUTOUPDATER": "1", "env": {}}"#;
+    fs::write(tree.path().join(SETTINGS), outside).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  Claude Code's updater is on");
+}
+
+#[test]
+fn check_fails_when_the_agent_can_t_reach_the_settings() {
+    let tree = clean_tree();
+    let dir = tree.path().join(SETTINGS);
+    let dir = dir.parent().unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /etc/claude-code/managed-settings.json isn't readable",
+    );
+}
+
 #[test]
 fn check_fails_when_the_agent_can_t_read_the_settings() {
     let tree = clean_tree();

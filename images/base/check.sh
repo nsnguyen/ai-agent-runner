@@ -43,16 +43,19 @@ else
 fi
 
 # Every claude reads its managed settings, however it starts, and these keep
-# it at the version the image installed.
+# it at the version the image installed. The variable counts only in env.
 settings=/etc/claude-code/managed-settings.json
-settings_mode=$(stat_of "$settings" | sed -n 's/.*Mode: *0*\([0-7]*\) .*/\1/p')
+mode_of() { stat_of "$1" | sed -n 's/.*Mode: *0*\([0-7]*\) .*/\1/p'; }
+file_mode=$(mode_of "$settings")
+dir_mode=$(mode_of "${settings%/*}")
+json=$(debugfs -R "cat $settings" "$disk" 2>/dev/null | tr -d ' \t\r\n')
+off='"env":\{[^}]*"DISABLE_AUTOUPDATER":"1"'
 if [[ $(type_of "$settings") != regular ]]; then
   bad "$settings is missing, so Claude Code updates itself"
-elif (( (8#${settings_mode:-0} & 8#004) == 0 )); then
+elif (( (8#${file_mode:-0} & 8#004) == 0 || (8#${dir_mode:-0} & 8#001) == 0 )); then
   bad "$settings isn't readable by agent"
-elif ! debugfs -R "cat $settings" "$disk" 2>/dev/null | tr -d ' \t\r\n' |
-    grep -q '"DISABLE_AUTOUPDATER":"1"'; then
-  bad "Claude Code's updater is on: $settings doesn't set DISABLE_AUTOUPDATER to \"1\""
+elif ! [[ $json =~ $off ]]; then
+  bad "Claude Code's updater is on: $settings doesn't set env.DISABLE_AUTOUPDATER to \"1\""
 else
   ok "Claude Code's updater is off"
 fi

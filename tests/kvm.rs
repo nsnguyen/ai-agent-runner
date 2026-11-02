@@ -35,7 +35,7 @@
 // host/install.sh after a build. The headless run needs the host's Claude
 // Code token in /etc/credstore (docs/host.md, step 6). The agent's own
 // checkpoints need a base built with this runner-guest, and the updater test
-// one built from this images/base (images/base/build.sh).
+// needs a base built from this images/base (images/base/build.sh).
 mod common;
 
 use std::fs::Permissions;
@@ -648,7 +648,12 @@ fn claude_code_in_a_vm_has_its_updater_off() {
     cmd.env_remove("TERM")
         .args(["claude", &name, "--", "doctor"]);
     let mut claude = t.spawn(cmd);
-    let screen = || in_vm(&["tmux", "capture-pane", "-p", "-S", "-", "-t", "=claude:"]);
+    // Empty until `runner claude` has made the session.
+    let capture = ["exec", &name, "--", "tmux", "capture-pane", "-p", "-S", "-"];
+    let screen = || {
+        let out = runner(&root, &[&capture[..], &["-t", "=claude:"]].concat());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
     eventually("claude doctor's report", || {
         screen().contains("Auto-updates:")
     });

@@ -183,7 +183,7 @@ The boot test needs `/dev/kvm` and `firecracker` on PATH. It boots a copy of the
 RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
 ```
 
-To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`. Claude Code doesn't update itself in a VM: `images/base/managed-settings.json`, which the image installs as `/etc/claude-code/managed-settings.json`, sets `DISABLE_AUTOUPDATER`, so every VM runs the version its base was built with, and a newer one comes from rebuilding `base`. A VM forked from an older base keeps updating itself.
+To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`. Claude Code doesn't update itself in a VM: `images/base/managed-settings.json`, which the image installs as `/etc/claude-code/managed-settings.json`, sets `DISABLE_AUTOUPDATER`, so every VM made from a `base` runs the version it was built with, and a newer one comes from rebuilding `base`. A VM forked from an older base keeps updating itself.
 
 ## Use it from the laptop
 
