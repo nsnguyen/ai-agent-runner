@@ -236,6 +236,8 @@ fn base(store: &Store) -> Verdict {
 
 // Three things have to hold: forwarding on, the unit active, and its rules
 // still loaded, since a firewall reload can flush them under an active unit.
+// A fourth only warns, since VMs still run without it: the rules keep VMs off
+// the host's own services.
 fn nat(host: &impl Host) -> Verdict {
     let unit = host::NAT_UNIT;
     match host.read(Path::new(host::IP_FORWARD)) {
@@ -253,19 +255,23 @@ fn nat(host: &impl Host) -> Verdict {
     }
     let [family, table] = host::NAT_TABLE;
     let restart = format!("systemctl restart {unit}");
-    let range = match host.run(host::NFT, &["list", "table", family, table]) {
+    let (range, guarded) = match host.run(host::NFT, &["list", "table", family, table]) {
         Ok(r) if r.ok && r.stdout.contains("masquerade") => {
             let mut words = r.stdout.split_whitespace();
             let range = words.find(|w| *w == "saddr").and(words.next());
-            range.map(str::to_string)
+            (range.map(str::to_string), Some(guards_host(&r.stdout)))
         }
         Ok(r) if r.ok => {
             return fail(format!(
                 "table {family} {table} has no masquerade rule: {restart}"
             ));
         }
-        // As the runner user, nft can't list rules, so the active unit has to do.
-        Ok(r) if r.stderr.contains("Operation not permitted") => None,
+        // As the runner user, nft can't list rules, so the active unit, and
+        // the file it loaded, have to do.
+        Ok(r) if r.stderr.contains("Operation not permitted") => {
+            let file = host.read(Path::new(host::NAT_RULES));
+            (None, file.ok().map(|rules| guards_host(&rules)))
+        }
         Ok(_) => {
             return fail(format!(
                 "no nftables table {family} {table}, though {unit} is active (a firewall reload?): {restart}"
@@ -273,27 +279,73 @@ fn nat(host: &impl Host) -> Verdict {
         }
         Err(e) => return fail(format!("nft: {e}")),
     };
-    let found = match &range {
-        Some(range) => format!("forwarding on, masquerading {range}"),
-        None => format!("forwarding on, {unit} active (run as root to read the rules)"),
+    let kept_off = if guarded == Some(true) {
+        ", VMs kept off the host"
+    } else {
+        ""
     };
+    let found = match &range {
+        Some(range) => format!("forwarding on, masquerading {range}{kept_off}"),
+        None => {
+            format!("forwarding on, {unit} active{kept_off} (run as root to read the loaded rules)")
+        }
+    };
+    let mut warnings = Vec::new();
+    if guarded == Some(false) {
+        let rules = if range.is_some() {
+            "the loaded rules"
+        } else {
+            host::NAT_RULES
+        };
+        warnings.push(format!(
+            "nothing in {rules} keeps the VMs off the host's own services, its sshd too: rerun {INSTALL}"
+        ));
+    }
     // Both drop forwarded traffic by default, so the VMs would lose the
     // internet under rules that look fine.
     let blockers: Vec<&str> = ["docker.service", "firewalld.service"]
         .into_iter()
         .filter(|u| host.run("systemctl", &["is-active", u]).is_ok_and(|r| r.ok))
         .collect();
-    if blockers.is_empty() {
+    if !blockers.is_empty() {
+        let range = range.as_deref().unwrap_or("the VMs' range");
+        let blockers = blockers.join(" and ");
+        warnings.push(format!(
+            "{blockers} is active and may drop forwarded traffic: allow {range} there"
+        ));
+    }
+    if warnings.is_empty() {
         return ok(found);
     }
-    let range = range.as_deref().unwrap_or("the VMs' range");
-    let blockers = blockers.join(" and ");
     (
         Status::Warn,
-        format!(
-            "{found}, but {blockers} is active and may drop forwarded traffic: allow {range} there"
-        ),
+        format!("{found}, but {}", warnings.join("; and ")),
     )
+}
+
+/// Whether nftables rules, as `nft list` prints them or as host/nat.nft has
+/// them, keep the VMs off the host: an input chain that lets in replies from
+/// a range, then drops the rest from it.
+fn guards_host(rules: &str) -> bool {
+    let mut input = false;
+    let mut replies = None;
+    for line in rules.lines().map(str::trim) {
+        if line.starts_with("chain ") {
+            (input, replies) = (false, None);
+        } else if line.starts_with("type filter hook input ") {
+            input = true;
+        } else if input {
+            let Some(from) = line.strip_prefix("ip saddr ") else {
+                continue;
+            };
+            if let Some(range) = from.strip_suffix(" ct state established,related accept") {
+                replies = Some(range);
+            } else if replies.is_some_and(|range| from.strip_prefix(range) == Some(" drop")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn unit(host: &impl Host) -> Verdict {
