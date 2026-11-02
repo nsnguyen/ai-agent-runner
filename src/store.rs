@@ -7,7 +7,7 @@
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
 //   <root>/vms/<name>/use.lock       flock'd shared by each command using the VM, and touched; exclusive by its boot as it sleeps it (idle.rs)
-//   <root>/vms/<name>/config.json    sizes, kernel and idle time, only where they differ from the defaults
+//   <root>/vms/<name>/config.json    sizes, kernel, idle time and URL, only where they differ from the defaults
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
@@ -29,6 +29,7 @@ use crate::calls;
 use crate::creds::{self, Cred, DEFAULT};
 use crate::idle::Idle;
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
+use crate::url::Setting;
 use chrono::{DateTime, SubsecRound, Utc};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -147,8 +148,8 @@ impl Checkpoint {
     }
 }
 
-/// A VM's sizes, kernel and idle time as stored: each one left out is the
-/// default.
+/// A VM's sizes, kernel, idle time and URL as stored: each one left out is
+/// the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -161,6 +162,9 @@ pub struct Config {
     /// How long it goes unused before it sleeps (idle.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<Idle>,
+    /// Its URL on the tailnet: on, and to port 8080 in the VM, unless set (url.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<Setting>,
 }
 
 impl Config {
@@ -171,6 +175,7 @@ impl Config {
             mem_mib: over.mem_mib.or(self.mem_mib),
             kernel: over.kernel.clone().or(self.kernel),
             idle: over.idle.or(self.idle),
+            url: over.url.or(self.url),
         }
     }
 
@@ -189,6 +194,9 @@ impl Config {
         }
         if self.idle == Some(Idle::After(0)) {
             return bad("a VM's idle time is at least a second, or never".to_string());
+        }
+        if self.url.and_then(|u| u.port) == Some(0) {
+            return bad("the port a VM's URL goes to is 1 to 65535, not 0".to_string());
         }
         if let Some(kernel) = &self.kernel {
             if !kernel.is_absolute() {
@@ -463,11 +471,28 @@ impl Store {
     /// Sets how long the VM goes unused before it sleeps. A running VM's boot
     /// reads it at each look, so it counts from now on.
     pub fn set_idle(&self, name: &str, idle: Idle) -> Result<Idle> {
+        self.set_config(name, |config| config.idle = Some(idle))?;
+        Ok(idle)
+    }
+
+    /// Whether the VM's URL is on, and the port in the VM it goes to.
+    pub fn url(&self, name: &str) -> Result<Setting> {
+        Ok(self.config(name)?.url.unwrap_or_default())
+    }
+
+    /// Sets the VM's URL. A running VM's boot reads it every second, so it
+    /// counts from then on.
+    pub fn set_url(&self, name: &str, url: Setting) -> Result<Setting> {
+        self.set_config(name, |config| config.url = Some(url))?;
+        Ok(url)
+    }
+
+    // Changes one setting in the VM's config, keeping the rest, and writes it
+    // whole, so a boot reading it sees the old one or the new.
+    fn set_config(&self, name: &str, change: impl FnOnce(&mut Config)) -> Result<()> {
         let dir = self.existing(name)?;
-        let config = Config {
-            idle: Some(idle),
-            ..read_config(&dir)?
-        };
+        let mut config = read_config(&dir)?;
+        change(&mut config);
         config.check()?;
         let path = dir.join(CONFIG);
         let mut text =
@@ -479,8 +504,7 @@ impl Store {
                 Error::NoVm(name.to_string())
             }
             e => e,
-        })?;
-        Ok(idle)
+        })
     }
 
     /// The lock each command using the VM holds (idle.rs).

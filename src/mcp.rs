@@ -219,6 +219,7 @@ impl Tools {
             mem_mib: mem_mib.map_err(|e| e.to_string())?,
             kernel: args.kernel,
             idle: args.idle.as_deref().map(str::parse).transpose()?,
+            url: None,
         };
         self.store
             .fork_with(from, &args.name, &config)
@@ -249,7 +250,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Say whether a VM is stopped, booting, running, sleeping or stopping, and while it's up, which credentials its guest took, by name."
+        description = "Say whether a VM is stopped, booting, running, sleeping or stopping; while it's up, which credentials its guest took, by name; and its URL on the tailnet, which goes to port 8080 in the VM unless `runner url --port` set another, answers while the VM is up, and wakes it if it's asleep."
     )]
     fn vm_status(
         &self,

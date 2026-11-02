@@ -22,3 +22,4 @@ pub mod sessions;
 pub mod sleep;
 pub mod store;
 pub mod systemd;
+pub mod url;
