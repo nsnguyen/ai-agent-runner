@@ -569,15 +569,16 @@ fn a_vm_reaches_the_internet_but_not_the_host() {
     // The host's end of the VM's /30.
     let gateway = std::net::Ipv4Addr::from(u32::from(address) - 1).to_string();
     // Dropped, so it times out: sshd would answer at once, and a closed port
-    // refuse at once.
-    let probe = "import socket, sys
+    // refuse at once. The host still answers ARP, which nftables' ip tables
+    // don't see.
+    let probe = "import errno, socket, sys
 try:
     socket.create_connection((sys.argv[1], 22), 5)
     print('connected')
 except TimeoutError:
     print('timed out')
 except OSError as e:
-    print(e)
+    print('unreachable' if e.errno == errno.EHOSTUNREACH else e)
 ";
     let ssh = ok(runner(
         &root,
@@ -586,7 +587,10 @@ except OSError as e:
     assert_eq!(ssh, "timed out\n", "{gateway}:22");
     // Nor over IPv6, at the host's link-local address on the VM's tap, which
     // the VM could work out from its gateway's MAC. The tap is named for the
-    // VM's /30. A host without IPv6 has no such address.
+    // VM's /30. A host without IPv6 has no such address. The ip6 input chain
+    // drops the VM's neighbor solicitations too, so the guest kernel may give
+    // up on the neighbor and fail the connect as unreachable before it times
+    // out: either means nothing got through.
     let tap = format!("fc{:08x}", u32::from(address) - 2);
     let shown = Command::new("ip")
         .args(["-6", "-o", "addr", "show", "dev", &tap, "scope", "link"])
@@ -604,7 +608,10 @@ except OSError as e:
                 &root,
                 &["exec", &name, "--", "python3", "-c", probe, &link_local],
             ));
-            assert_eq!(ssh6, "timed out\n", "[{link_local}]:22");
+            assert!(
+                matches!(ssh6.as_str(), "timed out\n" | "unreachable\n"),
+                "[{link_local}]:22: {ssh6}"
+            );
         }
         None => eprintln!("no IPv6 on {tap}, so no IPv6 to try"),
     }
