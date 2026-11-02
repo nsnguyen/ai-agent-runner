@@ -1,7 +1,7 @@
 // The filesystem is the database: each VM is a directory.
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
-//   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, and whether it's a checkpoint
+//   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, and whether it's a checkpoint and whose
 //   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
@@ -46,6 +46,10 @@ pub const BASE: &str = "base";
 
 /// How many generations gc keeps besides the current one and the checkpoints.
 pub const KEEP: usize = 5;
+/// How many of the checkpoints runs and the agent make gc keeps per VM,
+/// newest first, the two counted together. The owner's aren't counted: gc
+/// keeps every one.
+pub const KEEP_CHECKPOINTS: usize = 20;
 /// What a VM gets when its config doesn't say.
 pub const DEFAULT_CPUS: u32 = 2;
 pub const DEFAULT_MEM_MIB: u32 = 2048;
@@ -121,6 +125,9 @@ pub struct Checkpoint {
     pub auto: bool,
     /// Made by the agent in the VM, with `runner-guest checkpoint`.
     pub agent: bool,
+    /// Taken by a run before it joined the running VM, to restore if the run
+    /// fails.
+    pub run: bool,
     /// Size of its disk.
     pub bytes: u64,
     /// The disk the next boot starts from.
@@ -134,10 +141,11 @@ impl Checkpoint {
     pub fn row(&self) -> String {
         let mark = if self.current { '*' } else { ' ' };
         let time = self.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let kind = match (self.auto, self.agent) {
-            (true, _) => "auto",
-            (false, true) => "agent",
-            (false, false) => "checkpoint",
+        let kind = match (self.auto, self.agent, self.run) {
+            (true, ..) => "auto",
+            (false, true, _) => "agent",
+            (false, false, true) => "run",
+            (false, false, false) => "checkpoint",
         };
         let comment = self.comment.as_ref().map(|c| format!("  {c:?}"));
         let comment = comment.unwrap_or_default();
@@ -146,6 +154,18 @@ impl Checkpoint {
             self.id, self.bytes
         )
     }
+}
+
+/// Who made a checkpoint, which decides how long gc keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maker {
+    /// `runner checkpoint` or MCP's checkpoint_vm: kept until the VM is
+    /// deleted.
+    Owner,
+    /// The agent in the VM, with `runner-guest checkpoint`.
+    Agent,
+    /// A run, before it joins the running VM.
+    Run,
 }
 
 /// A VM's sizes, kernel, idle time and URL as stored: each one left out is
@@ -661,7 +681,8 @@ impl Store {
     }
 
     /// Deletes the disk generations a VM no longer needs: all but the current
-    /// one, every checkpoint, and the newest few others. A run
+    /// one, the owner's checkpoints, the newest KEEP_CHECKPOINTS of the ones
+    /// runs and the agent made, and the newest few others. A run
     /// holding the VM may be using any of them, so that's `Busy`, and a dry run
     /// only says what would go.
     pub fn gc(&self, name: &str, dry_run: bool) -> Result<Freed> {
@@ -673,13 +694,23 @@ impl Store {
     /// Freezes a copy of the current disk for `restore` to bring back. Nothing
     /// boots a checkpoint or writes to it; the VM carries on from its own disk.
     pub fn checkpoint(&self, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+        self.checkpoint_by(name, comment, Maker::Owner)
+    }
+
+    /// `checkpoint`, noted as `by`'s.
+    pub fn checkpoint_by(
+        &self,
+        name: &str,
+        comment: Option<&str>,
+        by: Maker,
+    ) -> Result<Checkpoint> {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
         let current = current(&dir)?;
         let id = next_generation(&dir)?;
         clone(&disk_of(&dir, current), &disk_of(&dir, id))?;
         // Written last: a disk without its note is a leftover nothing lists.
-        let note = Note::frozen(comment, false);
+        let note = Note::frozen(comment, by);
         write_note(&dir, id, &note)?;
         read_checkpoint(&dir, id, Some(note), false)
     }
@@ -941,14 +972,13 @@ impl Freezer {
     /// nothing lists a half-made one, and the next checkpoint clears what one
     /// killed partway left.
     pub fn freeze(&self, comment: Option<&str>) -> Result<Checkpoint> {
-        self.freeze_noted(Note::frozen(comment, false))
+        self.freeze_by(comment, Maker::Owner)
     }
 
-    /// `freeze`, for the agent in the VM, which asks through its boot
-    /// (src/calls.rs): noted as the agent's, which `agent_since` counts.
-    /// gc keeps it as it keeps every checkpoint.
-    pub fn freeze_for_agent(&self, comment: Option<&str>) -> Result<Checkpoint> {
-        self.freeze_noted(Note::frozen(comment, true))
+    /// `freeze`, noted as `by`'s: the agent in the VM's, which asks through
+    /// its boot (src/calls.rs) and which `agent_since` counts, or a run's.
+    pub fn freeze_by(&self, comment: Option<&str>, by: Maker) -> Result<Checkpoint> {
+        self.freeze_noted(Note::frozen(comment, by))
     }
 
     /// When each checkpoint the agent made after `since` was made, oldest
@@ -979,11 +1009,11 @@ impl Freezer {
     /// Copies checkpoint `id` aside for a restore that has to stop the VM
     /// first, before anything stops: a mistyped id stops nothing, and the
     /// stop's commit, whose gc may drop `id`, can't take it from the restore.
-    /// The copy is noted as a checkpoint, which gc keeps, until
+    /// The copy is noted as the owner's checkpoint, which gc keeps, until
     /// Store::finish_restore puts it in history; drop_restore deletes it.
     pub fn stage_restore(&self, id: u64) -> Result<Staged> {
         check_restorable(&self.name, &self.dir, id)?;
-        let note = Note::frozen(Some(&format!("restore of {id}")), false);
+        let note = Note::frozen(Some(&format!("restore of {id}")), Maker::Owner);
         let generation = self.copy(id, &note)?;
         Ok(Staged {
             from: id,
@@ -1192,16 +1222,29 @@ fn port_socket(dir: &Path, port: u32) -> PathBuf {
 fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> {
     let mut gens = history(dir)?;
     let current = current(dir)?;
-    let mut loose = generations(dir)?;
-    // A checkpoint stays until `restore` or a delete of the VM; only the
-    // generations runs, imports and restores made are gc's to drop.
-    let mut kept = Vec::new();
-    for &g in &loose {
-        if g == current || read_note(dir, g)?.is_some_and(|n| !n.auto) {
-            kept.push(g);
+    // The owner's checkpoints stay until the VM is deleted. Of the ones runs
+    // and the agent made, the newest KEEP_CHECKPOINTS stay; the rest go.
+    let mut made = Vec::new();
+    let mut loose = Vec::new();
+    for g in generations(dir)? {
+        match read_note(dir, g)? {
+            _ if g == current => {}
+            Some(n) if !n.auto && (n.agent || n.run) => made.push((g, n.run)),
+            Some(n) if !n.auto => {}
+            _ => loose.push(g),
         }
     }
-    loose.retain(|g| !kept.contains(g));
+    made.sort_unstable_by(|a, b| b.cmp(a));
+    // A run going on the VM took the newest run checkpoint before it joined,
+    // and restores it if it fails. Asked after the disks were listed, so a
+    // run that took one since holds the lock now, or took one this gc never
+    // saw. Whatever else holds the run lock keeps one more for the moment.
+    let held = match run_going(dir)? {
+        true => made.iter().find(|&&(_, run)| run).map(|&(g, _)| g),
+        false => None,
+    };
+    let past = made.iter().skip(KEEP_CHECKPOINTS).map(|&(g, _)| g);
+    let mut doomed: Vec<u64> = past.filter(|&g| Some(g) != held).collect();
     // In keeping order: undo's way back first, then the disks history doesn't
     // name (failed and undone runs'), each newest first. A crash loop's
     // disks can't push out what undo needs.
@@ -1213,7 +1256,7 @@ fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> 
     }
     loose.sort_unstable_by(|a, b| b.cmp(a));
     others.extend(loose);
-    let mut doomed = others.split_off(keep.min(others.len()));
+    doomed.extend(others.split_off(keep.min(others.len())));
     doomed.sort_unstable();
     let mut bytes = 0;
     for &g in &doomed {
@@ -1243,6 +1286,23 @@ fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> 
         generations: doomed,
         bytes,
     })
+}
+
+// Whether something holds the VM's run lock (src/runs.rs): a run going, or
+// what keeps one from starting. Asked once, so one just let go can look
+// held. Taking it for the asking holds off a run's start for that instant,
+// which its own try_lock waits out.
+fn run_going(dir: &Path) -> Result<bool> {
+    let path = dir.join("runs").join("lock");
+    let file = match File::open(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        r => r.map_err(at(&path))?,
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(e)) => Err(at(&path)(e)),
+    }
 }
 
 // flock, not a pid file: the kernel drops it when the holder dies, so a
@@ -1390,6 +1450,10 @@ struct Note {
     // Left out unless set, so a runner from before it reads the note the same.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     agent: bool,
+    // The same. A runner from before it keeps a run's checkpoint as the
+    // owner's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    run: bool,
 }
 
 impl Note {
@@ -1400,16 +1464,18 @@ impl Note {
             comment,
             auto: true,
             agent: false,
+            run: false,
         }
     }
 
-    // A checkpoint's: kept by gc, made now.
-    fn frozen(comment: Option<&str>, agent: bool) -> Note {
+    // A checkpoint's, made now by `by`.
+    fn frozen(comment: Option<&str>, by: Maker) -> Note {
         Note {
             time: now(),
             comment: comment.map(str::to_string),
             auto: false,
-            agent,
+            agent: by == Maker::Agent,
+            run: by == Maker::Run,
         }
     }
 }
@@ -1446,6 +1512,7 @@ fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Re
             comment: None,
             auto: true,
             agent: false,
+            run: false,
         },
     };
     Ok(Checkpoint {
@@ -1454,6 +1521,7 @@ fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Re
         comment: note.comment,
         auto: note.auto,
         agent: note.agent,
+        run: note.run,
         bytes: meta.len(),
         current,
     })

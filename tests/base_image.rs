@@ -145,6 +145,7 @@ fn llm_txt_says_how_to_checkpoint_and_restore_as_the_runner_does() {
         "runner-guest restore <id>",
         runner::claude::DIR,
         &format!("{} an hour", runner::checkpoint::AGENT_PER_HOUR),
+        &format!("newest {}", runner::store::KEEP_CHECKPOINTS),
         "CLAUDE_CODE_OAUTH_TOKEN",
         "GH_TOKEN",
         &format!("{}<name>", runner::services::PREFIX),
