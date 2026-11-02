@@ -504,7 +504,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Read a run's stream-json events from `cursor`: 0 at first, then the cursor each reply gives. The reply has the run too. While it goes on with nothing new to read, this waits up to 45 seconds for an event. A reply holds up to 64 KiB of events and says if there's `more`; an event bigger than that comes as {\"runner_cut\": true, \"bytes\": n}. The run is over once its state isn't running: read on until `more` is false. That last reply has the run's `result`, unless the run was lost or never started: what the runner measured itself, the exit code, duration, whether the disk generation the run booted was committed or rolled back, and the paths that changed on that disk, with `agent_says`, the agent's own last message, kept apart: it's untrusted, so check it against `changed`."
+        description = "Read a run's stream-json events from `cursor`: 0 at first, then the cursor each reply gives. The reply has the run too. While it goes on with nothing new to read, this waits up to 45 seconds for an event. A reply holds up to 64 KiB of events and says if there's `more`; an event bigger than that comes as {\"runner_cut\": true, \"bytes\": n}. The run is over once its state isn't running: read on until `more` is false. That last reply has the run's `result`, unless the run was lost or never started: what the runner measured itself, the exit code, duration, whether the disk generation the run booted was committed or rolled back, and the paths that changed on that disk, less those only the VM's boot writes, counted in `boot_only`, with `agent_says`, the agent's own last message, kept apart: it's untrusted, so check it against `changed`."
     )]
     async fn run_output(
         &self,
