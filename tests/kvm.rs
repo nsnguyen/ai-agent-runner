@@ -643,15 +643,18 @@ fn a_headless_run_edits_a_file_and_commits_it() {
     // And none of the boot's: it wrote its journal at least, which is only
     // counted. The agent writes without root only in its home and the temp
     // directories, so a path anywhere else is the boot's, and belongs on
-    // changes::BOOT_ONLY.
-    assert!(
-        result["changed"]["boot_only"].as_u64() > Some(0),
-        "{result}"
-    );
+    // changes::BOOT_ONLY. So are systemd's and X11's in /tmp. This is a first
+    // boot: the daily timers' writes a later boot catches up on aren't here.
+    let left_out = result["changed"]["boot_only"].as_u64();
+    assert!(left_out.is_some_and(|n| n > 0), "{result}");
+    let systemd = [
+        "/tmp/.",
+        "/tmp/systemd-private-",
+        "/var/tmp/systemd-private-",
+    ];
     let agents = |p: &&str| {
-        ["/home/", "/tmp/", "/var/tmp/"]
-            .iter()
-            .any(|d| p.starts_with(d))
+        let temp = ["/tmp/", "/var/tmp/"].iter().any(|d| p.starts_with(d));
+        p.starts_with("/home/") || temp && !systemd.iter().any(|d| p.starts_with(d))
     };
     let boots: Vec<&str> = paths
         .into_iter()

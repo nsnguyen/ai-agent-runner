@@ -445,3 +445,29 @@ fn nothing_under_home_is_ever_left_out() {
         assert!(*path != "/", "{path}");
     }
 }
+
+// A file on the list is left out only as a file: a directory in its place,
+// and what's under it, are listed. A directory the boot makes empty is left
+// out only while it's new and empty: a new mode on it is listed.
+#[test]
+fn only_what_the_boot_writes_there_is_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = tree(
+        &dir.path().join("before"),
+        &[("etc/mtab", "a file"), ("etc/machine-id", "")],
+    );
+    fs::create_dir_all(before.join("var/lib/systemd/linger")).unwrap();
+    let after = tree(
+        &dir.path().join("after"),
+        &[("etc/mtab/hidden", "x"), ("etc/machine-id", "")],
+    );
+    fs::create_dir_all(after.join("var/lib/systemd/linger")).unwrap();
+    let mode = fs::Permissions::from_mode(0o777);
+    fs::set_permissions(after.join("var/lib/systemd/linger"), mode).unwrap();
+    let got = between(&before, &after);
+    let want = vec![
+        whole_dir("/etc/mtab", Kind::Modified, 1),
+        change("/var/lib/systemd/linger", Kind::Modified),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+}

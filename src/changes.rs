@@ -40,16 +40,18 @@ const MAX_LINK: u64 = 4096;
 const ASK_EVERY: u32 = 1024;
 
 /// What a boot of the base image (images/base) writes on its own, so a run's
-/// result leaves it out and only counts it (#107). Found by booting the image
-/// and measuring its disk before and after, as a run does; each line says
-/// which boots write it. Nothing under /home, where the agent works, is on it.
+/// result leaves it out and only counts it (#107). Found by booting a copy of
+/// the image's systemd in a container and measuring its disk before and
+/// after, as a run does, plus systemd-random-seed, which a VM runs and a
+/// container skips. Each line says which boots write it. Nothing under /home,
+/// where the agent works, is on it.
 pub const BOOT_ONLY: &[(&str, Part)] = &[
     // systemd-update-done's stamp, at the first boot: the image has none.
-    ("/etc/.updated", Part::All),
+    ("/etc/.updated", Part::File),
     // The VM's own id, written at its first boot: base ships it empty.
-    ("/etc/machine-id", Part::All),
+    ("/etc/machine-id", Part::File),
     // The first boot's systemd-tmpfiles links it to ../proc/self/mounts.
-    ("/etc/mtab", Part::All),
+    ("/etc/mtab", Part::File),
     // Every boot empties /tmp (tmpfiles' tmp.conf), so what the last run left
     // there shows as deleted. What this run adds is listed.
     ("/tmp", Part::Deleted),
@@ -59,28 +61,28 @@ pub const BOOT_ONLY: &[(&str, Part)] = &[
     ("/tmp/.XIM-unix", Part::Empty),
     ("/tmp/.font-unix", Part::Empty),
     // As /etc/.updated.
-    ("/var/.updated", Part::All),
+    ("/var/.updated", Part::File),
     // The dpkg-db-backup and apt-daily-upgrade timers' backups. They're daily
     // and persistent, so a boot a day after the last one runs them.
     ("/var/backups", Part::All),
     // The apt-daily timer, twice a day: apt's caches, and its lock.
-    ("/var/cache/apt/pkgcache.bin", Part::All),
-    ("/var/cache/apt/srcpkgcache.bin", Part::All),
-    ("/var/lib/apt/daily_lock", Part::All),
+    ("/var/cache/apt/pkgcache.bin", Part::File),
+    ("/var/cache/apt/srcpkgcache.bin", Part::File),
+    ("/var/lib/apt/daily_lock", Part::File),
     // ldconfig.service's cache, at the first boot.
-    ("/var/cache/ldconfig/aux-cache", Part::All),
+    ("/var/cache/ldconfig/aux-cache", Part::File),
     // The first boot's tmpfiles links it to /etc/machine-id (dbus.conf).
-    ("/var/lib/dbus/machine-id", Part::All),
+    ("/var/lib/dbus/machine-id", Part::File),
     // The first boot's tmpfiles makes it. A user who lingers is listed.
     ("/var/lib/systemd/linger", Part::Empty),
     // systemd-random-seed's seed, saved at every boot and shutdown.
-    ("/var/lib/systemd/random-seed", Part::All),
+    ("/var/lib/systemd/random-seed", Part::File),
     // Each timer's last run: stamped at the first boot, and when it runs.
     ("/var/lib/systemd/timers", Part::All),
     // journald's journal: every boot writes it, and rotates it.
     ("/var/log/journal", Part::All),
     // systemd-update-utmp's records of every boot and shutdown.
-    ("/var/log/wtmp", Part::All),
+    ("/var/log/wtmp", Part::File),
 ];
 
 /// Which changes to a path on BOOT_ONLY are the boot's.
@@ -88,7 +90,9 @@ pub const BOOT_ONLY: &[(&str, Part)] = &[
 pub enum Part {
     /// Any, to it or anything under it.
     All,
-    /// It, while nothing is in it.
+    /// To it, but not to a directory put in its place.
+    File,
+    /// It added as an empty directory.
     Empty,
     /// Deletions under it.
     Deleted,
@@ -103,7 +107,8 @@ fn boot_only(path: &[u8], change: Kind, contains: Option<u64>) -> bool {
             .is_some_and(|rest| rest.starts_with(b"/"));
         match part {
             Part::All => path == at || under,
-            Part::Empty => path == at && contains.unwrap_or(0) == 0,
+            Part::File => path == at && contains.is_none(),
+            Part::Empty => path == at && change == Kind::Added && contains == Some(0),
             Part::Deleted => under && change == Kind::Deleted,
         }
     })
@@ -146,7 +151,8 @@ pub struct Changes {
     /// or link target. Extended attributes, file capabilities included, aren't
     /// read.
     pub paths: Vec<Change>,
-    /// How many more paths changed than are listed.
+    /// How many more paths changed than are listed, besides those counted
+    /// in `boot_only`.
     pub more: u64,
     /// How many changed paths are left out because only the VM's boot writes
     /// them, like its journal and systemd's state. Never one under /home.
