@@ -407,7 +407,15 @@ fn the_boot_serves_the_url_on_the_tailnet_address_only() {
 
     let pid = std::process::id();
     let dev = format!("tailscale{}", pid % 100_000);
-    let addr = Ipv4Addr::new(100, 127, (pid >> 8) as u8, (pid & 0xff).max(1) as u8);
+    // In 100.115.92.0/23, the one part of 100.64.0.0/10 that a running
+    // tailscaled's ts-input chain lets in off tailscale0. It drops the rest,
+    // so on a host with Tailscale up the URL never answered.
+    let addr = Ipv4Addr::new(
+        100,
+        115,
+        92 + ((pid >> 8) & 1) as u8,
+        (pid & 0xff).max(1) as u8,
+    );
     let ip = |args: &[&str]| {
         let out = Command::new("ip").args(args).output().unwrap();
         assert!(
