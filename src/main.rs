@@ -243,8 +243,8 @@ enum Cmd {
     /// print the run's id at once. A stopped VM is booted for the run and
     /// shut down after it: exit 0 commits what it wrote to its disk, and
     /// anything else rolls that back. A running VM is checkpointed and joined
-    /// as it is: exit 0 leaves it running, and anything else restores that
-    /// checkpoint, which restarts the VM. One run per VM at a time.
+    /// as it is, and left running however the run ends: `restore` that
+    /// checkpoint to roll a failed run back. One run per VM at a time.
     Run {
         name: String,
         /// What to ask Claude Code. It reaches claude on its stdin.
@@ -282,10 +282,10 @@ enum Cmd {
     /// did is kept apart, marked untrusted.
     Result { run: String },
     /// Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run
-    /// booted rolls back and shuts down, while one it joined running gets the
-    /// checkpoint it took back, which restarts it. A run whose Claude Code is done
-    /// stops measuring its disk. Returns once the run has ended, or after two
-    /// minutes.
+    /// booted rolls back and shuts down, while one it joined running is left
+    /// as it is, with the checkpoint it took to restore by hand. A run whose
+    /// Claude Code is done stops measuring its disk. Returns once the run has
+    /// ended, or after two minutes.
     Cancel { run: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,

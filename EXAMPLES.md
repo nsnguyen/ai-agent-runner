@@ -58,7 +58,7 @@ runner output demo.1 --follow                         # watch what it does, live
 runner result demo.1                                  # the summary once it's done
 ```
 
-If `demo` was stopped, the run boots it and keeps the changes only if the agent finishes without an error.
+If `demo` was stopped, the run boots it and keeps the changes only if the agent finishes without an error. If it was running, the run leaves it running, changes and all, even when the agent fails, so your own sessions in it carry on. The run saves a checkpoint first, and `runner result demo.1` gives its id: `runner restore demo <id>` undoes the run.
 
 ## 5. Checkpoints: an undo button for the whole VM
 

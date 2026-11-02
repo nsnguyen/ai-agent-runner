@@ -467,7 +467,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Start Claude Code in a VM on a prompt, headless (`claude -p`, stream-json) and detached, and return the run at once; read it with run_output. A stopped VM is booted for the run and shut down after it: exit 0 commits what the run wrote to the disk, and anything else rolls it back. A running VM is checkpointed and joined as it is: exit 0 leaves it running, and anything else restores that checkpoint, which restarts the VM. One run per VM at a time. Claude Code runs as the agent user, with its permission prompts skipped: the VM is the sandbox."
+        description = "Start Claude Code in a VM on a prompt, headless (`claude -p`, stream-json) and detached, and return the run at once; read it with run_output. A stopped VM is booted for the run and shut down after it: exit 0 commits what the run wrote to the disk, and anything else rolls it back. A running VM is checkpointed and joined as it is, and left running however the run ends: a failed or cancelled run's outcome is not_rolled_back, and restore_vm with its checkpoint rolls it back. One run per VM at a time. Claude Code runs as the agent user, with its permission prompts skipped: the VM is the sandbox."
     )]
     async fn run_agent(
         &self,
@@ -502,7 +502,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run booted rolls back and shuts down, while one it joined running gets the checkpoint it took back, which restarts it. A run whose Claude Code is done stops measuring its disk, and its result says so. Returns the run once it has ended, or as it stands after two minutes. Fails for a run that's already over."
+        description = "Stop a run: Claude Code gets SIGTERM, then SIGKILL, and a VM the run booted rolls back and shuts down, while one it joined running is left as it is: restore_vm with the run's checkpoint rolls it back. A run whose Claude Code is done stops measuring its disk, and its result says so. Returns the run once it has ended, or as it stands after two minutes. Fails for a run that's already over."
     )]
     async fn cancel_run(
         &self,
@@ -513,7 +513,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, rolled_back for one that joined it running and restored the checkpoint it took first."
+        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, not_rolled_back for one that joined it running and failed or was cancelled, with the checkpoint it took first to restore by hand."
     )]
     fn list_runs(
         &self,
