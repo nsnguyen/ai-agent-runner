@@ -11,6 +11,9 @@
 // never end, or never end in time. The time limit also covers ext4-view
 // finding each path from the root, a scan per lookup in a directory with no
 // hash index, as mkfs.ext4 -d leaves them.
+//
+// What the VM's boot writes on its own, like its journal, is left out of the
+// list and only counted (BOOT_ONLY), so the agent's changes stand out.
 use ext4_view::{Ext4, Ext4Error, File, Metadata, Path as InPath, PathBuf as InPathBuf};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -35,6 +38,81 @@ const MAX_ENTRIES: u64 = 10_000_000;
 const MAX_LINK: u64 = 4096;
 // How often measuring asks whether to stop, in entries and blocks read.
 const ASK_EVERY: u32 = 1024;
+
+/// What a boot of the base image (images/base) writes on its own, so a run's
+/// result leaves it out and only counts it (#107). Found by booting a copy of
+/// the image's systemd in a container and measuring its disk before and
+/// after, as a run does, plus systemd-random-seed, which a VM runs and a
+/// container skips. Each line says which boots write it. Nothing under /home,
+/// where the agent works, is on it.
+pub const BOOT_ONLY: &[(&str, Part)] = &[
+    // systemd-update-done's stamp, at the first boot: the image has none.
+    ("/etc/.updated", Part::File),
+    // The VM's own id, written at its first boot: base ships it empty.
+    ("/etc/machine-id", Part::File),
+    // The first boot's systemd-tmpfiles links it to ../proc/self/mounts.
+    ("/etc/mtab", Part::File),
+    // Every boot empties /tmp (tmpfiles' tmp.conf), so what the last run left
+    // there shows as deleted. What this run adds is listed.
+    ("/tmp", Part::Deleted),
+    // X11's socket directories, which every boot's tmpfiles makes (x11.conf).
+    ("/tmp/.ICE-unix", Part::Empty),
+    ("/tmp/.X11-unix", Part::Empty),
+    ("/tmp/.XIM-unix", Part::Empty),
+    ("/tmp/.font-unix", Part::Empty),
+    // As /etc/.updated.
+    ("/var/.updated", Part::File),
+    // The dpkg-db-backup and apt-daily-upgrade timers' backups. They're daily
+    // and persistent, so a boot a day after the last one runs them.
+    ("/var/backups", Part::All),
+    // The apt-daily timer, twice a day: apt's caches, and its lock.
+    ("/var/cache/apt/pkgcache.bin", Part::File),
+    ("/var/cache/apt/srcpkgcache.bin", Part::File),
+    ("/var/lib/apt/daily_lock", Part::File),
+    // ldconfig.service's cache, at the first boot.
+    ("/var/cache/ldconfig/aux-cache", Part::File),
+    // The first boot's tmpfiles links it to /etc/machine-id (dbus.conf).
+    ("/var/lib/dbus/machine-id", Part::File),
+    // The first boot's tmpfiles makes it. A user who lingers is listed.
+    ("/var/lib/systemd/linger", Part::Empty),
+    // systemd-random-seed's seed, saved at every boot and shutdown.
+    ("/var/lib/systemd/random-seed", Part::File),
+    // Each timer's last run: stamped at the first boot, and when it runs.
+    ("/var/lib/systemd/timers", Part::All),
+    // journald's journal: every boot writes it, and rotates it.
+    ("/var/log/journal", Part::All),
+    // systemd-update-utmp's records of every boot and shutdown.
+    ("/var/log/wtmp", Part::File),
+];
+
+/// Which changes to a path on BOOT_ONLY are the boot's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// Any, to it or anything under it.
+    All,
+    /// To it, but not to a directory put in its place.
+    File,
+    /// It added as an empty directory.
+    Empty,
+    /// Deletions under it.
+    Deleted,
+}
+
+// Whether a change is one only the boot makes.
+fn boot_only(path: &[u8], change: Kind, contains: Option<u64>) -> bool {
+    BOOT_ONLY.iter().any(|&(at, part)| {
+        let at = at.as_bytes();
+        let under = path
+            .strip_prefix(at)
+            .is_some_and(|rest| rest.starts_with(b"/"));
+        match part {
+            Part::All => path == at || under,
+            Part::File => path == at && contains.is_none(),
+            Part::Empty => path == at && change == Kind::Added && contains == Some(0),
+            Part::Deleted => under && change == Kind::Deleted,
+        }
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -73,8 +151,13 @@ pub struct Changes {
     /// or link target. Extended attributes, file capabilities included, aren't
     /// read.
     pub paths: Vec<Change>,
-    /// How many more paths changed than are listed.
+    /// How many more paths changed than are listed, besides those counted
+    /// in `boot_only`.
     pub more: u64,
+    /// How many changed paths are left out because only the VM's boot writes
+    /// them, like its journal and systemd's state. Never one under /home.
+    #[serde(default)]
+    pub boot_only: u64,
 }
 
 /// The paths that differ between two ext4 disks, listing at most `cap`, or an
@@ -299,9 +382,14 @@ impl Walk<'_> {
         }
     }
 
+    // The boot's own changes are only counted, and take no room in the list.
     // Once a path doesn't fit, the rest are only counted, so the list stays
     // in order.
     fn note(&mut self, path: &InPathBuf, change: Kind, contains: Option<u64>) {
+        if boot_only(path.as_ref(), change, contains) {
+            self.out.boot_only += 1;
+            return;
+        }
         if self.out.more == 0 && self.out.paths.len() < self.cap {
             let path = shown(path.as_ref());
             if self.listed + path.len() <= PATH_BYTES {

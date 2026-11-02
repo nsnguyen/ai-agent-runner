@@ -36,6 +36,7 @@ fn the_json_shape_is_pinned() {
             },
         ],
         more: 4,
+        boot_only: 12,
     });
     let got = result(changed, says("Fixed the bug."));
     let want = json!({
@@ -50,7 +51,8 @@ fn the_json_shape_is_pinned() {
                 {"path": "/home/agent/work/main.rs", "change": "modified"},
                 {"path": "/home/agent/work/target", "change": "added", "contains": 812}
             ],
-            "more": 4
+            "more": 4,
+            "boot_only": 12
         },
         "agent_says": {"untrusted": true, "text": "Fixed the bug.", "truncated": false}
     });
@@ -58,10 +60,18 @@ fn the_json_shape_is_pinned() {
     let back: RunResult = serde_json::from_value(want.clone()).unwrap();
     assert_eq!(back, got);
     // As a run from before checkpoints wrote it.
-    let mut old = want;
+    let mut old = want.clone();
     old.as_object_mut().unwrap().remove("checkpoint");
     let back: RunResult = serde_json::from_value(old).unwrap();
     assert_eq!(back, got);
+    // As a run from before the boot's paths were left out: it left none out.
+    let mut old = want;
+    old["changed"].as_object_mut().unwrap().remove("boot_only");
+    let back: RunResult = serde_json::from_value(old).unwrap();
+    let Changed::Measured(changes) = back.changed else {
+        panic!("{back:?}");
+    };
+    assert_eq!(changes.boot_only, 0);
 }
 
 #[test]
