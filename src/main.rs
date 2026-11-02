@@ -777,13 +777,14 @@ fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
                     f.bytes
                 );
             }
-            Err(e) => match sweep.then(|| up(store, &name, &e)).flatten() {
-                Some(state) => println!("{name}  skipped: {state}"),
-                None => {
+            Err(e) => {
+                if sweep && let Some(state) = up(store, &name, &e) {
+                    println!("{name}  skipped: {state}");
+                } else {
                     eprintln!("runner: {e}");
                     code = ExitCode::FAILURE;
                 }
-            },
+            }
         }
     }
     code

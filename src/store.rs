@@ -1239,7 +1239,8 @@ fn collect(name: &str, dir: &Path, keep: usize, dry_run: bool) -> Result<Freed> 
     // and restores it if it fails. Asked after the disks were listed, so a
     // run that took one since holds the lock now, or took one this gc never
     // saw. Whatever else holds the run lock keeps one more for the moment.
-    let held = match run_going(dir)? {
+    let over = made.len() > KEEP_CHECKPOINTS;
+    let held = match over && run_going(dir)? {
         true => made.iter().find(|&&(_, run)| run).map(|&(g, _)| g),
         false => None,
     };

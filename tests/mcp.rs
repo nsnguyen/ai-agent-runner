@@ -141,6 +141,16 @@ fn lists_its_tools() {
             "wake_vm"
         ]
     );
+    // It says how many of runs' and the agent's checkpoints gc keeps.
+    let listing = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "list_checkpoints")
+        .unwrap();
+    let said = listing["description"].as_str().unwrap();
+    let keep = format!("newest {}", runner::store::KEEP_CHECKPOINTS);
+    assert!(said.contains(&keep), "{said}");
 }
 
 #[test]

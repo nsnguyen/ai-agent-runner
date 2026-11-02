@@ -526,8 +526,8 @@ fn deleting_twice_in_one_process_works() {
     }
 }
 
-// gc: the current generation, every checkpoint and the newest few others
-// stay; everything else on disk goes.
+// gc: the current generation, my checkpoints, the newest of runs' and the
+// agent's, and the newest few others stay; everything else on disk goes.
 
 // A store that keeps everything, for building up generations to collect.
 fn hoarder(dir: &TempDir) -> Store {
@@ -583,7 +583,7 @@ fn gc_keeps_the_current_generation_and_the_newest_others() {
 }
 
 #[test]
-fn gc_keeps_every_checkpoint_and_drops_notes_with_their_disks() {
+fn gc_keeps_every_one_of_my_checkpoints_and_drops_notes_with_their_disks() {
     let dir = tempfile::tempdir().unwrap();
     committed(&dir, 6);
     let store = Store::new(dir.path().join("root")).keeping(2);

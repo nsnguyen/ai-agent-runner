@@ -21,7 +21,7 @@ const LIVE: &[u8] = b"written while running";
 // of it that the guest has since written LIVE to. As under the unit, `systemctl
 // stop` runs `runner halt dev`, whose Ctrl-Alt-Del has the stand-in commit
 // generation 1, as a clean shutdown does, and gc everything but the current
-// disk and the checkpoints, as `--keep 0` would. A pause takes a moment, so
+// disk and the checkpoints it keeps, as `--keep 0` would. A pause takes a moment, so
 // two that overlapped would show.
 struct Running {
     dir: TempDir,
