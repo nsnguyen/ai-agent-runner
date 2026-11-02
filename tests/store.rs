@@ -2,7 +2,8 @@
 use chrono::SubsecRound;
 use runner::creds::{Cred, DEFAULT};
 use runner::store::{
-    Booted, Checkpoint, Config, Error, Machine, Slept, Store, Vm, check_name, parse_mem,
+    Booted, Checkpoint, Config, Error, KEEP_CHECKPOINTS, Machine, Maker, Slept, Store, Vm,
+    check_name, parse_mem,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -525,8 +526,8 @@ fn deleting_twice_in_one_process_works() {
     }
 }
 
-// gc: the current generation, every checkpoint and the newest few others
-// stay; everything else on disk goes.
+// gc: the current generation, my checkpoints, the newest of runs' and the
+// agent's, and the newest few others stay; everything else on disk goes.
 
 // A store that keeps everything, for building up generations to collect.
 fn hoarder(dir: &TempDir) -> Store {
@@ -582,7 +583,7 @@ fn gc_keeps_the_current_generation_and_the_newest_others() {
 }
 
 #[test]
-fn gc_keeps_every_checkpoint_and_drops_notes_with_their_disks() {
+fn gc_keeps_every_one_of_my_checkpoints_and_drops_notes_with_their_disks() {
     let dir = tempfile::tempdir().unwrap();
     committed(&dir, 6);
     let store = Store::new(dir.path().join("root")).keeping(2);
@@ -693,6 +694,73 @@ fn gc_leaves_alone_a_vm_a_run_holds() {
         store.gc("dev", false).unwrap().generations,
         [0, 1, 2, 3, 4, 5, 6]
     );
+}
+
+// The checkpoints runs take before joining a running VM, and the agent's
+// own, pile up unasked, so gc keeps only the newest KEEP_CHECKPOINTS of the
+// two together. Every one I make stays, and so does the current disk, older
+// than them all.
+#[test]
+fn gc_keeps_the_newest_runs_and_agent_checkpoints_and_every_one_of_mine() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let mine: Vec<u64> = (0..3)
+        .map(|_| store.checkpoint("dev", Some("mine")).unwrap().id)
+        .collect();
+    let mut made = Vec::new();
+    for n in 1..=25 {
+        let before = format!("before run dev.{n}");
+        let run = store.checkpoint_by("dev", Some(&before), Maker::Run);
+        made.push(run.unwrap().id);
+        let agent = store.checkpoint_by("dev", None, Maker::Agent);
+        made.push(agent.unwrap().id);
+    }
+    let all = on_disk(dir.path());
+    assert_eq!(all.len(), 1 + 3 + 50);
+    let store = store.keeping(0);
+    let would = store.gc("dev", true).unwrap();
+    assert_eq!(would.generations, made[..50 - KEEP_CHECKPOINTS]);
+    assert_eq!(on_disk(dir.path()), all);
+    assert_eq!(store.gc("dev", false).unwrap(), would);
+
+    let listed = store.checkpoints("dev").unwrap();
+    let ids: Vec<u64> = listed.iter().map(|c| c.id).collect();
+    let mut want = vec![0];
+    want.extend(&mine);
+    want.extend(&made[50 - KEEP_CHECKPOINTS..]);
+    want.reverse();
+    assert_eq!(ids, want);
+    assert!(listed.last().unwrap().current);
+    let runs: Vec<&Checkpoint> = listed.iter().filter(|c| c.run).collect();
+    let agent = listed.iter().filter(|c| c.agent).count();
+    assert_eq!((runs.len(), agent), (10, 10));
+    assert!(runs.iter().all(|c| !c.auto && !c.agent));
+    assert!(runs[0].row().contains("  run  "), "{}", runs[0].row());
+    assert_eq!(runs[0].comment.as_deref(), Some("before run dev.25"));
+    for c in &listed[KEEP_CHECKPOINTS..KEEP_CHECKPOINTS + 3] {
+        assert!(c.row().contains("  checkpoint  "), "{}", c.row());
+    }
+}
+
+// A run that joined a running VM names the checkpoint it took in its
+// result, for a restore by hand, so gc keeps that one while a run holds the
+// VM, however many newer ones there are.
+#[test]
+fn gc_keeps_the_checkpoint_of_a_run_going_on_the_vm() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    let old = store.checkpoint_by("dev", Some("before run dev.1"), Maker::Run);
+    let going = runner::runs::hold(&store, "dev").unwrap();
+    let taken = store.checkpoint_by("dev", Some("before run dev.2"), Maker::Run);
+    for _ in 0..KEEP_CHECKPOINTS {
+        store.checkpoint_by("dev", None, Maker::Agent).unwrap();
+    }
+    let freed = store.gc("dev", false).unwrap();
+    assert_eq!(freed.generations, [old.unwrap().id]);
+    drop(going);
+    let taken = taken.unwrap().id;
+    assert_eq!(store.gc("dev", false).unwrap().generations, [taken]);
+    assert_eq!(on_disk(dir.path()).len(), 1 + KEEP_CHECKPOINTS);
 }
 
 fn gen_disk(dir: &Path, name: &str, generation: u64) -> PathBuf {
@@ -868,7 +936,7 @@ fn a_running_vm_s_checkpoint_copies_the_disk_its_boot_runs() {
 }
 
 // The agent in the VM checkpoints through its boot (src/calls.rs), and only
-// its own count toward its cap. gc keeps them as it keeps every checkpoint.
+// its own count toward its cap.
 #[test]
 fn an_agent_s_checkpoint_is_noted_as_its_own_and_counted_apart() {
     let (dir, store) = store();
@@ -877,7 +945,7 @@ fn an_agent_s_checkpoint_is_noted_as_its_own_and_counted_apart() {
     let since = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
     let freezer = store.hold_checkpoints("dev").unwrap();
     let mine = freezer
-        .freeze_for_agent(Some("before the migration"))
+        .freeze_by(Some("before the migration"), Maker::Agent)
         .unwrap();
     let host = freezer.freeze(Some("from the host")).unwrap();
     assert!(mine.agent && !mine.auto);

@@ -14,21 +14,22 @@
 // stopped is restored the same way once it's down, and left stopped.
 //
 // The agent in a VM checkpoints it too, through its boot (src/calls.rs), as
-// often as AGENT_PER_HOUR allows.
+// often as AGENT_PER_HOUR allows. Its checkpoints and runs' are noted as
+// theirs, and gc keeps only the newest store::KEEP_CHECKPOINTS of them.
 use crate::exec;
 use crate::firecracker::{self, Api};
 use crate::idle::InUse;
 use crate::proto::Request;
 use crate::runs;
-use crate::store::{self, Checkpoint, Freezer, Store, Vm};
+use crate::store::{self, Checkpoint, Freezer, Maker, Store, Vm};
 use crate::systemd::{self, State};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use std::time::Duration;
 
 /// How many checkpoints the agent in a VM may make of it in any hour. gc
-/// keeps every checkpoint, so this bounds how fast the agent's add up, not
-/// how much space they take in all.
+/// keeps the newest store::KEEP_CHECKPOINTS of its and runs' together, so
+/// this bounds how fast the agent pushes older ones out.
 pub const AGENT_PER_HOUR: usize = 10;
 
 // A guest flushing a lot of writes takes a while; one stuck longer than this
@@ -81,22 +82,32 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// to bring back: its current disk if it's stopped, or the one it runs if it's
 /// running, which carries on.
 pub fn checkpoint(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+    made_by(store, name, comment, Maker::Owner)
+}
+
+/// `checkpoint`, for a run about to join the VM: noted as the run's, which
+/// gc counts with the agent's.
+pub fn for_run(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+    made_by(store, name, comment, Maker::Run)
+}
+
+fn made_by(store: &Store, name: &str, comment: Option<&str>, by: Maker) -> Result<Checkpoint> {
     // Before the look, so an idle sleep can't start between it and the sync.
     let _in_use = InUse::take(store, name)?;
     // A stopped VM needs no systemd, so this works on any machine.
-    match store.checkpoint(name, comment) {
+    match store.checkpoint_by(name, comment, by) {
         Err(store::Error::Busy(_)) => {}
         done => return Ok(done?),
     }
     match systemd::status(store, name)?.state {
-        State::Running => running(store, name, comment),
+        State::Running => running(store, name, comment, by),
         // Its guest syncs its disk first, which it can only do awake.
         State::Sleeping => {
             systemd::wake(store, name)?;
-            running(store, name, comment)
+            running(store, name, comment, by)
         }
         // Held, but not by a boot: another runner command, gone in a moment.
-        State::Stopped => Ok(store.checkpoint(name, comment)?),
+        State::Stopped => Ok(store.checkpoint_by(name, comment, by)?),
         state => Err(not_now(name, state)),
     }
 }
@@ -116,12 +127,14 @@ pub fn for_agent(store: &Store, name: &str, comment: Option<&str>) -> Result<Che
             next,
         });
     }
-    paused(store, name, &freezer, |f| f.freeze_for_agent(comment))
+    paused(store, name, &freezer, |f| {
+        f.freeze_by(comment, Maker::Agent)
+    })
 }
 
-fn running(store: &Store, name: &str, comment: Option<&str>) -> Result<Checkpoint> {
+fn running(store: &Store, name: &str, comment: Option<&str>, by: Maker) -> Result<Checkpoint> {
     let freezer = store.hold_checkpoints(name)?;
-    paused(store, name, &freezer, |f| f.freeze(comment))
+    paused(store, name, &freezer, |f| f.freeze_by(comment, by))
 }
 
 // Syncs the guest, then freezes its disk with the VM paused. From the pause

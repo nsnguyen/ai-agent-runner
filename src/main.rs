@@ -9,8 +9,8 @@ use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
-use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
-use runner::systemd::{self, VmStatus};
+use runner::store::{self, BASE, Config, KEEP, Store, Vm, parse_mem};
+use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
 use std::io::IsTerminal;
@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long, env = "RUNNER_ROOT", default_value = "/var/lib/runner")]
     root: PathBuf,
     /// How many disk generations gc keeps besides the current one and the
-    /// checkpoints, at every commit and in `gc`.
+    /// checkpoints it keeps, at every commit and in `gc`.
     #[arg(long, env = "RUNNER_KEEP", default_value_t = KEEP, global = true)]
     keep: usize,
     #[command(subcommand)]
@@ -114,10 +114,12 @@ enum Cmd {
     Undo { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
-    /// Delete old disk generations: all but the current one, every checkpoint
-    /// and the newest --keep others. Every commit does this too.
+    /// Delete old disk generations: all but the current one, your checkpoints,
+    /// the newest 20 of the ones runs and the agent made, and the newest
+    /// --keep others. Every commit does this too.
     Gc {
-        /// Only this VM. Every VM if left out.
+        /// Only this VM, which has to be stopped. Every VM if left out,
+        /// skipping one that's up: its next commit does it.
         name: Option<String>,
         /// Print what would be freed, and free nothing.
         #[arg(long)]
@@ -743,9 +745,11 @@ fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
 }
 
-// One VM failing, say because a run holds it, doesn't stop the rest; it
-// fails the command.
+// One VM failing, say because another command holds it, doesn't stop the
+// rest; it fails the command. Sweeping every VM, one that's up is skipped:
+// its boot holds it, and gc's it when it commits.
 fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
+    let sweep = name.is_none();
     let names = match name {
         Some(name) => vec![name],
         None => match store.list() {
@@ -774,12 +778,26 @@ fn gc(store: &Store, name: Option<String>, dry_run: bool) -> ExitCode {
                 );
             }
             Err(e) => {
-                eprintln!("runner: {e}");
-                code = ExitCode::FAILURE;
+                if sweep && let Some(state) = up(store, &name, &e) {
+                    println!("{name}  skipped: {state}");
+                } else {
+                    eprintln!("runner: {e}");
+                    code = ExitCode::FAILURE;
+                }
             }
         }
     }
     code
+}
+
+// What a VM gc found busy is doing, if its boot is up. Stopped, another
+// runner command holds it.
+fn up(store: &Store, name: &str, e: &store::Error) -> Option<State> {
+    if !matches!(e, store::Error::Busy(_)) {
+        return None;
+    }
+    let state = systemd::status(store, name).ok()?.state;
+    (state != State::Stopped).then_some(state)
 }
 
 // The prompt is quoted, so one with a newline in it still takes one line.

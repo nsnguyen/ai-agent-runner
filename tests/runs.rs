@@ -461,7 +461,7 @@ fn a_joined_run_checkpoints_its_vm_first() {
     let listed = vm.ok(&["checkpoints", "dev"]);
     let first = listed.lines().next().unwrap();
     assert!(first.starts_with("  2  "), "{listed}");
-    assert!(first.contains("  checkpoint  "), "{listed}");
+    assert!(first.contains("  run  "), "{listed}");
     assert!(first.ends_with("  \"before run dev.1\""), "{listed}");
     vm.go(0, 0);
     let row = vm.wait_until_ended(&id);

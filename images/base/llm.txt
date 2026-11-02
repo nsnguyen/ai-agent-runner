@@ -31,8 +31,9 @@ you can go back.
 - A headless run on a VM it booted keeps what it wrote only if it exits 0. A
   run that joined a running VM checkpoints it first, and keeps what it wrote
   however it ends: the owner restores that checkpoint to undo it.
-- Checkpoints are frozen copies of the disk, kept until the owner deletes
-  the VM, whatever happens to this boot.
+- Checkpoints are frozen copies of the disk, whatever happens to this boot.
+  The owner's are kept until the VM is deleted; yours and runs' are kept
+  while they're among the newest 20 (Checkpoints, below).
 
 ## Services
 
@@ -49,7 +50,9 @@ you can go back.
   copy elsewhere. Then you carry on.
 - `runner-guest checkpoints` lists them, newest first: id, when, kind, size,
   comment. Kind is `agent` for yours, `checkpoint` for the owner's, and
-  `auto` for the generations boots, runs and restores made. `*` marks the
+  `auto` for the generations boots, runs and restores made. A run that
+  joins this VM running checkpoints it first, commented `before run
+  <vm>.<n>`, and that's listed as `checkpoint` here too. `*` marks the
   disk this boot started from. What you've written since is in none of
   them until you checkpoint or the VM shuts down cleanly, so restoring `*`
   throws it away.
@@ -58,8 +61,10 @@ you can go back.
   Claude Code's own session history included, and every process here ends,
   the one that asked too. The disk from before the restore is kept, and the
   owner can go back to it with `runner undo`.
-- You can make 10 an hour. They're kept for good, so make them at points
-  worth coming back to: before a risky change, after something works.
+- You can make 10 an hour. The host keeps only the newest 20 of yours and
+  runs' together, and deletes older ones as it cleans up, so make them at
+  points worth coming back to: before a risky change, after something
+  works. The owner's don't count toward the 20, and stay.
 - Restore is refused while a headless run is going in this VM.
 
 ## Credentials

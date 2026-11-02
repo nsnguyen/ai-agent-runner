@@ -118,6 +118,8 @@ impl From<Saved> for Checkpoint {
             comment: s.comment,
             auto: s.auto,
             agent: s.agent,
+            // Saved has no room for it: a guest lists a run's as `checkpoint`.
+            run: false,
             bytes: s.bytes,
             current: s.current,
         }
