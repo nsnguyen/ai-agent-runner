@@ -1,13 +1,18 @@
-// A VM's network: the /30 its slot picks, its boot argument, and its tap. The
-// tap tests drive a fake `ip`; the one that makes a real tap needs
-// CAP_NET_ADMIN and iproute2, so it's ignored by default.
+// A VM's network: the /30 its slot picks, its boot argument, its tap, and the
+// host's rules for it. The tap tests drive a fake `ip`; the one that makes a
+// real tap needs CAP_NET_ADMIN and iproute2, and the one that loads the rules
+// needs root and nftables too, so those are ignored by default.
+use runner::host;
 use runner::net::{DEFAULT_SUBNET, Net, Subnet, Tap, dns};
 use runner::store::Error;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 fn subnet(s: &str) -> Subnet {
     s.parse().unwrap_or_else(|e| panic!("{s}: {e}"))
@@ -255,6 +260,125 @@ fn a_real_tap_comes_up_with_the_gateway_address_and_goes() {
     let tap = Tap::add_with(Path::new("ip"), &net).unwrap();
     drop(tap);
     assert!(!sys.exists());
+}
+
+#[test]
+fn the_rules_name_the_range_everywhere_install_sh_would() {
+    let rules = host::nat_rules(&subnet("10.20.0.0/16"));
+    assert!(!rules.contains('@'), "{rules}");
+    assert!(
+        rules.contains("ip saddr 10.20.0.0/16 ip daddr != 10.20.0.0/16 masquerade"),
+        "{rules}"
+    );
+}
+
+// `ip` with these arguments, which has to work.
+fn ip_ok(args: &[&str]) {
+    let out = Command::new("ip").args(args).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ip {args:?}: {err}");
+}
+
+// Runs `f` on a thread inside the network namespace `ns`. A socket made
+// there stays in it, whichever thread uses it after.
+fn inside<T: Send + 'static>(ns: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let path = format!("/run/netns/{ns}");
+    std::thread::spawn(move || {
+        let ns = fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        f()
+    })
+    .join()
+    .unwrap()
+}
+
+// Answers each connection's first 4 bytes with `reply`.
+fn answer(listener: TcpListener, reply: &'static [u8]) {
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let mut req = [0u8; 4];
+            if conn.read_exact(&mut req).is_ok() {
+                let _ = conn.write_all(reply);
+            }
+        }
+    });
+}
+
+// Connects to `to` from inside `ns`, says ping and reads the reply.
+fn ask(ns: &str, to: SocketAddr) -> std::io::Result<String> {
+    inside(ns, move || {
+        let mut conn = TcpStream::connect_timeout(&to, Duration::from_secs(2))?;
+        conn.set_read_timeout(Some(Duration::from_secs(2)))?;
+        conn.write_all(b"ping")?;
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply)?;
+        Ok(reply)
+    })
+}
+
+// The rules install.sh writes, loaded in a network namespace that stands in
+// for the host, with a VM's /30 on a veth to a second namespace that stands
+// in for the VM. The host's own namespace and rules are never touched.
+// Run as root: cargo test --test net -- --ignored
+#[test]
+#[ignore = "needs root, nftables and iproute2"]
+fn a_vm_can_t_reach_the_host_but_hears_back_from_it() {
+    let range = subnet("10.254.0.0/16");
+    let net = range.net(16001).unwrap();
+    let pid = std::process::id();
+    let (host_ns, vm_ns) = (format!("runner-host-{pid}"), format!("runner-vm-{pid}"));
+    struct Gone(Vec<String>);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            for ns in &self.0 {
+                let _ = Command::new("ip").args(["netns", "del", ns]).status();
+            }
+        }
+    }
+    let mut gone = Gone(Vec::new());
+    for ns in [&host_ns, &vm_ns] {
+        ip_ok(&["netns", "add", ns]);
+        gone.0.push(ns.clone());
+    }
+    let (tap, eth) = (net.tap.as_str(), "eth0");
+    ip_ok(&[
+        "-n", &host_ns, "link", "add", tap, "type", "veth", "peer", "name", eth, "netns", &vm_ns,
+    ]);
+    let gateway = format!("{}/30", net.gateway);
+    let address = format!("{}/30", net.address);
+    ip_ok(&["-n", &host_ns, "addr", "add", &gateway, "dev", tap]);
+    ip_ok(&["-n", &host_ns, "link", "set", "dev", tap, "up"]);
+    ip_ok(&["-n", &vm_ns, "addr", "add", &address, "dev", eth]);
+    ip_ok(&["-n", &vm_ns, "link", "set", "dev", eth, "up"]);
+
+    // The host's sshd, and a service in the VM the host's URL proxy goes to.
+    let sshd = inside(&host_ns, || TcpListener::bind("0.0.0.0:22").unwrap());
+    answer(sshd, b"host");
+    let at = SocketAddr::new(net.address.into(), 8080);
+    let service = inside(&vm_ns, move || TcpListener::bind(at).unwrap());
+    answer(service, b"vm");
+    let host_22 = SocketAddr::new(net.gateway.into(), 22);
+    // Without the rules both ways work, so what changes below is the rules'.
+    assert_eq!(ask(&vm_ns, host_22).unwrap(), "host");
+    assert_eq!(ask(&host_ns, at).unwrap(), "vm");
+
+    let rules = host::nat_rules(&range);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), &rules).unwrap();
+    let out = Command::new("ip")
+        .args(["netns", "exec", &host_ns, "nft", "-f"])
+        .arg(file.path())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "nft -f: {err}\n{rules}");
+
+    // Dropped, not refused: the VM can't even tell the port is there.
+    let got = ask(&vm_ns, host_22);
+    assert_eq!(got.as_ref().map_err(|e| e.kind()), Err(ErrorKind::TimedOut));
+    // The host opened this one, so the VM's replies come back.
+    assert_eq!(ask(&host_ns, at).unwrap(), "vm");
 }
 
 mod props {
