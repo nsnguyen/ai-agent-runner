@@ -59,19 +59,35 @@ impl Laptop {
         let bin = dir.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(dir.path().join("home")).unwrap();
+        // Every call goes in SSH_LOG too, one record each. A tunnel (-N) runs
+        // nothing on the host: it notes the VM's state as it opens, and ends.
         script(
             &bin.join("ssh"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$SSH_ARGV"
+{ for arg; do printf '%s\0' "$arg"; done; printf '\036'; } >>"$SSH_LOG"
+for arg; do
+  if [ "$arg" = -N ]; then
+    cat "$VM_STATE" >"$TUNNEL_SAW" 2>/dev/null
+    exit "${TUNNEL_EXIT:-0}"
+  fi
+done
 for cmd; do :; done
 exec bash -c "$cmd"
 "#,
         );
         // Reads stdin only when asked, since a terminal's would never end.
+        // `start` brings the VM up and `ip` prints its address, as the real
+        // ones do; HOST_LOG has every call, a line each.
         script(
             &bin.join("runner"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$HOST_ARGV"
+printf '%s\n' "$*" >>"$HOST_LOG"
 [ -z "${HOST_STDIN-}" ] || cat >"$HOST_STDIN"
-exit "${HOST_EXIT:-0}"
+[ -z "${HOST_EXIT-}" ] || { echo "runner: no VM named $2" >&2; exit "$HOST_EXIT"; }
+case $1 in
+start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
+ip) printf '%s\n' "${HOST_IP-172.16.0.6}" ;;
+esac
 "#,
         );
         Laptop { dir }
@@ -100,9 +116,15 @@ exit "${HOST_EXIT:-0}"
             .env("HOME", self.home())
             .env("RUNNER_HOST", HOST)
             .env("SSH_ARGV", self.path("ssh-argv"))
+            .env("SSH_LOG", self.path("ssh-log"))
             .env("HOST_ARGV", self.path("host-argv"))
+            .env("HOST_LOG", self.path("host-log"))
+            .env("VM_STATE", self.path("vm-state"))
+            .env("TUNNEL_SAW", self.path("tunnel-saw"))
             .env_remove("HOST_STDIN")
             .env_remove("HOST_EXIT")
+            .env_remove("HOST_IP")
+            .env_remove("TUNNEL_EXIT")
             .stdin(Stdio::null());
         cmd
     }
@@ -113,6 +135,33 @@ exit "${HOST_EXIT:-0}"
 
     fn host_argv(&self) -> Vec<String> {
         args_in(&self.path("host-argv"))
+    }
+
+    /// Every ssh run, in order, each its argv.
+    fn ssh_calls(&self) -> Vec<Vec<String>> {
+        let log = fs::read(self.path("ssh-log")).unwrap_or_default();
+        text(&log)
+            .split_terminator('\x1e')
+            .map(|call| call.split_terminator('\0').map(str::to_string).collect())
+            .collect()
+    }
+
+    /// Every command the host's runner got, in order.
+    fn host_calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.path("host-log")).unwrap_or_default();
+        log.lines().map(str::to_string).collect()
+    }
+
+    /// The VM's state on the fake host: stopped, sleeping or running.
+    fn vm(&self, state: &str) -> &Laptop {
+        fs::write(self.path("vm-state"), format!("{state}\n")).unwrap();
+        self
+    }
+
+    /// The VM's state when the tunnel opened, if one did.
+    fn tunnel_saw(&self) -> Option<String> {
+        let saw = fs::read_to_string(self.path("tunnel-saw")).ok()?;
+        Some(saw.trim().to_string())
     }
 }
 
@@ -381,5 +430,222 @@ fn install_puts_runner_in_local_bin_and_saves_the_host() {
             assert_eq!(out.status.code(), Some(2), "{bad:?}");
             assert_eq!(fs::read_to_string(&host).unwrap(), format!("{HOST}\n"));
         }
+    }
+}
+
+// `runner proxy`: the host starts the VM and says its address, then ssh
+// forwards each laptop port to it, through the host.
+const ASK: &str = "runner start dev >/dev/null && runner ip dev";
+
+// No stdin and no tty: keys typed while the VM boots stay in the terminal,
+// and the address comes back without a \r.
+fn ask(cmd: &str) -> Vec<String> {
+    ["-n", "-T", HOST, cmd].map(str::to_string).to_vec()
+}
+
+fn tunnel(forwards: &[&str]) -> Vec<String> {
+    let mut argv = vec!["-N", "-o", "ExitOnForwardFailure=yes"];
+    for f in forwards {
+        argv.extend(["-L", f]);
+    }
+    argv.push(HOST);
+    argv.into_iter().map(str::to_string).collect()
+}
+
+#[test]
+fn proxy_forwards_one_port_to_the_same_port_on_the_vm() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.ssh_calls(),
+            [ask(ASK), tunnel(&["localhost:3000:172.16.0.6:3000"])],
+            "{shell:?}"
+        );
+        assert_eq!(laptop.host_calls(), ["start dev", "ip dev"], "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("localhost:3000 is dev's port 3000"), "{err}");
+    }
+}
+
+#[test]
+fn proxy_forwards_several_ports_at_once() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000", "5173", "8080:80"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(laptop.ssh_calls().len(), 2, "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            tunnel(&[
+                "localhost:3000:172.16.0.6:3000",
+                "localhost:5173:172.16.0.6:5173",
+                "localhost:8080:172.16.0.6:80"
+            ]),
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn proxy_takes_local_colon_remote() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "8080:3000"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.ssh_argv(),
+            tunnel(&["localhost:8080:172.16.0.6:3000"]),
+            "{shell:?}"
+        );
+        let err = text(&out.stderr);
+        assert!(err.contains("localhost:8080 is dev's port 3000"), "{err}");
+    }
+}
+
+#[test]
+fn proxy_starts_or_wakes_a_vm_that_isnt_running_before_the_tunnel_opens() {
+    for shell in SHELLS {
+        for state in ["stopped", "sleeping"] {
+            let laptop = Laptop::new();
+            let out = laptop
+                .vm(state)
+                .runner(shell, &["proxy", "dev", "3000"])
+                .output()
+                .unwrap();
+            ok(&out);
+            assert_eq!(laptop.host_calls(), ["start dev", "ip dev"], "{shell:?}");
+            assert_eq!(
+                laptop.tunnel_saw().as_deref(),
+                Some("running"),
+                "{shell:?} {state}"
+            );
+            // start's status line is the host's business, not the laptop's.
+            assert!(!text(&out.stdout).contains("gen 1"), "{shell:?}");
+        }
+    }
+}
+
+#[test]
+fn proxy_to_a_vm_that_cant_start_opens_no_tunnel_and_says_why() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("stopped")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("HOST_EXIT", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        assert_eq!(laptop.ssh_calls().len(), 1, "{shell:?}");
+        assert_eq!(laptop.host_calls(), ["start dev"], "{shell:?}");
+        assert!(text(&out.stderr).contains("no VM named dev"), "{shell:?}");
+        assert_eq!(laptop.tunnel_saw(), None, "{shell:?}");
+    }
+}
+
+#[test]
+fn proxy_refuses_an_address_that_isnt_one() {
+    // Say a login script on the host printed a banner first.
+    for shell in SHELLS {
+        for said in ["", "Welcome!\n172.16.0.6", "-oProxyCommand=x"] {
+            let laptop = Laptop::new();
+            let out = laptop
+                .vm("running")
+                .runner(shell, &["proxy", "dev", "3000"])
+                .env("HOST_IP", said)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "{shell:?} {said:?}");
+            assert_eq!(laptop.ssh_calls().len(), 1, "{shell:?} {said:?}");
+            let err = text(&out.stderr);
+            assert!(err.contains("dev's address"), "{err}");
+        }
+    }
+}
+
+#[test]
+fn proxy_quotes_the_vm_name_for_the_host() {
+    let laptop = Laptop::new();
+    let out = laptop
+        .vm("running")
+        .runner(SHELLS[0], &["proxy", "it's", "3000"])
+        .output()
+        .unwrap();
+    ok(&out);
+    assert_eq!(
+        laptop.ssh_calls()[0],
+        ask(r#"runner start 'it'\''s' >/dev/null && runner ip 'it'\''s'"#)
+    );
+    assert_eq!(laptop.host_argv(), ["ip", "it's"]);
+}
+
+#[test]
+fn proxy_with_bad_arguments_says_how_and_runs_nothing() {
+    let bad: &[&[&str]] = &[
+        &["proxy"],
+        &["proxy", "dev"],
+        &["proxy", "", "3000"],
+        &["proxy", "dev", "0"],
+        &["proxy", "dev", "65536"],
+        &["proxy", "dev", "030"],
+        &["proxy", "dev", "web"],
+        &["proxy", "dev", "3000:"],
+        &["proxy", "dev", ":3000"],
+        &["proxy", "dev", "1:2:3"],
+        &["proxy", "dev", "3000", "-L"],
+        &["proxy", "dev", "3000", "x\n-oProxyCommand=y"],
+    ];
+    for shell in SHELLS {
+        for args in bad {
+            let laptop = Laptop::new();
+            let out = laptop.runner(shell, args).output().unwrap();
+            assert_eq!(out.status.code(), Some(2), "{shell:?} {args:?}");
+            assert!(
+                text(&out.stderr).contains("runner proxy <vm> <port>"),
+                "{args:?}: {}",
+                text(&out.stderr)
+            );
+            assert!(laptop.ssh_calls().is_empty(), "{shell:?} {args:?}");
+        }
+    }
+}
+
+#[test]
+fn proxy_help_says_how_and_runs_nothing() {
+    let laptop = Laptop::new();
+    let out = laptop
+        .runner(SHELLS[0], &["proxy", "--help"])
+        .output()
+        .unwrap();
+    ok(&out);
+    assert!(text(&out.stdout).contains("runner proxy <vm> <port>"));
+    assert!(laptop.ssh_calls().is_empty());
+}
+
+#[test]
+fn the_tunnels_exit_code_is_the_proxys() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .vm("running")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .env("TUNNEL_EXIT", "255")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
     }
 }

@@ -19,7 +19,11 @@ use std::process::ExitCode;
 /// Firecracker microVMs for AI agents. Runs on the KVM host, usually as
 /// `ssh -t host runner ...`; `runner mcp` serves the same commands to Claude Code.
 #[derive(Parser)]
-#[command(name = "runner", version)]
+#[command(
+    name = "runner",
+    version,
+    after_help = "On the laptop, `runner proxy <vm> <port>` forwards a VM's port to localhost (README.md, Ports)."
+)]
 struct Cli {
     /// Where VMs live.
     #[arg(long, env = "RUNNER_ROOT", default_value = "/var/lib/runner")]

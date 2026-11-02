@@ -12,7 +12,7 @@ runner CLI  ── ssh -t kvm-host runner … ─┴──▶ /var/lib/runner/vm
                                               vsock ─▶ small guest agent in the VM
 ```
 
-- **No daemon, no API, no open ports.** Local Claude Code registers `ssh kvm-host runner mcp` as a stdio MCP server, and the CLI is `ssh -t kvm-host runner …`. SSH keys are the auth and the tailnet is the network. MCP tools and CLI commands call the same functions.
+- **No daemon, no API, no open ports.** Local Claude Code registers `ssh kvm-host runner mcp` as a stdio MCP server, and the CLI is `ssh -t kvm-host runner …`. `runner proxy`, the one command the laptop runs itself, is `ssh -N -L` to a VM's address through the host. SSH keys are the auth and the tailnet is the network. MCP tools and CLI commands call the same functions.
 - **The filesystem is the database.** Each VM is a directory with its disk generations and a `history` whose last line is the current one.
 - **Every VM is a fork.** Disks are reflink copies on XFS or btrfs, with a sparse full copy elsewhere. An image is a VM you stopped changing; `base` is the one you fork most. A run clones the current disk into a new generation that only a clean finish commits, so a crash rolls back for free and `undo` steps back one. Every commit then deletes old generations, keeping every checkpoint and five more, undo's way back first; `runner gc` does the same by hand. A running VM's checkpoint syncs the guest, pauses it through Firecracker's API, copies the disk it runs, and resumes it.
 - **One run per VM.** The process running a VM holds an flock on it, which the kernel drops if that process dies. In M2 that process is the VM's systemd unit.

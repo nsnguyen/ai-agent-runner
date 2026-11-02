@@ -1,6 +1,6 @@
 # Examples
 
-Every command here runs on your laptop, in this repo's folder. The `runner` on your laptop is a small wrapper: each command runs on the server over SSH (`ssh runner@kvm-host runner ...`), through Tailscale.
+Every command here runs on your laptop, in this repo's folder. The `runner` on your laptop is a small wrapper: each command but `proxy` runs on the server over SSH (`ssh runner@kvm-host runner ...`), through Tailscale.
 
 **Before you start:** the server is set up (README.md, "Set up a host" and "On AWS"), Tailscale is connected on your laptop, and `AWS_PROFILE=runner` is set (`aws login --profile runner` if it's been more than 12 hours).
 
@@ -41,6 +41,7 @@ runner service add demo web -- python3 -m http.server 8080   # a server that's u
 runner service list demo    # its services, and whether each is running
 runner service logs demo web    # what web printed
 runner service rm demo web  # stop web for good
+runner proxy demo 8080      # open localhost:8080 on your laptop: demo's web server, until Ctrl-C
 ```
 
 A service starts again on its own: when it exits, and every time the VM starts.
@@ -131,5 +132,6 @@ client/aws.sh stop     # turn the server off
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |
+| `administratively prohibited` from `runner proxy` | Add `port-forwarding` to the laptop's key line on the server (README.md, Add the laptop's key) |
 
 More detail: README.md.

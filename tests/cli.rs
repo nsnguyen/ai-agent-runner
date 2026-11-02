@@ -463,6 +463,14 @@ fn boot_and_halt_stay_out_of_the_help() {
 }
 
 #[test]
+fn the_help_points_to_proxy_which_only_the_laptop_runs() {
+    // The laptop's `runner --help` is this help, over SSH.
+    let dir = tempfile::tempdir().unwrap();
+    let help = text(&runner(dir.path(), &["--help"]).stdout);
+    assert!(help.contains("runner proxy <vm> <port>"), "{help}");
+}
+
+#[test]
 fn creds_shows_and_sets_what_a_vm_gets() {
     let dir = with_base();
     runner(dir.path(), &["create", "dev"]);
