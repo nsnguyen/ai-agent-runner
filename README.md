@@ -32,6 +32,7 @@ runner shell dev                          # a shell in dev, as agent
 runner exec dev -- ls -la /home/agent/work
 runner run dev "Add a README to work/"    # headless: prints a run id, like dev.1
 runner output dev.1 --follow              # its stream, until it ends
+runner proxy dev 3000                     # localhost:3000 here is port 3000 in dev, until Ctrl-C
 runner result dev.1                       # what the runner measured, apart from what the agent says
 ```
 
@@ -72,7 +73,8 @@ The install ends with `runner doctor`: every line should be `ok`. The boot tests
 ### When something's off
 
 - `aws.sh: AWS won't take this laptop's credentials`: run `aws login --profile runner`, and check `AWS_PROFILE=runner` is set.
-- `runner@kvm-host: Permission denied (publickey)`: the laptop's key line in the host's `~runner/.ssh/authorized_keys` must read `from="…",restrict,pty ssh-ed25519 AAAA…`, with nothing between `pty` and the key.
+- `runner@kvm-host: Permission denied (publickey)`: the laptop's key line in the host's `~runner/.ssh/authorized_keys` must read `from="…",restrict,pty,port-forwarding ssh-ed25519 AAAA…`, with nothing between `port-forwarding` and the key.
+- `runner proxy` prints `open failed: administratively prohibited` when something connects: the laptop's key line lacks `port-forwarding` (Add the laptop's key).
 - `runner list` hangs or can't resolve `kvm-host`: Tailscale isn't connected on the laptop, or the host is stopped (`client/aws.sh ip` says).
 - `client/aws.sh ssh` times out: after `close` it goes over the tailnet, as `kvm-host`, so Tailscale has to be connected on the laptop. Before `close`, it goes to the public address, which lets in only the laptop's address from when `up` or `open` last ran: run `client/aws.sh open` again.
 - A VM won't start or stop: `runner logs dev` shows its console and boot notes.
@@ -100,12 +102,13 @@ VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/ins
 From the laptop, through your own sudo account on the host (`admin` here):
 
 ```sh
-ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"
+ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty,port-forwarding $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"
 ```
 
 - `from=` takes this key only from Tailscale's IPv4 and IPv6 ranges: the tailnet-only rule, held per key.
 - `restrict` turns off port, agent and X11 forwarding.
 - `pty` gives back the terminal `restrict` takes away, so `ssh -t` works for `runner shell`.
+- `port-forwarding` gives back `ssh -L`, for `runner proxy`. sshd can't limit it to the VMs' range (`permitopen` takes only exact addresses), so the key can reach, through the host, anything the host reaches. A key line from before `runner proxy` lacks it: edit the line in `~runner/.ssh/authorized_keys` to add it.
 
 ### Tailnet only
 
@@ -146,7 +149,7 @@ Put the host on the tailnet as `kvm-host`, so the name the steps above use resol
 
 ```sh
 curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname kvm-host   # on the host
-ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
+ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty,port-forwarding $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
 ```
 
 Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` then goes over the tailnet, as `kvm-host`, and the rsync above, to `ubuntu@kvm-host:ai-agent-runner/`, upgrades the host. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
@@ -184,7 +187,7 @@ To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node
 
 ## Use it from the laptop
 
-On the laptop, `runner` is a short sh script that runs each command on the host over SSH: `runner shell dev` is `ssh -t runner@kvm-host runner shell dev`. Nothing else goes on the laptop.
+On the laptop, `runner` is a short sh script that runs each command on the host over SSH, all but `proxy` (Ports): `runner shell dev` is `ssh -t runner@kvm-host runner shell dev`. Nothing else goes on the laptop.
 
 ```sh
 git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
@@ -212,6 +215,15 @@ lands you in Claude Code running in dev, logged in with the host's token (docs/h
 ### Services
 
 `runner service add dev web -- python3 -m http.server 8080` keeps a dev server up whenever dev is: a systemd unit in the VM, `runner-svc-web`, runs it as `agent` in `/home/agent/work` (`--dir` picks another, and a relative program like `./serve` is taken from there), now and at every boot, and starts it again a second after it exits. It runs as given, not through a shell: `-- sh -c 'npm i && npm run dev'` for shell syntax. `add` returns once the program has started; one that can't start fails, leaves nothing behind, and says why: its command and the journal's last lines, or plainly that its program couldn't be run. `runner service list dev` shows each one's systemd state, like `active/running`, or `activating/auto-restart` while it crash-loops; `runner service logs dev web` its output (`-f`, `-n 50`); and `runner service rm dev web` stops it for good. Each starts a stopped VM, or wakes a sleeping one, first, and sleep keeps a service running as it was. A service gets no credentials. From the host it answers at `runner ip dev`'s address. MCP has `add_service`, `list_services` and `remove_service`.
+
+### Ports
+
+```sh
+runner proxy dev 3000              # localhost:3000 on the laptop is port 3000 in dev
+runner proxy dev 3000 5173 8080:80 # several at once; 8080:80 puts dev's port 80 at localhost:8080
+```
+
+It starts dev if it's stopped, or wakes it if it's sleeping, asks the host for `runner ip dev`, then runs `ssh -N -L 3000:<dev's address>:3000` to the host, which reaches dev's address, until Ctrl-C. Only the laptop's own localhost gets the port. A local port that's taken ends it at once (`cannot listen to port`). The program in dev has to listen on dev's address, not just its 127.0.0.1: `vite --host`, `next dev -H 0.0.0.0`; `python3 -m http.server` does already. Traffic through the proxy doesn't count as use, so dev still sleeps when idle, and the proxy gets no answer until something wakes it: `runner idle dev never` for a VM you browse. It needs `port-forwarding` in the laptop's key line (Add the laptop's key). `proxy` runs on the laptop, so the host's own `runner` has no such command.
 
 ### Headless runs
 
