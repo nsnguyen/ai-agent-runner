@@ -2,7 +2,8 @@
 // rule that it binds only the host's tailnet address and takes connections
 // only from the tailnet, its setting, and a connection held through a wake.
 use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, bind, getsockname, listen, socket,
+    AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, bind, getsockname, getsockopt, listen,
+    socket, sockopt,
 };
 use proptest::prelude::*;
 use runner::store::{Config, Store};
@@ -343,4 +344,205 @@ fn bytes_pass_both_ways_until_each_side_is_done() {
     echo.join().unwrap();
     assert!(got == big, "echoed {} of {} bytes", got.len(), big.len());
     proxy.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_guest_that_takes_a_moment_after_the_wake_is_waited_for() {
+    let (guest_fd, guest) = unready_guest();
+    let (mut client, taken) = client_pair();
+    client.write_all(b"ping").unwrap();
+    let (ready, listening) = mpsc::channel();
+    // The wake returns at once; the guest listens only later, as an app
+    // still starting would.
+    let wake = move || {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            listen(&guest_fd, Backlog::new(8).unwrap()).unwrap();
+            ready.send(guest_fd).unwrap();
+        });
+        Ok(())
+    };
+    let proxy = std::thread::spawn(move || url::proxy(taken, guest, wake, Duration::from_secs(10)));
+    let guest_listener = TcpListener::from(listening.recv_timeout(Duration::from_secs(5)).unwrap());
+    let (mut conn, _) = guest_listener.accept().unwrap();
+    let mut got = [0u8; 4];
+    conn.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"ping");
+    conn.write_all(b"pong").unwrap();
+    drop(conn);
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut back = String::new();
+    client.read_to_string(&mut back).unwrap();
+    assert_eq!(back, "pong");
+    proxy.join().unwrap().unwrap();
+}
+
+// A client that vanishes without a FIN, like a laptop that sleeps, is found
+// out by keepalive and the unanswered-data timeout, so its connection ends
+// and stops holding the VM awake.
+#[test]
+fn a_client_that_vanishes_is_found_out_within_minutes() {
+    let (_client, taken) = client_pair();
+    url::keep_alive(&taken).unwrap();
+    assert!(getsockopt(&taken, sockopt::KeepAlive).unwrap());
+    let idle = getsockopt(&taken, sockopt::TcpKeepIdle).unwrap();
+    let every = getsockopt(&taken, sockopt::TcpKeepInterval).unwrap();
+    let probes = getsockopt(&taken, sockopt::TcpKeepCount).unwrap();
+    let unacked = getsockopt(&taken, sockopt::TcpUserTimeout).unwrap();
+    let silent = idle + every * probes;
+    assert!((60..=180).contains(&silent), "{idle}+{every}x{probes}");
+    assert!((60_000..=180_000).contains(&unacked), "{unacked}ms");
+}
+
+// The boot's side, on a tun device that stands in for tailscale0: it serves
+// the URL only on that address, holds the VM in use while a connection
+// lasts, refuses a peer off the tailnet without waking the VM, and follows
+// `off`, `on` and `--port` within a second or two.
+#[test]
+#[ignore = "makes a tun device: needs root and iproute2"]
+fn the_boot_serves_the_url_on_the_tailnet_address_only() {
+    use runner::idle::Uses;
+    use std::process::Command;
+    use std::sync::atomic::AtomicUsize;
+
+    let pid = std::process::id();
+    let dev = format!("tailscale{}", pid % 100_000);
+    let addr = Ipv4Addr::new(100, 127, (pid >> 8) as u8, (pid & 0xff).max(1) as u8);
+    let ip = |args: &[&str]| {
+        let out = Command::new("ip").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "ip {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ip(&["tuntap", "add", "dev", &dev, "mode", "tun"]);
+    struct Gone(String);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = Command::new("ip")
+                .args(["link", "del", "dev", &self.0])
+                .status();
+        }
+    }
+    let _gone = Gone(dev.clone());
+    ip(&["addr", "add", &format!("{addr}/32"), "dev", &dev]);
+    ip(&["link", "set", "dev", &dev, "up"]);
+
+    let (_dir, store) = store_with(&["base", "dev"]);
+    let port = url::port(&store, "dev").unwrap();
+    let at = SocketAddr::new(addr.into(), port);
+    // Two guests on loopback, the VM's address here, on ports of their own.
+    let echo = |reply: &'static [u8]| {
+        let guest = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = guest.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in guest.incoming() {
+                let mut conn = conn.unwrap();
+                let mut req = [0u8; 4];
+                if conn.read_exact(&mut req).is_ok() {
+                    let _ = conn.write_all(reply);
+                }
+            }
+        });
+        port
+    };
+    let (first, second) = (echo(b"one"), echo(b"two"));
+    let on = |port| Setting {
+        off: false,
+        port: Some(port),
+    };
+    store.set_url("dev", on(first)).unwrap();
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let woken = wakes.clone();
+    let wake: url::Wake = Arc::new(move || {
+        woken.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    // Only the test's device, so a host on a real tailnet doesn't bind its own.
+    let only = dev.clone();
+    let ifaces = move || {
+        Ok(url::ifaces()?
+            .into_iter()
+            .filter(|i| i.name == only)
+            .collect())
+    };
+    let served = url::Served::start_with(&store, "dev", Ipv4Addr::LOCALHOST, wake, ifaces).unwrap();
+    let get = |from: Option<Ipv4Addr>| -> Option<String> {
+        let sock = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .ok()?;
+        if let Some(from) = from {
+            let [a, b, c, d] = from.octets();
+            bind(sock.as_raw_fd(), &SockaddrIn::new(a, b, c, d, 0)).ok()?;
+        }
+        let mut conn = TcpStream::from(sock);
+        let [a, b, c, d] = addr.octets();
+        nix::sys::socket::connect(conn.as_raw_fd(), &SockaddrIn::new(a, b, c, d, port)).ok()?;
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        conn.write_all(b"ping").ok()?;
+        let mut got = String::new();
+        conn.read_to_string(&mut got).ok()?;
+        Some(got)
+    };
+    let eventually = |what: &str, check: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gave up waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    eventually("the URL to answer", &|| get(None).as_deref() == Some("one"));
+    assert!(wakes.load(Ordering::SeqCst) >= 1);
+    // Bound to the tailnet address alone.
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+
+    // Held in use while a connection is open, and touched after.
+    let mut uses = Uses::open(&store, "dev").unwrap();
+    let _ = uses.quiet().unwrap();
+    let held = TcpStream::connect(at).unwrap();
+    eventually("the connection to hold the VM", &|| {
+        let mut uses = Uses::open(&store, "dev").unwrap();
+        uses.quiet().unwrap().is_none()
+    });
+    drop(held);
+
+    // From off the tailnet: closed unanswered, and the VM isn't woken.
+    let before = wakes.load(Ordering::SeqCst);
+    assert_eq!(get(Some(Ipv4Addr::LOCALHOST)).unwrap_or_default(), "");
+    assert_eq!(wakes.load(Ordering::SeqCst), before);
+
+    store.set_url("dev", on(second)).unwrap();
+    eventually("the new port", &|| get(None).as_deref() == Some("two"));
+    store
+        .set_url(
+            "dev",
+            Setting {
+                off: true,
+                ..on(second)
+            },
+        )
+        .unwrap();
+    eventually("the URL to go", &|| TcpStream::connect(at).is_err());
+    store.set_url("dev", on(second)).unwrap();
+    eventually("the URL to come back", &|| {
+        get(None).as_deref() == Some("two")
+    });
+
+    let began = std::time::Instant::now();
+    drop(served);
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
+    );
+    assert!(TcpStream::connect(at).is_err());
 }

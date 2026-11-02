@@ -19,6 +19,7 @@
 use crate::idle::InUse;
 use crate::store::{self, Store};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::socket::{setsockopt, sockopt};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -40,6 +41,19 @@ pub const ACCEPT_WAIT: Duration = Duration::from_secs(30);
 
 // How often the boot looks at the VM's setting and the host's tailnet address.
 const LOOK: Duration = Duration::from_secs(1);
+// The most connections taken between looks, so a flood can't hold off a stop.
+const BATCH: usize = 64;
+// Notes about refused connections come at most this often, so a flood from a
+// VM can't fill the journal.
+const HUSH: Duration = Duration::from_secs(60);
+// A client that goes silent, like a laptop that sleeps with a connection
+// open, is probed after a minute and dropped after three unanswered probes,
+// and data it leaves unacknowledged as long ends it too. Then its connection
+// stops holding the VM awake.
+const KEEP_IDLE: u32 = 60;
+const KEEP_EVERY: u32 = 10;
+const KEEP_PROBES: u32 = 3;
+const UNACKED_MS: u32 = 90_000;
 // One try at reaching the guest.
 const TRY: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_millis(100);
@@ -57,7 +71,7 @@ pub enum Error {
     NotTailnet(IpAddr),
     #[error(
         "this host has no tailnet address: is Tailscale up? A VM's URL binds only \
-         Tailscale's 100.x address on tailscale0"
+         Tailscale's 100.x address on its own interface"
     )]
     NoTailnet,
     #[error("slot {0} has no port: URLs take ports {FIRST_PORT} and up, one per slot")]
@@ -184,9 +198,6 @@ pub fn peer_allowed(peer: IpAddr) -> bool {
 
 /// The VM's URL, or None if it's off.
 pub fn url(store: &Store, name: &str) -> Result<Option<String>> {
-    if store.url(name)?.off {
-        return Ok(None);
-    }
     let ifaces = ifaces().map_err(io_err("listing this host's addresses"))?;
     url_on(store, name, &ifaces)
 }
@@ -210,9 +221,23 @@ pub fn proxy(
     wake: impl FnOnce() -> std::result::Result<(), String>,
     wait: Duration,
 ) -> Result<()> {
+    keep_alive(&client).map_err(io_err("setting keepalive"))?;
     wake().map_err(Error::Unwoken)?;
     let upstream = reach(guest, wait)?;
     pipe(client, upstream)
+}
+
+/// Has the kernel find out a client that has gone silent within a minute and
+/// a half, by keepalive probes and by data it doesn't acknowledge. The guest's
+/// side is left alone: an explicit sleep stops it answering for as long as it
+/// sleeps.
+pub fn keep_alive(conn: &TcpStream) -> io::Result<()> {
+    setsockopt(conn, sockopt::KeepAlive, &true)?;
+    setsockopt(conn, sockopt::TcpKeepIdle, &KEEP_IDLE)?;
+    setsockopt(conn, sockopt::TcpKeepInterval, &KEEP_EVERY)?;
+    setsockopt(conn, sockopt::TcpKeepCount, &KEEP_PROBES)?;
+    setsockopt(conn, sockopt::TcpUserTimeout, &UNACKED_MS)?;
+    Ok(())
 }
 
 // Tries until the guest accepts, or `wait` has passed.
@@ -271,6 +296,17 @@ impl Served {
     /// Serves the VM's URL, to its guest at `guest`. Off, or with no tailnet
     /// address, it listens on nothing, and looks again every second.
     pub fn start(store: &Store, name: &str, guest: Ipv4Addr, wake: Wake) -> io::Result<Served> {
+        Served::start_with(store, name, guest, wake, ifaces)
+    }
+
+    /// `start`, taking the host's addresses from `ifaces`.
+    pub fn start_with(
+        store: &Store,
+        name: &str,
+        guest: Ipv4Addr,
+        wake: Wake,
+        ifaces: impl Fn() -> io::Result<Vec<Iface>> + Send + 'static,
+    ) -> io::Result<Served> {
         let stop = Arc::new(AtomicBool::new(false));
         let serving = Serving {
             store: store.clone(),
@@ -278,9 +314,11 @@ impl Served {
             guest,
             guest_port: GUEST_PORT,
             wake,
+            ifaces: Box::new(ifaces),
             stop: stop.clone(),
             bound: None,
             said: None,
+            hush: Hush::default(),
         };
         let thread = thread::Builder::new().spawn(move || serving.run())?;
         Ok(Served {
@@ -305,19 +343,24 @@ struct Serving {
     guest: Ipv4Addr,
     guest_port: u16,
     wake: Wake,
+    ifaces: Box<dyn Fn() -> io::Result<Vec<Iface>> + Send>,
     stop: Arc<AtomicBool>,
     /// The address it listens on, and the listener.
     bound: Option<(SocketAddr, TcpListener)>,
     /// The last trouble noted, so it's noted once, not every second.
     said: Option<String>,
+    hush: Hush,
 }
 
 impl Serving {
     fn run(mut self) {
         while !self.stop.load(Ordering::SeqCst) {
             self.settle();
-            match &self.bound {
-                Some((_, listener)) => self.take_all(listener),
+            match self.bound.take() {
+                Some((at, listener)) => {
+                    self.take_all(&listener);
+                    self.bound = Some((at, listener));
+                }
                 None => thread::sleep(LOOK),
             }
         }
@@ -327,7 +370,7 @@ impl Serving {
     // changed. Trouble that may pass, like Tailscale not up yet, leaves what's
     // bound as it is, and is looked at again.
     fn settle(&mut self) {
-        let ifaces = match ifaces() {
+        let ifaces = match (self.ifaces)() {
             Ok(ifaces) => ifaces,
             Err(e) => return self.say(format!("can't list this host's addresses: {e}")),
         };
@@ -374,22 +417,25 @@ impl Serving {
         }
     }
 
-    // Waits up to a second for connections, and takes each that's come.
-    fn take_all(&self, listener: &TcpListener) {
+    // Waits up to a second for connections, and takes those that have come,
+    // up to a batch, so the stop and the setting are looked at again soon.
+    fn take_all(&mut self, listener: &TcpListener) {
         let mut fds = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
         let ms = u16::try_from(LOOK.as_millis()).unwrap_or(u16::MAX);
         if !matches!(poll(&mut fds, PollTimeout::from(ms)), Ok(n) if n > 0) {
             return;
         }
-        loop {
+        for _ in 0..BATCH {
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
             match listener.accept() {
                 Ok((conn, peer)) => self.take(conn, peer),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    note(format_args!(
-                        "{}'s URL: taking a connection: {e}",
-                        self.name
-                    ));
+                    let name = &self.name;
+                    self.hush
+                        .note(format_args!("{name}'s URL: taking a connection: {e}"));
                     thread::sleep(RETRY);
                     return;
                 }
@@ -398,10 +444,10 @@ impl Serving {
     }
 
     // Each connection on a thread of its own, holding the VM in use.
-    fn take(&self, conn: TcpStream, peer: SocketAddr) {
+    fn take(&mut self, conn: TcpStream, peer: SocketAddr) {
         let name = self.name.clone();
         if !peer_allowed(peer.ip()) {
-            note(format_args!(
+            self.hush.note(format_args!(
                 "{name}'s URL refused {peer}: only the tailnet may connect"
             ));
             return;
@@ -425,6 +471,32 @@ impl Serving {
         if let Err(e) = thread::Builder::new().spawn(serve) {
             note(format_args!("{}'s URL: starting a thread: {e}", self.name));
         }
+    }
+}
+
+// Notes at most one a minute, saying how many were held back since.
+#[derive(Default)]
+struct Hush {
+    last: Option<Instant>,
+    held: u32,
+}
+
+impl Hush {
+    fn note(&mut self, msg: std::fmt::Arguments) {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < HUSH)
+        {
+            self.held = self.held.saturating_add(1);
+            return;
+        }
+        match self.held {
+            0 => note(msg),
+            held => note(format_args!("{msg} (and {held} more held back)")),
+        }
+        self.last = Some(now);
+        self.held = 0;
     }
 }
 

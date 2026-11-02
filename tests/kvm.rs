@@ -406,10 +406,15 @@ fn a_session_outlives_a_dropped_connection() {
 
 // What a GET of / at the address gets back first, if anything.
 fn http_status(address: &str, port: u16) -> Option<String> {
+    http_status_within(address, port, Duration::from_secs(5))
+}
+
+// `http_status`, waiting up to `wait` for the answer.
+fn http_status_within(address: &str, port: u16, wait: Duration) -> Option<String> {
     use std::io::{BufRead, Write};
     let to = std::net::SocketAddr::new(address.parse().ok()?, port);
     let mut conn = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(2)).ok()?;
-    conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    conn.set_read_timeout(Some(wait)).ok()?;
     conn.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
     let mut line = String::new();
     std::io::BufReader::new(conn).read_line(&mut line).ok()?;
@@ -508,9 +513,9 @@ fn a_service_answers_through_its_url_after_the_vm_slept() {
 
     let slept = ok(runner(&root, &["sleep", &name]));
     assert!(slept.contains("  sleeping"), "{slept}");
-    // One GET, held through the wake: http_status gives it 5 seconds.
+    // One GET, held through the wake, for as long as the URL would hold it.
     let began = Instant::now();
-    let first = http_status(host, port);
+    let first = http_status_within(host, port, Duration::from_secs(30));
     let took = began.elapsed();
     assert!(
         first.as_deref().is_some_and(|l| l.ends_with(" 200 OK")),
@@ -521,6 +526,21 @@ fn a_service_answers_through_its_url_after_the_vm_slept() {
     let logs = ok(runner(&root, &["logs", &name]));
     assert!(logs.contains(&format!("{name}'s URL is {url}")), "{logs}");
     eprintln!("a GET to the sleeping VM's URL was answered in {took:?}");
+
+    // A VM reaches the host's tailnet address, but the URL won't take it: no
+    // VM gets into another, or its own, through a URL.
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    let inside = runner(&root, &["exec", &name, "--", "curl", "-s", "-m", "5", &url]);
+    assert!(
+        !inside.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inside.stdout)
+    );
+    let logs = ok(runner(&root, &["logs", &name]));
+    assert!(
+        logs.contains(&format!("{name}'s URL refused {address}:")),
+        "{logs}"
+    );
 
     // Off, it doesn't answer; on, it does again.
     ok(runner(&root, &["url", &name, "off"]));
