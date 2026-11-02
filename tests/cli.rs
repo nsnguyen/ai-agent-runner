@@ -573,3 +573,53 @@ fn idle_shows_and_sets_how_long_a_vm_goes_unused_before_it_sleeps() {
     assert!(!out.status.success());
     assert_eq!(ok(&["idle", "dev"]), "dev  idle never\n");
 }
+
+#[test]
+fn url_prints_turns_off_and_on_and_sets_the_vm_side_port() {
+    let dir = with_base();
+    let run = |args: &[&str]| runner(dir.path(), args);
+    let ok = |args: &[&str]| {
+        let out = run(args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    ok(&["create", "dev"]);
+    let store = Store::new(dir.path());
+    // dev took slot 1, after base.
+    let port = runner::url::FIRST_PORT + 1;
+    // On by default: its URL on a host with Tailscale up, else why not.
+    let shown = |out: Output| {
+        if out.status.success() {
+            let url = text(&out.stdout);
+            assert!(url.starts_with("http://100."), "{url}");
+            assert!(url.ends_with(&format!(":{port}\n")), "{url}");
+        } else {
+            let err = text(&out.stderr);
+            assert!(err.contains("no tailnet address"), "{err}");
+        }
+    };
+    shown(run(&["url", "dev"]));
+
+    let off = "dev's URL is off: `runner url dev on` turns it on\n";
+    assert_eq!(ok(&["url", "dev", "off"]), off);
+    assert_eq!(ok(&["url", "dev"]), off);
+    // The port can change while it's off, and stays off.
+    assert_eq!(ok(&["url", "dev", "--port", "3000"]), off);
+    assert_eq!(store.url("dev").unwrap().guest_port(), 3000);
+    assert!(store.url("dev").unwrap().off);
+    shown(run(&["url", "dev", "on"]));
+    assert!(!store.url("dev").unwrap().off);
+    assert_eq!(store.url("dev").unwrap().guest_port(), 3000);
+
+    let zero = run(&["url", "dev", "--port", "0"]);
+    assert!(!zero.status.success());
+    assert!(
+        text(&zero.stderr).contains("not 0"),
+        "{}",
+        text(&zero.stderr)
+    );
+    let bad = run(&["url", "dev", "sideways"]);
+    assert!(!bad.status.success());
+    assert!(!run(&["url", "nope"]).status.success());
+    assert_eq!(store.url("dev").unwrap().guest_port(), 3000);
+}

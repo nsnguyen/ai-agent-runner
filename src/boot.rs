@@ -21,6 +21,10 @@
 //
 // And it puts the VM to sleep once it has gone unused for its idle time: every
 // few seconds it looks at whether anything is using it (src/idle.rs).
+//
+// It serves the VM's URL on the tailnet, too (src/url.rs), for as long as it's
+// up: a connection to a sleeping VM has the loop wake it, as a `runner wake`
+// does.
 use crate::calls::{Calls, Restore};
 use crate::creds::{Cred, Keyring, Source};
 use crate::exec;
@@ -33,6 +37,7 @@ use crate::sessions;
 use crate::sleep::{self, Ask, Asks, Reply};
 use crate::store::{self, Handed, Run, Slept, Store};
 use crate::systemd;
+use crate::url;
 use chrono::Utc;
 use nix::errno::Errno;
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
@@ -187,9 +192,11 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             .map_err(io_err(format!("serving calls on {}", calls_sock.display())))?;
         let asks = Asks::serve(&boot_sock, asker(events.clone(), name))
             .map_err(io_err(format!("taking asks on {}", boot_sock.display())))?;
-        Ok((offer, calls, asks))
+        let url = url::Served::start(store, name, net.address, waker(events.clone(), name))
+            .map_err(io_err("serving the VM's URL"))?;
+        Ok((offer, calls, asks, url))
     });
-    let (offer, calls, asks) = match served {
+    let (offer, calls, asks, url) = match served {
         Ok(served) => served,
         Err(e) => {
             let _ = remove_sockets(&sockets);
@@ -235,6 +242,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         let _ = child.kill();
         let _ = child.wait();
         drop(up);
+        drop(url);
         drop(asks);
         drop(calls);
         drop(offer);
@@ -257,6 +265,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     let over = up.serve();
     drop(up);
     let restore = calls.close();
+    drop(url);
     drop(asks);
     drop(calls);
     // Before the clear, so a handoff in flight can't note after it.
@@ -403,6 +412,15 @@ fn asker(events: mpsc::Sender<Event>, name: &str) -> impl Fn(Ask) -> Reply + Sen
         let down = |_| Reply::Refused(format!("{name} went down first"));
         answer.recv().unwrap_or_else(down)
     }
+}
+
+// What the URL asks to have the VM awake: a wake, through the loop.
+fn waker(events: mpsc::Sender<Event>, name: &str) -> url::Wake {
+    let ask = asker(events, name);
+    Arc::new(move || match ask(Ask::Wake) {
+        Reply::Done => Ok(()),
+        Reply::Refused(why) => Err(why),
+    })
 }
 
 // The VM from its start to its shutdown, awake or asleep.

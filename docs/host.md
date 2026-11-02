@@ -44,6 +44,19 @@ Then: `runner import base rootfs.ext4 && runner create dev && runner start dev &
 
 The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own root, but systemd boots the one in the unit's.
 
+## HTTPS for a VM's URL (optional)
+
+`runner url dev` is plain HTTP on the tailnet, which WireGuard already encrypts. When a browser needs HTTPS (a service worker, a secure cookie) or you'd rather have a name than an address, `tailscale serve` can front it with a certificate for the host's MagicDNS name. Turn HTTPS on for the tailnet first (admin console, DNS), then on the host:
+
+```
+sudo tailscale serve --bg --https=443 http://100.101.102.103:10001    # dev's URL, as `runner url dev` prints it
+sudo tailscale serve --bg --https=8443 http://100.101.102.103:10002   # another VM, another HTTPS port
+tailscale serve status                                               # https://kvm-host.<tailnet>.ts.net/ is dev
+sudo tailscale serve --https=443 off
+```
+
+Give each an HTTPS port that isn't one of the URL ports (10000 and up). tailscaled connects to the URL from the host's own tailnet address, so the URL takes it, and it wakes a sleeping VM as any connection does.
+
 ## Boot tests
 
 They need KVM, so they're `#[ignore]`d and skipped everywhere else. On a host set up as above, with `runner doctor` all ok, from a checkout:
@@ -53,6 +66,6 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
 RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux cargo test --test kvm -- --ignored --test-threads=1
 ```
 
-The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so after a change run `cargo build --release && sudo host/install.sh` first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
+The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so after a change run `cargo build --release && sudo host/install.sh` first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. The URL's test reaches the VM through the host's tailnet address, so it needs Tailscale up. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, and that a real tap comes and goes.
 
 The rootfs's init must take Ctrl-Alt-Del (systemd does) and print a login prompt on the serial console.

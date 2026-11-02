@@ -100,6 +100,10 @@ pub struct VmStatus {
     /// The credentials its guest took this boot, by name; absent until it has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creds: Option<Vec<Cred>>,
+    /// Its URL on the tailnet, which answers while it's up and wakes it from
+    /// sleep (url.rs); absent while it's off, or the host isn't on the tailnet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 pub fn unit_name(vm: &str) -> String {
@@ -191,11 +195,13 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
         State::Stopped => None,
         _ => store.handed(name).ok().flatten(),
     };
+    let url = crate::url::url(store, name).ok().flatten();
     Ok(VmStatus {
         vm,
         address,
         state,
         creds,
+        url,
     })
 }
 

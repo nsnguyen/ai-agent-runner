@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use runner::checkpoint;
 use runner::claude::{self, Claude};
 use runner::creds::Cred;
@@ -11,6 +11,7 @@ use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
 use runner::store::{BASE, Config, KEEP, Store, Vm, parse_mem};
 use runner::systemd::{self, VmStatus};
+use runner::url;
 use std::error::Error;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,17 @@ enum Cmd {
         /// Minutes, or with s, m or h, like 90s or 2h, or never. Ten minutes
         /// until set.
         idle: Option<Idle>,
+    },
+    /// Print a VM's URL on the tailnet, http://<host>:<port>, with a port of
+    /// its own that goes to port 8080 in the VM. It answers while the VM is
+    /// up, and a connection to a sleeping VM wakes it. Only the tailnet can
+    /// reach it. `off` turns it off, `on` back on.
+    Url {
+        name: String,
+        switch: Option<Switch>,
+        /// The port in the VM it goes to, from now on.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Show a VM's serial console and boot notes, from journald.
     Logs {
@@ -306,6 +318,12 @@ enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
 #[derive(Subcommand)]
 enum ServiceCmd {
     /// Run a command in a VM as a service: systemd starts it now and at
@@ -373,6 +391,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 mem_mib: mem.as_deref().map(parse_mem).transpose()?,
                 kernel: kernel.map(absolute_kernel).transpose()?,
                 idle,
+                url: None,
             };
             show(&store.fork_with(&from, &name, &config)?);
         }
@@ -396,6 +415,20 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 None => store.idle(&name)?,
             };
             println!("{name}  idle {idle}");
+        }
+        Cmd::Url { name, switch, port } => {
+            let mut setting = store.url(&name)?;
+            if switch.is_some() || port.is_some() {
+                if let Some(switch) = switch {
+                    setting.off = matches!(switch, Switch::Off);
+                }
+                setting.port = port.or(setting.port);
+                store.set_url(&name, setting)?;
+            }
+            match url::url(&store, &name)? {
+                Some(url) => println!("{url}"),
+                None => println!("{name}'s URL is off: `runner url {name} on` turns it on"),
+            }
         }
         Cmd::Logs {
             name,

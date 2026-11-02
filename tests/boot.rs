@@ -315,6 +315,7 @@ fn a_vm_boots_with_its_own_sizes_and_kernel() {
         mem_mib: Some(4096),
         kernel: Some(kernel.clone()),
         idle: None,
+        url: None,
     };
     h.store.delete("dev").unwrap();
     h.store.fork_with("base", "dev", &config).unwrap();

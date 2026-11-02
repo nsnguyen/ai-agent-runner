@@ -24,6 +24,7 @@
 // `an_idle_vm_sleeps_and_exec_wakes_it`,
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
+// `a_service_answers_through_its_url_after_the_vm_slept`,
 // `claude_keeps_running_after_a_detach` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
@@ -405,10 +406,15 @@ fn a_session_outlives_a_dropped_connection() {
 
 // What a GET of / at the address gets back first, if anything.
 fn http_status(address: &str, port: u16) -> Option<String> {
+    http_status_within(address, port, Duration::from_secs(5))
+}
+
+// `http_status`, waiting up to `wait` for the answer.
+fn http_status_within(address: &str, port: u16, wait: Duration) -> Option<String> {
     use std::io::{BufRead, Write};
     let to = std::net::SocketAddr::new(address.parse().ok()?, port);
     let mut conn = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(2)).ok()?;
-    conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    conn.set_read_timeout(Some(wait)).ok()?;
     conn.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
     let mut line = String::new();
     std::io::BufReader::new(conn).read_line(&mut line).ok()?;
@@ -467,6 +473,80 @@ fn a_service_answers_again_after_a_stop_and_start() {
         "no services\n"
     );
     assert!(!answers());
+}
+
+// The URL, from the host itself through its tailnet address, so Tailscale has
+// to be up: it answers while the VM runs, and a GET to it once it's asleep
+// wakes it and is answered.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and Tailscale up"]
+fn a_service_answers_through_its_url_after_the_vm_slept() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("url-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let url = ok(runner(&root, &["url", &name])).trim().to_string();
+    let (host, port) = url
+        .strip_prefix("http://")
+        .and_then(|at| at.rsplit_once(':'))
+        .unwrap_or_else(|| panic!("not a URL: {url}"));
+    assert!(host.starts_with("100."), "{url}");
+    let port: u16 = port.parse().unwrap();
+    let answers = || http_status(host, port).is_some_and(|l| l.ends_with(" 200 OK"));
+
+    let web = [
+        "service",
+        "add",
+        &name,
+        "web",
+        "--",
+        "python3",
+        "-m",
+        "http.server",
+        "8080",
+    ];
+    ok(runner(&root, &web));
+    eventually("the service to answer through the URL", answers);
+
+    let slept = ok(runner(&root, &["sleep", &name]));
+    assert!(slept.contains("  sleeping"), "{slept}");
+    // One GET, held through the wake, for as long as the URL would hold it.
+    let began = Instant::now();
+    let first = http_status_within(host, port, Duration::from_secs(30));
+    let took = began.elapsed();
+    assert!(
+        first.as_deref().is_some_and(|l| l.ends_with(" 200 OK")),
+        "{first:?} after {took:?}"
+    );
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.contains("  running"), "{status}");
+    let logs = ok(runner(&root, &["logs", &name]));
+    assert!(logs.contains(&format!("{name}'s URL is {url}")), "{logs}");
+    eprintln!("a GET to the sleeping VM's URL was answered in {took:?}");
+
+    // A VM reaches the host's tailnet address, but the URL won't take it: no
+    // VM gets into another, or its own, through a URL.
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    let inside = runner(&root, &["exec", &name, "--", "curl", "-s", "-m", "5", &url]);
+    assert!(
+        !inside.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inside.stdout)
+    );
+    let logs = ok(runner(&root, &["logs", &name]));
+    assert!(
+        logs.contains(&format!("{name}'s URL refused {address}:")),
+        "{logs}"
+    );
+
+    // Off, it doesn't answer; on, it does again.
+    ok(runner(&root, &["url", &name, "off"]));
+    eventually("the URL to stop answering", || !answers());
+    ok(runner(&root, &["url", &name, "on"]));
+    eventually("the URL to answer again", answers);
 }
 
 // No token needed: a logged-out claude waits at its login screen.
