@@ -18,8 +18,8 @@ pub struct RunResult {
     pub duration_ms: u64,
     /// What became of the disk generation a run that booted its VM ran. For
     /// a run that joined its VM running, not_rolled_back if it failed or was
-    /// cancelled once Claude Code had started: the VM was left as the run
-    /// left it, and restoring `checkpoint` rolls it back by hand. Else null
+    /// cancelled once Claude Code had started: the run left the VM running,
+    /// its writes and all, and restoring `checkpoint` rolls it back. Else null
     /// for a joined run: it commits nothing. Null too for a run that never
     /// got as far as starting its VM.
     pub outcome: Option<Outcome>,

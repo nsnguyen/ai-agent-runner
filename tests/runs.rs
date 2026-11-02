@@ -362,7 +362,7 @@ fn follow_prints_until_the_run_ends_and_says_how() {
     // checkpoint that rolls it back.
     assert_eq!(
         text(&out.stderr),
-        "runner: dev.1 exited 4, not rolled back to checkpoint 2\n"
+        "runner: dev.1 exited 4, not rolled back, checkpoint 2 undoes it\n"
     );
 }
 
@@ -501,7 +501,7 @@ fn a_joined_run_that_fails_leaves_its_vm_running() {
     vm.go(0, 3);
     let row = vm.wait_until_ended(&id);
     assert!(
-        row.contains("  exited 3, not rolled back to checkpoint 2  "),
+        row.contains("  exited 3, not rolled back, checkpoint 2 undoes it  "),
         "{row}"
     );
     // Still running on generation 1, what the run wrote and all: nothing
@@ -529,7 +529,7 @@ fn a_cancelled_joined_run_leaves_its_vm_running() {
     wait_for("claude to start", || vm.started());
     let row = vm.ok(&["cancel", &id]);
     assert!(
-        row.contains("  cancelled, not rolled back to checkpoint 2  "),
+        row.contains("  cancelled, not rolled back, checkpoint 2 undoes it  "),
         "{row}"
     );
     assert_eq!(stops_and_starts(&vm), Vec::<String>::new());
@@ -544,7 +544,7 @@ fn a_cancelled_joined_run_leaves_its_vm_running() {
 // run leaves the VM stopping, as it was asked to be: it neither stops nor
 // starts it, and rolls nothing back.
 #[test]
-fn a_joined_run_whose_vm_is_stopped_under_it_leaves_it_stopped() {
+fn a_joined_run_whose_vm_is_stopped_under_it_doesn_t_start_it() {
     let vm = vm(true);
     let id = vm.start("break it");
     wait_for("claude to start", || vm.started());
@@ -552,7 +552,7 @@ fn a_joined_run_whose_vm_is_stopped_under_it_leaves_it_stopped() {
     vm.go(0, 143);
     let row = vm.wait_until_ended(&id);
     assert!(
-        row.contains("  exited 143, not rolled back to checkpoint 2  "),
+        row.contains("  exited 143, not rolled back, checkpoint 2 undoes it  "),
         "{row}"
     );
     assert_eq!(stops_and_starts(&vm), Vec::<String>::new());

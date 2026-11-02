@@ -99,6 +99,7 @@ fn a_joined_run_left_as_it_was_says_it_was_not_rolled_back() {
         AgentSays::new(None),
     );
     got.exit_code = Some(3);
+    (got.from_generation, got.generation) = (None, None);
     got.outcome = Some(Outcome::NotRolledBack);
     got.checkpoint = Some(2);
     let json = serde_json::to_value(&got).unwrap();
@@ -108,10 +109,10 @@ fn a_joined_run_left_as_it_was_says_it_was_not_rolled_back() {
     assert_eq!(back, got);
 }
 
-// A run that joined a running VM: there's no disk from before it, only the
-// checkpoint it took.
+// A run that joined a running VM and exited 0: there's no disk from before
+// it, only the checkpoint it took.
 #[test]
-fn a_joined_run_has_no_outcome_or_generations() {
+fn a_joined_run_that_exited_0_has_no_outcome_or_generations() {
     let mut got = result(
         Changed::Unmeasured {
             error: "joined dev running".to_string(),

@@ -941,7 +941,7 @@ pub fn describe(run: &AgentRun) -> String {
         (Some(Outcome::Committed), ..) => ", committed".to_string(),
         (Some(Outcome::RolledBack), ..) => ", rolled back".to_string(),
         (Some(Outcome::NotRolledBack), ..) => match run.checkpoint {
-            Some(id) => format!(", not rolled back to checkpoint {id}"),
+            Some(id) => format!(", not rolled back, checkpoint {id} undoes it"),
             None => ", not rolled back".to_string(),
         },
         (None, false, _) => ", joined".to_string(),
