@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use runner::checkpoint;
 use runner::claude::{self, Claude};
-use runner::creds::Cred;
+use runner::creds::{self, Cred};
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::idle::Idle;
@@ -228,7 +228,8 @@ enum Cmd {
         /// Run it on a terminal of its own, as `ssh -t` does.
         #[arg(short, long)]
         tty: bool,
-        /// Set a variable for it. Repeat for more.
+        /// Set a variable for it. Repeat for more. A credential's is
+        /// refused: those reach a VM only through `runner creds`.
         #[arg(short, long = "env", value_name = "K=V", value_parser = parse_env)]
         env: Vec<(String, String)>,
         /// The directory to run it in. Defaults to the user's home.
@@ -516,6 +517,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             user,
             argv,
         } => {
+            // Before the VM is looked at, so nothing boots. Not in parse_env:
+            // clap's error would print the value too.
+            if let Err(e) = creds::refuse(env.iter().map(|(k, _)| k.as_str())) {
+                return Ok(exit_code(Err(e.into())));
+            }
             let req = Request {
                 argv,
                 env: if tty { term() } else { Vec::new() }

@@ -450,9 +450,125 @@ fn exec_takes_stdin_and_caps_output() {
         json!({"name": "dev", "argv": ["sh", "-c", script]}),
     );
     let out = &got["structuredContent"];
-    assert_eq!(out["stdout"].as_str().unwrap().len(), OUTPUT_CAP, "{got}");
+    let half = "a".repeat(OUTPUT_CAP / 2);
+    let want = format!("{half}\n[runner cut 1 byte here]\n{half}");
+    assert_eq!(out["stdout"], json!(want), "{got}");
     assert_eq!(out["stdout_truncated"], json!(true));
     assert_eq!(out["exit_code"], json!(0));
+}
+
+// Lines numbered from 1, each 16 bytes, so every slice is told apart.
+fn numbered(bytes: usize) -> String {
+    let lines: String = (1..=bytes / 16)
+        .map(|n| format!("line {n:>10}\n"))
+        .collect();
+    assert_eq!(lines.len(), bytes);
+    lines
+}
+
+#[test]
+fn exec_keeps_the_first_and_last_16_kib_of_each_stream() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let out = numbered(100 * 1024);
+    let both = ["sh", "-c", "tee /dev/stderr"];
+    let got = s.call(
+        2,
+        "exec",
+        json!({"name": "dev", "argv": both, "stdin": out}),
+    );
+    let want = format!(
+        "{}\n[runner cut {} bytes here]\n{}",
+        &out[..16 * 1024],
+        68 * 1024,
+        &out[out.len() - 16 * 1024..],
+    );
+    let got = &got["structuredContent"];
+    assert_eq!(got["stdout"], json!(want), "{got}");
+    assert_eq!(got["stderr"], json!(want));
+    assert_eq!(got["stdout_truncated"], json!(true));
+    assert_eq!(got["stderr_truncated"], json!(true));
+    assert_eq!(got["exit_code"], json!(0));
+    // 32 KiB or less comes back whole.
+    for len in [32 * 1024, 32 * 1024 - 16, 16] {
+        let out = numbered(len);
+        let got = s.call(
+            3,
+            "exec",
+            json!({"name": "dev", "argv": both, "stdin": out}),
+        );
+        let got = &got["structuredContent"];
+        assert_eq!(got["stdout"], json!(out), "{len}");
+        assert_eq!(got["stderr"], json!(out), "{len}");
+        assert_eq!(got["stdout_truncated"], json!(false), "{len}");
+        assert_eq!(got["stderr_truncated"], json!(false), "{len}");
+    }
+}
+
+#[test]
+fn exec_s_description_says_it_keeps_both_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = start(dir.path());
+    s.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = s.reply(2)["result"]["tools"].clone();
+    let exec = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "exec")
+        .unwrap();
+    let said = exec["description"].as_str().unwrap();
+    assert!(said.contains("first 16 KiB and the last 16 KiB"), "{said}");
+    assert!(said.contains("only through `runner creds`"), "{said}");
+}
+
+#[test]
+fn exec_sets_env() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let argv = ["sh", "-c", "echo \"$FOO|$X\""];
+    let env = json!({"FOO": "bar baz", "X": "a=b"});
+    let got = s.call(2, "exec", json!({"name": "dev", "argv": argv, "env": env}));
+    assert_eq!(
+        got["structuredContent"]["stdout"],
+        json!("bar baz|a=b\n"),
+        "{got}"
+    );
+    // A name a variable can't have is a tool error.
+    for bad in ["", "A=B"] {
+        let got = s.call(
+            3,
+            "exec",
+            json!({"name": "dev", "argv": ["true"], "env": {bad: "x"}}),
+        );
+        assert_eq!(got["isError"], json!(true), "{got}");
+        let why = got["content"][0]["text"].as_str().unwrap();
+        assert!(why.contains("isn't a variable name"), "{why}");
+    }
+}
+
+// Refused before the VM is looked at, so nothing runs and nothing boots.
+#[test]
+fn exec_refuses_a_credential_variable() {
+    let vm = guest_vm();
+    let mut s = vm.serve();
+    let ran = vm.dir.path().join("ran");
+    let argv = ["touch", ran.to_str().unwrap()];
+    for (id, var) in [
+        (2, "GH_TOKEN"),
+        (3, "CLAUDE_CODE_OAUTH_TOKEN"),
+        (4, "ANTHROPIC_API_KEY"),
+    ] {
+        let env = json!({"FOO": "1", var: "x"});
+        let got = s.call(id, "exec", json!({"name": "dev", "argv": argv, "env": env}));
+        assert_eq!(got["isError"], json!(true), "{got}");
+        let why = got["content"][0]["text"].as_str().unwrap();
+        let want =
+            format!("{var} is a credential: credentials reach a VM only through `runner creds`");
+        assert_eq!(why, want);
+        assert!(!ran.exists(), "{var} ran the command");
+    }
+    assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
 }
 
 #[test]

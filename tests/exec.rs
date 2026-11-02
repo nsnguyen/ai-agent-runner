@@ -5,7 +5,8 @@ mod common;
 
 use common::{FakeSystemd, FakeVsock, Guest, me, pty, set_size, text};
 use nix::sys::termios::Termios;
-use runner::exec::{self, Captured};
+use proptest::prelude::*;
+use runner::exec::{self, Captured, Kept};
 use runner::proto::{self, Request};
 use runner::store::Store;
 use std::fs;
@@ -145,6 +146,42 @@ fn exec_takes_env_and_a_directory() {
     let out = vm.run(&["exec", "dev", "--env", "FOO", "--", "true"], b"");
     assert_ne!(code(&out), 0);
     assert!(text(&out.stderr).contains("K=V"), "{}", text(&out.stderr));
+}
+
+// Refused before the VM is looked at, so nothing runs and nothing boots.
+#[test]
+fn exec_refuses_a_credential_variable() {
+    let vm = vm();
+    let ran = vm.dir.path().join("ran");
+    let touch = format!("touch {}", ran.display());
+    for var in ["GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+        let set = format!("{var}=sekret-value");
+        let args = [
+            "exec", "dev", "-e", "FOO=1", "-e", &set, "--", "sh", "-c", &touch,
+        ];
+        let out = vm.run(&args, b"");
+        assert_eq!(code(&out), 255, "{var}");
+        // Named, and its value never printed.
+        let want = format!(
+            "runner: {var} is a credential: credentials reach a VM only through `runner creds`\n"
+        );
+        assert_eq!(text(&out.stderr), want);
+        assert!(!ran.exists(), "{var} ran the command");
+    }
+    assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
+    // Only those names: one that merely starts like them passes through.
+    let args = [
+        "exec",
+        "dev",
+        "-e",
+        "GH_TOKEN_FILE=f",
+        "--",
+        "sh",
+        "-c",
+        "echo $GH_TOKEN_FILE",
+    ];
+    let out = vm.run(&args, b"");
+    assert_eq!(text(&out.stdout), "f\n", "{}", text(&out.stderr));
 }
 
 #[test]
@@ -458,20 +495,91 @@ fn capture_feeds_stdin_then_closes_it() {
 }
 
 #[test]
-fn capture_keeps_the_first_cap_bytes_of_each_stream() {
+fn capture_keeps_both_ends_of_each_stream() {
     let vm = vm();
-    let script = "head -c 5000000 /dev/zero | tr '\\0' a; printf 'bbb' >&2";
+    let script = "printf start; head -c 5000000 /dev/zero | tr '\\0' a; printf end; printf bbb >&2";
     let got = capture(&vm, &["sh", "-c", script], b"", LONG, 1000);
     assert_eq!(got.exit_code, Some(0));
-    assert_eq!(got.stdout, "a".repeat(1000));
+    let (head, tail) = ("a".repeat(495), "a".repeat(497));
+    let want = format!("start{head}\n[runner cut 4999008 bytes here]\n{tail}end");
+    assert_eq!(got.stdout, want);
     assert!(got.stdout_truncated);
     assert_eq!((got.stderr.as_str(), got.stderr_truncated), ("bbb", false));
     // Exactly the cap isn't cut.
     let got = capture(&vm, &["printf", "abc"], b"", LONG, 3);
     assert_eq!((got.stdout.as_str(), got.stdout_truncated), ("abc", false));
-    // A character the cap cuts in two goes, rather than ending in U+FFFD.
+    // An odd cap's spare byte goes to the start.
+    let got = capture(&vm, &["printf", "abcd"], b"", LONG, 3);
+    let want = "ab\n[runner cut 1 byte here]\nd";
+    assert_eq!((got.stdout.as_str(), got.stdout_truncated), (want, true));
+    // A character the cut splits goes, rather than leaving U+FFFD, and it's
+    // counted in what was cut.
     let got = capture(&vm, &["printf", "aé"], b"", LONG, 2);
-    assert_eq!((got.stdout.as_str(), got.stdout_truncated), ("a", true));
+    let want = "a\n[runner cut 2 bytes here]\n";
+    assert_eq!((got.stdout.as_str(), got.stdout_truncated), (want, true));
+    let got = capture(&vm, &["printf", "éa"], b"", LONG, 2);
+    let want = "\n[runner cut 2 bytes here]\na";
+    assert_eq!((got.stdout.as_str(), got.stdout_truncated), (want, true));
+}
+
+// Every request the host sends is checked, whoever built it.
+#[test]
+fn capture_refuses_a_credential_variable() {
+    let vm = vm();
+    let ran = vm.dir.path().join("ran");
+    let mut request = req(&["touch", ran.to_str().unwrap()]);
+    request.env = vec![("ANTHROPIC_API_KEY".into(), "x".into())];
+    let err = exec::capture(open(&vm), &request, b"", LONG, 100).unwrap_err();
+    let want =
+        "ANTHROPIC_API_KEY is a credential: credentials reach a VM only through `runner creds`";
+    assert_eq!(err.to_string(), want);
+    assert!(!ran.exists());
+}
+
+proptest! {
+    // Whatever the chunks, it's the whole output up to the cap, and past it
+    // the first and last halves, with the bytes between counted.
+    #[test]
+    fn kept_is_both_ends_of_the_whole(
+        out in proptest::collection::vec(0u8..128, 0..300),
+        cuts in proptest::collection::vec(0usize..300, 0..8),
+        cap in 0usize..100,
+    ) {
+        let mut kept = Kept::new(cap);
+        let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(out.len())).collect();
+        cuts.sort();
+        let mut from = 0;
+        for to in cuts.into_iter().chain([out.len()]) {
+            kept.push(&out[from..to]);
+            from = to;
+        }
+        let whole = String::from_utf8(out.clone()).unwrap();
+        if out.len() <= cap {
+            prop_assert!(!kept.cut());
+            prop_assert_eq!(kept.text(), whole);
+        } else {
+            let (head, tail) = (cap - cap / 2, cap / 2);
+            let gone = out.len() - cap;
+            let s = if gone == 1 { "" } else { "s" };
+            let want = format!(
+                "{}\n[runner cut {gone} byte{s} here]\n{}",
+                &whole[..head],
+                &whole[out.len() - tail..],
+            );
+            prop_assert!(kept.cut());
+            prop_assert_eq!(kept.text(), want);
+        }
+    }
+
+    // Valid UTF-8 in, valid UTF-8 out: a character cut in two at either end
+    // goes whole.
+    #[test]
+    fn kept_never_splits_a_character(out in "[^\\x{FFFD}]{0,80}", cap in 0usize..40) {
+        let mut kept = Kept::new(cap);
+        kept.push(out.as_bytes());
+        let text = kept.text();
+        prop_assert!(!text.contains(char::REPLACEMENT_CHARACTER), "{:?}", text);
+    }
 }
 
 #[test]

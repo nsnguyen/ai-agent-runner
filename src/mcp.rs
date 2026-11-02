@@ -3,6 +3,7 @@
 // protocol: log to stderr only.
 use crate::checkpoint;
 use crate::claude;
+use crate::creds;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::proto::Request;
@@ -15,6 +16,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,10 @@ pub struct ExecArgs {
     stdin: Option<String>,
     /// Seconds before the command is killed. Defaults to 120; at most 86400.
     timeout_secs: Option<u64>,
+    /// Variables to set for it, like {"FOO": "bar"}, over a clean
+    /// environment. CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY and GH_TOKEN
+    /// are refused: credentials reach a VM only through `runner creds`.
+    env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -334,16 +340,25 @@ impl Tools {
     }
 
     #[tool(
-        description = "Run a command in a VM, starting the VM first if it's stopped, and return its exit code (or the signal that ended it), stdout and stderr. It runs as the agent user in its home directory, without a terminal. Each stream keeps its first 32 KiB, with a truncated flag. Past timeout_secs (default 120) the command is killed and timed_out is true."
+        description = "Run a command in a VM, starting the VM first if it's stopped, and return its exit code (or the signal that ended it), stdout and stderr. It runs as the agent user in its home directory, without a terminal, with `env` set over a clean environment; a credential's variable (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, GH_TOKEN) is refused, since credentials reach a VM only through `runner creds`. Each stream comes back whole up to 32 KiB; past that, its first 16 KiB and the last 16 KiB, with a line between saying how many bytes were cut, and its truncated flag set. Past timeout_secs (default 120) the command is killed and timed_out is true."
     )]
     async fn exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<Json<Captured>, String> {
         if args.argv.is_empty() {
             return Err("argv is empty: give the program and its arguments".into());
         }
+        let env: Vec<(String, String)> = args.env.unwrap_or_default().into_iter().collect();
+        if let Some((bad, _)) = env
+            .iter()
+            .find(|(k, _)| k.is_empty() || k.contains(['=', '\0']))
+        {
+            return Err(format!("{bad:?} isn't a variable name"));
+        }
+        // Before the VM is looked at, so a refused request boots nothing.
+        creds::refuse(env.iter().map(|(k, _)| k.as_str())).map_err(|e| e.to_string())?;
         let store = self.store.clone();
         let req = Request {
             argv: args.argv,
-            env: Vec::new(),
+            env,
             cwd: None,
             user: Some(self.user.clone()),
             tty: None,

@@ -206,7 +206,7 @@ lands you in Claude Code running in dev, logged in with the host's token (docs/h
 
 ### Shell and exec
 
-`runner shell dev` logs in to dev as `agent`, in `/home/agent`, on a terminal of its own, which follows your window's size. `runner exec dev -- cmd args` runs one command there: no terminal unless `--tty`, `--env K=V` and `--dir` for its environment and directory, stdin passed through, and the command's exit code back (128 plus the signal for one a signal killed, 255 when it couldn't run). Both start a stopped VM first and wait up to a minute for its guest agent. `--user` runs as someone else.
+`runner shell dev` logs in to dev as `agent`, in `/home/agent`, on a terminal of its own, which follows your window's size. `runner exec dev -- cmd args` runs one command there: no terminal unless `--tty`, `--env K=V` and `--dir` for its environment and directory (a credential's variable, like `GH_TOKEN`, is refused: credentials reach a VM only through `runner creds`), stdin passed through, and the command's exit code back (128 plus the signal for one a signal killed, 255 when it couldn't run). Both start a stopped VM first and wait up to a minute for its guest agent. `--user` runs as someone else.
 
 ### Sessions
 
@@ -330,7 +330,7 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
 
 Restart the app after editing its config.
 
-The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each cut at 32 KiB with a truncated flag. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
+The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
 `run_agent`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
 
