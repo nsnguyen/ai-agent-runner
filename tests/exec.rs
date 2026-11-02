@@ -155,16 +155,17 @@ fn exec_refuses_a_credential_variable() {
     let ran = vm.dir.path().join("ran");
     let touch = format!("touch {}", ran.display());
     for var in ["GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-        let set = format!("{var}=x");
+        let set = format!("{var}=sekret-value");
         let args = [
             "exec", "dev", "-e", "FOO=1", "-e", &set, "--", "sh", "-c", &touch,
         ];
         let out = vm.run(&args, b"");
-        assert_ne!(code(&out), 0, "{var}");
-        let err = text(&out.stderr);
-        let want =
-            format!("{var} is a credential: credentials reach a VM only through `runner creds`");
-        assert!(err.contains(&want), "{err}");
+        assert_eq!(code(&out), 255, "{var}");
+        // Named, and its value never printed.
+        let want = format!(
+            "runner: {var} is a credential: credentials reach a VM only through `runner creds`\n"
+        );
+        assert_eq!(text(&out.stderr), want);
         assert!(!ran.exists(), "{var} ran the command");
     }
     assert!(vm.sd.calls().is_empty(), "{:?}", vm.sd.calls());
@@ -509,7 +510,7 @@ fn capture_keeps_both_ends_of_each_stream() {
     assert_eq!((got.stdout.as_str(), got.stdout_truncated), ("abc", false));
     // An odd cap's spare byte goes to the start.
     let got = capture(&vm, &["printf", "abcd"], b"", LONG, 3);
-    let want = "ab\n[runner cut 1 bytes here]\nd";
+    let want = "ab\n[runner cut 1 byte here]\nd";
     assert_eq!((got.stdout.as_str(), got.stdout_truncated), (want, true));
     // A character the cut splits goes, rather than leaving U+FFFD, and it's
     // counted in what was cut.
@@ -559,8 +560,9 @@ proptest! {
         } else {
             let (head, tail) = (cap - cap / 2, cap / 2);
             let gone = out.len() - cap;
+            let s = if gone == 1 { "" } else { "s" };
             let want = format!(
-                "{}\n[runner cut {gone} bytes here]\n{}",
+                "{}\n[runner cut {gone} byte{s} here]\n{}",
                 &whole[..head],
                 &whole[out.len() - tail..],
             );

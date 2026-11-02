@@ -451,7 +451,7 @@ fn exec_takes_stdin_and_caps_output() {
     );
     let out = &got["structuredContent"];
     let half = "a".repeat(OUTPUT_CAP / 2);
-    let want = format!("{half}\n[runner cut 1 bytes here]\n{half}");
+    let want = format!("{half}\n[runner cut 1 byte here]\n{half}");
     assert_eq!(out["stdout"], json!(want), "{got}");
     assert_eq!(out["stdout_truncated"], json!(true));
     assert_eq!(out["exit_code"], json!(0));

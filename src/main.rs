@@ -517,6 +517,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             user,
             argv,
         } => {
+            // Before the VM is looked at, so nothing boots. Not in parse_env:
+            // clap's error would print the value too.
+            if let Err(e) = creds::refuse(env.iter().map(|(k, _)| k.as_str())) {
+                return Ok(exit_code(Err(e.into())));
+            }
             let req = Request {
                 argv,
                 env: if tty { term() } else { Vec::new() }
@@ -730,14 +735,9 @@ fn term() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-// Refused here, a credential's variable stops the command before the VM is
-// looked at.
 fn parse_env(kv: &str) -> Result<(String, String), String> {
     match kv.split_once('=') {
-        Some((k, v)) if !k.is_empty() => {
-            creds::refuse([k]).map_err(|e| e.to_string())?;
-            Ok((k.to_string(), v.to_string()))
-        }
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
         _ => Err(format!("{kv:?} isn't K=V")),
     }
 }

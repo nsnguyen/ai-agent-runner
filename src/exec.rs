@@ -499,8 +499,9 @@ impl Kept {
             .count();
         let tail = &tail[split..];
         let gone = self.seen - (head.len() + tail.len()) as u64;
+        let s = if gone == 1 { "" } else { "s" };
         format!(
-            "{}\n[runner cut {gone} bytes here]\n{}",
+            "{}\n[runner cut {gone} byte{s} here]\n{}",
             String::from_utf8_lossy(head),
             String::from_utf8_lossy(tail),
         )
