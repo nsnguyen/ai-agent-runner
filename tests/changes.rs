@@ -30,6 +30,14 @@ fn whole_dir(path: &str, change: Kind, entries: u64) -> Change {
     }
 }
 
+fn listed(paths: Vec<Change>, more: u64, boot_only: u64) -> Changes {
+    Changes {
+        paths,
+        more,
+        boot_only,
+    }
+}
+
 fn between(before: &Path, after: &Path) -> Changes {
     changes::between(&image(before), &image(after), changes::CAP, changes::TIME).unwrap()
 }
@@ -68,13 +76,7 @@ fn a_file_added_one_modified_and_one_deleted() {
         change("/gone.txt", Kind::Deleted),
         change("/new.txt", Kind::Added),
     ];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 // A directory added or deleted whole is one entry with a count, so a new
@@ -107,13 +109,7 @@ fn modes_links_and_type_changes_count_and_whole_directories_are_one_entry() {
         whole_dir("/old", Kind::Deleted, 1),
         whole_dir("/swap", Kind::Modified, 1),
     ];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 #[test]
@@ -125,13 +121,7 @@ fn the_list_is_capped_and_counts_the_rest() {
 
     let got = changes::between(&before, &after, 2, changes::TIME).unwrap();
     let want = vec![change("/a", Kind::Added), change("/b", Kind::Added)];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 3
-        }
-    );
+    assert_eq!(got, listed(want, 3, 0));
 }
 
 // Paths a guest names can be long, and a result goes to the caller whole.
@@ -180,13 +170,7 @@ fn names_that_are_not_utf8_stay_distinct() {
         change(r"/caf\\xe9", Kind::Added),
         change(r"/caf\xe9", Kind::Added),
     ];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 // A guest with root can write its block device directly, under the
@@ -211,13 +195,7 @@ fn bytes_written_under_the_filesystem_still_count() {
 
     let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
     let want = vec![change("/run.sh", Kind::Modified)];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 #[test]
@@ -296,13 +274,7 @@ fn a_link_claiming_a_huge_target_is_modified_not_read() {
     debugfs(&after, "sif /l size 0x10000000000");
     let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
     let want = vec![change("/l", Kind::Modified)];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 // A sparse file is mostly holes, so it can be far bigger than its disk.
@@ -317,13 +289,7 @@ fn a_sparse_file_bigger_than_the_disk_is_measured() {
     }
     let got = between(&before, &after);
     let want = vec![change("/edit.txt", Kind::Modified)];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
-    );
+    assert_eq!(got, listed(want, 0, 0));
 }
 
 // The way a real run looks: its disk is a clone of the last generation, and
@@ -357,11 +323,125 @@ fn a_run_reports_what_its_guest_changed_on_its_disk() {
         change("/home/agent/work/new.rs", Kind::Added),
         change("/home/agent/work/old.rs", Kind::Deleted),
     ];
-    assert_eq!(
-        got,
-        Changes {
-            paths: want,
-            more: 0
-        }
+    assert_eq!(got, listed(want, 0, 0));
+}
+
+// What a boot of the base image writes on its own, beside the agent's one
+// edit: the journal, the timers' stamps, systemd's random seed, the first
+// boot's machine id and the login records.
+fn a_boot_and_one_edit(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let id = "var/log/journal/73791ad19edd4802b88a49d7333b8a22";
+    let before = tree(
+        &dir.join("before"),
+        &[
+            ("etc/machine-id", ""),
+            (&format!("{id}/system.journal"), "boot 1"),
+            ("var/log/wtmp", "boot 1"),
+            ("var/lib/systemd/random-seed", "seed 1"),
+            ("home/agent/work/keep.txt", "keep"),
+        ],
     );
+    let after = tree(
+        &dir.join("after"),
+        &[
+            ("etc/machine-id", "73791ad19edd4802b88a49d7333b8a22\n"),
+            (&format!("{id}/system.journal"), "boot 1, boot 2"),
+            (&format!("{id}/system@e14baf-01e3.journal"), "boot 1"),
+            ("var/log/wtmp", "boot 1, boot 2"),
+            ("var/lib/systemd/random-seed", "seed 2"),
+            ("var/lib/systemd/timers/stamp-apt-daily.timer", ""),
+            ("var/lib/systemd/timers/stamp-motd-news.timer", ""),
+            ("home/agent/work/keep.txt", "keep"),
+            ("home/agent/work/a.txt", "hi"),
+        ],
+    );
+    (image(&before), image(&after))
+}
+
+// #107: the agent's changes don't get lost among the boot's.
+#[test]
+fn what_only_the_boot_writes_is_left_out_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (before, after) = a_boot_and_one_edit(dir.path());
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
+    let want = vec![change("/home/agent/work/a.txt", Kind::Added)];
+    // machine-id, the journal's two files, the seed, the timers directory
+    // added whole, and wtmp.
+    assert_eq!(got, listed(want, 0, 6));
+}
+
+// Left out, the boot's paths leave the whole list to the agent's.
+#[test]
+fn what_only_the_boot_writes_takes_no_room_in_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (before, after) = a_boot_and_one_edit(dir.path());
+    let got = changes::between(&before, &after, 1, changes::TIME).unwrap();
+    let want = vec![change("/home/agent/work/a.txt", Kind::Added)];
+    assert_eq!(got, listed(want, 0, 6));
+}
+
+// Only the paths themselves: not the same names elsewhere, a name that only
+// starts the same, or what a user puts in a directory the boot makes.
+#[test]
+fn paths_beside_or_inside_what_the_boot_writes_are_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let was = [
+        ("var/lib/systemd/x", ""),
+        ("var/log/x", ""),
+        ("home/agent/var/log/journal/old", ""),
+        ("home/agent/etc/machine-id", "a"),
+    ];
+    let before = tree(&dir.path().join("before"), &was);
+    let after = tree(
+        &dir.path().join("after"),
+        &[
+            ("var/lib/systemd/x", ""),
+            ("var/log/x", ""),
+            ("home/agent/var/log/journal/old", ""),
+            ("home/agent/var/log/journal/j", "the agent's"),
+            ("home/agent/etc/machine-id", "b"),
+            ("var/log/journal-old/j", "not the journal"),
+            ("var/lib/systemd/linger/agent", ""),
+            ("var/lib/systemd/random-seed.bak", ""),
+        ],
+    );
+    let got = between(&before, &after);
+    let want = vec![
+        change("/home/agent/etc/machine-id", Kind::Modified),
+        change("/home/agent/var/log/journal/j", Kind::Added),
+        whole_dir("/var/lib/systemd/linger", Kind::Added, 1),
+        change("/var/lib/systemd/random-seed.bak", Kind::Added),
+        whole_dir("/var/log/journal-old", Kind::Added, 1),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+}
+
+// Every boot empties /tmp, then makes X11's socket directories in it, and
+// the first boot makes systemd's linger directory: left out while empty.
+#[test]
+fn tmp_emptied_by_the_boot_and_the_empty_directories_it_makes_are_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = tree(
+        &dir.path().join("before"),
+        &[("tmp/last-run.txt", "x"), ("tmp/cache/a", "x")],
+    );
+    fs::create_dir_all(before.join("var/lib/systemd")).unwrap();
+    let after = tree(&dir.path().join("after"), &[("tmp/this-run.txt", "x")]);
+    for empty in ["tmp/.X11-unix", "tmp/.ICE-unix", "var/lib/systemd/linger"] {
+        fs::create_dir_all(after.join(empty)).unwrap();
+    }
+    let got = between(&before, &after);
+    let want = vec![change("/tmp/this-run.txt", Kind::Added)];
+    // Two empty directories, linger, and the two entries the boot deleted.
+    assert_eq!(got, listed(want, 0, 5));
+}
+
+// The list never reaches into /home, where the agent works.
+#[test]
+fn nothing_under_home_is_ever_left_out() {
+    for (path, _) in changes::BOOT_ONLY {
+        assert!(path.starts_with('/') && !path.ends_with('/'), "{path}");
+        assert!(*path != "/home" && !path.starts_with("/home/"), "{path}");
+        assert!(*path != "/", "{path}");
+    }
 }
