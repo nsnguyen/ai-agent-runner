@@ -27,9 +27,10 @@
 // the ask back only when Claude Code has exited 0, so a VM shut down under
 // the run, by a host reboot, `runner stop` or the agent itself, rolls back
 // too. A run on a running VM joins it as it is, and commits nothing, but
-// takes a checkpoint of it first (checkpoint.rs). A clean exit leaves the VM
-// running on; anything else restores that checkpoint, which stops the VM and
-// starts it again, ending whatever else ran in it.
+// takes a checkpoint of it first (checkpoint.rs). It never stops or starts
+// the VM: restoring the checkpoint would, ending whatever else ran in it, like
+// an interactive Claude Code. So one that fails or is cancelled says it
+// wasn't rolled back, and names the checkpoint, for `runner restore` by hand.
 //
 // Once Claude Code is done, and a VM the run booted is down, the process
 // driving the run measures what the run changed on its disk (changes.rs), in
@@ -192,9 +193,14 @@ pub struct AgentRun {
     pub signal: Option<i32>,
     /// For a run that booted its VM, once the VM is down: whether the disk
     /// generation it ran was committed or rolled back. For one that joined
-    /// it running: rolled back if it restored the checkpoint it took.
+    /// it running: not rolled back if it failed or was cancelled once Claude
+    /// Code had started, which left the VM as it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
+    /// For a run that joined its VM running, once it's over: the checkpoint
+    /// it took first, which `restore` brings back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<u64>,
     /// What went wrong, if anything did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -227,6 +233,9 @@ struct End {
     signal: Option<i32>,
     cancelled: bool,
     outcome: Option<Outcome>,
+    // Missing from the end of a run from before it was noted here.
+    #[serde(default)]
+    checkpoint: Option<u64>,
     error: Option<String>,
 }
 
@@ -438,24 +447,14 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
             }
             None => {}
         }
-    } else if let Some(id) = gens.checkpoint
+    } else if gens.checkpoint.is_some()
         && gens.ran
         && !(end.exit_code == Some(0) && !end.cancelled && end.error.is_none())
     {
-        // Under the run lock this process holds, so no run starts on the VM
-        // while it's down.
-        match checkpoint::restore_held(store, vm, id) {
-            Ok(_) => end.outcome = Some(Outcome::RolledBack),
-            Err(e) => {
-                let why = format!("restoring checkpoint {id} failed: {e}");
-                eprintln!("runner: {why}");
-                end.error = Some(match end.error.take() {
-                    Some(was) => format!("{was}; {why}"),
-                    None => why,
-                });
-            }
-        }
+        // Left as it was: a restore would restart the VM, ending its sessions.
+        end.outcome = Some(Outcome::NotRolledBack);
     }
+    end.checkpoint = gens.checkpoint;
     end.ended = now();
     let took = began.elapsed();
     let result = RunResult {
@@ -483,10 +482,10 @@ struct Gens {
     from: Option<u64>,
     // What boot noted once its guest answered: what it cloned, and its own.
     booted: Option<Booted>,
-    // Taken of a running VM before the run, to restore if the run fails.
+    // Taken of a running VM before the run, for a restore by hand.
     checkpoint: Option<u64>,
-    // Whether claude started: a run cancelled or failed before then restores
-    // nothing, since stopping the VM would end its sessions for nothing.
+    // Whether claude started: a run cancelled or failed before then changed
+    // nothing, so it has nothing to roll back.
     ran: bool,
 }
 
@@ -748,6 +747,7 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
         exit_code: end.exit_code,
         signal: end.signal,
         outcome: end.outcome,
+        checkpoint: end.checkpoint,
         error: end.error,
         stderr,
         bytes,
@@ -937,11 +937,15 @@ pub fn describe(run: &AgentRun) -> String {
         (state, ..) => state.to_string(),
     };
     let disk = match (run.outcome, run.boots, run.state) {
-        (_, _, State::Lost) => "",
-        (Some(Outcome::Committed), ..) => ", committed",
-        (Some(Outcome::RolledBack), ..) => ", rolled back",
-        (None, false, _) => ", joined",
-        (None, true, _) => "",
+        (_, _, State::Lost) => String::new(),
+        (Some(Outcome::Committed), ..) => ", committed".to_string(),
+        (Some(Outcome::RolledBack), ..) => ", rolled back".to_string(),
+        (Some(Outcome::NotRolledBack), ..) => match run.checkpoint {
+            Some(id) => format!(", not rolled back to checkpoint {id}"),
+            None => ", not rolled back".to_string(),
+        },
+        (None, false, _) => ", joined".to_string(),
+        (None, true, _) => String::new(),
     };
     let error = run.error.as_deref().map(|e| {
         let lines: Vec<&str> = e.lines().collect();

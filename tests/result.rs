@@ -89,6 +89,25 @@ fn a_run_that_did_not_exit_and_could_not_be_measured_says_so() {
     assert_eq!(back, got);
 }
 
+// A run that joined its VM running and failed leaves it as it was.
+#[test]
+fn a_joined_run_left_as_it_was_says_it_was_not_rolled_back() {
+    let mut got = result(
+        Changed::Unmeasured {
+            error: "the run joined dev running".to_string(),
+        },
+        AgentSays::new(None),
+    );
+    got.exit_code = Some(3);
+    got.outcome = Some(Outcome::NotRolledBack);
+    got.checkpoint = Some(2);
+    let json = serde_json::to_value(&got).unwrap();
+    assert_eq!(json["outcome"], "not_rolled_back");
+    assert_eq!(json["checkpoint"], 2);
+    let back: RunResult = serde_json::from_value(json).unwrap();
+    assert_eq!(back, got);
+}
+
 // A run that joined a running VM: there's no disk from before it, only the
 // checkpoint it took.
 #[test]

@@ -17,9 +17,11 @@ pub struct RunResult {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     /// What became of the disk generation a run that booted its VM ran. For
-    /// a run that joined its VM running, rolled_back if it failed and its
-    /// checkpoint was restored, else null: it commits nothing. Null too for a
-    /// run that never got as far as starting its VM.
+    /// a run that joined its VM running, not_rolled_back if it failed or was
+    /// cancelled once Claude Code had started: the VM was left as the run
+    /// left it, and restoring `checkpoint` rolls it back by hand. Else null
+    /// for a joined run: it commits nothing. Null too for a run that never
+    /// got as far as starting its VM.
     pub outcome: Option<Outcome>,
     /// The disk generation the run started from. Null when outcome is, and
     /// for a run that joined its VM.
@@ -44,6 +46,7 @@ pub struct RunResult {
 pub enum Outcome {
     Committed,
     RolledBack,
+    NotRolledBack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
