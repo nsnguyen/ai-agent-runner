@@ -29,13 +29,16 @@ const PRELUDE: &str = r#"wrong() { grep -qx "$1" "$FAKE/wrong" 2>/dev/null; }
 "#;
 
 // Every call on a line in ssh-calls: RUNNER_HOST as it was, then the argv,
-// split by US. A tunnel (-L) runs its command as is, so the proxy's pid is
-// the hold's, as a real ssh's end is the hold's end.
+// split by US. A tunnel (-L) notes what it forwards, and runs its command as
+// is, so the proxy's pid is the hold's, as a real ssh's end is the hold's end.
+// With -tt, lines end in CRLF, as a terminal's do.
 const FAKE_SSH: &str = r#"{ printf 'RUNNER_HOST=%s' "${RUNNER_HOST-}"; for arg; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$FAKE/ssh-calls"
 tunnel=
+tty=
 while [ $# -gt 0 ]; do
   case $1 in
-  -L) tunnel=1; shift 2 ;;
+  -L) tunnel=1; echo "$2" >"$FAKE/tunnel"; shift 2 ;;
+  -tt) tty=1; shift ;;
   -[ioplF]) shift 2 ;;
   -n) exec </dev/null; shift ;;
   -*) shift ;;
@@ -57,7 +60,9 @@ if [ -n "$tunnel" ]; then
   eval "set -- $cmd"
   exec "$@"
 fi
-exec bash -c "$cmd"
+[ -n "$tty" ] || exec bash -c "$cmd"
+{ bash -c "$cmd"; echo $? >"$FAKE/tty-exit"; } | sed 's/$/\r/'
+exit "$(cat "$FAKE/tty-exit")"
 "#;
 
 const FAKE_RSYNC: &str = r#"{ printf 'PWD=%s' "$PWD"; for arg; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$FAKE/rsync-calls"
@@ -73,14 +78,14 @@ fi
 "#;
 
 // localhost:18080 answers while the host's hold is up, as the proxy's
-// tunnel would; the VM's URL answers while it's on, and wakes the VM.
+// tunnel to the VM's port 8080 would; the VM's URL answers while it's on, and wakes the VM.
 const FAKE_CURL: &str = r#"for url; do :; done
 code=000
 case $url in
 http://localhost:18080/*)
   if wrong port-taken; then
     code=200
-  elif [ -e "$FAKE/holding" ] && ! wrong proxy-dead && ! { wrong proxy-drops && grep -qx 150 "$FAKE/sleeps"; }; then
+  elif [ -e "$FAKE/holding" ] && [ "$(cat "$FAKE/tunnel")" = localhost:18080:172.16.0.6:8080 ] && ! wrong proxy-dead && ! { wrong proxy-drops && grep -qx 150 "$FAKE/sleeps"; }; then
     code=200
   fi
   ;;
@@ -153,7 +158,11 @@ exec)
   for kv in $env; do
     case ${kv%%=*} in
     GH_TOKEN | CLAUDE_CODE_OAUTH_TOKEN | ANTHROPIC_API_KEY)
-      wrong cred-allowed || { echo "runner: ${kv%%=*} is a credential: credentials reach a VM only through \`runner creds\`" >&2; exit 255; } ;;
+      wrong cred-allowed || {
+        echo "runner: ${kv%%=*} is a credential: credentials reach a VM only through \`runner creds\`" >&2
+        ! wrong cred-exits-0 || exit 0
+        exit 255
+      } ;;
     esac
   done
   there
@@ -165,7 +174,7 @@ exec)
     ! wrong env-dropped || exit 1
     for kv in $env; do [ "${kv%%=*}" != FOO ] || echo "${kv#*=}"; done ;;
   "tmux new-session -d -s in-use sleep 100000") touch "$vm/session" ;;
-  "cat /proc/sys/kernel/random/boot_id") cat "$vm/boot" ;;
+  "cat /proc/sys/kernel/random/boot_id") wrong boot-id-empty || cat "$vm/boot" ;;
   "timeout 300 sh -c "*/home/agent/work/joined.txt*) [ -e "$vm/joined" ] ;;
   "test -f /home/agent/work/joined.txt") [ -e "$vm/joined" ] ;;
   "test ! -e /home/agent/work/joined.txt") [ ! -e "$vm/joined" ] ;;
@@ -189,6 +198,7 @@ run)
     echo running >"$FAKE/runs/$id.state"
     wrong run-writes-nothing || touch "$vm/joined"
   else
+    ! wrong booted-run-fails || { echo "runner: $name: no token for Claude Code" >&2; exit 1; }
     echo booted >"$FAKE/runs/$id.kind"
     if wrong hello-rolled-back; then
       echo "exited 1, rolled back" >"$FAKE/runs/$id.state"
@@ -216,6 +226,7 @@ runs)
   done ;;
 output) echo "runner: $2 exited 0" >&2 ;;
 result)
+  ! wrong result-empty || [ "$(cat "$FAKE/runs/$2.kind")" = joined ] || { echo "runner: $2 has no result yet" >&2; exit 1; }
   if [ "$(cat "$FAKE/runs/$2.kind")" = joined ]; then
     outcome=not_rolled_back checkpoint=4 boot_only=0
     ! wrong result-outcome || outcome=committed
@@ -271,8 +282,9 @@ gc)
     fi
   else
     there
+    ! wrong gc-other-error || { echo "ssh: connect to host kvm-host port 22: Connection reset" >&2; exit 255; }
     if [ "$(state)" != stopped ] && ! wrong gc-runs; then
-      echo "runner: $name is busy: a runner command or its boot holds it" >&2
+      echo "runner: $name is busy: it's running or sleeping, or another runner command holds it" >&2
       exit 1
     fi
     echo "$name  nothing to free"
@@ -287,6 +299,7 @@ restore)
 service)
   name=$3
   there
+  ! wrong service-fails || { echo "runner: web didn't start" >&2; exit 1; }
   up
   echo "web  active  /home/agent/work  python3 -m http.server 8080" ;;
 url)
@@ -657,7 +670,14 @@ fn it_copies_the_checkout_then_runs_the_host_check_as_the_admin_login() {
         admin,
         [
             call(&["-n", ADMIN, "true"]),
-            call(&["-n", ADMIN, "cd ai-agent-runner && host/check.sh"]),
+            call(&[
+                "-n",
+                "-tt",
+                "-o",
+                "LogLevel=ERROR",
+                ADMIN,
+                "cd ai-agent-runner && host/check.sh"
+            ]),
         ]
     );
     assert!(laptop.host_check_ran());
@@ -999,6 +1019,7 @@ const WRONG: &[(&str, &[&str])] = &[
             "MCP exec with env GH_TOKEN",
         ],
     ),
+    ("cred-exits-0", &["exec -e GH_TOKEN: said"]),
     ("env-dropped", &["exec -e FOO=bar"]),
     // MCP
     ("mcp-head-lost", &["MCP exec: stdout doesn't start at 1"]),
@@ -1010,6 +1031,7 @@ const WRONG: &[(&str, &[&str])] = &[
     ("run-writes-nothing", &["the run never wrote joined.txt"]),
     ("run-rolled-back", &["cancelled, but runs says"]),
     ("run-restarts", &["the VM was restarted"]),
+    ("boot-id-empty", &["the VM's boot_id reads empty"]),
     ("session-lost", &["its tmux session is gone"]),
     ("joined-lost", &["joined.txt is gone"]),
     ("result-outcome", &["runner result:"]),
@@ -1020,9 +1042,23 @@ const WRONG: &[(&str, &[&str])] = &[
     ("checkpoint-kind", &["checkpoint 4:"]),
     ("gc-sweeps", &["gc --dry-run"]),
     ("gc-runs", &["gc client-check: ran on a running VM"]),
+    ("gc-other-error", &["gc client-check: exit 255"]),
     ("restore-keeps", &["restore 4 didn't roll the run back"]),
     // A run's result without boot noise
+    (
+        "booted-run-fails",
+        &["runner run on the stopped client-check printed no run"],
+    ),
     ("hello-rolled-back", &["runner result:"]),
+    (
+        "result-empty",
+        &[
+            "runner result:",
+            "changed doesn't list hello.txt",
+            "boot_only: missing",
+            "changed lists no paths",
+        ],
+    ),
     ("hello-missing", &["changed doesn't list hello.txt"]),
     ("boot-only-zero", &["boot_only: 0"]),
     (
@@ -1030,6 +1066,7 @@ const WRONG: &[(&str, &[&str])] = &[
         &["changed lists, outside /home and /tmp: /var/log/journal/system.journal"],
     ),
     // The proxy
+    ("service-fails", &["service add web"]),
     ("port-taken", &["localhost:18080 answers before the proxy"]),
     (
         "proxy-dead",
@@ -1092,6 +1129,13 @@ fn each_laptop_check_fails_when_the_host_answers_it_wrong() {
                 Some(1),
                 "{shell:?} {key}: {}",
                 says(&out)
+            );
+            // Each FAIL on a line of its own, however many lines it quotes.
+            let summary = summary(&out);
+            let listed = summary.iter().take_while(|l| !l.starts_with("laptop: "));
+            assert!(
+                listed.clone().all(|l| l.starts_with("FAIL  ")),
+                "{shell:?} {key}: {summary:?}"
             );
             let fails = fails(&out);
             assert_eq!(fails.len(), want.len(), "{shell:?} {key}: {fails:?}");

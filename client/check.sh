@@ -11,7 +11,8 @@
 #         lines shown as they come.
 # laptop: what only the laptop's path shows, through this checkout's
 #         client/runner, on a scratch VM, client-check, forked from base and
-#         deleted at the end, after a FAIL too, unless KEEP=1.
+#         deleted at the end, after a FAIL too, unless KEEP=1. laptop_checks,
+#         below, lists them in order.
 #
 # The host is RUNNER_HOST, else the first line of ~/.config/runner/host, as
 # client/runner has it, and every laptop check runs with RUNNER_HOST set to
@@ -21,7 +22,8 @@
 #
 # It ends with a summary: every FAIL again, then the counts. Exit 0 when
 # nothing failed, 1 on any FAIL, 2 when the host doesn't answer. Ctrl-C ends
-# a proxy and leaves the scratch VM for a look, saying how to delete it.
+# host/check.sh on the host, or a proxy, and leaves the scratch VM for a
+# look, saying how to delete it.
 # A new by-hand check goes in here, under Laptop checks, never in a script of
 # its own. POSIX sh only, since macOS's /bin/sh runs it.
 
@@ -128,9 +130,11 @@ pass() {
   printf 'PASS  %s\n' "$*"
   if [ "$part" = host ]; then hp=$((hp + 1)); else lp=$((lp + 1)); fi
 }
+# A FAIL quoting output takes one line, so the summary lists each on its own.
 fail() {
-  printf 'FAIL  %s\n' "$*"
-  printf 'FAIL  %s: %s\n' "$part" "$*" >>"$tmp/fails"
+  msg=$(printf '%s' "$*" | tr '\n' ' ')
+  printf 'FAIL  %s\n' "$msg"
+  printf 'FAIL  %s: %s\n' "$part" "$msg" >>"$tmp/fails"
   if [ "$part" = host ]; then hf=$((hf + 1)); else lf=$((lf + 1)); fi
 }
 delete_how() {
@@ -175,11 +179,19 @@ host_part() {
     return 1
   fi
   step "Host: host/check.sh, about 12 minutes, and 10 more when base is rebuilt"
+  # On a terminal there, so a Ctrl-C here, which ends ssh, hangs up
+  # host/check.sh and its tests too. Its lines come back in CRLF.
+  : >"$tmp/host"
+  cr=$(printf '\r')
   {
-    admin_ssh -n "$admin" 'cd ai-agent-runner && host/check.sh'
+    admin_ssh -n -tt -o LogLevel=ERROR "$admin" 'cd ai-agent-runner && host/check.sh'
     echo $? >"$tmp/host-exit"
-  } | tee "$tmp/host"
-  code=$(cat "$tmp/host-exit")
+  } | while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%"$cr"}
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >>"$tmp/host"
+  done
+  code=$(cat "$tmp/host-exit" 2>/dev/null || echo 255)
   hp=$((hp + $(grep -c '^PASS  ' "$tmp/host")))
   hf=$((hf + $(grep -c '^FAIL  ' "$tmp/host")))
   sed -n 's/^FAIL  /FAIL  host: /p' "$tmp/host" >>"$tmp/fails"
@@ -279,13 +291,18 @@ check_joined() {
   echo "runner runs: $row"
   n=$(printf '%s' "$row" | sed -n 's/.*not rolled back, checkpoint \([0-9]*\) undoes it.*/\1/p')
   [ -n "$n" ] && pass "cancelled: not rolled back, checkpoint $n undoes it" || fail "cancelled, but runs says: $row"
-  [ "$(r exec "$vm" -- cat /proc/sys/kernel/random/boot_id)" = "$boot" ] && pass "the VM wasn't restarted" || fail "the VM was restarted"
+  if [ -z "$boot" ]; then
+    fail "the VM's boot_id reads empty, so a restart can't be told"
+  else
+    [ "$(r exec "$vm" -- cat /proc/sys/kernel/random/boot_id)" = "$boot" ] && pass "the VM wasn't restarted" || fail "the VM was restarted"
+  fi
   if [ "$session" = yes ]; then
     r sessions "$vm" | grep -q '^in-use  ' && pass "its tmux session carried on" || fail "its tmux session is gone"
   fi
   r exec "$vm" -- test -f /home/agent/work/joined.txt && pass "what the run wrote is still there" || fail "joined.txt is gone"
   got=$(r result "$run")
-  printf '%s' "$got" | grep -q '"outcome": "not_rolled_back"' && pass "runner result: outcome not_rolled_back" || fail "runner result: $(printf '%s' "$got" | grep '"outcome"')"
+  outcome=$(printf '%s\n' "$got" | grep '"outcome"')
+  printf '%s' "$got" | grep -q '"outcome": "not_rolled_back"' && pass "runner result: outcome not_rolled_back" || fail "runner result: ${outcome:-no outcome}"
   if [ -n "$n" ]; then
     printf '%s' "$got" | grep -q "\"checkpoint\": $n," && pass "runner result: checkpoint $n" || fail "runner result doesn't name checkpoint $n"
   fi
@@ -297,7 +314,16 @@ check_joined() {
   got=$(r gc --dry-run 2>&1)
   code=$?
   printf '%s\n' "$got" | grep -q "^$vm  skipped: running" && [ "$code" -eq 0 ] && pass "gc --dry-run: skips $vm, exit 0" || fail "gc --dry-run: exit $code, '$got'"
-  r gc "$vm" >/dev/null 2>&1 && fail "gc $vm: ran on a running VM" || pass "gc $vm: refused while it runs"
+  got=$(r gc "$vm" 2>&1)
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    fail "gc $vm: ran on a running VM"
+  else
+    case $got in
+    *"$vm is busy"*) pass "gc $vm: refused while it runs" ;;
+    *) fail "gc $vm: exit $code, '$got'" ;;
+    esac
+  fi
   if [ -n "$n" ]; then
     r restore "$vm" "$n" >/dev/null && r exec "$vm" -- test ! -e /home/agent/work/joined.txt && pass "restore $n rolled the run back by hand" || fail "restore $n didn't roll the run back"
   fi
@@ -314,18 +340,24 @@ check_result() {
   echo "$run started on the stopped VM; waiting for it to end and be measured"
   r output "$run" --follow >/dev/null 2>&1
   got=$(r result "$run")
-  printf '%s' "$got" | grep -q '"outcome": "committed"' && pass "runner result: committed" || fail "runner result: $(printf '%s' "$got" | grep '"outcome"')"
+  outcome=$(printf '%s\n' "$got" | grep '"outcome"')
+  printf '%s' "$got" | grep -q '"outcome": "committed"' && pass "runner result: committed" || fail "runner result: ${outcome:-no outcome}"
   printf '%s' "$got" | grep -q '"path": "/home/agent/work/hello.txt"' && pass "changed lists /home/agent/work/hello.txt" || fail "changed doesn't list hello.txt"
   boot_only=$(printf '%s' "$got" | sed -n 's/.*"boot_only": \([0-9]*\).*/\1/p')
   [ "${boot_only:-0}" -gt 0 ] && pass "boot_only: $boot_only paths left out" || fail "boot_only: ${boot_only:-missing}"
-  others=$(printf '%s\n' "$got" | sed -n 's/^ *"path": "\(.*\)",*$/\1/p' | grep -v -e '^/home/' -e '^/tmp/' -e '^/tmp$')
-  [ -z "$others" ] && pass "changed lists nothing outside /home and /tmp" || fail "changed lists, outside /home and /tmp: $(echo "$others" | tr '\n' ' ')"
+  paths=$(printf '%s\n' "$got" | sed -n 's/^ *"path": "\(.*\)",*$/\1/p')
+  others=$(printf '%s\n' "$paths" | grep -v -e '^/home/' -e '^/tmp/' -e '^/tmp$')
+  if [ -z "$paths" ]; then
+    fail "changed lists no paths"
+  else
+    [ -z "$others" ] && pass "changed lists nothing outside /home and /tmp" || fail "changed lists, outside /home and /tmp: $others"
+  fi
 }
 
 check_proxy() {
   step "runner proxy, and an open proxy keeps the VM awake"
   r idle "$vm" 90s >/dev/null
-  r service add "$vm" web -- python3 -m http.server 8080 >/dev/null || fail "service add web"
+  r service add "$vm" web -- python3 -m http.server 8080 >/dev/null || fail "service add web failed"
   # Else what answers is that, not the VM.
   if [ "$(http "http://localhost:$port/" 5)" != 000 ]; then
     fail "localhost:$port answers before the proxy opens: stop what's on it"
