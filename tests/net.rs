@@ -271,7 +271,12 @@ fn the_rules_name_the_range_everywhere_install_sh_would() {
         rules.contains("ip saddr 10.20.0.0/16 ip daddr != 10.20.0.0/16 masquerade"),
         "{rules}"
     );
-    // The ip6 table goes by the taps' names, so every tap has to match it.
+    // What a tap brings in from outside the range goes first.
+    assert!(
+        rules.contains("iifname \"fc*\" ip saddr != 10.20.0.0/16 drop"),
+        "{rules}"
+    );
+    // The filters go by the taps' names, so every tap has to match them.
     assert!(rules.contains("iifname \"fc*\" drop"), "{rules}");
     for slot in [0, 1, 16383] {
         assert!(DEFAULT_SUBNET.net(slot).unwrap().tap.starts_with("fc"));
@@ -338,11 +343,16 @@ fn ask(ns: &str, to: SocketAddr) -> std::io::Result<String> {
 // Sends a datagram from inside `ns` to `to`, and says whether `inbox`, the
 // socket listening there, got it within a second.
 fn datagram(ns: &str, to: SocketAddr, inbox: &UdpSocket) -> bool {
+    datagram_from(ns, "0.0.0.0:0".parse().unwrap(), to, inbox)
+}
+
+// The same, sent from `from`, an address of `ns`'s own.
+fn datagram_from(ns: &str, from: SocketAddr, to: SocketAddr, inbox: &UdpSocket) -> bool {
     static SENT: AtomicU32 = AtomicU32::new(0);
     let token = format!("probe {}", SENT.fetch_add(1, Ordering::Relaxed));
     let sent = token.clone();
     inside(ns, move || {
-        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let socket = UdpSocket::bind(from).unwrap();
         socket.send_to(sent.as_bytes(), to).unwrap();
     });
     inbox
@@ -380,30 +390,29 @@ impl Drop for Spaces {
     }
 }
 
+// `ip -n <ns>` with these arguments, split at spaces, which has to work.
+fn ip_in(ns: &str, args: &str) {
+    let args: Vec<&str> = ["-n", ns].into_iter().chain(args.split(' ')).collect();
+    ip_ok(&args);
+}
+
 // A VM's tap, but a veth: the host's end, named like the tap and holding the
 // gateway's address, in `host`, and the VM's eth0 in `vm`, with `address` on
 // it and the gateway as its way out.
 fn plug(host: &str, vm: &str, net: &Net, address: &str) {
-    let (tap, gateway) = (net.tap.as_str(), net.gateway.to_string());
-    ip_ok(&[
-        "-n", host, "link", "add", tap, "type", "veth", "peer", "name", "eth0", "netns", vm,
-    ]);
-    ip_ok(&[
-        "-n",
+    let (tap, gateway) = (&net.tap, net.gateway);
+    ip_in(
         host,
-        "addr",
-        "add",
-        &format!("{gateway}/30"),
-        "dev",
-        tap,
-    ]);
-    ip_ok(&["-n", host, "link", "set", "dev", tap, "up"]);
-    ip_ok(&["-n", vm, "addr", "add", address, "dev", "eth0"]);
-    ip_ok(&["-n", vm, "link", "set", "dev", "eth0", "up"]);
-    let way_out = &gateway;
-    ip_ok(&[
-        "-n", vm, "route", "add", "default", "via", way_out, "dev", "eth0", "onlink",
-    ]);
+        &format!("link add {tap} type veth peer name eth0 netns {vm}"),
+    );
+    ip_in(host, &format!("addr add {gateway}/30 dev {tap}"));
+    ip_in(host, &format!("link set dev {tap} up"));
+    ip_in(vm, &format!("addr add {address} dev eth0"));
+    ip_in(vm, "link set dev eth0 up");
+    ip_in(
+        vm,
+        &format!("route add default via {gateway} dev eth0 onlink"),
+    );
 }
 
 // Loads the rules install.sh writes for `range` in `ns`.
@@ -459,10 +468,11 @@ fn a_vm_can_t_reach_the_host_but_hears_back_from_it() {
 
 // A VM that gives itself an address outside the VMs' range gets nothing past
 // the rules, over TCP or UDP: not to the host, at its tap's address or its
-// LAN one, and not through it to the LAN or the internet. Without the rules
-// all of it gets there, and the host routes the replies back, so it's the
-// rules that stop it. A VM at its own address still reaches the internet,
-// masqueraded as the host, and the LAN's resolver, but nothing else there.
+// LAN one, not through it to the LAN or the internet, and not as a forged
+// reply to what the host opened. Without the rules all of it gets there, and
+// the host routes the replies back, so it's the rules that stop it. A VM at
+// its own address still reaches the internet, masqueraded as the host, and
+// the LAN's resolver, but nothing else there.
 // Run as root: cargo test --test net -- --ignored
 #[test]
 #[ignore = "needs root, nftables and iproute2"]
@@ -475,39 +485,39 @@ fn a_vm_that_forges_its_source_gets_nothing_past_the_rules() {
     let lan = spaces.add("forge-lan");
     plug(&host, &vm, &own, &format!("{}/30", own.address));
     plug(&host, &forger, &other, "192.0.2.66/32");
-    ip_ok(&[
-        "-n",
+    ip_in(&host, &format!("route add 192.0.2.66/32 dev {}", other.tap));
+    // The host's LAN, with a resolver on it, and the internet beyond: a web
+    // server, and the resolver the host itself uses.
+    ip_in(
         &host,
-        "route",
-        "add",
-        "192.0.2.66/32",
-        "dev",
-        &other.tap,
-    ]);
-    // The host's LAN, with a resolver on it, and the internet beyond.
-    ip_ok(&[
-        "-n", &host, "link", "add", "lan0", "type", "veth", "peer", "name", "lan0", "netns", &lan,
-    ]);
-    ip_ok(&["-n", &host, "addr", "add", "192.168.77.1/24", "dev", "lan0"]);
-    ip_ok(&["-n", &host, "link", "set", "dev", "lan0", "up"]);
-    ip_ok(&[
-        "-n",
-        &host,
-        "route",
-        "add",
-        "default",
-        "via",
-        "192.168.77.2",
-    ]);
-    ip_ok(&["-n", &lan, "addr", "add", "192.168.77.2/24", "dev", "lan0"]);
-    ip_ok(&["-n", &lan, "addr", "add", "203.0.113.1/32", "dev", "lo"]);
-    ip_ok(&["-n", &lan, "link", "set", "dev", "lan0", "up"]);
-    ip_ok(&["-n", &lan, "link", "set", "dev", "lo", "up"]);
-    ip_ok(&["-n", &lan, "route", "add", "default", "via", "192.168.77.1"]);
-    inside(&host, || fs::write("/proc/sys/net/ipv4/ip_forward", "1")).unwrap();
+        &format!("link add lan0 type veth peer name lan0 netns {lan}"),
+    );
+    ip_in(&host, "addr add 192.168.77.1/24 dev lan0");
+    ip_in(&host, "link set dev lan0 up");
+    ip_in(&host, "route add default via 192.168.77.2");
+    ip_in(&lan, "addr add 192.168.77.2/24 dev lan0");
+    ip_in(&lan, "addr add 203.0.113.1/32 dev lo");
+    ip_in(&lan, "addr add 198.51.100.53/32 dev lo");
+    ip_in(&lan, "link set dev lan0 up");
+    ip_in(&lan, "link set dev lo up");
+    ip_in(&lan, "route add default via 192.168.77.1");
+    // The forger takes that resolver's address too, to answer the host's
+    // lookups.
+    ip_in(&forger, "addr add 198.51.100.53/32 dev eth0");
+    // The host forwards, and doesn't check that a source routes back the way
+    // it came, as a host with a strict reverse-path filter would: the rules
+    // have to hold without it.
+    let tap = other.tap.clone();
+    inside(&host, move || {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+        for conf in ["all", &tap] {
+            let path = format!("/proc/sys/net/ipv4/conf/{conf}/rp_filter");
+            fs::write(path, "0").unwrap();
+        }
+    });
 
-    // The host's sshd and resolver, and on the LAN, a resolver and sshd that
-    // say who they see, and a web server standing in for the internet.
+    // The host's sshd and resolver, and beyond it, servers that say who they
+    // see: the LAN's sshd and resolver, and a web server.
     answer(
         inside(&host, || TcpListener::bind("0.0.0.0:22").unwrap()),
         "host",
@@ -530,6 +540,14 @@ fn a_vm_that_forges_its_source_gets_nothing_past_the_rules() {
         (to("192.168.77.2", 53), &lan_inbox),
         (to("203.0.113.1", 53), &lan_inbox),
     ];
+    // The host looks something up, and the forger answers as the resolver.
+    let lookup = inside(&host, || UdpSocket::bind("192.168.77.1:0").unwrap());
+    let upstream = to("198.51.100.53", 53);
+    let forged_answer = || {
+        lookup.send_to(b"query", upstream).unwrap();
+        let to = lookup.local_addr().unwrap();
+        datagram_from(&forger, upstream, to, &lookup)
+    };
 
     // Without the rules, every forged packet gets there, and back.
     for at in host_tcp {
@@ -541,6 +559,7 @@ fn a_vm_that_forges_its_source_gets_nothing_past_the_rules() {
     for (at, inbox) in udp {
         assert!(datagram(&forger, at, inbox), "{at}");
     }
+    assert!(forged_answer());
 
     load_rules(&host, &range);
     for at in host_tcp.into_iter().chain(beyond_tcp) {
@@ -549,6 +568,9 @@ fn a_vm_that_forges_its_source_gets_nothing_past_the_rules() {
     for (at, inbox) in udp {
         assert!(!datagram(&forger, at, inbox), "{at}");
     }
+    // To the host, it looks like a reply to its own lookup, which the rules
+    // let in from the VMs' range.
+    assert!(!forged_answer());
     let web = to("203.0.113.1", 80);
     assert_eq!(ask(&vm, web).unwrap(), "192.168.77.1");
     let resolver = to("192.168.77.2", 53);
