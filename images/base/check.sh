@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Check a built base disk without mounting it (debugfs, no root): the guest
 # agent is installed and enabled at boot, Claude Code is on PATH with its
-# updater off, the agent's /.runner/llm.txt is there, and no Claude Code login
-# or state is baked in for any fork to inherit.
+# updater off, the agent's /.runner/llm.txt is there, /.runner/build says what
+# the image was built from, and no Claude Code login or state is baked in for
+# any fork to inherit.
 #
 #   images/base/check.sh images/base/out/base.ext4
 set -euo pipefail
@@ -64,6 +65,16 @@ if [[ $(type_of /.runner/llm.txt) == regular ]]; then
   ok "/.runner/llm.txt is there"
 else
   bad "/.runner/llm.txt is missing"
+fi
+
+# What `runner import` notes, with the fingerprint build.sh --fingerprint gives.
+record=$(debugfs -R "cat /.runner/build" "$disk" 2>/dev/null)
+if [[ $(type_of /.runner/build) != regular ]]; then
+  bad "/.runner/build is missing"
+elif ! grep -Eq '^fingerprint=[0-9a-f]{64}$' <<<"$record"; then
+  bad "/.runner/build has no fingerprint"
+else
+  ok "/.runner/build says what the image was built from"
 fi
 
 # Claude Code keeps its login in ~/.claude and its account in ~/.claude.json.

@@ -16,6 +16,10 @@ you can go back.
 - Claude Code stays at the version this image was built with: its updater
   is off, in /etc/claude-code/managed-settings.json. VMs made from a
   rebuilt base image get a newer one.
+- /.runner/build says what the image this VM was made from was built from:
+  a fingerprint of what went into it, and the commit of ai-agent-runner.
+  The host noted it when it brought that image in, so changing it here
+  changes nothing there.
 - There's no sshd. The owner reaches you through runner-guest over vsock:
   `runner shell`, `runner exec`, `runner claude` and headless runs.
 
