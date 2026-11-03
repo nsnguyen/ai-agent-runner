@@ -37,30 +37,46 @@ need_guest() {
 or point RUNNER_GUEST at one"
 }
 
-# What the image is made from, as one sha256: every file under images/base
-# but out/, by path, owner execute bit and contents, then the runner-guest
-# binary. That takes in what it copies in or runs, and the kernel pin, which
-# is in this file. Times don't count, nor do files elsewhere. When unsure
-# whether a file counts, it does: a needless rebuild costs minutes, a missed
-# one leaves a stale base.
+# What the image is made from, as one sha256: every file and link under
+# images/base but the build's output, by path, owner execute bit and
+# contents (a link's target), then the runner-guest binary. That takes in
+# what it copies in or runs, and the kernel pin, which is in this file. Times
+# don't count, nor do files elsewhere. When unsure whether a file counts, it
+# does: a needless rebuild costs minutes, a missed one leaves a stale base.
 fingerprint() {
   need_guest
-  local files sum
+  local files sum skip
+  # OUT may be under images/base too.
+  skip=$(realpath -m -- "$out")
+  skip=./${skip#"$here"/}
   files=$(
     cd "$here" || exit
-    find . -path ./out -prune -o -type f -print0 | LC_ALL=C sort -z |
+    find . \( -path ./out -o -path "$skip" \) -prune -o \( -type f -o -type l \) -print0 |
+      LC_ALL=C sort -z |
       while IFS= read -r -d '' f; do
-        sum=$(sha256sum <"$f") && mode=$(stat -c %A -- "$f") || exit
+        if [[ -L $f ]]; then
+          sum=$(readlink -- "$f" | sha256sum) && mode=---l || exit
+        else
+          sum=$(sha256sum <"$f") && mode=$(stat -c %A -- "$f") || exit
+        fi
         printf '%s %s %s\n' "${sum%% *}" "${mode:3:1}" "${f#./}"
       done
   ) || die "can't read every file under $here"
   sum=$(sha256sum <"$guest") || die "can't read $guest"
   printf '%s\n%s x runner-guest\n' "$files" "${sum%% *}" | sha256sum | cut -d' ' -f1
+  # It's of the binary there is, which a pull doesn't rebuild.
+  if [[ -n $(find "$repo/src" "$repo/Cargo.toml" "$repo/Cargo.lock" -newer "$guest" \
+    -print -quit 2>/dev/null) ]]; then
+    echo "build.sh: $guest is older than the source in $repo: rebuild it, or this" \
+      "fingerprint may be of an old one" >&2
+  fi
 }
 
-case ${1:-} in
-  --fingerprint) fingerprint; exit 0 ;;
-  "") ;;
+case $# in
+  0) ;;
+  1) [[ $1 == --fingerprint ]] || die "usage: build.sh [--fingerprint]"
+    fingerprint
+    exit 0 ;;
   *) die "usage: build.sh [--fingerprint]" ;;
 esac
 

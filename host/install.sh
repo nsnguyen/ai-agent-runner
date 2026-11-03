@@ -150,5 +150,5 @@ cat <<EOF
 Next:
   1. Put a guest kernel at /var/lib/runner/kernel/vmlinux.
   2. Add the laptop's SSH key to $home/.ssh/authorized_keys, as README.md says.
-  3. Bring in the base disk, or a new one: sudo -u runner /usr/local/bin/runner import --replace base - <disk>
+  3. Bring in the base disk, or a new one: sudo -u runner /usr/local/bin/runner import --replace base - <path/to/base.ext4>
 EOF

@@ -232,7 +232,8 @@ fn base(store: &Store) -> Verdict {
     let vm = match store.get(BASE) {
         Ok(vm) => vm,
         Err(Error::NoVm(_)) => {
-            return fail("no base VM, which create forks: runner import base <disk>");
+            let how = "runner import base - <path/to/base.ext4";
+            return fail(format!("no base VM, which create forks: {how}"));
         }
         Err(e) => return fail(e.to_string()),
     };

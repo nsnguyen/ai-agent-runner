@@ -296,6 +296,10 @@ fn base_copy() -> (TempDir, PathBuf, PathBuf) {
 // `build.sh --fingerprint`, run as nobody when the tests run as root, so it
 // shows it needs no root.
 fn fingerprint(base: &Path, guest: &Path) -> String {
+    fingerprint_with(base, guest, &[])
+}
+
+fn fingerprint_with(base: &Path, guest: &Path, env: &[(&str, &Path)]) -> String {
     let build = base.join("build.sh");
     let mut cmd = if nix::unistd::geteuid().is_root() {
         let mut cmd = Command::new("setpriv");
@@ -308,9 +312,12 @@ fn fingerprint(base: &Path, guest: &Path) -> String {
         .arg(&build)
         .arg("--fingerprint")
         .env("RUNNER_GUEST", guest)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
+    // The copy has no source beside it to be older than.
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     let print = text(&out.stdout);
     let print = print.strip_suffix('\n').unwrap_or(&print).to_string();
     let hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
@@ -350,6 +357,15 @@ fn the_fingerprint_changes_with_what_the_image_is_made_from_and_nothing_else() {
     fs::write(base.join("extra.conf"), b"x").unwrap();
     assert_ne!(fingerprint(&base, &guest), first);
     fs::remove_file(base.join("extra.conf")).unwrap();
+    symlink("llm.txt", base.join("link.txt")).unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+    fs::remove_file(base.join("link.txt")).unwrap();
+    // A build's output elsewhere under images/base doesn't count either.
+    let out = base.join("built");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("base.ext4"), b"a built disk").unwrap();
+    assert_eq!(fingerprint_with(&base, &guest, &[("OUT", &out)]), first);
+    fs::remove_dir_all(&out).unwrap();
     let build = base.join("build.sh");
     let sh = fs::read_to_string(&build).unwrap();
     let pin = sh
@@ -364,6 +380,35 @@ fn the_fingerprint_changes_with_what_the_image_is_made_from_and_nothing_else() {
     // And so does the guest binary.
     fs::write(&guest, b"guest v2").unwrap();
     assert_ne!(fingerprint(&base, &guest), first);
+}
+
+// A pull changes the guest's source but not the binary build.sh hashes.
+#[test]
+fn the_fingerprint_warns_of_a_guest_older_than_its_source() {
+    let (dir, base, guest) = base_copy();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let rs = src.join("guest.rs");
+    fs::write(&rs, b"fn main() {}").unwrap();
+    let then = fs::metadata(&guest).unwrap().modified().unwrap();
+    let file = fs::File::options().write(true).open(&rs).unwrap();
+    file.set_modified(then + std::time::Duration::from_secs(60))
+        .unwrap();
+    let out = Command::new("bash")
+        .arg(base.join("build.sh"))
+        .arg("--fingerprint")
+        .env("RUNNER_GUEST", &guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("older than the source"),
+        "{}",
+        text(&out.stderr)
+    );
+    // The print is the same: only the warning says.
+    fs::remove_dir_all(&src).unwrap();
+    assert_eq!(text(&out.stdout).trim(), fingerprint(&base, &guest));
 }
 
 #[test]
