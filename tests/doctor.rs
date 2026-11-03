@@ -21,16 +21,28 @@ const NAT: &str = "table ip runner {
 
 \tchain forward {
 \t\ttype filter hook forward priority filter; policy accept;
-\t\tip saddr 172.16.0.0/16 ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
-\t\tip saddr 172.16.0.0/16 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
+\t\tiifname \"fc*\" ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
+\t\tiifname \"fc*\" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
 \t}
 
 \tchain input {
 \t\ttype filter hook input priority filter; policy accept;
-\t\tip saddr 172.16.0.0/16 ct state established,related accept
-\t\tip saddr 172.16.0.0/16 drop
+\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
+\t\tiifname \"fc*\" ct state established,related accept
+\t\tiifname \"fc*\" drop
 \t}
 }
+";
+
+// The ip input chain's rules as install.sh writes them, and as it wrote them
+// before, by source address, which let in a VM that forged its source.
+const INPUT: &str = "\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
+\t\tiifname \"fc*\" ct state established,related accept
+\t\tiifname \"fc*\" drop
+";
+const INPUT_BY_SOURCE: &str = "\t\tip saddr 172.16.0.0/16 ct state established,related accept
+\t\tip saddr 172.16.0.0/16 drop
 ";
 
 // What `nft list table ip6 runner` prints for them: VMs get no IPv6 through
@@ -215,6 +227,17 @@ fn a_healthy_host_passes_every_check_in_order() {
     assert!(nat.contains("VMs kept off the host"), "{nat}");
     let pinned = host::firecracker_version();
     assert!(verdict(&report, "firecracker").1.contains(pinned));
+
+    // The range comes from the masquerade rule, wherever nft lists it: the
+    // filters name it after a !=.
+    let (head, filters) = NAT.split_at(NAT.find("\tchain forward").unwrap());
+    let postrouting = head.strip_prefix("table ip runner {\n").unwrap();
+    let filters = filters.strip_suffix("}\n").unwrap();
+    let last = format!("table ip runner {{\n{filters}\n{postrouting}}}\n");
+    let fake = Fake::healthy(store.root()).cmd(&list_nat(), ran(true, &last, ""));
+    let nat = verdict(&doctor::check(&fake, &store), "nat");
+    assert_eq!(nat.0, Status::Ok, "{}", nat.1);
+    assert!(nat.1.contains("masquerading 172.16.0.0/16"), "{}", nat.1);
 }
 
 #[test]
@@ -335,12 +358,38 @@ fn nat_warns_when_nothing_keeps_vms_off_the_host() {
     assert_verdict(open6, &store, "nat", Status::Warn, "off the host");
 
     // A drop in another chain, or an input chain that only accepts, isn't it.
-    let accepts = NAT.replace("\t\tip saddr 172.16.0.0/16 drop\n", "");
+    let accepts = NAT.replace("\t\tiifname \"fc*\" drop\n", "");
+    assert!(
+        accepts.contains("ip saddr != 172.16.0.0/16 drop"),
+        "{accepts}"
+    );
     let open = fake().cmd(list, ran(true, &accepts, ""));
     assert_verdict(open, &store, "nat", Status::Warn, "off the host");
     let forward = NAT.replace("hook input", "hook forward");
     let elsewhere = fake().cmd(list, ran(true, &forward, ""));
     assert_verdict(elsewhere, &store, "nat", Status::Warn, "off the host");
+
+    // Rules that go by source address let in a VM that forges one, loaded
+    // or in the file.
+    assert!(NAT.contains(INPUT));
+    let by_source = NAT.replace(INPUT, INPUT_BY_SOURCE);
+    let old = fake().cmd(list, ran(true, &by_source, ""));
+    assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    let file = host::nat_rules(&DEFAULT_SUBNET);
+    assert!(file.contains(INPUT), "{file}");
+    let old = unprivileged().file(host::NAT_RULES, Ok(&file.replace(INPUT, INPUT_BY_SOURCE)));
+    assert_verdict(old, &store, "nat", Status::Warn, "off the host");
+    // Nor is a drop on the taps that lets a forged reply in first.
+    let forged = "\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop\n";
+    let forged_in = NAT.replace(INPUT, &INPUT.replace(forged, ""));
+    let forged_in = fake().cmd(list, ran(true, &forged_in, ""));
+    assert_verdict(forged_in, &store, "nat", Status::Warn, "off the host");
+    let late = INPUT
+        .replace(forged, "")
+        .replace("accept\n", &format!("accept\n{forged}"));
+    assert!(late.ends_with("drop\n\t\tiifname \"fc*\" drop\n"), "{late}");
+    let late = fake().cmd(list, ran(true, &NAT.replace(INPUT, &late), ""));
+    assert_verdict(late, &store, "nat", Status::Warn, "off the host");
 
     // Along with a firewall that drops forwarded traffic, it says both.
     let docker = "systemctl is-active docker.service";

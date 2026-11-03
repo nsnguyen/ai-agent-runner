@@ -257,7 +257,8 @@ fn nat(host: &impl Host) -> Verdict {
     let restart = format!("systemctl restart {unit}");
     let (range, guarded) = match host.run(host::NFT, &["list", "table", family, table]) {
         Ok(r) if r.ok && r.stdout.contains("masquerade") => {
-            let mut words = r.stdout.split_whitespace();
+            let masquerade = r.stdout.lines().find(|l| l.contains("masquerade"));
+            let mut words = masquerade.unwrap_or_default().split_whitespace();
             let range = words.find(|w| *w == "saddr").and(words.next());
             // An install.sh from before the ip6 table left none to list.
             let [family6, table6] = host::NAT6_TABLE;
@@ -298,12 +299,12 @@ fn nat(host: &impl Host) -> Verdict {
     let mut warnings = Vec::new();
     if guarded == Some(false) {
         let rules = if range.is_some() {
-            "the loaded rules"
+            "the loaded rules".to_string()
         } else {
-            host::NAT_RULES
+            format!("the rules in {}", host::NAT_RULES)
         };
         warnings.push(format!(
-            "nothing in {rules} keeps the VMs off the host's own services, its sshd too: rerun {INSTALL}"
+            "{rules} don't keep the VMs off the host's own services: rerun {INSTALL}"
         ));
     }
     // Both drop forwarded traffic by default, so the VMs would lose the
@@ -329,32 +330,34 @@ fn nat(host: &impl Host) -> Verdict {
 }
 
 /// Whether nftables rules, as `nft list` prints them or as host/nat.nft has
-/// them, keep the VMs off the host: an ip input chain that lets in replies
-/// from a range, then drops the rest from it, and an ip6 one that drops all
-/// that comes in on a tap.
+/// them, keep the VMs off the host: input chains that drop all that comes in
+/// on a tap, the ip one only after it drops what a tap brings in from outside
+/// the range, before it accepts anything. Rules that went by source address,
+/// as install.sh wrote them before, let in a VM that forges one.
 fn guards_host(rules: &str) -> bool {
+    const FROM_A_TAP: &str = r#"iifname "fc*" drop"#;
     let (mut v4, mut v6) = (false, false);
     let mut family = "";
-    let mut input = false;
-    let mut replies = None;
+    let (mut input, mut forged, mut accepted) = (false, false, false);
     for line in rules.lines().map(str::trim) {
         if let Some(table) = line.strip_prefix("table ") {
             family = table.split_whitespace().next().unwrap_or("");
-            (input, replies) = (false, None);
+            (input, forged, accepted) = (false, false, false);
         } else if line.starts_with("chain ") {
-            (input, replies) = (false, None);
+            (input, forged, accepted) = (false, false, false);
         } else if line.starts_with("type filter hook input ") {
             input = true;
         } else if input && family == "ip6" {
-            v6 |= line == r#"iifname "fc*" drop"#;
+            v6 |= line == FROM_A_TAP;
         } else if input && family == "ip" {
-            let Some(from) = line.strip_prefix("ip saddr ") else {
-                continue;
-            };
-            if let Some(range) = from.strip_suffix(" ct state established,related accept") {
-                replies = Some(range);
-            } else if replies.is_some_and(|range| from.strip_prefix(range) == Some(" drop")) {
-                v4 = true;
+            let outside = line.strip_prefix(r#"iifname "fc*" ip saddr != "#);
+            if outside.is_some_and(|range| range.ends_with(" drop")) {
+                // Too late after an accept: a forged reply is in by then.
+                forged |= !accepted;
+            } else if line.ends_with(" accept") {
+                accepted = true;
+            } else if line == FROM_A_TAP {
+                v4 |= forged;
             }
         }
     }
