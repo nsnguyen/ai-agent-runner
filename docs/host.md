@@ -59,7 +59,7 @@ Give each an HTTPS port that isn't one of the URL ports (10000 and up). tailscal
 
 ## Boot tests
 
-They need KVM, so they're `#[ignore]`d and skipped everywhere else. On a host set up as above, from a checkout, as the sudo user (`ubuntu` on AWS), not root:
+They need KVM, so they're `#[ignore]`d and skipped everywhere else. From the laptop, `client/check.sh` copies the checkout to the host and runs `host/check.sh` there, then the laptop checks (README.md, After merging a change). On a host set up as above, from a checkout, as the sudo user (`ubuntu` on AWS), not root:
 
 ```
 host/check.sh             # all of them, about 12 minutes

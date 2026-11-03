@@ -60,15 +60,18 @@ client/aws.sh stop        # the host: about $0.10 an hour while it runs, only it
 
 ### After merging a change
 
-The host runs whatever was last copied to it. Copy it over, then check it there:
+The host runs whatever was last copied to it. One command copies this checkout over and checks it end to end:
 
 ```sh
 git checkout main && git pull
-rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ ubuntu@kvm-host:ai-agent-runner/
-client/aws.sh ssh 'cd ai-agent-runner && host/check.sh'
+client/check.sh          # about 30 minutes, 40 when base is rebuilt
+client/check.sh host     # only the copy and host/check.sh
+client/check.sh laptop   # only the laptop checks
 ```
 
-`host/check.sh` installs the new build. It rebuilds and imports base only when what base is made from changed. Then it checks that `runner doctor` is all `ok` and runs every boot test. Each step and test gets a `PASS` or `FAIL` line. It takes about 12 minutes, and about 10 more when base is rebuilt. It ends with a count and its log's path on the host, and exits 1 on any `FAIL`. docs/host.md (Boot tests) says more.
+It names the branch and commit, then copies the checkout to `ubuntu@kvm-host:ai-agent-runner/` with `--delete`, leaving the host's `target` and `images/base/out` be. Then it runs `host/check.sh` there, its lines shown as they come: that installs the new build, rebuilds and imports base only when what base is made from changed, checks that `runner doctor` is all `ok`, and runs every boot test (docs/host.md, Boot tests). Then come the laptop checks, which only the laptop's path shows, through this checkout's `client/runner` on a scratch VM, `client-check`, forked from base: exec refusing a credential's variable, MCP exec's long output, a run that joins a VM in use and is cancelled, a run's result without boot noise, gc skipping a running VM, an open proxy keeping its VM awake, and the URL on and off.
+
+Each step and check gets a `PASS` or `FAIL` line. It ends with every `FAIL` again, the counts, and the host's log path, and exits 1 on any `FAIL`. A host that doesn't answer ends it at once, with exit 2: `client/aws.sh start`. The scratch VM is deleted at the end, after a `FAIL` too, unless `KEEP=1`; Ctrl-C leaves it and says how to delete it. The copy and `host/check.sh` go in as `ubuntu` with `~/.ssh/kvm-host.pem` (`RUNNER_ADMIN` names another login), the laptop checks as `runner` does, on `RUNNER_HOST` or the first host in `~/.config/runner/host`. A new by-hand check goes into `client/check.sh`, never a script of its own.
 
 ### When something's off
 
@@ -152,7 +155,7 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname
 ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty,port-forwarding $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
 ```
 
-Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` then goes over the tailnet, as `kvm-host`, and the rsync above, to `ubuntu@kvm-host:ai-agent-runner/`, upgrades the host. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
+Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` then goes over the tailnet, as `kvm-host`, and `client/check.sh` upgrades and checks the host (After merging a change). `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
 
 ## Build the base image
 
