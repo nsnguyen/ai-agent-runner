@@ -35,4 +35,4 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Firecracker needs Linux with `/dev/kvm`. Claude's cloud sessions don't have it, so tests there can't boot a VM. Keep tests that boot one apart from the rest, so they're skippable, and say in each PR which ones didn't run.
 - The session tests run the real tmux, as the test's user and on that user's own tmux server, so install tmux first. Each test names its sessions apart and kills them after.
 - One service test runs `systemd-analyze verify` to check how systemd reads a unit, so the test machine needs systemd installed (it needn't be running).
-- Making a tap needs CAP_NET_ADMIN and iproute2, so those tests are `#[ignore]`d too: `cargo test --test net --test boot -- --ignored`, as root (docs/host.md says how). The rules test needs nftables as well. Cloud sessions run as root; install iproute2 first.
+- Making a tap needs CAP_NET_ADMIN and iproute2, so those tests are `#[ignore]`d too: `cargo test --test net --test boot -- --ignored`, as root (docs/host.md says how). The rules tests need nftables as well. Cloud sessions run as root; install iproute2 first.
