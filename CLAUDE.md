@@ -13,7 +13,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Not a cloud buyer. `runner` never signs up for or rents hosts; it runs on machines I give it. `client/aws.sh`, which I run by hand, is how I make one on AWS.
 
 ## Autonomy
-- Merging: only forge's review task merges, and only the build PRs it approves with every check passing, so issues that depend on each other build one after another. No other session merges, the builder included. The cloud has no KVM, so those PRs merge without a VM booted: at each milestone, run every `#[ignore]`d test on the KVM host (Commands and Sharp edges say how).
+- Merging: only forge's review task merges, and only the build PRs it approves with every check passing, so issues that depend on each other build one after another. No other session merges, the builder included. The cloud has no KVM, so those PRs merge without a VM booted: a milestone ends with `client/check.sh` from the laptop, which runs every `#[ignore]`d test on the KVM host and the laptop checks (Commands says how).
 - Deploys: previews only.
 
 ## Stack
@@ -27,6 +27,7 @@ A cloud runner for AI agents on Firecracker microVMs, like fly.io Sprites. Each 
 - Test: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && shellcheck host/*.sh client/*`
 - Run locally: `RUNNER_ROOT=/tmp/runner cargo run -- list`. No KVM needed until VMs boot.
 - Boot tests, on the KVM host only, as the sudo user: `host/check.sh` installs the build, rebuilds and imports base when it changed, checks `runner doctor`, and runs every `#[ignore]`d test one at a time, a `PASS` or `FAIL` line each (docs/host.md, Boot tests). `host/check.sh <filter>` runs only the matching tests.
+- Milestone check, from the laptop: `client/check.sh` copies this checkout to the KVM host, runs `host/check.sh` there, then the laptop checks on a scratch VM, and ends with every FAIL and the counts (README.md, After merging a change). A new by-hand check goes into it, never into a script of its own.
 
 ## Sharp edges
 - On a filesystem without reflink, like ext4, every fork and run is a full (sparse) copy of the disk: slow, and real space. Put `/var/lib/runner` on XFS or btrfs.
