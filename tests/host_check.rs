@@ -331,12 +331,7 @@ fn passes(out: &Output) -> String {
 
 fn fails(out: &Output) -> String {
     let stdout = text(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "{stdout}{}",
-        text(&out.stderr)
-    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}{}", text(&out.stderr));
     stdout
 }
 
@@ -367,10 +362,19 @@ fn an_unchanged_base_builds_and_imports_nothing() {
     let stdout = passes(&host.run());
     assert!(!host.built(), "{:?}", host.calls());
     assert_eq!(host.called(&["runner", "import"]), None);
-    assert!(line(&stdout, "PASS", "base").contains("unchanged"), "{stdout}");
-    assert!(line(&stdout, "PASS", "kernel").contains("unchanged"), "{stdout}");
+    assert!(
+        line(&stdout, "PASS", "base").contains("unchanged"),
+        "{stdout}"
+    );
+    assert!(
+        line(&stdout, "PASS", "kernel").contains("unchanged"),
+        "{stdout}"
+    );
     // And the kernel isn't copied in again.
-    let installs = host.calls().into_iter().filter(|c| c[0] == "sudo" && c.get(1).is_some_and(|a| a == "install"));
+    let installs = host
+        .calls()
+        .into_iter()
+        .filter(|c| c[0] == "sudo" && c.get(1).is_some_and(|a| a == "install"));
     assert_eq!(installs.count(), 0, "{:?}", host.calls());
 }
 
@@ -381,8 +385,15 @@ fn a_changed_base_is_built_then_imported_with_replace_from_stdin() {
     disk(&host.out("base.ext4"), OLD);
     let stdout = passes(&host.run());
 
-    let build = host.called(&["sudo", "ENGINE=podman"]).expect("no sudo build.sh");
-    assert!(host.calls()[build].last().unwrap().ends_with("images/base/build.sh"));
+    let build = host
+        .called(&["sudo", "ENGINE=podman"])
+        .expect("no sudo build.sh");
+    assert!(
+        host.calls()[build]
+            .last()
+            .unwrap()
+            .ends_with("images/base/build.sh")
+    );
     assert_eq!(
         fs::read_to_string(host.path("fake/build-env")).unwrap(),
         "engine=podman\n"
@@ -392,7 +403,10 @@ fn a_changed_base_is_built_then_imported_with_replace_from_stdin() {
         .expect("no import --replace from stdin");
     assert!(build < import, "{:?}", host.calls());
     // As its own user, as the runner user can't read the checkout.
-    assert!(host.called(&["sudo", "-u", "runner", "runner", "import"]).is_some());
+    assert!(
+        host.called(&["sudo", "-u", "runner", "runner", "import"])
+            .is_some()
+    );
     assert_eq!(
         fs::read(host.path("fake/imported")).unwrap(),
         fs::read(host.path("fake/new.ext4")).unwrap()
@@ -410,7 +424,10 @@ fn a_missing_base_is_built_then_imported() {
     fs::remove_file(host.out("base.ext4")).unwrap();
     passes(&host.run());
     assert!(host.built());
-    assert!(host.called(&["runner", "import", "--replace", "base", "-"]).is_some());
+    assert!(
+        host.called(&["runner", "import", "--replace", "base", "-"])
+            .is_some()
+    );
 }
 
 #[test]
@@ -428,8 +445,14 @@ fn a_base_only_the_host_lacks_is_imported_without_a_rebuild() {
     host.has("host-fp", OLD);
     let stdout = passes(&host.run());
     assert!(!host.built(), "{:?}", host.calls());
-    assert!(host.called(&["runner", "import", "--replace", "base", "-"]).is_some());
-    assert!(line(&stdout, "PASS", "base").contains("imported"), "{stdout}");
+    assert!(
+        host.called(&["runner", "import", "--replace", "base", "-"])
+            .is_some()
+    );
+    assert!(
+        line(&stdout, "PASS", "base").contains("imported"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -437,7 +460,10 @@ fn force_base_rebuilds_an_unchanged_base() {
     let host = Host::new();
     passes(&host.check(&[], &[("FORCE_BASE", "1")]));
     assert!(host.built());
-    assert!(host.called(&["runner", "import", "--replace", "base", "-"]).is_some());
+    assert!(
+        host.called(&["runner", "import", "--replace", "base", "-"])
+            .is_some()
+    );
 }
 
 #[test]
@@ -449,7 +475,10 @@ fn a_kernel_that_differs_from_the_host_s_is_installed() {
         fs::read_to_string(host.path("root/kernel/vmlinux")).unwrap(),
         "kernel 2"
     );
-    assert!(line(&stdout, "PASS", "kernel").contains("installed"), "{stdout}");
+    assert!(
+        line(&stdout, "PASS", "kernel").contains("installed"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -471,12 +500,21 @@ fn all_passing_exits_0_with_a_line_per_test_and_a_count_naming_the_log() {
     assert_eq!(count(&stdout, "FAIL"), 0, "{stdout}");
     let last = stdout.lines().last().unwrap();
     assert!(last.contains("8 passed, 0 failed"), "{last}");
-    let log = last.split("Log: ").nth(1).unwrap_or_else(|| panic!("{last}"));
+    let log = last
+        .split("Log: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{last}"));
     let log = fs::read_to_string(log.trim()).unwrap();
     // Each step's own output is there.
     assert!(log.contains("installing runner from the fake"), "{log}");
-    assert!(log.contains("test sleep_and_wake_keep_a_process ... ok"), "{log}");
-    assert!(log.contains("ok    kvm          /dev/kvm opens read-write"), "{log}");
+    assert!(
+        log.contains("test sleep_and_wake_keep_a_process ... ok"),
+        "{log}"
+    );
+    assert!(
+        log.contains("ok    kvm          /dev/kvm opens read-write"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -485,7 +523,11 @@ fn it_installs_then_tests_every_ignored_test_as_root_with_the_built_disk() {
     passes(&host.run());
     let build = host.called(&["cargo", "build", "--release"]).unwrap();
     let install = host.called(&["sudo"]).unwrap();
-    assert!(host.calls()[install][1].ends_with("host/install.sh"), "{:?}", host.calls());
+    assert!(
+        host.calls()[install][1].ends_with("host/install.sh"),
+        "{:?}",
+        host.calls()
+    );
     assert!(build < install);
     host.called(&[
         "cargo",
@@ -503,7 +545,14 @@ fn it_installs_then_tests_every_ignored_test_as_root_with_the_built_disk() {
     let test = host.called(&["cargo", "test"]).expect("no cargo test");
     assert_eq!(
         host.calls()[test],
-        ["cargo", "test", "--no-fail-fast", "--", "--ignored", "--test-threads=1"]
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--",
+            "--ignored",
+            "--test-threads=1"
+        ]
     );
     let out = host.repo().join("images/base/out");
     assert_eq!(
@@ -534,7 +583,14 @@ fn a_test_cargo_reports_failed_is_a_fail_naming_it() {
     line(&stdout, "PASS", "kvm: sleep_and_wake_keep_a_process");
     line(&stdout, "PASS", "net: a_tap_comes_and_goes");
     assert_eq!(count(&stdout, "FAIL"), 1, "{stdout}");
-    assert!(stdout.lines().last().unwrap().contains("7 passed, 1 failed"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .unwrap()
+            .contains("7 passed, 1 failed"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -605,7 +661,10 @@ fn a_host_base_that_isn_t_the_checkout_s_after_import_is_a_fail() {
     host.has("import-keeps", "");
     let stdout = fails(&host.run());
     let fail = line(&stdout, "FAIL", "doctor");
-    assert!(fail.contains("base") && fail.contains(&NEW[..12]), "{stdout}");
+    assert!(
+        fail.contains("base") && fail.contains(&NEW[..12]),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -613,10 +672,20 @@ fn a_failed_install_is_a_fail_and_nothing_after_it_runs() {
     let host = Host::new();
     host.has("install-fails", "");
     let stdout = fails(&host.run());
-    assert!(line(&stdout, "FAIL", "install").contains("install.sh"), "{stdout}");
+    assert!(
+        line(&stdout, "FAIL", "install").contains("install.sh"),
+        "{stdout}"
+    );
     assert_eq!(host.called(&["cargo", "test"]), None);
     assert!(!host.built());
-    assert!(stdout.lines().last().unwrap().contains("0 passed, 1 failed"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .unwrap()
+            .contains("0 passed, 1 failed"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -624,7 +693,10 @@ fn a_failed_build_is_a_fail_and_nothing_after_it_runs() {
     let host = Host::new();
     host.has("build-fails", "");
     let stdout = fails(&host.run());
-    assert!(line(&stdout, "FAIL", "install").contains("cargo build"), "{stdout}");
+    assert!(
+        line(&stdout, "FAIL", "install").contains("cargo build"),
+        "{stdout}"
+    );
     assert_eq!(host.called(&["sudo"]), None, "{:?}", host.calls());
 }
 

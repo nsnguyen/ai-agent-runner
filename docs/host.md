@@ -59,13 +59,23 @@ Give each an HTTPS port that isn't one of the URL ports (10000 and up). tailscal
 
 ## Boot tests
 
-They need KVM, so they're `#[ignore]`d and skipped everywhere else. On a host set up as above, with `runner doctor` all ok, from a checkout:
+They need KVM, so they're `#[ignore]`d and skipped everywhere else. On a host set up as above, from a checkout, as the sudo user (`ubuntu` on AWS), not root:
 
 ```
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
-RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux cargo test --test kvm -- --ignored --test-threads=1
+host/check.sh             # all of them, about 12 minutes
+host/check.sh sleep       # only the tests whose names contain "sleep"
+FORCE_BASE=1 host/check.sh
 ```
 
-The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, so after a change run `cargo build --release && sudo host/install.sh` first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. The URL's test reaches the VM through the host's tailnet address, so it needs Tailscale up. With it set, `cargo test --test boot --test net -- --ignored` also checks that Firecracker doesn't inherit boot's CAP_NET_ADMIN, that a real tap comes and goes, and, in network namespaces of its own, that `host/nat.nft` drops a VM's connection to the host's port 22 but lets the host's own connection to a VM get its replies, and that a VM that forges a source outside the range gets nothing past it, to the host or beyond.
+It does each step a milestone check needs, with a `PASS` or `FAIL` line for each:
+
+1. `cargo build --release && sudo host/install.sh`.
+2. Builds runner-guest for musl, then holds `images/base/build.sh --fingerprint` against what `runner doctor` says base was built from and against the disk in `images/base/out`. When the disk is missing or differs, it rebuilds it (`sudo ENGINE=podman images/base/build.sh`; `ENGINE=docker` picks docker), and when either differs, imports it: `sudo -u runner runner import --replace base - <images/base/out/base.ext4`. It installs `images/base/out/vmlinux` as the host's kernel where it differs. `FORCE_BASE=1` rebuilds and imports anyway.
+3. `sudo -u runner runner doctor`: every line `ok`, since a `warn` is a `FAIL` here too, and base built from this checkout.
+4. Every `#[ignore]`d test, in every test file, one at a time, a line each as it ends: `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux RUNNER_GUEST_PORT=10022 cargo test --no-fail-fast -- --ignored --test-threads=1`, with the filter after it. A test file that doesn't build is a `FAIL`, and then none run.
+
+A failed install or base stops it there. It ends with a count and the path of its log, `target/check/<time>.log`, which holds each step's full output, and exits 1 on any `FAIL`.
+
+The runner variable builds as you and runs only the tests as root, which `runner boot` needs for the VM's tap. The tests that boot by hand do that in a root of their own. The ones under the unit fork the host's `base` in the unit's root and run `runner` as that root's owner, as SSH would; the unit boots them with the installed runner, which is why the install comes first. They boot the guest in the host's `base`, so a rebuilt image reaches them only once it's `base` again, which is why the import comes before them. One test at a time, since a small host (2 vCPUs) can't boot nine VMs at once. The URL's test reaches the VM through the host's tailnet address, so it needs Tailscale up. The boot and net tests also check that Firecracker doesn't inherit boot's CAP_NET_ADMIN, that a real tap comes and goes, and, in network namespaces of its own, that `host/nat.nft` drops a VM's connection to the host's port 22 but lets the host's own connection to a VM get its replies, and that a VM that forges a source outside the range gets nothing past it, to the host or beyond.
 
 The rootfs's init must take Ctrl-Alt-Del (systemd does) and print a login prompt on the serial console.

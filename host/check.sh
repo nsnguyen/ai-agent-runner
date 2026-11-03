@@ -44,8 +44,7 @@ if ! command -v cargo >/dev/null && [[ -f $HOME/.cargo/env ]]; then
 fi
 
 mkdir -p target/check || exit 2
-log=$repo/target/check/$(date -u +%Y%m%dT%H%M%SZ).log
-: >"$log" || exit 2
+log=$(mktemp "$repo/target/check/$(date -u +%Y%m%dT%H%M%SZ)-XXXX.log") || exit 2
 echo "check: log at $log"
 
 passed=0
@@ -115,6 +114,9 @@ if [[ ${FORCE_BASE:-} == 1 || $on_disk != "$want" || ! -f $kernel ]]; then
 fi
 if [[ -n $built || $on_host != "$want" ]]; then
   printf '\n== sudo -u runner runner import --replace base - <%s\n' "$disk" >>"$log"
+  # The redirects are this user's on purpose: the runner user can't read
+  # the checkout, so the disk comes in on stdin.
+  # shellcheck disable=SC2024
   if ! sudo -u runner runner import --replace base - <"$disk" >>"$log" 2>&1; then
     fail "base: runner import --replace base failed"
     summary "stopped"
