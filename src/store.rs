@@ -79,6 +79,9 @@ pub enum Error {
     NoSlot(Subnet),
     #[error("{cmd}: {why}")]
     Command { cmd: String, why: String },
+    /// A disk's stream that ended before the disk did.
+    #[error("{0}")]
+    Cut(String),
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -1688,14 +1691,28 @@ fn numbered(dir: &Path, suffix: &str) -> Result<Vec<u64>> {
 fn bring(disk: Source, to: &Path) -> Result<()> {
     match disk {
         Source::File(from) => clone(from, to),
-        Source::Stream(from) => write_sparse(from, to),
+        Source::Stream(from) => {
+            let len = write_sparse(from, to)?;
+            if len == 0 {
+                return Err(Error::Cut(
+                    "the stream was empty, so no disk came in".into(),
+                ));
+            }
+            match image::ext4_size(to) {
+                Some(want) if want > len => Err(Error::Cut(format!(
+                    "the stream ended at {len} bytes, but the ext4 superblock it starts \
+                     with says {want}: was it cut off?"
+                ))),
+                _ => Ok(()),
+            }
+        }
     }
 }
 
 // A stream into a new file at `to`, leaving a hole wherever a block is all
 // zeros, so a sparse disk that comes in as a stream stays sparse. As clone
-// leaves a copy: writable, and synced.
-fn write_sparse(from: &mut dyn Read, to: &Path) -> Result<()> {
+// leaves a copy: writable, and synced. Returns its length.
+fn write_sparse(from: &mut dyn Read, to: &Path) -> Result<u64> {
     const BLOCK: usize = 4096;
     let mut file = File::create(to).map_err(at(to))?;
     let mut buf = vec![0; 1 << 20];
@@ -1730,7 +1747,8 @@ fn write_sparse(from: &mut dyn Read, to: &Path) -> Result<()> {
     file.set_len(len)
         .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o644)))
         .and_then(|()| file.sync_all())
-        .map_err(at(to))
+        .map_err(at(to))?;
+    Ok(len)
 }
 
 // Reads until `buf` is full or the stream ends: a pipe gives what it has.

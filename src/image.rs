@@ -19,6 +19,8 @@ use crate::store::{self, Source, Store, Vm};
 use crate::systemd::{self, State};
 use ext4_view::Ext4;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Where in an image its record is.
@@ -56,6 +58,30 @@ pub fn read(disk: &Path) -> Option<Build> {
         }
     }
     parse(std::str::from_utf8(&text[..n]).ok()?)
+}
+
+/// How long the ext4 filesystem at the start of `disk` says it is, from its
+/// superblock: what a disk that came in as a stream should be at least. None
+/// if it doesn't start with one.
+pub fn ext4_size(disk: &Path) -> Option<u64> {
+    let mut sb = [0; 1024];
+    let mut file = File::open(disk).ok()?;
+    file.seek(SeekFrom::Start(1024)).ok()?;
+    file.read_exact(&mut sb).ok()?;
+    let u32_at = |i: usize| u32::from_le_bytes(sb[i..i + 4].try_into().unwrap());
+    if u16::from_le_bytes([sb[0x38], sb[0x39]]) != 0xEF53 {
+        return None;
+    }
+    let mut blocks = u64::from(u32_at(0x04));
+    // The high half counts only with the 64bit feature.
+    if u32_at(0x60) & 0x80 != 0 {
+        blocks |= u64::from(u32_at(0x150)) << 32;
+    }
+    let log = u32_at(0x18);
+    if log > 6 {
+        return None;
+    }
+    blocks.checked_mul(1024 << log)
 }
 
 fn parse(text: &str) -> Option<Build> {
@@ -120,14 +146,14 @@ pub fn import(store: &Store, name: &str, disk: Source, replace: bool) -> Result<
         return Err(Error::Up { vm, state });
     }
     let staged = store.stage_disk(name, disk, "import")?;
-    match store.finish_restore(name, &staged) {
-        Ok(vm) => Ok(vm),
-        Err(e) => {
-            let generation = staged.generation;
-            if let Err(e) = store.drop_restore(name, staged) {
-                eprintln!("runner: couldn't remove {name}'s generation {generation}: {e}");
-            }
-            Err(e.into())
+    let finished = store.finish_restore(name, &staged);
+    // One that failed after it went into history is current: it stays.
+    let current = store.get(name).map(|vm| vm.generation);
+    if finished.is_err() && current.is_ok_and(|g| g != staged.generation) {
+        let generation = staged.generation;
+        if let Err(e) = store.drop_restore(name, staged) {
+            eprintln!("runner: couldn't remove {name}'s generation {generation}: {e}");
         }
     }
+    Ok(finished?)
 }

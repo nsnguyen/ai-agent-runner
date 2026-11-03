@@ -191,14 +191,20 @@ fn forks_keep_their_own_disks() {
     assert_eq!(fs::read(host.current("dev")).unwrap(), b"old base");
 }
 
-// 64 MiB, with data in three places and holes everywhere else.
-fn sparse_disk() -> Vec<u8> {
+// 64 MiB, with data in a few places, one across a block and one across a
+// MiB, and holes everywhere else. It ends in data, or in zeros, which only
+// the copy's length keeps.
+fn sparse_disk(ends_in_data: bool) -> Vec<u8> {
     let mut disk = vec![0u8; 64 << 20];
-    for (at, what) in [
+    let mut data = vec![
         (0, &b"superblock"[..]),
-        (5 << 20, b"middle"),
-        ((64 << 20) - 3, b"end"),
-    ] {
+        (4094, b"across"),
+        ((5 << 20) - 2, b"middle"),
+    ];
+    if ends_in_data {
+        data.push(((64 << 20) - 3, b"end"));
+    }
+    for (at, what) in data {
         disk[at..at + what.len()].copy_from_slice(what);
     }
     disk
@@ -211,7 +217,7 @@ fn allocated(path: &Path) -> u64 {
 #[test]
 fn an_import_from_stdin_of_a_sparse_disk_allocates_about_its_data() {
     let host = Host::new();
-    let disk = sparse_disk();
+    let disk = sparse_disk(true);
     let out = host.ok_in(&["import", "base", "-"], Some(disk.clone()));
     assert_eq!(out, format!("base  gen 0  {} bytes\n", 64 << 20));
     let current = host.current("base");
@@ -223,6 +229,7 @@ fn an_import_from_stdin_of_a_sparse_disk_allocates_about_its_data() {
     );
     assert_eq!(fs::metadata(&current).unwrap().mode() & 0o777, 0o644);
 
+    let disk = sparse_disk(false);
     let out = host.ok_in(&["import", "--replace", "base", "-"], Some(disk.clone()));
     assert_eq!(out, format!("base  gen 1  {} bytes\n", 64 << 20));
     let current = host.current("base");
@@ -232,6 +239,35 @@ fn an_import_from_stdin_of_a_sparse_disk_allocates_about_its_data() {
         "{} bytes allocated",
         allocated(&current)
     );
+}
+
+// An ssh that drops, or a `-` with no `<`, ends the stream early: that's
+// refused, not made base.
+#[test]
+fn a_stream_that_is_empty_or_cut_off_is_refused() {
+    let host = Host::new();
+    let out = host.runner(&["import", "base", "-"], Some(Vec::new()));
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    let err = text(&out.stderr);
+    assert!(err.contains("the stream was empty"), "{err}");
+    assert!(!host.root().join("vms/base").exists());
+
+    host.ok(&["import", "base", &host.file("old.ext4", b"old base")]);
+    let whole = fs::read(ext4(host.dir.path(), "whole.ext4", None)).unwrap();
+    let cut = whole[..8 << 20].to_vec();
+    let out = host.runner(&["import", "--replace", "base", "-"], Some(cut));
+    let err = text(&out.stderr);
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    assert!(
+        err.contains(&format!("ended at {} bytes", 8 << 20)),
+        "{err}"
+    );
+    assert!(err.contains(&format!("says {}", 16 << 20)), "{err}");
+    assert_eq!(fs::read(host.current("base")).unwrap(), b"old base");
+    assert_eq!(host.gens("base"), ["0.ext4", "0.json"]);
+    // The whole one goes in.
+    host.ok_in(&["import", "--replace", "base", "-"], Some(whole.clone()));
+    assert_eq!(fs::read(host.current("base")).unwrap(), whole);
 }
 
 const PRINT: &str = "3f2a4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
