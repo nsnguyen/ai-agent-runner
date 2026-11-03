@@ -1,10 +1,7 @@
 // Boot tests: real Firecracker, real KVM. Skipped unless asked for, since
-// cloud sessions have no /dev/kvm. On the host, as docs/host.md says:
-//
-//   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-//   RUNNER_TEST_DISK=$PWD/images/base/out/base.ext4 \
-//   RUNNER_TEST_KERNEL=$PWD/images/base/out/vmlinux \
-//   cargo test --test kvm -- --ignored --test-threads=1
+// cloud sessions have no /dev/kvm. On the host, `host/check.sh` runs them
+// with every other #[ignore]d test, as docs/host.md (Boot tests) says, or
+// only those matching a filter: `host/check.sh <name>`.
 //
 // The rootfs's init must be systemd or another that takes Ctrl-Alt-Del, with
 // a login prompt on the serial console.

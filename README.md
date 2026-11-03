@@ -60,15 +60,15 @@ client/aws.sh stop        # the host: about $0.10 an hour while it runs, only it
 
 ### After merging a change
 
-The host runs whatever was last copied to it. Copy and install again:
+The host runs whatever was last copied to it. Copy it over, then check it there:
 
 ```sh
 git checkout main && git pull
 rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ ubuntu@kvm-host:ai-agent-runner/
-client/aws.sh ssh 'cd ai-agent-runner && . ~/.cargo/env && cargo build --release && sudo host/install.sh'
+client/aws.sh ssh 'cd ai-agent-runner && host/check.sh'
 ```
 
-The install ends with `runner doctor`: every line should be `ok`. The boot tests, at each milestone, are in docs/host.md (Boot tests): run them on the host, in `~/ai-agent-runner`.
+`host/check.sh` installs the new build. It rebuilds and imports base only when what base is made from changed. Then it checks that `runner doctor` is all `ok` and runs every boot test. Each step and test gets a `PASS` or `FAIL` line. It takes about 12 minutes, and about 10 more when base is rebuilt. It ends with a count and its log's path on the host, and exits 1 on any `FAIL`. docs/host.md (Boot tests) says more.
 
 ### When something's off
 
