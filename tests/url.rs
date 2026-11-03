@@ -513,14 +513,26 @@ fn the_boot_serves_the_url_on_the_tailnet_address_only() {
     // Bound to the tailnet address alone.
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
 
-    // Held in use while a connection is open, and touched after.
-    let mut uses = Uses::open(&store, "dev").unwrap();
-    let _ = uses.quiet().unwrap();
+    // Held in use while a connection is open. The last connection's thread
+    // can still hold the VM after its client has the reply, so wait for it to
+    // let go, or the look below could see that one instead of `held`. Then
+    // wait for `held`'s own wake, so none comes during the count from off the
+    // tailnet.
+    let quiet = || {
+        Uses::open(&store, "dev")
+            .unwrap()
+            .quiet()
+            .unwrap()
+            .is_some()
+    };
+    eventually("the last connection to let go", &quiet);
+    let woke = wakes.load(Ordering::SeqCst);
     let held = TcpStream::connect(at).unwrap();
-    eventually("the connection to hold the VM", &|| {
-        let mut uses = Uses::open(&store, "dev").unwrap();
-        uses.quiet().unwrap().is_none()
+    // Taken, held in use, then woken, in that order.
+    eventually("the connection to wake the VM", &|| {
+        wakes.load(Ordering::SeqCst) > woke
     });
+    assert!(!quiet(), "a connection holds the VM while it's open");
     drop(held);
 
     // From off the tailnet: closed unanswered, and the VM isn't woken.

@@ -2,9 +2,11 @@
 mod common;
 
 use common::{FakeApi, script};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket};
 use runner::firecracker::{self, Api, BOOT_ARGS, Error, Guest};
 use runner::net::DEFAULT_SUBNET;
 use serde_json::json;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 #[test]
@@ -87,9 +89,19 @@ fn no_socket_means_nothing_is_listening() {
         .unwrap_err();
     assert!(matches!(err, Error::NotListening(_)), "{err}");
 
-    // A socket file left by a Firecracker that died.
+    // A socket file left by a Firecracker that died. Bound, never listening:
+    // a listener would still take a connection while a process another test
+    // starts holds a copy of it until its exec, then reset it.
     let stale = dir.path().join("stale.sock");
-    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    let sock = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap();
+    bind(sock.as_raw_fd(), &UnixAddr::new(&stale).unwrap()).unwrap();
+    drop(sock);
     let err = Api::new(&stale).put("/actions", &json!({})).unwrap_err();
     assert!(matches!(err, Error::NotListening(_)), "{err}");
 }
