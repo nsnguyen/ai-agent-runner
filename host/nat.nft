@@ -10,7 +10,8 @@
 # opens, like the URL proxy's connection to a VM, still come back.
 # The filters go by the VMs' taps (net.rs names each fc<8 hex digits>), not
 # by source address, which a VM can forge. What a tap brings in from outside
-# the range is dropped first, so a forged source gets neither in nor through.
+# the range is dropped first, so a source forged from outside it gets
+# neither in nor through.
 # VMs have no IPv6 address at all: no IPv6 from a VM reaches the host, its
 # link-local address on the tap included, or goes through it.
 table ip runner

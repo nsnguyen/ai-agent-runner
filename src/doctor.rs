@@ -332,19 +332,19 @@ fn nat(host: &impl Host) -> Verdict {
 /// Whether nftables rules, as `nft list` prints them or as host/nat.nft has
 /// them, keep the VMs off the host: input chains that drop all that comes in
 /// on a tap, the ip one only after it drops what a tap brings in from outside
-/// the range. Rules that went by source address, as install.sh wrote them
-/// before, let in a VM that forges one.
+/// the range, before it accepts anything. Rules that went by source address,
+/// as install.sh wrote them before, let in a VM that forges one.
 fn guards_host(rules: &str) -> bool {
     const FROM_A_TAP: &str = r#"iifname "fc*" drop"#;
     let (mut v4, mut v6) = (false, false);
     let mut family = "";
-    let (mut input, mut forged) = (false, false);
+    let (mut input, mut forged, mut accepted) = (false, false, false);
     for line in rules.lines().map(str::trim) {
         if let Some(table) = line.strip_prefix("table ") {
             family = table.split_whitespace().next().unwrap_or("");
-            (input, forged) = (false, false);
+            (input, forged, accepted) = (false, false, false);
         } else if line.starts_with("chain ") {
-            (input, forged) = (false, false);
+            (input, forged, accepted) = (false, false, false);
         } else if line.starts_with("type filter hook input ") {
             input = true;
         } else if input && family == "ip6" {
@@ -352,7 +352,10 @@ fn guards_host(rules: &str) -> bool {
         } else if input && family == "ip" {
             let outside = line.strip_prefix(r#"iifname "fc*" ip saddr != "#);
             if outside.is_some_and(|range| range.ends_with(" drop")) {
-                forged = true;
+                // Too late after an accept: a forged reply is in by then.
+                forged |= !accepted;
+            } else if line.ends_with(" accept") {
+                accepted = true;
             } else if line == FROM_A_TAP {
                 v4 |= forged;
             }

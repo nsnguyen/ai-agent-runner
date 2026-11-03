@@ -227,6 +227,17 @@ fn a_healthy_host_passes_every_check_in_order() {
     assert!(nat.contains("VMs kept off the host"), "{nat}");
     let pinned = host::firecracker_version();
     assert!(verdict(&report, "firecracker").1.contains(pinned));
+
+    // The range comes from the masquerade rule, wherever nft lists it: the
+    // filters name it after a !=.
+    let (head, filters) = NAT.split_at(NAT.find("\tchain forward").unwrap());
+    let postrouting = head.strip_prefix("table ip runner {\n").unwrap();
+    let filters = filters.strip_suffix("}\n").unwrap();
+    let last = format!("table ip runner {{\n{filters}\n{postrouting}}}\n");
+    let fake = Fake::healthy(store.root()).cmd(&list_nat(), ran(true, &last, ""));
+    let nat = verdict(&doctor::check(&fake, &store), "nat");
+    assert_eq!(nat.0, Status::Ok, "{}", nat.1);
+    assert!(nat.1.contains("masquerading 172.16.0.0/16"), "{}", nat.1);
 }
 
 #[test]
@@ -373,6 +384,12 @@ fn nat_warns_when_nothing_keeps_vms_off_the_host() {
     let forged_in = NAT.replace(INPUT, &INPUT.replace(forged, ""));
     let forged_in = fake().cmd(list, ran(true, &forged_in, ""));
     assert_verdict(forged_in, &store, "nat", Status::Warn, "off the host");
+    let late = INPUT
+        .replace(forged, "")
+        .replace("accept\n", &format!("accept\n{forged}"));
+    assert!(late.ends_with("drop\n\t\tiifname \"fc*\" drop\n"), "{late}");
+    let late = fake().cmd(list, ran(true, &NAT.replace(INPUT, &late), ""));
+    assert_verdict(late, &store, "nat", Status::Warn, "off the host");
 
     // Along with a firewall that drops forwarded traffic, it says both.
     let docker = "systemctl is-active docker.service";
