@@ -10,6 +10,11 @@ const UNIT: &str = "etc/systemd/system/runner-guest.service";
 const WANTS: &str = "etc/systemd/system/multi-user.target.wants/runner-guest.service";
 const LLM_TXT: &str = ".runner/llm.txt";
 const SETTINGS: &str = "etc/claude-code/managed-settings.json";
+const BUILD: &str = ".runner/build";
+const RECORD: &str = "# What this image was built from: images/base/build.sh wrote it.
+fingerprint=3f2a4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819
+commit=42f0b7d1e2a3
+";
 
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,6 +47,7 @@ fn clean_tree() -> TempDir {
     fs::create_dir_all(root.join("root")).unwrap();
     fs::create_dir_all(root.join(".runner")).unwrap();
     fs::write(root.join(LLM_TXT), b"# You're in a runner VM\n").unwrap();
+    fs::write(root.join(BUILD), RECORD).unwrap();
     // The image's own, as the Dockerfile installs it.
     let settings = root.join(SETTINGS);
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
@@ -138,6 +144,23 @@ fn check_fails_without_the_agent_s_llm_txt() {
     let tree = clean_tree();
     fs::remove_file(tree.path().join(LLM_TXT)).unwrap();
     fails_mentioning(&check(tree.path()), "FAIL  /.runner/llm.txt is missing");
+}
+
+#[test]
+fn check_fails_without_the_build_record() {
+    let tree = clean_tree();
+    fs::remove_file(tree.path().join(BUILD)).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  /.runner/build is missing");
+}
+
+#[test]
+fn check_fails_when_the_build_record_has_no_fingerprint() {
+    let tree = clean_tree();
+    fs::write(tree.path().join(BUILD), "commit=42f0b7d1e2a3\n").unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  /.runner/build has no fingerprint",
+    );
 }
 
 #[test]
@@ -238,10 +261,191 @@ fn llm_txt_says_how_to_checkpoint_and_restore_as_the_runner_does() {
     let dockerfile = fs::read_to_string(script("Dockerfile")).unwrap();
     assert!(dockerfile.contains("COPY llm.txt /.runner/llm.txt"));
     assert!(llm.contains("/.runner/llm.txt"));
+    assert!(
+        llm.contains("/.runner/build"),
+        "llm.txt doesn't say what /.runner/build is"
+    );
     let build = fs::read_to_string(script("build.sh")).unwrap();
     assert!(
         build.contains("\"$here/llm.txt\""),
         "build.sh doesn't copy llm.txt"
+    );
+}
+
+// A copy of images/base, out/ left out, in a temp directory of its own,
+// with a stand-in runner-guest beside it, so a test can change either.
+fn base_copy() -> (TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("images/base");
+    fs::create_dir_all(&base).unwrap();
+    for entry in fs::read_dir(script("")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), base.join(entry.file_name())).unwrap();
+        }
+    }
+    let guest = dir.path().join("runner-guest");
+    fs::write(&guest, b"guest v1").unwrap();
+    // Readable by anyone, for the run as nobody below.
+    for path in [dir.path(), &dir.path().join("images"), &base] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, base, guest)
+}
+
+// `build.sh --fingerprint`, run as nobody when the tests run as root, so it
+// shows it needs no root.
+fn fingerprint(base: &Path, guest: &Path) -> String {
+    fingerprint_with(base, guest, &[])
+}
+
+fn fingerprint_with(base: &Path, guest: &Path, env: &[(&str, &Path)]) -> String {
+    let build = base.join("build.sh");
+    let mut cmd = if nix::unistd::geteuid().is_root() {
+        let mut cmd = Command::new("setpriv");
+        cmd.args(["--reuid=65534", "--regid=65534", "--clear-groups", "bash"]);
+        cmd
+    } else {
+        Command::new("bash")
+    };
+    let out = cmd
+        .arg(&build)
+        .arg("--fingerprint")
+        .env("RUNNER_GUEST", guest)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // The copy has no source beside it to be older than.
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    let print = text(&out.stdout);
+    let print = print.strip_suffix('\n').unwrap_or(&print).to_string();
+    let hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    assert!(print.len() == 64 && print.chars().all(hex), "{print:?}");
+    print
+}
+
+#[test]
+fn the_fingerprint_changes_with_what_the_image_is_made_from_and_nothing_else() {
+    let (dir, base, guest) = base_copy();
+    let first = fingerprint(&base, &guest);
+    assert_eq!(fingerprint(&base, &guest), first);
+
+    // What a build leaves, and what lies outside images/base, don't count.
+    fs::create_dir_all(base.join("out")).unwrap();
+    fs::write(base.join("out/base.ext4"), b"a built disk").unwrap();
+    fs::write(dir.path().join("README.md"), b"elsewhere").unwrap();
+    let llm = base.join("llm.txt");
+    let then = fs::metadata(&llm).unwrap().modified().unwrap();
+    let file = fs::File::options().write(true).open(&llm).unwrap();
+    file.set_modified(then + std::time::Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(fingerprint(&base, &guest), first);
+
+    // A file under images/base does, back to the same print once it's undone.
+    let was = fs::read(&llm).unwrap();
+    fs::write(&llm, b"# You're somewhere else\n").unwrap();
+    let edited = fingerprint(&base, &guest);
+    assert_ne!(edited, first);
+    fs::write(&llm, &was).unwrap();
+    assert_eq!(fingerprint(&base, &guest), first);
+    // So does its mode, a new file, and the kernel pin in build.sh.
+    fs::set_permissions(&llm, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+    fs::set_permissions(&llm, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fingerprint(&base, &guest), first);
+    fs::write(base.join("extra.conf"), b"x").unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+    fs::remove_file(base.join("extra.conf")).unwrap();
+    symlink("llm.txt", base.join("link.txt")).unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+    fs::remove_file(base.join("link.txt")).unwrap();
+    // A build's output elsewhere under images/base doesn't count either.
+    let out = base.join("built");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("base.ext4"), b"a built disk").unwrap();
+    assert_eq!(fingerprint_with(&base, &guest, &[("OUT", &out)]), first);
+    fs::remove_dir_all(&out).unwrap();
+    let build = base.join("build.sh");
+    let sh = fs::read_to_string(&build).unwrap();
+    let pin = sh
+        .lines()
+        .find(|l| l.starts_with("kernel_sha256="))
+        .unwrap();
+    fs::write(&build, sh.replace(pin, "kernel_sha256=00")).unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+    fs::write(&build, &sh).unwrap();
+    assert_eq!(fingerprint(&base, &guest), first);
+
+    // And so does the guest binary.
+    fs::write(&guest, b"guest v2").unwrap();
+    assert_ne!(fingerprint(&base, &guest), first);
+}
+
+// A pull changes the guest's source but not the binary build.sh hashes.
+#[test]
+fn the_fingerprint_warns_of_a_guest_older_than_its_source() {
+    let (dir, base, guest) = base_copy();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let rs = src.join("guest.rs");
+    fs::write(&rs, b"fn main() {}").unwrap();
+    let then = fs::metadata(&guest).unwrap().modified().unwrap();
+    let file = fs::File::options().write(true).open(&rs).unwrap();
+    file.set_modified(then + std::time::Duration::from_secs(60))
+        .unwrap();
+    let out = Command::new("bash")
+        .arg(base.join("build.sh"))
+        .arg("--fingerprint")
+        .env("RUNNER_GUEST", &guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("older than the source"),
+        "{}",
+        text(&out.stderr)
+    );
+    // The print is the same: only the warning says.
+    fs::remove_dir_all(&src).unwrap();
+    assert_eq!(text(&out.stdout).trim(), fingerprint(&base, &guest));
+}
+
+#[test]
+fn the_fingerprint_needs_the_guest_binary() {
+    let (dir, base, _guest) = base_copy();
+    let out = Command::new("bash")
+        .arg(base.join("build.sh"))
+        .arg("--fingerprint")
+        .env("RUNNER_GUEST", dir.path().join("missing"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("no runner-guest"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+}
+
+// build.sh writes the record into the image, with the print --fingerprint
+// gives, before it makes the disk that check.sh, which fails an image
+// without one, looks at.
+#[test]
+fn build_sh_writes_the_record_it_fingerprints() {
+    let build = fs::read_to_string(script("build.sh")).unwrap();
+    let write = build
+        .find("/.runner/build\"")
+        .expect("build.sh doesn't write /.runner/build");
+    let mkfs = build.find("mkfs.ext4 -q").unwrap();
+    assert!(
+        write < mkfs,
+        "build.sh makes the disk before writing the record"
+    );
+    assert!(
+        build.contains("fingerprint=$print"),
+        "build.sh doesn't record its fingerprint"
     );
 }
 

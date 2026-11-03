@@ -4,7 +4,12 @@
 #
 #   cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
 #   sudo images/base/build.sh
-#   runner import base images/base/out/base.ext4
+#   sudo -u runner runner import --replace base - <images/base/out/base.ext4
+#
+# The disk's /.runner/build says what it was built from: a fingerprint of what
+# the image is made from, and the commit. `build.sh --fingerprint` prints the
+# fingerprint alone and builds nothing, needing no root, so a check can hold
+# it against what `runner doctor` says base was built from.
 #
 # Runs as root, so unpacking the image keeps every file's owner and mode.
 # Settings, from the environment:
@@ -26,16 +31,73 @@ kernel_url=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vm
 kernel_sha256=e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
 
 die() { echo "build.sh: $*" >&2; exit 1; }
-
-[[ $(id -u) -eq 0 ]] || die "run as root (sudo), so the disk keeps file owners"
-[[ -x $guest ]] || die "no runner-guest at $guest: build it first with
+need_guest() {
+  [[ -f $guest && -r $guest ]] || die "no runner-guest at $guest: build it first with
   cargo build --release --target x86_64-unknown-linux-musl --bin runner-guest
 or point RUNNER_GUEST at one"
+}
+
+# What the image is made from, as one sha256: every file and link under
+# images/base but the build's output, by path, owner execute bit and
+# contents (a link's target), then the runner-guest binary. That takes in
+# what it copies in or runs, and the kernel pin, which is in this file. Times
+# don't count, nor do files elsewhere. When unsure whether a file counts, it
+# does: a needless rebuild costs minutes, a missed one leaves a stale base.
+fingerprint() {
+  need_guest
+  local files sum skip
+  # OUT may be under images/base too.
+  skip=$(realpath -m -- "$out")
+  skip=./${skip#"$here"/}
+  files=$(
+    cd "$here" || exit
+    find . \( -path ./out -o -path "$skip" \) -prune -o \( -type f -o -type l \) -print0 |
+      LC_ALL=C sort -z |
+      while IFS= read -r -d '' f; do
+        if [[ -L $f ]]; then
+          sum=$(readlink -- "$f" | sha256sum) && mode=---l || exit
+        else
+          sum=$(sha256sum <"$f") && mode=$(stat -c %A -- "$f") || exit
+        fi
+        printf '%s %s %s\n' "${sum%% *}" "${mode:3:1}" "${f#./}"
+      done
+  ) || die "can't read every file under $here"
+  sum=$(sha256sum <"$guest") || die "can't read $guest"
+  printf '%s\n%s x runner-guest\n' "$files" "${sum%% *}" | sha256sum | cut -d' ' -f1
+  # It's of the binary there is, which a pull doesn't rebuild.
+  if [[ -n $(find "$repo/src" "$repo/Cargo.toml" "$repo/Cargo.lock" -newer "$guest" \
+    -print -quit 2>/dev/null) ]]; then
+    echo "build.sh: $guest is older than the source in $repo: rebuild it, or this" \
+      "fingerprint may be of an old one" >&2
+  fi
+}
+
+case $# in
+  0) ;;
+  1) [[ $1 == --fingerprint ]] || die "usage: build.sh [--fingerprint]"
+    fingerprint
+    exit 0 ;;
+  *) die "usage: build.sh [--fingerprint]" ;;
+esac
+
+[[ $(id -u) -eq 0 ]] || die "run as root (sudo), so the disk keeps file owners"
+need_guest
+[[ -x $guest ]] || die "$guest isn't executable"
 engine=${ENGINE:-$(command -v docker || command -v podman || true)}
 [[ -n $engine ]] || die "needs docker or podman"
 for tool in mkfs.ext4 debugfs curl sha256sum tar truncate; do
   command -v "$tool" >/dev/null || die "needs $tool"
 done
+
+# Taken before anything is built, so it's of what this build is made from.
+print=$(fingerprint)
+# As root, git refuses a repo someone else owns unless told it's safe, and
+# status mustn't write root's index into it.
+in_repo() { git -c safe.directory="$repo" -C "$repo" --no-optional-locks "$@" 2>/dev/null; }
+commit=$(in_repo rev-parse --short=12 HEAD) || commit=
+if [[ -n $commit && -n $(in_repo status --porcelain --untracked-files=no) ]]; then
+  commit+=-dirty
+fi
 
 mkdir -p "$out"
 disk=$out/base.ext4
@@ -68,6 +130,13 @@ install -m 0644 /dev/null "$etc/hostname"
 printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' > "$etc/hosts"
 chmod 0644 "$etc/hosts"
 ln -s /proc/net/pnp "$etc/resolv.conf"
+# What it was built from, for `runner import` to note (src/image.rs).
+{
+  echo "# What this image was built from: images/base/build.sh wrote it."
+  echo "fingerprint=$print"
+  [[ -z $commit ]] || echo "commit=$commit"
+} >"$work/root/.runner/build"
+chmod 0644 "$work/root/.runner/build"
 
 echo "== disk ($size)"
 truncate -s "$size" "$work/base.ext4"
@@ -97,8 +166,9 @@ fi
 
 cat <<EOF
 
-Built $disk ($(du -h "$disk" | cut -f1) used of $size) and $kernel.
+Built $disk ($(du -h "$disk" | cut -f1) used of $size) and $kernel,
+fingerprint $print${commit:+ at commit $commit}.
 Next, on the runner host:
-  runner import base $disk
-  install -D -m 0644 $kernel /var/lib/runner/kernel/vmlinux
+  sudo -u runner runner import --replace base - <$disk
+  sudo install -D -m 0644 $kernel /var/lib/runner/kernel/vmlinux
 EOF

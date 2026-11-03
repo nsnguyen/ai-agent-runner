@@ -5,11 +5,12 @@ use runner::creds::{self, Cred};
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::idle::Idle;
+use runner::image;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
-use runner::store::{self, BASE, Config, KEEP, Store, Vm, parse_mem};
+use runner::store::{self, BASE, Config, KEEP, Source, Store, Vm, parse_mem};
 use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
@@ -39,8 +40,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Bring an ext4 disk in as a new VM, usually `base`.
-    Import { name: String, disk: PathBuf },
+    /// Bring an ext4 disk in as a new VM, usually `base`, noted with what its
+    /// /.runner/build says it was built from (`runner doctor` shows base's).
+    Import {
+        name: String,
+        /// The disk, or - to read it from stdin, which needs no read access
+        /// to where it is: `sudo -u runner runner import base - <base.ext4`.
+        disk: PathBuf,
+        /// Put the disk on top of an existing VM's history as a new
+        /// generation, keeping its settings: `runner undo <name>` brings back
+        /// the old one, and forks keep theirs. Refused while the VM is up. A
+        /// name that doesn't exist is imported.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Make a VM whose disk is a copy-on-write fork of another's.
     Create {
         name: String,
@@ -387,7 +400,11 @@ fn main() -> ExitCode {
 
 fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> {
     match cmd {
-        Cmd::Import { name, disk } => show(&store.import(&name, &disk)?),
+        Cmd::Import {
+            name,
+            disk,
+            replace,
+        } => show(&import(&store, &name, &disk, replace)?),
         Cmd::Create {
             name,
             from,
@@ -828,6 +845,26 @@ fn session_row(s: &Session) -> String {
 
 fn show(vm: &Vm) {
     println!("{}", line(vm));
+}
+
+// A disk of `-` is stdin, which a terminal can't be: it would wait for a
+// disk typed in.
+fn import(store: &Store, name: &str, disk: &Path, replace: bool) -> Result<Vm, Box<dyn Error>> {
+    if disk != Path::new("-") {
+        return Ok(image::import(store, name, Source::File(disk), replace)?);
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        let how = format!("runner import {name} - <base.ext4");
+        return Err(format!("stdin is a terminal: send the disk in, as `{how}`").into());
+    }
+    let mut stdin = stdin.lock();
+    Ok(image::import(
+        store,
+        name,
+        Source::Stream(&mut stdin),
+        replace,
+    )?)
 }
 
 fn show_status(status: &VmStatus) {

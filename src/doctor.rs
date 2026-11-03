@@ -226,12 +226,30 @@ fn kernel(host: &impl Host, root: &Path) -> Verdict {
     }
 }
 
+// With what it says it was built from, for a check to hold against
+// `images/base/build.sh --fingerprint`.
 fn base(store: &Store) -> Verdict {
-    match store.get(BASE) {
-        Ok(vm) => ok(format!("gen {}, {} bytes", vm.generation, vm.bytes)),
-        Err(Error::NoVm(_)) => fail("no base VM, which create forks: runner import base <disk>"),
-        Err(e) => fail(e.to_string()),
-    }
+    let vm = match store.get(BASE) {
+        Ok(vm) => vm,
+        Err(Error::NoVm(_)) => {
+            let how = "runner import base - <path/to/base.ext4";
+            return fail(format!("no base VM, which create forks: {how}"));
+        }
+        Err(e) => return fail(e.to_string()),
+    };
+    let built = match store.build(BASE) {
+        Ok(Some(b)) => {
+            let commit = b.commit.map(|c| format!("commit {c}"));
+            let commit = commit.unwrap_or_else(|| "an unknown commit".to_string());
+            format!("built from {} at {commit}", b.fingerprint)
+        }
+        Ok(None) => "build unknown".to_string(),
+        Err(e) => return fail(e.to_string()),
+    };
+    ok(format!(
+        "gen {}, {} bytes, {built}",
+        vm.generation, vm.bytes
+    ))
 }
 
 // Three things have to hold: forwarding on, the unit active, and its rules

@@ -1,7 +1,7 @@
 // The filesystem is the database: each VM is a directory.
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
-//   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, and whether it's a checkpoint and whose
+//   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, whether it's a checkpoint and whose, and what an imported disk says it was built from (image.rs)
 //   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
@@ -28,6 +28,7 @@
 use crate::calls;
 use crate::creds::{self, Cred, DEFAULT};
 use crate::idle::Idle;
+use crate::image::{self, Build};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
 use crate::url::Setting;
 use chrono::{DateTime, SubsecRound, Utc};
@@ -35,7 +36,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +79,9 @@ pub enum Error {
     NoSlot(Subnet),
     #[error("{cmd}: {why}")]
     Command { cmd: String, why: String },
+    /// A disk's stream that ended before the disk did.
+    #[error("{0}")]
+    Cut(String),
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -166,6 +170,16 @@ pub enum Maker {
     Agent,
     /// A run, before it joins the running VM.
     Run,
+}
+
+/// Where a disk brought into the store comes from.
+pub enum Source<'a> {
+    /// A file, which `cp` copies: a reflink where the filesystem has them,
+    /// else a copy that keeps its holes.
+    File(&'a Path),
+    /// A stream, like stdin. Each block of it that's all zeros becomes a
+    /// hole, so a sparse disk stays sparse.
+    Stream(&'a mut dyn Read),
 }
 
 /// A VM's sizes, kernel, idle time and URL as stored: each one left out is
@@ -324,9 +338,16 @@ impl Store {
         }
     }
 
-    /// Brings an ext4 disk in as a new VM, usually `base`.
+    /// Brings an ext4 disk in as a new VM, usually `base`, noted with what
+    /// it says it was built from (image.rs).
     pub fn import(&self, name: &str, disk: &Path) -> Result<Vm> {
-        self.make(name, disk, &Config::default(), "import")
+        self.import_from(name, Source::File(disk))
+    }
+
+    /// `import`, from a file or a stream.
+    pub fn import_from(&self, name: &str, disk: Source) -> Result<Vm> {
+        let note = |disk: &Path| Note::auto("import").built(image::read(disk));
+        self.make(name, disk, &Config::default(), note)
     }
 
     /// A new VM whose disk is a copy-on-write fork of `from`'s current disk,
@@ -339,17 +360,21 @@ impl Store {
     pub fn fork_with(&self, from: &str, name: &str, over: &Config) -> Result<Vm> {
         let src = self.existing(from)?;
         let config = read_config(&src)?.with(over);
-        self.make(
-            name,
-            &disk_of(&src, current(&src)?),
-            &config,
-            &format!("fork of {from}"),
-        )
+        let why = format!("fork of {from}");
+        let disk = disk_of(&src, current(&src)?);
+        self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
     }
 
     // Built aside under a dot-name that list skips, then renamed into place, so
     // a create killed partway never takes the name.
-    fn make(&self, name: &str, disk: &Path, config: &Config, why: &str) -> Result<Vm> {
+    // `note` is what the new disk is noted as, given it.
+    fn make(
+        &self,
+        name: &str,
+        disk: Source,
+        config: &Config,
+        note: impl FnOnce(&Path) -> Note,
+    ) -> Result<Vm> {
         check_name(name)?;
         config.check()?;
         let vms = self.vms();
@@ -364,9 +389,9 @@ impl Store {
             .and_then(|()| fs::create_dir(staged.join("gens")))
             .map_err(at(&staged))
             .and_then(|()| self.assign_slot(&staged).map(drop))
-            .and_then(|()| clone(disk, &disk_of(&staged, 0)))
+            .and_then(|()| bring(disk, &disk_of(&staged, 0)))
             .and_then(|()| write_config(&staged, config))
-            .and_then(|()| write_note(&staged, 0, &Note::auto(why)))
+            .and_then(|()| write_note(&staged, 0, &note(&disk_of(&staged, 0))))
             .and_then(|()| write_history(&staged, &[0]))
             // rename won't replace a directory with anything in it, so a
             // create that raced this one keeps its VM. Under the slots lock,
@@ -763,21 +788,46 @@ impl Store {
         read_vm(name, &dir)
     }
 
-    /// Puts a restore staged by Freezer::stage_restore on top of history, as
-    /// `restore` would have: `undo` goes back to the disk from before it.
-    /// Needs the VM stopped.
+    /// Copies `disk` into a new generation of the VM, aside from its
+    /// history, for finish_restore to put on top, as a restore's copy is: a
+    /// disk from outside the VM, which `undo` then goes back from. It's
+    /// noted as `note` once finished, with what the disk says it was built
+    /// from (image.rs), and until then as the owner's checkpoint, which gc
+    /// keeps; drop_restore deletes it. The VM may be up meanwhile, and its
+    /// running checkpoints wait for the copy.
+    pub fn stage_disk(&self, name: &str, disk: Source, note: &str) -> Result<Staged> {
+        let freezer = self.hold_checkpoints(name)?;
+        let from = current(&freezer.dir)?;
+        let generation = freezer.copy(disk, &Note::frozen(Some(note), Maker::Owner))?;
+        let build = image::read(&disk_of(&freezer.dir, generation));
+        Ok(Staged {
+            from,
+            generation,
+            note: Note::auto(note).built(build),
+        })
+    }
+
+    /// Puts a disk staged by Freezer::stage_restore or stage_disk on top of
+    /// history, as `restore` would have: `undo` goes back to the disk from
+    /// before it. Needs the VM stopped.
     pub fn finish_restore(&self, name: &str, staged: &Staged) -> Result<Vm> {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
-        let note = Note::auto(&format!("restore of {}", staged.from));
-        write_note(&dir, staged.generation, &note)?;
+        write_note(&dir, staged.generation, &staged.note.now())?;
         let mut gens = history(&dir)?;
         gens.push(staged.generation);
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
     }
 
-    /// Deletes a staged restore that didn't go ahead.
+    /// What the VM's current disk says it was built from, as noted when it
+    /// came in (image.rs). None if it didn't say, or came in another way.
+    pub fn build(&self, name: &str) -> Result<Option<Build>> {
+        let dir = self.existing(name)?;
+        Ok(read_note(&dir, current(&dir)?)?.and_then(|n| n.build))
+    }
+
+    /// Deletes a staged restore, or a staged disk, that didn't go ahead.
     pub fn drop_restore(&self, name: &str, staged: Staged) -> Result<()> {
         let dir = self.existing(name)?;
         remove_if_there(&disk_of(&dir, staged.generation))?;
@@ -876,8 +926,7 @@ impl Run {
         let mut gens = history(&self.dir)?;
         gens.push(self.generation);
         if let Some(staged) = restore {
-            let note = Note::auto(&format!("restore of {}", staged.from));
-            write_note(&self.dir, staged.generation, &note)?;
+            write_note(&self.dir, staged.generation, &staged.note.now())?;
             gens.push(staged.generation);
         }
         write_history(&self.dir, &gens)?;
@@ -1002,7 +1051,7 @@ impl Freezer {
     fn freeze_noted(&self, note: Note) -> Result<Checkpoint> {
         let booted = read_booted(&self.dir)?;
         let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
-        let id = self.copy(booted.generation, &note)?;
+        let id = self.copy(Source::File(&disk_of(&self.dir, booted.generation)), &note)?;
         read_checkpoint(&self.dir, id, Some(note), false)
     }
 
@@ -1013,16 +1062,18 @@ impl Freezer {
     /// Store::finish_restore puts it in history; drop_restore deletes it.
     pub fn stage_restore(&self, id: u64) -> Result<Staged> {
         check_restorable(&self.name, &self.dir, id)?;
-        let note = Note::frozen(Some(&format!("restore of {id}")), Maker::Owner);
-        let generation = self.copy(id, &note)?;
+        let why = format!("restore of {id}");
+        let note = Note::frozen(Some(&why), Maker::Owner);
+        let generation = self.copy(Source::File(&disk_of(&self.dir, id)), &note)?;
         Ok(Staged {
             from: id,
             generation,
+            note: Note::auto(&why),
         })
     }
 
-    // A copy of generation `from` under a new number, with its note.
-    fn copy(&self, from: u64, note: &Note) -> Result<u64> {
+    // A copy of `from` under a new number, with its note.
+    fn copy(&self, from: Source, note: &Note) -> Result<u64> {
         let gens = self.dir.join("gens");
         for left in numbered(&self.dir, PART)? {
             let part = part_of(&self.dir, left);
@@ -1034,7 +1085,7 @@ impl Freezer {
         let id = next_generation(&self.dir)?;
         write_note(&self.dir, id, note)?;
         let (part, disk) = (part_of(&self.dir, id), disk_of(&self.dir, id));
-        let made = clone(&disk_of(&self.dir, from), &part)
+        let made = bring(from, &part)
             .and_then(|()| fs::rename(&part, &disk).map_err(at(&disk)))
             .and_then(|()| sync_dir(&gens));
         if let Err(e) = made {
@@ -1115,13 +1166,16 @@ pub struct Slept {
 const SLEPT: &str = "slept.json";
 
 /// A restore's copy of a checkpoint, made while the VM still ran
-/// (Freezer::stage_restore).
+/// (Freezer::stage_restore), or a disk from outside it (Store::stage_disk).
 #[derive(Debug)]
 pub struct Staged {
-    /// The checkpoint it's a copy of.
+    /// The checkpoint it's a copy of; for a staged disk, the generation that
+    /// was current when it was staged.
     pub from: u64,
     /// The copy's own generation.
     pub generation: u64,
+    // What it's noted as once it's in history.
+    note: Note,
 }
 
 // What `restore` takes: a checkpoint, or a generation in history, whose disk
@@ -1443,7 +1497,7 @@ fn read_booted(dir: &Path) -> Result<Option<Booted>> {
     Ok(Some(booted))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Note {
     time: DateTime<Utc>,
     comment: Option<String>,
@@ -1455,6 +1509,10 @@ struct Note {
     // owner's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     run: bool,
+    // What an imported or staged disk says it was built from (image.rs).
+    // Left out when unknown, as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<Build>,
 }
 
 impl Note {
@@ -1466,6 +1524,19 @@ impl Note {
             auto: true,
             agent: false,
             run: false,
+            build: None,
+        }
+    }
+
+    fn built(self, build: Option<Build>) -> Note {
+        Note { build, ..self }
+    }
+
+    // The same, made now.
+    fn now(&self) -> Note {
+        Note {
+            time: now(),
+            ..self.clone()
         }
     }
 
@@ -1477,6 +1548,7 @@ impl Note {
             auto: false,
             agent: by == Maker::Agent,
             run: by == Maker::Run,
+            build: None,
         }
     }
 }
@@ -1514,6 +1586,7 @@ fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Re
             auto: true,
             agent: false,
             run: false,
+            build: None,
         },
     };
     Ok(Checkpoint {
@@ -1612,6 +1685,84 @@ fn numbered(dir: &Path, suffix: &str) -> Result<Vec<u64>> {
         out.extend(n);
     }
     Ok(out)
+}
+
+// A disk into `to`, from wherever it comes.
+fn bring(disk: Source, to: &Path) -> Result<()> {
+    match disk {
+        Source::File(from) => clone(from, to),
+        Source::Stream(from) => {
+            let len = write_sparse(from, to)?;
+            if len == 0 {
+                return Err(Error::Cut(
+                    "the stream was empty, so no disk came in".into(),
+                ));
+            }
+            match image::ext4_size(to) {
+                Some(want) if want > len => Err(Error::Cut(format!(
+                    "the stream ended at {len} bytes, but the ext4 superblock it starts \
+                     with says {want}: was it cut off?"
+                ))),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+// A stream into a new file at `to`, leaving a hole wherever a block is all
+// zeros, so a sparse disk that comes in as a stream stays sparse. As clone
+// leaves a copy: writable, and synced. Returns its length.
+fn write_sparse(from: &mut dyn Read, to: &Path) -> Result<u64> {
+    const BLOCK: usize = 4096;
+    let mut file = File::create(to).map_err(at(to))?;
+    let mut buf = vec![0; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        let n = fill(from, &mut buf).map_err(at(to))?;
+        if n == 0 {
+            break;
+        }
+        // Runs of data blocks are written whole, and runs of zeros skipped.
+        let zeros = |b: &[u8]| b.iter().fold(0, |a, &x| a | x) == 0;
+        let next = |i: usize| (i + BLOCK).min(n);
+        let mut start = 0;
+        while start < n {
+            let hole = zeros(&buf[start..next(start)]);
+            let mut stop = next(start);
+            while stop < n && zeros(&buf[stop..next(stop)]) == hole {
+                stop = next(stop);
+            }
+            let run = &buf[start..stop];
+            match hole {
+                true => file.seek(SeekFrom::Current(run.len() as i64)).map(drop),
+                false => file.write_all(run),
+            }
+            .map_err(at(to))?;
+            start = stop;
+        }
+        len += n as u64;
+    }
+    // A stream that ends in zeros ends in a hole, which only the length
+    // keeps.
+    file.set_len(len)
+        .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o644)))
+        .and_then(|()| file.sync_all())
+        .map_err(at(to))?;
+    Ok(len)
+}
+
+// Reads until `buf` is full or the stream ends: a pipe gives what it has.
+fn fill(from: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match from.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
 }
 
 // GNU cp does the copying: a reflink on XFS or btrfs, which takes constant

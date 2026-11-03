@@ -40,7 +40,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
    ```
    The unit loads `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` from `/etc/credstore/` at each boot, and skips one that isn't there. That needs systemd 251 or later (Debian 12, Ubuntu 24.04); an older one loads nothing, and `runner logs` says the token is missing. An API key goes in `ANTHROPIC_API_KEY` the same way, and is used only without the token. A GitHub token in `GH_TOKEN` reaches only VMs given it with `runner creds <vm> claude github`. Each VM's guest gets its credentials from boot over vsock and keeps them in memory: `runner status dev` says which it took, and `runner logs dev` names any the host lacks. Only a runner-guest from this version on asks for them: rebuild `base` (images/base), then make VMs from it. A VM forked from an older base keeps its older guest, and gets none.
 
-Then: `runner import base rootfs.ext4 && runner create dev && runner start dev && runner logs dev`.
+Then: `runner import base rootfs.ext4 && runner create dev && runner start dev && runner logs dev`. A new base later goes on top of the old one: `runner import --replace base - <rootfs.ext4`, with base stopped, and `runner undo base` brings the old one back (README.md, Build the base image).
 
 The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own root, but systemd boots the one in the unit's.
 
