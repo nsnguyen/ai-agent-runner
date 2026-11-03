@@ -515,8 +515,9 @@ fn the_boot_serves_the_url_on_the_tailnet_address_only() {
 
     // Held in use while a connection is open. The last connection's thread
     // can still hold the VM after its client has the reply, so wait for it to
-    // let go, or the look below sees that one and `held` wakes the VM late,
-    // in the middle of the count from off the tailnet.
+    // let go, or the look below could see that one instead of `held`. Then
+    // wait for `held`'s own wake, so none comes during the count from off the
+    // tailnet.
     let quiet = || {
         Uses::open(&store, "dev")
             .unwrap()
