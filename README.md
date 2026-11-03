@@ -68,7 +68,7 @@ rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.
 client/aws.sh ssh 'cd ai-agent-runner && host/check.sh'
 ```
 
-`host/check.sh` installs the new build, rebuilds base and imports it only when what it's made from changed, checks that `runner doctor` is all `ok`, and runs every boot test, with a `PASS` or `FAIL` line for each: about 12 minutes, and about 10 more when base is rebuilt. It ends with a count and its log's path on the host, and exits 1 on any `FAIL`. docs/host.md (Boot tests) says more.
+`host/check.sh` installs the new build. It rebuilds and imports base only when what base is made from changed. Then it checks that `runner doctor` is all `ok` and runs every boot test. Each step and test gets a `PASS` or `FAIL` line. It takes about 12 minutes, and about 10 more when base is rebuilt. It ends with a count and its log's path on the host, and exits 1 on any `FAIL`. docs/host.md (Boot tests) says more.
 
 ### When something's off
 

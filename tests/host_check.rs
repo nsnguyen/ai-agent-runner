@@ -44,10 +44,12 @@ exec "$@"
 "#;
 
 // host-fp is the fingerprint the host's base was built from: none, no base.
-// doctor-extra is a line to add to doctor's. An import takes on the disk's
+// doctor-extra is a line to add to doctor's, and doctor-silent makes it
+// print nothing. An import takes on the disk's
 // record, unless import-fails or import-keeps.
 const FAKE_RUNNER: &str = r#"case "$1" in
 doctor)
+  [ ! -e "$FAKE/doctor-silent" ] || exit 1
   echo "ok    kvm          /dev/kvm opens read-write"
   if [ -e "$FAKE/host-fp" ]; then
     echo "ok    base         gen 3, 4096 bytes, built from $(cat "$FAKE/host-fp") at commit 0123456789ab"
@@ -150,6 +152,46 @@ Caused by:
   process didn't exit successfully: `target/debug/deps/kvm-2959d868bbe323b9 --ignored --test-threads=1` (signal: 6, SIGABRT: process abort signal)
 error: 1 target failed:
     `--test kvm`
+";
+
+// A crash after a failure, and before the binary's last test.
+const FAILS_THEN_CRASHES: &str = "     Running tests/kvm.rs (target/debug/deps/kvm-2959d868bbe323b9)
+
+running 3 tests
+test a_vm_boots_and_answers_exec ... FAILED
+test sleep_and_wake_keep_a_process ... error: test failed, to rerun pass `--test kvm`
+
+Caused by:
+  process didn't exit successfully: `target/debug/deps/kvm-2959d868bbe323b9 --ignored --test-threads=1` (signal: 6, SIGABRT: process abort signal)
+error: 1 target failed:
+    `--test kvm`
+";
+
+// The binary never got to run a test: sudo turned it down.
+const BINARY_FAILS: &str = "     Running tests/kvm.rs (target/debug/deps/kvm-2959d868bbe323b9)
+sudo: a terminal is required to read the password
+error: test failed, to rerun pass `--test kvm`
+
+Caused by:
+  process didn't exit successfully: `sudo -E target/debug/deps/kvm-2959d868bbe323b9 --ignored --test-threads=1` (exit status: 1)
+error: 1 target failed:
+    `--test kvm`
+";
+
+// A child line that is just "ok" takes the test's verdict; the counts catch it.
+const CHILD_SAYS_OK: &str = "     Running tests/kvm.rs (target/debug/deps/kvm-2959d868bbe323b9)
+
+running 1 test
+test a_vm_boots_and_answers_exec ... child-out
+ok
+FAILED
+
+failures:
+    a_vm_boots_and_answers_exec
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.34s
+
+error: test failed, to rerun pass `--test kvm`
 ";
 
 const DOESNT_BUILD: &str = "   Compiling runner v0.1.0 (/home/ubuntu/ai-agent-runner)
@@ -282,7 +324,7 @@ impl Host {
             .env("PATH", path)
             .env("HOME", self.path("home"))
             .env("FAKE", self.path("fake"))
-            .env("RUNNER_ROOT", self.path("root"))
+            .env("CHECK_RUNNER_ROOT", self.path("root"))
             .env_remove("FORCE_BASE")
             .env_remove("ENGINE")
             .envs(env.iter().copied())
@@ -613,6 +655,64 @@ fn a_test_whose_verdict_lands_after_a_child_s_output_still_gets_its_line() {
     line(&stdout, "PASS", "kvm: a_vm_boots_and_answers_exec");
     line(&stdout, "FAIL", "kvm: sleep_and_wake_keep_a_process");
     assert_eq!(count(&stdout, "FAIL"), 1, "{stdout}");
+}
+
+#[test]
+fn a_crash_after_a_failure_is_a_fail_and_so_are_the_tests_it_kept_from_running() {
+    let host = Host::new();
+    host.has("test-output", FAILS_THEN_CRASHES);
+    host.has("test-exit", "101");
+    let stdout = fails(&host.run());
+    line(&stdout, "FAIL", "kvm: a_vm_boots_and_answers_exec");
+    line(&stdout, "FAIL", "kvm: sleep_and_wake_keep_a_process");
+    assert!(
+        line(&stdout, "FAIL", "kvm: 1").contains("didn't run"),
+        "{stdout}"
+    );
+    assert_eq!(count(&stdout, "FAIL"), 3, "{stdout}");
+    assert_eq!(count(&stdout, "PASS"), 5, "{stdout}");
+}
+
+#[test]
+fn a_test_binary_that_fails_before_any_test_is_a_fail() {
+    let host = Host::new();
+    host.has("test-output", BINARY_FAILS);
+    host.has("test-exit", "101");
+    let stdout = fails(&host.run());
+    assert!(line(&stdout, "FAIL", "kvm").contains("binary"), "{stdout}");
+    assert_eq!(count(&stdout, "FAIL"), 1, "{stdout}");
+}
+
+#[test]
+fn a_failure_its_line_missed_is_caught_by_the_count() {
+    let host = Host::new();
+    host.has("test-output", CHILD_SAYS_OK);
+    host.has("test-exit", "101");
+    let stdout = fails(&host.run());
+    assert!(
+        line(&stdout, "FAIL", "kvm: 1").contains("more failed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_cargo_test_that_fails_after_every_test_passed_is_a_fail() {
+    let host = Host::new();
+    host.has("test-exit", "101");
+    let stdout = fails(&host.run());
+    assert!(line(&stdout, "FAIL", "tests").contains("101"), "{stdout}");
+    line(&stdout, "PASS", "kvm: a_vm_boots_and_answers_exec");
+}
+
+#[test]
+fn a_doctor_that_prints_nothing_is_a_fail() {
+    let host = Host::new();
+    host.has("doctor-silent", "");
+    let stdout = fails(&host.run());
+    assert!(
+        line(&stdout, "FAIL", "doctor").contains("nothing"),
+        "{stdout}"
+    );
 }
 
 #[test]

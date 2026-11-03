@@ -28,8 +28,9 @@ repo=$(dirname "$here")
 out=$repo/images/base/out
 disk=$out/base.ext4
 kernel=$out/vmlinux
-# RUNNER_ROOT is for tests: sudo drops it, so doctor never sees it.
-root=${RUNNER_ROOT:-/var/lib/runner}
+# For tests only. Not RUNNER_ROOT: sudo drops that, so doctor and import
+# would be looking somewhere else.
+root=${CHECK_RUNNER_ROOT:-/var/lib/runner}
 port=10022 # runner-guest's vsock port (src/proto.rs)
 
 if (($# > 1)); then
@@ -151,16 +152,23 @@ elif ((failed == was)); then
   pass "doctor: every line ok"
 fi
 
-# 4. tests, a line each as it ends. One that ends with no verdict on its line
-# (it crashed, or a child wrote to its stdout) is settled by its binary's
-# counts.
+# 4. tests, a line each as it ends. One whose verdict isn't on its line (a
+# child wrote to its stdout) is settled by its binary's counts, and one whose
+# binary stops under it fails, as do the tests it never got to.
 bin=
 pending=
-bin_failed=0
 ran=0
 was=$failed
+start() { # the binary's name
+  settle
+  bin=$1
+  bin_total=0
+  bin_seen=0
+  bin_failed=0
+}
 verdict() { # ok|FAILED NAME [why]
   ran=$((ran + 1))
+  bin_seen=$((bin_seen + 1))
   if [[ $1 == ok ]]; then
     pass "$bin: $2"
   else
@@ -168,11 +176,24 @@ verdict() { # ok|FAILED NAME [why]
     fail "$bin: $2${3:+ ($3)}"
   fi
 }
-settle() { # [how many of the binary's tests failed]
+settle() { # [how many of the binary's tests failed, if it said]
   [[ -n $pending ]] || return 0
-  if ((${1:-1} > bin_failed)); then verdict FAILED "$pending" "no result: see the log"; else verdict ok "$pending"; fi
+  if (($# == 0)) || (($1 > bin_failed)); then
+    verdict FAILED "$pending" "no result: see the log"
+  else
+    verdict ok "$pending"
+  fi
   pending=
 }
+stopped() { # cargo says the binary failed
+  settle
+  if ((bin_seen < bin_total)); then
+    fail "$bin: $((bin_total - bin_seen)) more didn't run: the binary stopped, see the log"
+  elif ((bin_failed == 0)); then
+    fail "$bin: the test binary failed: see the log"
+  fi
+}
+start ""
 printf '\n== tests\n' >>"$log"
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$disk \
   RUNNER_TEST_KERNEL=$kernel RUNNER_GUEST_PORT=$port \
@@ -180,18 +201,16 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$disk \
   tee -a "$log" |
   while IFS= read -r line; do
     if [[ $line =~ ^\ +Running\ (unittests\ )?([^ ]+) ]]; then
-      settle
-      bin=$(basename "${BASH_REMATCH[2]}" .rs)
-      bin_failed=0
+      start "$(basename "${BASH_REMATCH[2]}" .rs)"
     elif [[ $line =~ ^\ +Doc-tests\  ]]; then
-      settle
-      bin=doc
-      bin_failed=0
+      start doc
+    elif [[ $line =~ ^running\ ([0-9]+)\ tests?$ ]]; then
+      bin_total=${BASH_REMATCH[1]}
     elif [[ $line =~ ^test\ (.+)\ \.\.\.\ (ok|FAILED|ignored)$ ]]; then
       [[ ${BASH_REMATCH[2]} == ignored ]] || verdict "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
     elif [[ $line =~ ^test\ ([^ ]+)\ \.\.\.\ (.*)$ ]]; then
       pending=${BASH_REMATCH[1]}
-      [[ ${BASH_REMATCH[2]} != *"error: test failed"* ]] || settle
+      [[ ${BASH_REMATCH[2]} != *"error: test failed"* ]] || stopped
     elif [[ -n $pending && ($line == ok || $line == FAILED) ]]; then
       verdict "$line" "$pending"
       pending=
@@ -201,8 +220,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$disk \
         fail "$bin: $((BASH_REMATCH[1] - bin_failed)) more failed: see the log"
       fi
     elif [[ $line =~ ^error:\ test\ failed ]]; then
-      settle
-      ((bin_failed > 0)) || fail "$bin: the test binary failed: see the log"
+      stopped
     elif [[ $line =~ ^error:\ could\ not\ compile\ .*\((.+)\) ]]; then
       what=${BASH_REMATCH[1]}
       [[ ! $what =~ ^test\ \"(.+)\"( |$) ]] || what=${BASH_REMATCH[1]}
