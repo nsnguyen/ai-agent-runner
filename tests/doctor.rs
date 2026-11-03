@@ -289,6 +289,51 @@ fn kernel_fails_when_missing_or_empty() {
     assert_verdict(empty, &store, "kernel", Status::Fail, "empty");
 }
 
+// An ext4 disk made with mkfs.ext4 -d (e2fsprogs, no root), with `record`
+// as its /.runner/build, or none.
+fn ext4(dir: &Path, record: Option<&str>) -> PathBuf {
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join(".runner")).unwrap();
+    if let Some(record) = record {
+        fs::write(tree.join(".runner/build"), record).unwrap();
+    }
+    let disk = dir.join("base.ext4");
+    let out = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .arg(&tree)
+        .arg(&disk)
+        .arg("16M")
+        .output()
+        .expect("mkfs.ext4 from e2fsprogs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    disk
+}
+
+#[test]
+fn base_says_what_it_was_built_from_or_that_it_is_unknown() {
+    let print = "3f2a4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("root"));
+    let record = format!("fingerprint={print}\ncommit=42f0b7d1e2a3\n");
+    store
+        .import("base", &ext4(dir.path(), Some(&record)))
+        .unwrap();
+    let fake = Fake::healthy(store.root());
+    let report = assert_verdict(fake, &store, "base", Status::Ok, print);
+    let detail = verdict(&report, "base").1;
+    assert!(detail.contains("at commit 42f0b7d1e2a3"), "{detail}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("root"));
+    store.import("base", &ext4(dir.path(), None)).unwrap();
+    let fake = Fake::healthy(store.root());
+    assert_verdict(fake, &store, "base", Status::Ok, "build unknown");
+}
+
 #[test]
 fn base_fails_until_one_is_imported() {
     let dir = tempfile::tempdir().unwrap();
