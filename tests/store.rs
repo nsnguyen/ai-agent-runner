@@ -2,7 +2,7 @@
 use chrono::SubsecRound;
 use runner::creds::{Cred, DEFAULT};
 use runner::store::{
-    Booted, Checkpoint, Config, Error, KEEP_CHECKPOINTS, Machine, Maker, Slept, Store, Vm,
+    Booted, Checkpoint, Config, Error, KEEP_CHECKPOINTS, Machine, Maker, Slept, Source, Store, Vm,
     check_name, parse_mem,
 };
 use std::fs;
@@ -1062,6 +1062,69 @@ fn a_staged_restore_goes_into_history_only_once_finished() {
             .iter()
             .all(|c| c.id != generation)
     );
+}
+
+#[test]
+fn a_staged_disk_goes_on_top_of_history_once_finished() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"old")).unwrap();
+    let new = dir.path().join("new.ext4");
+    fs::write(&new, b"the new one").unwrap();
+    let staged = store
+        .stage_disk("base", Source::File(&new), "import")
+        .unwrap();
+    assert_eq!((staged.from, staged.generation), (0, 1));
+    assert_eq!(
+        fs::read(gen_disk(dir.path(), "base", 1)).unwrap(),
+        b"the new one"
+    );
+    // Not current until finished, and kept meanwhile, as a restore's copy is.
+    assert_eq!(store.get("base").unwrap(), vm("base", 0, 3));
+    let spare = store.clone().keeping(0);
+    assert!(spare.gc("base", true).unwrap().generations.is_empty());
+    assert_eq!(
+        store.finish_restore("base", &staged).unwrap(),
+        vm("base", 1, 11)
+    );
+    let listed = store.checkpoints("base").unwrap();
+    assert_eq!(summary(&listed)[0], (1, true, Some("import"), true));
+    assert_eq!(store.undo("base").unwrap(), vm("base", 0, 3));
+
+    // From a stream, the same, and one dropped leaves nothing behind.
+    let mut stream: &[u8] = b"streamed";
+    let staged = store
+        .stage_disk("base", Source::Stream(&mut stream), "import")
+        .unwrap();
+    let generation = staged.generation;
+    assert_eq!(
+        fs::read(gen_disk(dir.path(), "base", generation)).unwrap(),
+        b"streamed"
+    );
+    store.drop_restore("base", staged).unwrap();
+    assert!(!gen_disk(dir.path(), "base", generation).exists());
+    let listed = store.checkpoints("base").unwrap();
+    assert!(listed.iter().all(|c| c.id != generation));
+    assert!(matches!(
+        store.stage_disk("nope", Source::File(&new), "import"),
+        Err(Error::NoVm(n)) if n == "nope"
+    ));
+}
+
+#[test]
+fn a_staged_disk_is_refused_at_its_finish_while_the_vm_is_held() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"old")).unwrap();
+    let new = dir.path().join("new.ext4");
+    fs::write(&new, b"new").unwrap();
+    let staged = store
+        .stage_disk("base", Source::File(&new), "import")
+        .unwrap();
+    let run = store.begin_run("base").unwrap();
+    assert!(matches!(
+        store.finish_restore("base", &staged),
+        Err(Error::Busy(_))
+    ));
+    run.discard();
 }
 
 #[test]
