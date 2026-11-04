@@ -22,6 +22,7 @@
 // `an_open_proxy_keeps_its_vm_awake`,
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
+// `an_imported_export_boots_with_its_files_and_services`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
 // `a_vm_reaches_the_internet_but_not_the_host`,
 // `claude_keeps_running_after_a_detach`,
@@ -474,6 +475,71 @@ fn a_service_answers_again_after_a_stop_and_start() {
         "no services\n"
     );
     assert!(!answers());
+}
+
+// Exported and imported under another name on the same host, as a move to
+// another host would: the copy boots with the file, and its service answers
+// at the copy's own address.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_imported_export_boots_with_its_files_and_services() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("export-test-{}", std::process::id());
+    let copy = format!("import-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let _copy_cleanup = Cleanup {
+        root: root.clone(),
+        name: copy.clone(),
+    };
+    let write = "echo kept > /home/agent/work/kept.txt";
+    ok(runner(&root, &["exec", &name, "--", "sh", "-c", write]));
+    let mut add = vec!["service", "add", &name, "web", "--"];
+    add.extend(["python3", "-m", "http.server", "8080"]);
+    ok(runner(&root, &add));
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    let answers = |at: &str| http_status(at, 8080).is_some_and(|l| l.ends_with(" 200 OK"));
+    eventually("the service to answer", || answers(&address));
+    ok(runner(&root, &["stop", &name]));
+
+    // Through a file root writes and reads, as the laptop's pipe would carry it.
+    let tar = tempfile::NamedTempFile::new_in("/var/tmp").unwrap();
+    let exported = cli(&root)
+        .args(["export", &name])
+        .stdout(tar.reopen().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let imported = cli(&root)
+        .args(["import", &copy, "-"])
+        .stdin(tar.reopen().unwrap())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&imported.stderr);
+    assert!(imported.status.success(), "{said}");
+    assert!(
+        said.contains(&format!("imported {name}'s export as {copy}")),
+        "{said}"
+    );
+
+    let there = ok(runner(&root, &["ip", &copy])).trim().to_string();
+    assert_ne!(there, address);
+    let kept = ok(runner(
+        &root,
+        &["exec", &copy, "--", "cat", "/home/agent/work/kept.txt"],
+    ));
+    assert_eq!(kept, "kept\n");
+    eventually("the copy's service to answer at its address", || {
+        answers(&there)
+    });
+    assert!(!answers(&address), "the original is up");
 }
 
 // The URL, from the host itself through its tailnet address, so Tailscale has
