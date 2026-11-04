@@ -962,6 +962,30 @@ fn a_kernel_this_host_lacks_is_kept_and_named() {
     let config = host.store().config("dev2").unwrap();
     assert_eq!(config.kernel, Some(PathBuf::from("/no/such/vmlinux")));
     assert_eq!(config.cpus, Some(4));
+    // Its settings still change: only its boot needs the kernel.
+    assert_eq!(host.ok(&["idle", "dev2", "30m"]), "dev2  idle 30m\n");
+    assert_eq!(
+        host.ok(&["url", "dev2", "off"]),
+        "dev2's URL is off: `runner url dev2 on` turns it on\n"
+    );
+    let config = host.store().config("dev2").unwrap();
+    assert_eq!(config.kernel, Some(PathBuf::from("/no/such/vmlinux")));
+    assert!(config.url.unwrap().off);
+    // A fork is a create, which wants a kernel it can boot: one named here.
+    let out = host
+        .runner(&["create", "dev3", "--from", "dev2"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("no kernel file at /no/such/vmlinux"), "{err}");
+    let here = host.path("vmlinux");
+    fs::write(&here, b"kernel").unwrap();
+    let here = here.display().to_string();
+    host.ok(&["create", "dev3", "--from", "dev2", "--kernel", &here]);
+    let config = host.store().config("dev3").unwrap();
+    assert_eq!(config.kernel, Some(PathBuf::from(&here)));
+    assert_eq!(config.cpus, Some(4));
 }
 
 #[test]

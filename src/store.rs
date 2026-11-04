@@ -583,12 +583,13 @@ impl Store {
     }
 
     // Changes one setting in the VM's config, keeping the rest, and writes it
-    // whole, so a boot reading it sees the old one or the new.
+    // whole, so a boot reading it sees the old one or the new. An imported
+    // VM's kernel needn't be on this host: only its boot needs it.
     fn set_config(&self, name: &str, change: impl FnOnce(&mut Config)) -> Result<()> {
         let dir = self.existing(name)?;
         let mut config = read_config(&dir)?;
         change(&mut config);
-        config.check()?;
+        config.check_values()?;
         let path = dir.join(CONFIG);
         let mut text =
             serde_json::to_string(&config).map_err(|e| at(&path)(io::Error::other(e)))?;
