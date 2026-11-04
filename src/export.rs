@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufWriter, Write};
 use tar::{Builder, EntryType, Header};
 
-/// The manifest's format: an import refuses one it doesn't know.
+/// The manifest's format: an import reads it before the rest, and refuses
+/// one it doesn't know. A field an older import wouldn't know, in the
+/// manifest or its config (which denies unknown fields), bumps it.
 pub const FORMAT: u32 = 1;
 
 /// The stream's first entry, under the VM's name.
@@ -52,8 +54,6 @@ pub struct Manifest {
 pub struct Disk {
     /// Its entry.
     pub path: String,
-    /// Its generation in the VM's history.
-    pub generation: u64,
     /// Its size, holes and all.
     pub bytes: u64,
 }
@@ -108,13 +108,16 @@ pub fn export(store: &Store, name: &str, checkpoints: bool, out: impl Write) -> 
         return Err(Error::Up { vm, state });
     }
     let disks = store.open_disks(name, checkpoints)?;
-    stream(name, disks, out)
+    write(name, disks, out)
 }
 
 // Big writes, so a disk goes out in few syscalls.
 const BUF: usize = 1 << 20;
 
-fn stream(name: &str, disks: Disks, out: impl Write) -> Result<Exported> {
+/// Writes `disks`, as Store::open_disks opened them, to `out` as the export
+/// of `name`. A failure partway leaves the stream cut short, never ended as
+/// a whole one is.
+pub fn write(name: &str, disks: Disks, out: impl Write) -> Result<Exported> {
     let entry = |rest: &str| format!("{name}/{rest}");
     let Disks {
         config,
@@ -124,7 +127,6 @@ fn stream(name: &str, disks: Disks, out: impl Write) -> Result<Exported> {
     } = disks;
     let disk = Disk {
         path: entry("disk.ext4"),
-        generation: current.info.id,
         bytes: current.info.bytes,
     };
     let saved = checkpoints.iter().map(|c| Saved {

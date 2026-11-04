@@ -104,7 +104,7 @@ printf '%s\n' "$*" >>"$HOST_LOG"
 case $1 in
 start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
 ip) printf '%s\n' "${HOST_IP-172.16.0.6}" ;;
-export) cat "$HOST_EXPORT" ;;
+export) [ -z "${HOST_EXPORT-}" ] || cat "$HOST_EXPORT" ;;
 hold)
   [ -z "${HOLD_OLD-}" ] || { echo "error: unrecognized subcommand 'hold'" >&2; exit 2; }
   [ -n "${HOLD_ON-}" ] || exit 0
@@ -154,6 +154,7 @@ esac
             .env_remove("HOST_STDIN")
             .env_remove("HOST_EXIT")
             .env_remove("HOST_IP")
+            .env_remove("HOST_EXPORT")
             .env_remove("TUNNEL_EXIT")
             .stdin(Stdio::null());
         cmd
@@ -275,6 +276,28 @@ fn an_export_piped_from_a_terminal_passes_every_byte_through_without_a_tty() {
             out.stdout.len()
         );
         assert_eq!(text(&out.stderr), "", "{shell:?}");
+    }
+}
+
+// The host refuses an export onto a terminal, so it has to see this one,
+// even with stdin elsewhere: `runner export dev </dev/null`.
+#[test]
+fn an_export_onto_a_terminal_gets_a_tty_even_without_one_on_stdin() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let OpenptyResult {
+            master: _master,
+            slave,
+        } = openpty(None, None).unwrap();
+        let out = laptop
+            .runner(shell, &["export", "dev"])
+            .stdout(Stdio::from(slave))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        ok(&out);
+        let tty = ["-tt", "-o", "LogLevel=ERROR", HOST, "runner export dev"];
+        assert_eq!(laptop.ssh_argv(), tty, "{shell:?}");
     }
 }
 

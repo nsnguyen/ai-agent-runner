@@ -11,12 +11,12 @@ use nix::pty::{OpenptyResult, openpty};
 use nix::unistd::{Whence, lseek};
 use proptest::prelude::*;
 use runner::creds::Cred;
-use runner::export::{FORMAT, Manifest};
+use runner::export::{self, FORMAT, Manifest};
 use runner::store::{Checkpoint, Maker, Slept, Store};
 use runner::url::Setting;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -326,7 +326,6 @@ fn an_export_streams_only_data_and_tar_gives_each_disk_back() {
     assert_eq!(m.config.url.and_then(|u| u.port), Some(3000));
     assert_eq!(m.creds, [Cred::Claude, Cred::Github]);
     assert_eq!(m.disk.path, disks[0]);
-    assert_eq!(m.disk.generation, store.get("dev").unwrap().generation);
     assert_eq!(m.disk.bytes, 2 * GIB);
     let got: Vec<_> = m
         .checkpoints
@@ -469,6 +468,60 @@ fn a_vm_deleted_while_its_export_streams_still_exports_whole() {
     extract(&tar, &dir);
     same(&dir.join("dev/disk.ext4"), &src);
     same(&dir.join(format!("dev/checkpoints/{}.ext4", mine.id)), &src);
+}
+
+// Fails once, at `at` bytes, and takes everything after: what a stream that
+// broke partway would show if anything wrote on.
+struct Flaky {
+    out: Vec<u8>,
+    at: usize,
+    failed: bool,
+}
+
+impl Write for Flaky {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.failed && self.out.len() + buf.len() > self.at {
+            self.failed = true;
+            return Err(io::Error::other("the pipe broke"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// The tar Builder ends the stream as it's dropped; a failed export mustn't,
+// so a reader sees it cut short.
+#[test]
+fn an_export_that_fails_partway_is_left_cut_short_not_ended() {
+    let host = Host::new();
+    let src = host.path("src.ext4");
+    sparse(&src, 64 * MIB, &[(0, 8 * MIB)], 1);
+    host.ok(&["import", "dev", &src.display().to_string()]);
+    let disks = host.store().open_disks("dev", true).unwrap();
+    let mut out = Flaky {
+        out: Vec::new(),
+        at: 4 << 20,
+        failed: false,
+    };
+    let err = export::write("dev", disks, &mut out)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("exporting dev: dev/disk.ext4: the pipe broke"),
+        "{err}"
+    );
+    assert!(out.failed);
+    // It ends in the disk's data, which is never zero, not in tar's end.
+    let tail = &out.out[out.out.len() - 1024..];
+    assert!(tail.iter().all(|&b| b != 0), "it ends in zeros");
+    let tar = host.path("cut.tar");
+    fs::write(&tar, &out.out).unwrap();
+    let listed = Command::new("tar").arg("-tf").arg(&tar).output().unwrap();
+    assert!(!listed.status.success(), "tar took it whole");
 }
 
 // Past 8 GiB, tar's octal fields run out, and GNU tar's base-256 takes over:

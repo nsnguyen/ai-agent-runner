@@ -424,10 +424,11 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             no_checkpoints,
         } => {
             let done = export_to_stdout(&store, &name, !no_checkpoints)?;
-            let checkpoints = done.manifest.checkpoints.len();
+            let n = done.manifest.checkpoints.len();
+            let s = if n == 1 { "" } else { "s" };
             eprintln!(
-                "runner: exported {name}  gen {}  {checkpoints} checkpoints  {} bytes",
-                done.manifest.disk.generation, done.bytes
+                "runner: exported {name}: its disk and {n} checkpoint{s}, {} bytes",
+                done.bytes
             );
         }
         Cmd::Create {
