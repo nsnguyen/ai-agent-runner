@@ -14,6 +14,7 @@ pub mod guest;
 pub mod host;
 pub mod idle;
 pub mod image;
+pub mod import;
 pub mod mcp;
 pub mod net;
 pub mod proto;

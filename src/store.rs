@@ -19,7 +19,7 @@
 //   <root>/vms/<name>/rollback       a run's ask that its boot not commit, naming the run
 //   <root>/vms/<name>/booted         the generations of its latest boot: the one it cloned, and its own
 //   <root>/vms/<name>/runs/          its headless runs: their streams, how each ended, and its result (runs.rs)
-//   <root>/vms/.new-<name>-<pid>/    a VM being created, renamed into place when done
+//   <root>/vms/.new-<name>-<pid>/    a VM being created or imported, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
 //   <root>/slots.lock                flock'd while a slot is picked
@@ -213,8 +213,22 @@ impl Config {
         }
     }
 
-    // Firecracker's limits, checked here so a bad size fails at create, not boot.
+    // Firecracker's limits, checked here so a bad size fails at create, not
+    // boot, and a kernel that's there.
     fn check(&self) -> Result<()> {
+        self.check_values()?;
+        if let Some(kernel) = &self.kernel
+            && !kernel.is_file()
+        {
+            let why = format!("no kernel file at {}", kernel.display());
+            return Err(Error::BadConfig(why));
+        }
+        Ok(())
+    }
+
+    // `check`, but for the kernel only that its path is absolute: an import
+    // keeps one this host lacks.
+    fn check_values(&self) -> Result<()> {
         let bad = |why: String| Err(Error::BadConfig(why));
         if let Some(n) = self.cpus
             && !(1..=32).contains(&n)
@@ -232,16 +246,13 @@ impl Config {
         if self.url.and_then(|u| u.port) == Some(0) {
             return bad("the port a VM's URL goes to is 1 to 65535, not 0".to_string());
         }
-        if let Some(kernel) = &self.kernel {
-            if !kernel.is_absolute() {
-                return bad(format!(
-                    "the kernel path {} isn't absolute",
-                    kernel.display()
-                ));
-            }
-            if !kernel.is_file() {
-                return bad(format!("no kernel file at {}", kernel.display()));
-            }
+        if let Some(kernel) = &self.kernel
+            && !kernel.is_absolute()
+        {
+            return bad(format!(
+                "the kernel path {} isn't absolute",
+                kernel.display()
+            ));
         }
         Ok(())
     }
@@ -365,9 +376,8 @@ impl Store {
         self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
     }
 
-    // Built aside under a dot-name that list skips, then renamed into place, so
-    // a create killed partway never takes the name.
-    // `note` is what the new disk is noted as, given it.
+    // A new VM with `disk` as its only generation, noted as `note` says,
+    // given it.
     fn make(
         &self,
         name: &str,
@@ -377,40 +387,80 @@ impl Store {
     ) -> Result<Vm> {
         check_name(name)?;
         config.check()?;
+        self.make_from(name, config, None, |vm: &NewVm| {
+            let at = vm.disk(0);
+            bring(disk, &at)?;
+            vm.commit(0, &note(&at))
+        })
+    }
+
+    /// Refuses a name that isn't one, or that a VM has, before anything is
+    /// read for it.
+    pub fn check_free(&self, name: &str) -> Result<()> {
+        check_name(name)?;
+        match self.vms().join(name).exists() {
+            true => Err(Error::Exists(name.to_string())),
+            false => Ok(()),
+        }
+    }
+
+    /// A new VM `name`, with `config`, a slot of its own, the allowlist
+    /// `creds` (the default if None), and whatever disks `fill` puts in it,
+    /// one of them made current. Built aside under a dot-name that list
+    /// skips, then renamed into place, so one that fails or is killed
+    /// partway never takes the name and leaves nothing. A kernel in `config`
+    /// needn't be on this host.
+    pub fn make_from<E: From<Error>>(
+        &self,
+        name: &str,
+        config: &Config,
+        creds: Option<&[Cred]>,
+        fill: impl FnOnce(&NewVm) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Vm, E> {
+        check_name(name)?;
+        config.check_values()?;
         let vms = self.vms();
         fs::create_dir_all(&vms).map_err(at(&vms))?;
         sweep_staging(&vms);
         let dir = vms.join(name);
         if dir.exists() {
-            return Err(Error::Exists(name.to_string()));
+            return Err(Error::Exists(name.to_string()).into());
         }
         let staged = vms.join(format!(".new-{name}-{}", std::process::id()));
-        let made = fs::create_dir(&staged)
-            .and_then(|()| fs::create_dir(staged.join("gens")))
-            .map_err(at(&staged))
-            .and_then(|()| self.assign_slot(&staged).map(drop))
-            .and_then(|()| bring(disk, &disk_of(&staged, 0)))
-            .and_then(|()| write_config(&staged, config))
-            .and_then(|()| write_note(&staged, 0, &note(&disk_of(&staged, 0))))
-            .and_then(|()| write_history(&staged, &[0]))
+        let made = (|| -> std::result::Result<(), E> {
+            fs::create_dir(&staged)
+                .and_then(|()| fs::create_dir(staged.join("gens")))
+                .map_err(at(&staged))?;
+            self.assign_slot(&staged)?;
+            write_config(&staged, config)?;
+            if let Some(creds) = creds {
+                write_creds(&staged, creds)?;
+            }
+            fill(&NewVm {
+                dir: staged.clone(),
+            })?;
+            // A VM exists once it has a history, which commit writes.
+            if !staged.join("history").is_file() {
+                let why = "no disk was made current";
+                return Err(invalid(&staged.join("history"), why).into());
+            }
             // rename won't replace a directory with anything in it, so a
             // create that raced this one keeps its VM. Under the slots lock,
             // or a slot scan could miss this VM between its two names.
-            .and_then(|()| {
-                let _slots = self.lock_slots()?;
-                fs::rename(&staged, &dir).map_err(|e| match e.kind() {
-                    io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists => {
-                        Error::Exists(name.to_string())
-                    }
-                    _ => at(&dir)(e),
-                })
-            })
-            .and_then(|()| sync_dir(&vms));
+            let _slots = self.lock_slots()?;
+            fs::rename(&staged, &dir).map_err(|e| match e.kind() {
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists => {
+                    Error::Exists(name.to_string())
+                }
+                _ => at(&dir)(e),
+            })?;
+            Ok(sync_dir(&vms)?)
+        })();
         if made.is_err() {
             let _ = fs::remove_dir_all(&staged);
         }
         made?;
-        read_vm(name, &dir)
+        Ok(read_vm(name, &dir)?)
     }
 
     /// The VM's tap and addresses, from its slot.
@@ -533,12 +583,13 @@ impl Store {
     }
 
     // Changes one setting in the VM's config, keeping the rest, and writes it
-    // whole, so a boot reading it sees the old one or the new.
+    // whole, so a boot reading it sees the old one or the new. An imported
+    // VM's kernel needn't be on this host: only its boot needs it.
     fn set_config(&self, name: &str, change: impl FnOnce(&mut Config)) -> Result<()> {
         let dir = self.existing(name)?;
         let mut config = read_config(&dir)?;
         change(&mut config);
-        config.check()?;
+        config.check_values()?;
         let path = dir.join(CONFIG);
         let mut text =
             serde_json::to_string(&config).map_err(|e| at(&path)(io::Error::other(e)))?;
@@ -866,18 +917,13 @@ impl Store {
     /// next boot, so a running VM doesn't block it.
     pub fn set_creds(&self, name: &str, creds: &[Cred]) -> Result<Vec<Cred>> {
         let dir = self.existing(name)?;
-        let mut creds = creds.to_vec();
-        creds.sort();
-        creds.dedup();
-        let text: String = creds.iter().map(|c| format!("{c}\n")).collect();
-        write_aside(&dir, "creds", &text).map_err(|e| match e {
+        write_creds(&dir, creds).map_err(|e| match e {
             // Deleted between the check and the write.
             Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 Error::NoVm(name.to_string())
             }
             e => e,
-        })?;
-        Ok(creds)
+        })
     }
 
     /// Removes a VM and all its disk generations. Forks of it are unaffected:
@@ -904,6 +950,44 @@ impl Store {
             eprintln!("runner: {name} is deleted, but {}: {e}", doomed.display());
         }
         Ok(vm)
+    }
+}
+
+/// A VM Store::make_from is building, under its staging name: where its
+/// disks go, and what each one is.
+#[derive(Debug)]
+pub struct NewVm {
+    dir: PathBuf,
+}
+
+impl NewVm {
+    /// Where generation `id`'s disk goes.
+    pub fn disk(&self, id: u64) -> PathBuf {
+        disk_of(&self.dir, id)
+    }
+
+    /// Notes generation `id`, its disk in place, as the owner's checkpoint,
+    /// made at `time` with `comment`.
+    pub fn checkpoint(&self, id: u64, time: DateTime<Utc>, comment: Option<&str>) -> Result<()> {
+        settle(&self.disk(id))?;
+        let note = Note {
+            time,
+            ..Note::frozen(comment, Maker::Owner)
+        };
+        write_note(&self.dir, id, &note)
+    }
+
+    /// Makes generation `id`, its disk in place, the current disk, noted as
+    /// made now by `why`, with what it says it was built from (image.rs).
+    pub fn current(&self, id: u64, why: &str) -> Result<()> {
+        let disk = self.disk(id);
+        settle(&disk)?;
+        self.commit(id, &Note::auto(why).built(image::read(&disk)))
+    }
+
+    fn commit(&self, id: u64, note: &Note) -> Result<()> {
+        write_note(&self.dir, id, note)?;
+        write_history(&self.dir, &[id])
     }
 }
 
@@ -1732,6 +1816,16 @@ fn current(dir: &Path) -> Result<u64> {
     gens.last().copied().ok_or_else(empty)
 }
 
+// The allowlist, sorted, each name once, as set_creds leaves it.
+fn write_creds(dir: &Path, creds: &[Cred]) -> Result<Vec<Cred>> {
+    let mut creds = creds.to_vec();
+    creds.sort();
+    creds.dedup();
+    let text: String = creds.iter().map(|c| format!("{c}\n")).collect();
+    write_aside(dir, "creds", &text)?;
+    Ok(creds)
+}
+
 fn write_history(dir: &Path, gens: &[u64]) -> Result<()> {
     let text: String = gens.iter().map(|g| format!("{g}\n")).collect();
     write_aside(dir, "history", &text)
@@ -1879,6 +1973,13 @@ fn fill(from: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
         }
     }
     Ok(n)
+}
+
+// A disk written in place, left as clone leaves a copy: writable, and synced.
+fn settle(disk: &Path) -> Result<()> {
+    fs::set_permissions(disk, fs::Permissions::from_mode(0o644))
+        .and_then(|()| File::open(disk)?.sync_all())
+        .map_err(at(disk))
 }
 
 // GNU cp does the copying: a reflink on XFS or btrfs, which takes constant
