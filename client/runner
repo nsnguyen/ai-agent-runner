@@ -110,6 +110,10 @@ done
 if [ "${1-}" = mcp ]; then
   # No terminal, so stdout carries only JSON-RPC, and no prompt to hang the client.
   exec ssh -T -o BatchMode=yes "$host" "$cmd"
+elif [ "${1-}" = export ] && [ -t 1 ]; then
+  # The host refuses a terminal on an export's stdout, so it has to see this
+  # one, even when stdin isn't one: -tt.
+  exec ssh -tt -o LogLevel=ERROR "$host" "$cmd"
 elif [ -t 0 ] && [ -t 1 ]; then
   # A tty only when typed at one: piped output would get CRLF and stderr mixed in.
   # LogLevel=ERROR drops ssh's "Connection to … closed." after every command.
