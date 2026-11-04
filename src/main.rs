@@ -4,6 +4,7 @@ use runner::claude::{self, Claude};
 use runner::creds::{self, Cred};
 use runner::doctor::{self, System};
 use runner::exec;
+use runner::export;
 use runner::idle::Idle;
 use runner::image;
 use runner::proto::{Exit, Request};
@@ -15,6 +16,7 @@ use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
 use std::io::IsTerminal;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -53,6 +55,18 @@ enum Cmd {
         /// name that doesn't exist is imported.
         #[arg(long)]
         replace: bool,
+    },
+    /// Write a stopped VM to stdout as one tar stream, to keep anywhere: its
+    /// current disk, your checkpoints, its settings and its allowlist's
+    /// names, with a manifest first. Disks go sparse, so only the data on them
+    /// streams, and `tar -xf` reads it. Services are on its disk, so they
+    /// come too; its sleep snapshot, runs and undo history don't. Pipe it on:
+    /// `runner export dev > dev.tar`, or `| zstd`.
+    Export {
+        name: String,
+        /// Only the current disk, without your checkpoints.
+        #[arg(long)]
+        no_checkpoints: bool,
     },
     /// Make a VM whose disk is a copy-on-write fork of another's.
     Create {
@@ -405,6 +419,17 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             disk,
             replace,
         } => show(&import(&store, &name, &disk, replace)?),
+        Cmd::Export {
+            name,
+            no_checkpoints,
+        } => {
+            let done = export_to_stdout(&store, &name, !no_checkpoints)?;
+            let checkpoints = done.manifest.checkpoints.len();
+            eprintln!(
+                "runner: exported {name}  gen {}  {checkpoints} checkpoints  {} bytes",
+                done.manifest.disk.generation, done.bytes
+            );
+        }
         Cmd::Create {
             name,
             from,
@@ -865,6 +890,25 @@ fn import(store: &Store, name: &str, disk: &Path, replace: bool) -> Result<Vm, B
         Source::Stream(&mut stdin),
         replace,
     )?)
+}
+
+// A terminal on stdout would get the disks typed out on it. The stream goes
+// to a copy of stdout's fd, which Rust's stdout would line-buffer.
+fn export_to_stdout(
+    store: &Store,
+    name: &str,
+    checkpoints: bool,
+) -> Result<export::Exported, Box<dyn Error>> {
+    let stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        let how = format!("runner export {name} > {name}.tar");
+        return Err(format!(
+            "stdout is a terminal: send the export to a file or a pipe, as `{how}`"
+        )
+        .into());
+    }
+    let out = std::fs::File::from(stdout.as_fd().try_clone_to_owned()?);
+    Ok(export::export(store, name, checkpoints, out)?)
 }
 
 fn show_status(status: &VmStatus) {

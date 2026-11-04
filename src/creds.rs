@@ -7,7 +7,7 @@
 // `vsock.sock_<PORT>` in the VM's directory, where `runner boot` hands it the
 // VM's keyring (`send`, then `receive` in the guest).
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -20,7 +20,9 @@ use std::str::FromStr;
 pub const PORT: u32 = 10023;
 
 /// A credential a VM's allowlist can name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Cred {
     /// Claude Code's login: a `claude setup-token` token or an API key.

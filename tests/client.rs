@@ -94,7 +94,7 @@ exec bash -c "$cmd"
         // ones do; HOST_LOG has every call, a line each. `hold` ends at once
         // unless HOLD_ON is set: then it holds until its stdout's far end
         // closes, which a write finds, noting both in HELD. HOLD_OLD makes
-        // it a host runner from before `hold`.
+        // it a host runner from before `hold`. `export` prints HOST_EXPORT.
         script(
             &bin.join("runner"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$HOST_ARGV"
@@ -104,6 +104,7 @@ printf '%s\n' "$*" >>"$HOST_LOG"
 case $1 in
 start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
 ip) printf '%s\n' "${HOST_IP-172.16.0.6}" ;;
+export) cat "$HOST_EXPORT" ;;
 hold)
   [ -z "${HOLD_OLD-}" ] || { echo "error: unrecognized subcommand 'hold'" >&2; exit 2; }
   [ -n "${HOLD_ON-}" ] || exit 0
@@ -249,6 +250,31 @@ fn output_piped_from_a_terminal_gets_no_tty() {
         let out = piped_from_a_terminal(&mut laptop.runner(shell, &["list"]));
         ok(&out);
         assert_eq!(laptop.ssh_argv(), [HOST, "runner list"], "{shell:?}");
+    }
+}
+
+// `runner export dev | cat > f`: a tty would turn \n into \r\n on the way.
+#[test]
+fn an_export_piped_from_a_terminal_passes_every_byte_through_without_a_tty() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let bytes: Vec<u8> = (0..4 << 20).map(|i: u32| (i ^ (i >> 8)) as u8).collect();
+        let stream = laptop.path("stream");
+        fs::write(&stream, &bytes).unwrap();
+        let out = piped_from_a_terminal(
+            laptop
+                .runner(shell, &["export", "dev"])
+                .env("HOST_EXPORT", &stream),
+        );
+        ok(&out);
+        assert_eq!(laptop.ssh_argv(), [HOST, "runner export dev"], "{shell:?}");
+        assert_eq!(laptop.host_argv(), ["export", "dev"], "{shell:?}");
+        assert!(
+            out.stdout == bytes,
+            "{shell:?}: {} bytes came",
+            out.stdout.len()
+        );
+        assert_eq!(text(&out.stderr), "", "{shell:?}");
     }
 }
 

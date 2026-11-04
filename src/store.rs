@@ -772,6 +772,44 @@ impl Store {
         Ok(out)
     }
 
+    /// A stopped VM's current disk and settings, and unless `checkpoints` is
+    /// false, the owner's checkpoints, oldest first, every disk open, for an
+    /// export to stream (export.rs). Under the VM's lock, let go before this
+    /// returns: a committed disk is never written again, so the VM can start
+    /// while they stream, and a delete or gc can't take an open one away.
+    /// `Busy` if something holds the VM, its boot included.
+    pub fn open_disks(&self, name: &str, checkpoints: bool) -> Result<Disks> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        let open = |id, note, current| -> Result<OpenDisk> {
+            let disk = disk_of(&dir, id);
+            let file = File::open(&disk).map_err(at(&disk))?;
+            let info = read_checkpoint(&dir, id, note, current)?;
+            Ok(OpenDisk { info, file })
+        };
+        let now = current(&dir)?;
+        let current = open(now, read_note(&dir, now)?, true)?;
+        let mut mine = Vec::new();
+        if checkpoints {
+            let mut ids = generations(&dir)?;
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(note) = read_note(&dir, id)?
+                    && !(note.auto || note.agent || note.run)
+                {
+                    mine.push(open(id, Some(note), id == now)?);
+                }
+            }
+        }
+        let creds = read_creds(&dir.join("creds"))?.unwrap_or_else(|| DEFAULT.to_vec());
+        Ok(Disks {
+            config: read_config(&dir)?,
+            creds,
+            current,
+            checkpoints: mine,
+        })
+    }
+
     /// Makes a copy of checkpoint `id` the current disk. The copy goes on the
     /// end of history, so `undo` goes back to the disk from before the restore,
     /// and the checkpoint stays as it was, to restore again.
@@ -1095,6 +1133,26 @@ impl Freezer {
         }
         Ok(id)
     }
+}
+
+/// What Store::open_disks opened.
+#[derive(Debug)]
+pub struct Disks {
+    /// Its sizes, kernel, idle time and URL, as stored.
+    pub config: Config,
+    /// Its allowlist, names only.
+    pub creds: Vec<Cred>,
+    pub current: OpenDisk,
+    /// The owner's checkpoints, oldest first.
+    pub checkpoints: Vec<OpenDisk>,
+}
+
+/// One of a VM's disks, open.
+#[derive(Debug)]
+pub struct OpenDisk {
+    /// Its id, time and comment, as `checkpoints` lists it.
+    pub info: Checkpoint,
+    pub file: File,
 }
 
 /// A sleeping VM's snapshot (src/sleep.rs): Firecracker's state of it and
