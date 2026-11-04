@@ -981,10 +981,12 @@ fn a_kernel_this_host_lacks_is_kept_and_named() {
     assert!(err.contains("no kernel file at /no/such/vmlinux"), "{err}");
     let here = host.path("vmlinux");
     fs::write(&here, b"kernel").unwrap();
-    let here = here.display().to_string();
-    host.ok(&["create", "dev3", "--from", "dev2", "--kernel", &here]);
+    // --kernel takes the path canonical, as a tmpdir through a link isn't.
+    let here = fs::canonicalize(here).unwrap();
+    let arg = here.display().to_string();
+    host.ok(&["create", "dev3", "--from", "dev2", "--kernel", &arg]);
     let config = host.store().config("dev3").unwrap();
-    assert_eq!(config.kernel, Some(PathBuf::from(&here)));
+    assert_eq!(config.kernel, Some(here));
     assert_eq!(config.cpus, Some(4));
 }
 
