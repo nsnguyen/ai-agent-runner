@@ -14,6 +14,7 @@
 // The tests under the unit (`start_logs_and_stop_under_systemd`,
 // `exec_starts_the_vm_and_runs_in_the_guest`,
 // `a_running_vm_s_checkpoint_brings_a_deleted_file_back`,
+// `a_running_vm_s_export_boots_elsewhere_and_it_carries_on`,
 // `an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints`,
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
 // `a_process_lives_through_sleep_and_wake`,
@@ -905,6 +906,69 @@ fn a_running_vm_s_checkpoint_brings_a_deleted_file_back() {
     // Says how long the whole checkpoint took, pause and all: on XFS, well
     // under a second of it is the pause.
     eprintln!("checkpoint of a running VM took {took:?}");
+}
+
+// A running VM's export, through `tar -xO` into an import under another
+// name: the VM carries on, its process too, and the copy boots with what it
+// wrote a moment before, never synced by hand: the export syncs it.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_running_vm_s_export_boots_elsewhere_and_it_carries_on() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("export-test-{}", std::process::id());
+    let copy = format!("export-copy-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let _copy = Cleanup {
+        root: root.clone(),
+        name: copy.clone(),
+    };
+    let sh = |vm: &str, script: &str| ok(runner(&root, &["exec", vm, "--", "sh", "-c", script]));
+
+    // Boots it. In a session of its own, so the exec's end doesn't end it.
+    let pid = sh(
+        &name,
+        "setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+    );
+    let pid = pid.trim().to_string();
+    sh(&name, "echo kept > ~/exported");
+
+    let began = Instant::now();
+    let mut export = cli(&root)
+        .args(["export", &name, "--no-checkpoints"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut tar = Command::new("tar")
+        .args(["-xOf", "-", &format!("{name}/disk.ext4")])
+        .stdin(export.stdout.take().unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let import = cli(&root)
+        .args(["import", &copy, "-"])
+        .stdin(tar.stdout.take().unwrap())
+        .output()
+        .unwrap();
+    let exported = export.wait_with_output().unwrap();
+    let took = began.elapsed();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert!(tar.wait().unwrap().success());
+    ok(import);
+
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.contains("  running"), "{status}");
+    assert_eq!(sh(&name, &format!("cat /proc/{pid}/comm")), "sleep\n");
+    assert_eq!(sh(&copy, "cat ~/exported"), "kept\n");
+    eprintln!("export of a running VM, through tar into an import, took {took:?}");
 }
 
 #[test]

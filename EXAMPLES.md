@@ -127,7 +127,6 @@ Then in `claude` on your laptop:
 ## 8. Back up a VM, and bring it back
 
 ```sh
-runner stop demo                                          # export takes a stopped VM
 runner export demo > demo.tar                             # its disk, your checkpoints and its settings, in one file
 set -o pipefail; runner export demo | aws s3 cp - s3://<bucket>/demo.tar   # or straight to S3
 tar -tf demo.tar                                          # a manifest, then each disk
@@ -136,7 +135,7 @@ runner creds demo2 claude github                          # if demo had github: 
 runner start demo2                                        # its files and services, at its own address
 ```
 
-The file holds only what's on the disks, so a 20 GiB VM with 4.6 GB on it makes a file of about 4.6 GB, and each of your checkpoints adds about as much again. `--no-checkpoints` leaves them out, and `| zstd` makes it smaller. `set -o pipefail` makes a failed export fail the whole line, so S3 isn't left holding half a backup you think is whole.
+demo carries on while it's exported: the disk is a copy made with demo paused for a moment, after a `sync`, as a checkpoint is, and no checkpoint is left behind. A sleeping demo is woken for it; one with a run going is refused until the run is over. The file holds only what's on the disks, so a 20 GiB VM with 4.6 GB on it makes a file of about 4.6 GB, and each of your checkpoints adds about as much again. `--no-checkpoints` leaves them out, and `| zstd` makes it smaller. `set -o pipefail` makes a failed export fail the whole line, so S3 isn't left holding half a backup you think is whole.
 
 `import` brings your checkpoints back under the same ids, so `runner restore demo2 4` is the checkpoint 4 demo had. A cut-off download is refused and leaves no `demo2`, so just run it again.
 
