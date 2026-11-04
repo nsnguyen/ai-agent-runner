@@ -12,9 +12,10 @@
 // generations, runs' and the agent's checkpoints, `runs/`, the slot, and the
 // sleep snapshot, which holds the guest's memory and credentials.
 //
-// The tar crate writes it, from files the store opened under the VM's lock
-// and let go (Store::open_disks), so the VM can start, or be deleted, while
-// it streams.
+// The tar crate writes it, from files the store opened and let go of, under
+// the VM's lock (Store::open_disks), or a running VM's under its freezer
+// (Freezer::open_disks), so the VM can start, stop, or be deleted while it
+// streams.
 //
 // A running VM's current disk is a copy, made as its checkpoint is
 // (checkpoint.rs): `sync` in the guest, a pause, a copy of the disk its boot
@@ -108,8 +109,8 @@ pub enum Error {
     )]
     RunGoing { vm: String, run: String },
     #[error(
-        "a run is starting in {0}, or a restore its agent asked for is under way: \
-         export it once that's over"
+        "something holds {0}'s run lock: a run starting, a restore, a sleep or another \
+         export. Export it once that's over"
     )]
     RunStarting(String),
     #[error("exporting {vm}: {source}")]
@@ -133,27 +134,32 @@ pub fn export(store: &Store, name: &str, checkpoints: bool, out: impl Write) -> 
 fn open(store: &Store, name: &str, checkpoints: bool) -> Result<Disks> {
     // Before the look, so an idle sleep can't start between it and the sync.
     let _in_use = InUse::take(store, name)?;
-    // Asked first, as import --replace does: only systemd tells running
-    // from sleeping. Its boot holds the VM's lock while it's up, which
-    // open_disks then goes by.
-    let state = systemd::status(store, name)?.state;
-    match state {
-        State::Stopped => return Ok(store.open_disks(name, checkpoints)?),
-        State::Running | State::Sleeping => {}
-        state => {
-            let vm = name.to_string();
-            return Err(Error::NotNow { vm, state });
-        }
+    // A stopped VM needs no systemd, so this works on any machine. Its boot
+    // holds the VM's lock while it's up, which open_disks goes by.
+    match store.open_disks(name, checkpoints) {
+        Err(store::Error::Busy(_)) => {}
+        done => return Ok(done?),
     }
-    // A run's disk may roll back when it ends. Held until the copy is made.
+    // A run's disk may roll back when it ends. Held until the copy is made,
+    // and before the look, so no sleep starts after it: a sleep takes it too.
     let _no_run = runs::hold(store, name).map_err(|e| match e {
         runs::Error::Busy { vm, run } => Error::RunGoing { vm, run },
         runs::Error::Starting(vm) => Error::RunStarting(vm),
         e => e.into(),
     })?;
-    // Its guest syncs its disk first, which it can only do awake.
-    if state == State::Sleeping {
-        systemd::wake(store, name)?;
+    // Only systemd tells running from sleeping.
+    match systemd::status(store, name)?.state {
+        State::Running => {}
+        // Its guest syncs its disk first, which it can only do awake.
+        State::Sleeping => {
+            systemd::wake(store, name)?;
+        }
+        // Held, but not by a boot, or stopped since: as a stopped VM.
+        State::Stopped => return Ok(store.open_disks(name, checkpoints)?),
+        state => {
+            let vm = name.to_string();
+            return Err(Error::NotNow { vm, state });
+        }
     }
     let freezer = store.hold_checkpoints(name)?;
     let current = checkpoint::paused(store, name, &freezer, |f| f.open_copy())?;

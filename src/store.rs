@@ -69,7 +69,7 @@ pub enum Error {
     NothingToUndo(String),
     #[error("{0} has no checkpoint {1}")]
     NoCheckpoint(String, u64),
-    #[error("{0} has never booted, so it has no running disk to checkpoint")]
+    #[error("{0} has never booted, so it has no running disk to copy")]
     NeverBooted(String),
     #[error("{0}")]
     BadConfig(String),
@@ -1091,7 +1091,8 @@ impl Freezer {
     /// `runner export` streams of a running VM. Nothing is noted, so no
     /// checkpoint or generation is left, however the export ends. Pause the
     /// VM first, so the copy is of one moment. A copy killed before it's
-    /// unlinked leaves a part, which the next checkpoint or export clears.
+    /// unlinked leaves a part, which the VM's next copy while it runs (a
+    /// checkpoint, an export or a restore) clears.
     pub fn open_copy(&self) -> Result<OpenDisk> {
         let booted = read_booted(&self.dir)?;
         let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;

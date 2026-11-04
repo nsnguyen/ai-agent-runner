@@ -376,6 +376,8 @@ fn a_booting_or_stopping_vm_is_refused() {
     let src = host.path("src.ext4");
     sparse(&src, 4 * MIB, &[(0, MIB)], 1);
     host.ok(&["import", "dev", &src.display().to_string()]);
+    // Its boot holds it, as it does from early in a boot to late in a stop.
+    let _boot = host.store().begin_run("dev").unwrap();
 
     host.sd.set_state("activating");
     let err = host.refused(&["dev"]);
@@ -571,9 +573,11 @@ proptest! {
 // dev, running: imported from a 64 MiB disk, with a checkpoint of mine,
 // and its boot (a stand-in, which holds the VM as a boot does and answers
 // sleep and wake) running a copy of it that the guest has since written
-// over. runner-guest, behind a fake vsock socket, takes the sync; the fake
-// API notes how far the guest had got at the pause, and at the resume
-// writes the disk over again, as the VM carrying on would.
+// over. runner-guest, behind a fake vsock socket, takes the sync. At the
+// pause, the fake API notes how far the guest had got, writes the disk
+// once more, as the guest's last write the sync flushed, and keeps a copy
+// of it as it then is; at the resume it writes it over again, as the VM
+// carrying on would.
 struct Running {
     host: Host,
     boot: StandIn,
@@ -581,7 +585,7 @@ struct Running {
     vsock: Arc<FakeVsock>,
     /// The disk the boot runs.
     live: PathBuf,
-    /// A copy of `live` as it was at the pause.
+    /// A copy of `live` as it was at the pause, once there's been one.
     at_pause: PathBuf,
     /// The checkpoint of mine.
     mine: Checkpoint,
@@ -604,13 +608,6 @@ fn running() -> Running {
         .unwrap();
     sparse_over(&live, &[(0, MIB), (20 * MIB, MIB)], 2);
     let at_pause = host.path("at-pause.ext4");
-    let out = Command::new("cp")
-        .arg("--sparse=always")
-        .arg(&live)
-        .arg(&at_pause)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "cp: {}", text(&out.stderr));
 
     let guest = Guest::spawn(&host.path("guest.sock"));
     let vsock = Arc::new(FakeVsock::serve(
@@ -619,11 +616,24 @@ fn running() -> Running {
     ));
     let synced = Arc::new(Mutex::new(None));
     let (seen, conns, carried_on) = (synced.clone(), vsock.clone(), live.clone());
+    let kept = at_pause.clone();
     let api = FakeApi::serve(&host.root().join("vms/dev/api.sock"), move |req| {
+        // A test may have taken the disk away.
+        let there = carried_on.exists();
         if req.body == json!({"state": "Paused"}) {
             *seen.lock().unwrap() = Some(conns.connects().len());
         }
-        if req.body == json!({"state": "Resumed"}) {
+        if req.body == json!({"state": "Paused"}) && there {
+            sparse_over(&carried_on, &[(30 * MIB, MIB)], 6);
+            let out = Command::new("cp")
+                .arg("--sparse=always")
+                .arg(&carried_on)
+                .arg(&kept)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "cp: {}", text(&out.stderr));
+        }
+        if req.body == json!({"state": "Resumed"}) && there {
             sparse_over(&carried_on, &[(0, MIB)], 4);
         }
         (204, None)
@@ -685,7 +695,8 @@ fn a_running_vm_s_export_is_a_copy_made_paused_and_leaves_nothing_behind() {
     );
     let out = vm.host.path("out");
     extract(&tar, &out);
-    // The disk as it was at the pause, not as the VM has written it since.
+    // The disk as it was at the pause: not before it, nor as the VM has
+    // written it since.
     same(&out.join("dev/disk.ext4"), &vm.at_pause);
     let reads = |p: &Path| {
         let mut b = vec![0; 64];
@@ -759,14 +770,32 @@ fn a_sleeping_vm_is_woken_then_exported_as_a_running_one() {
 fn a_running_vm_s_export_is_refused_while_a_run_is_going() {
     let vm = running();
     vm.host.ok(&["sleep", "dev"]);
-    // What `runner drive` holds for as long as its run goes on.
+    // What `runner drive` holds for as long as its run goes on, and a run
+    // starting, a restore or a sleep for a moment.
     let runs = vm.host.store().runs("dev").unwrap();
     fs::create_dir_all(&runs).unwrap();
     let lock = File::create(runs.join("lock")).unwrap();
     lock.lock().unwrap();
     let err = vm.host.refused(&["dev"]);
-    assert!(err.contains("a run is starting in dev"), "{err}");
-    assert!(err.contains("export it once"), "{err}");
+    assert!(err.contains("something holds dev's run lock"), "{err}");
+    assert!(err.contains("Export it once that's over"), "{err}");
+
+    // With the run's record, it's the run going.
+    fs::create_dir_all(runs.join("1")).unwrap();
+    let ask = json!({
+        "prompt": "fix it",
+        "dir": "/home/agent/work",
+        "resume": null,
+        "user": "agent",
+        "boots": false,
+        "started": Utc::now(),
+    });
+    fs::write(runs.join("1/ask.json"), ask.to_string()).unwrap();
+    let err = vm.host.refused(&["dev"]);
+    assert!(
+        err.contains("run dev.1 is going in dev, and its disk may roll back"),
+        "{err}"
+    );
     assert_eq!(vm.boot.asked(), [Ask::Sleep]);
     assert!(vm.vsock.connects().is_empty());
     assert!(vm.states().is_empty());

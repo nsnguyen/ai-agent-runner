@@ -52,13 +52,15 @@ pub enum Error {
     Runs(#[from] runs::Error),
     #[error("{vm} is {state}: try again once it's running or stopped")]
     NotNow { vm: String, state: State },
-    #[error("`sync` in {vm} {how}, so a checkpoint could miss what it last wrote: {stderr}")]
+    #[error("`sync` in {vm} {how}, so a copy of its disk could miss what it last wrote: {stderr}")]
     Sync {
         vm: String,
         how: String,
         stderr: String,
     },
-    #[error("{vm} is still paused after its checkpoint: {source}. `runner stop {vm}` stops it")]
+    #[error(
+        "{vm} is still paused after its disk was copied: {source}. `runner stop {vm}` stops it"
+    )]
     StillPaused {
         vm: String,
         source: firecracker::Error,
