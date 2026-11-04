@@ -124,7 +124,18 @@ Then in `claude` on your laptop:
 
 > Use the runner MCP: checkpoint demo as "safe point", run an agent in demo to clean up /home/agent/work, show me the result, and restore "safe point" if anything looks wrong.
 
-## 8. When you're done
+## 8. Back up a VM
+
+```sh
+runner stop demo                                          # export takes a stopped VM
+runner export demo > demo.tar                             # its disk, your checkpoints and its settings, in one file
+runner export demo | aws s3 cp - s3://<bucket>/demo.tar   # or straight to S3
+tar -tf demo.tar                                          # a manifest, then each disk
+```
+
+The file holds only what's on the disks, so a 20 GiB VM with 4.6 GB on it makes a file of about 4.6 GB. `| zstd` makes it smaller, and `--no-checkpoints` leaves your checkpoints out.
+
+## 9. When you're done
 
 ```sh
 runner stop demo       # saves its disk

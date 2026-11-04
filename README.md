@@ -313,6 +313,18 @@ Each VM gets a URL on the tailnet, like a Sprite's but private: open it on the l
 
 The VM's boot holds the URL, so it answers while the VM is up. A connection to a sleeping VM wakes it and waits up to 30 seconds for the guest to take it; one to a stopped VM is refused, as nothing starts it. An open connection counts as use, so the VM doesn't idle-sleep under it; one from a client that went silent, like a laptop that slept, is dropped within a minute and a half. It's tailnet only: it listens only on the host's Tailscale address, never 0.0.0.0, and takes connections only from Tailscale's 100.64.0.0/10, so neither the LAN nor another VM gets in through it. Without Tailscale up there's no URL and `runner url` says so; a running VM's boot binds it once Tailscale is up, and takes `on`, `off` and `--port` within a second. A fork keeps its source's setting, on a port of its own. After an upgrade to this runner, a VM that's already up gets its URL at its next start, since its boot is the old one. MCP's `vm_status` gives the URL as `url`. For HTTPS and a name in place of the address, put `tailscale serve` in front (docs/host.md).
 
+### Back up and move
+
+```sh
+runner export dev > dev.tar                               # stopped dev as one stream; tar -xf reads it
+runner export dev | aws s3 cp - s3://<bucket>/dev.tar     # straight off the host, through the laptop
+runner export dev --no-checkpoints | zstd > dev.tar.zst   # only its current disk, compressed
+```
+
+`export` writes a stopped VM to stdout as one tar: `dev/manifest.json` first, then `dev/disk.ext4`, its current disk, and `dev/checkpoints/<id>.ext4` for each of your checkpoints (kind `checkpoint` in `runner checkpoints`), oldest first. The manifest has a format version, dev's config (sizes, kernel path, idle time, URL setting), its allowlist's names, and each checkpoint's id, time and comment. Each disk goes as a sparse file, only the extents the host's filesystem holds data in, so a 20 GiB disk with 4.6 GB on it streams about 4.6 GB, and `tar -xf` gives it back sparse. Space the guest freed that the host's file still holds goes as data. Services are units on the disk, so they come with it. Not in it: undo's older generations, runs' and the agent's checkpoints, `runs/`, dev's slot, and its sleep snapshot, which holds the guest's memory and credentials. There's no compression: `| zstd` on either end. For `aws s3 cp -`, a stream past 50 GB needs `--expected-size`.
+
+A running or sleeping dev is refused until you `runner stop dev`, and so is a terminal on stdout. Every disk is open before a byte goes out, so dev can start again, or be deleted, while the stream goes on. From the laptop it's `ssh runner@kvm-host runner export dev` with no tty, so the bytes pass as they are, and the host needs no cloud credentials. There's no MCP tool, since JSON-RPC can't carry a disk.
+
 ### MCP clients
 
 `runner mcp` is `ssh -T -o BatchMode=yes runner@kvm-host runner mcp`: no terminal, so stdout carries only JSON-RPC, and no prompts, so the SSH key has to load without one (from the agent, or with no passphrase). Run `runner list` once from a terminal first, so ssh can ask you to accept the host's key.
