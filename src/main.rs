@@ -56,11 +56,13 @@ enum Cmd {
         #[arg(long)]
         replace: bool,
     },
-    /// Write a stopped VM to stdout as one tar stream, to keep anywhere: its
-    /// current disk, your checkpoints, its settings and its allowlist's
-    /// names, with a manifest first. Disks go sparse, so only the data on them
-    /// streams, and `tar -xf` reads it. Services are on its disk, so they
-    /// come too; its sleep snapshot, runs and undo history don't. Pipe it on:
+    /// Write a VM to stdout as one tar stream, to keep anywhere: its current
+    /// disk, your checkpoints, its settings and its allowlist's names, with a
+    /// manifest first. Disks go sparse, so only the data on them streams, and
+    /// `tar -xf` reads it. Services are on its disk, so they come too; its
+    /// sleep snapshot, runs and undo history don't. A running VM's disk is a
+    /// copy made as its checkpoint is, and it carries on; a sleeping one is
+    /// woken first; one with a run going is refused. Pipe it on:
     /// `runner export dev > dev.tar`, or `| zstd`.
     Export {
         name: String,
