@@ -103,7 +103,9 @@ pub enum Error {
     Runs(#[from] runs::Error),
     #[error("{vm} is {state}: try again once it's running or stopped")]
     NotNow { vm: String, state: State },
-    #[error("run {run} is going in {vm}, and its disk may roll back: export it once the run is over")]
+    #[error(
+        "run {run} is going in {vm}, and its disk may roll back: export it once the run is over"
+    )]
     RunGoing { vm: String, run: String },
     #[error(
         "a run is starting in {0}, or a restore its agent asked for is under way: \

@@ -863,7 +863,10 @@ fn a_running_vm_s_export_boots_elsewhere_and_it_carries_on() {
     let sh = |vm: &str, script: &str| ok(runner(&root, &["exec", vm, "--", "sh", "-c", script]));
 
     // Boots it. In a session of its own, so the exec's end doesn't end it.
-    let pid = sh(&name, "setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!");
+    let pid = sh(
+        &name,
+        "setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+    );
     let pid = pid.trim().to_string();
     sh(&name, "echo kept > ~/exported");
 

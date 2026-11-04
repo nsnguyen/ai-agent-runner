@@ -667,7 +667,10 @@ fn a_running_vm_s_export_is_a_copy_made_paused_and_leaves_nothing_behind() {
     let listed = vm.host.ok(&["checkpoints", "dev"]);
     let tar = vm.host.path("dev.tar");
     let said = vm.host.exported(&["dev"], &tar);
-    assert!(said.contains("exported dev: its disk and 1 checkpoint"), "{said}");
+    assert!(
+        said.contains("exported dev: its disk and 1 checkpoint"),
+        "{said}"
+    );
 
     // Synced, then paused and resumed once, for the copy.
     assert_eq!(vm.vsock.connects(), ["CONNECT 10022"]);
