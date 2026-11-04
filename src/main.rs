@@ -7,6 +7,7 @@ use runner::exec;
 use runner::export;
 use runner::idle::Idle;
 use runner::image;
+use runner::import;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
@@ -15,7 +16,8 @@ use runner::store::{self, BASE, Config, KEEP, Source, Store, Vm, parse_mem};
 use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
-use std::io::IsTerminal;
+use std::fs::File;
+use std::io::{BufReader, Cursor, IsTerminal, Read};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -42,19 +44,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Bring an ext4 disk in as a new VM, usually `base`, noted with what its
-    /// /.runner/build says it was built from (`runner doctor` shows base's).
+    /// Bring an export (`runner export`) in as a new VM, here or on another
+    /// host: its disk, your checkpoints under the same ids, and its settings,
+    /// with a slot of its own and the claude credential only. Or bring a raw
+    /// ext4 disk in, usually as `base`, noted with what its /.runner/build
+    /// says it was built from (`runner doctor` shows base's). Which it is,
+    /// import tells from the stream's first block.
     Import {
         name: String,
-        /// The disk, or - to read it from stdin, which needs no read access
-        /// to where it is: `sudo -u runner runner import base - <base.ext4`.
+        /// The export or the disk, or - to read it from stdin, which needs no
+        /// read access to where it is: `sudo -u runner runner import base -
+        /// <base.ext4`, or `aws s3 cp s3://<bucket>/dev.tar - | runner import
+        /// dev -`.
         disk: PathBuf,
-        /// Put the disk on top of an existing VM's history as a new
+        /// Put a raw disk on top of an existing VM's history as a new
         /// generation, keeping its settings: `runner undo <name>` brings back
         /// the old one, and forks keep theirs. Refused while the VM is up. A
-        /// name that doesn't exist is imported.
+        /// name that doesn't exist is imported. Not for an export, which
+        /// comes in only as a new VM.
         #[arg(long)]
         replace: bool,
+        /// The credentials the new VM gets at boot, like claude,github, in
+        /// place of claude alone.
+        #[arg(long, value_delimiter = ',', conflicts_with = "replace")]
+        creds: Option<Vec<Cred>>,
     },
     /// Write a stopped VM to stdout as one tar stream, to keep anywhere: its
     /// current disk, your checkpoints, its settings and its allowlist's
@@ -418,7 +431,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             name,
             disk,
             replace,
-        } => show(&import(&store, &name, &disk, replace)?),
+            creds,
+        } => import(&store, &name, &disk, replace, creds.as_deref())?,
         Cmd::Export {
             name,
             no_checkpoints,
@@ -874,23 +888,107 @@ fn show(vm: &Vm) {
 }
 
 // A disk of `-` is stdin, which a terminal can't be: it would wait for a
-// disk typed in.
-fn import(store: &Store, name: &str, disk: &Path, replace: bool) -> Result<Vm, Box<dyn Error>> {
-    if disk != Path::new("-") {
-        return Ok(image::import(store, name, Source::File(disk), replace)?);
+// disk typed in. A name that's taken is refused before a byte is read, unless
+// it's a raw disk to replace; then the first block says whether the stream
+// is an export. A raw disk in a file goes to cp, which can reflink it.
+fn import(
+    store: &Store,
+    name: &str,
+    disk: &Path,
+    replace: bool,
+    creds: Option<&[Cred]>,
+) -> Result<(), Box<dyn Error>> {
+    if !replace && let Err(e) = store.check_free(name) {
+        return Err(match e {
+            store::Error::Exists(_) => format!(
+                "a VM named {name} already exists: import under a name that's free, \
+                 or --replace puts a raw disk on top of its history"
+            )
+            .into(),
+            e => e.into(),
+        });
     }
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        let how = format!("runner import {name} - <base.ext4");
-        return Err(format!("stdin is a terminal: send the disk in, as `{how}`").into());
+    let (what, mut from): (String, Box<dyn Read>) = if disk == Path::new("-") {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            let how = format!("runner import {name} - <base.ext4");
+            return Err(format!("stdin is a terminal: send the disk in, as `{how}`").into());
+        }
+        ("stdin".into(), Box::new(stdin.lock()))
+    } else {
+        let file = File::open(disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+        (disk.display().to_string(), Box::new(file))
+    };
+    let mut head = vec![0; 512];
+    let n = fill(&mut from, &mut head).map_err(|e| format!("{what}: {e}"))?;
+    head.truncate(n);
+    let export = import::is_export(&head);
+    let mut stream = BufReader::with_capacity(1 << 20, Cursor::new(head).chain(from));
+    if export {
+        if replace {
+            return Err(format!(
+                "{what} is an export, and an export comes in only as a new VM: \
+                 import it without --replace, under a name that's free"
+            )
+            .into());
+        }
+        let done = import::import(store, name, stream, creds)?;
+        show(&done.vm);
+        report_import(name, &done);
+        return Ok(());
     }
-    let mut stdin = stdin.lock();
-    Ok(image::import(
-        store,
-        name,
-        Source::Stream(&mut stdin),
-        replace,
-    )?)
+    let regular = disk != Path::new("-") && std::fs::metadata(disk)?.is_file();
+    let source = match regular {
+        true => Source::File(disk),
+        false => Source::Stream(&mut stream),
+    };
+    let vm = image::import(store, name, source, replace)?;
+    if let Some(creds) = creds {
+        store.set_creds(name, creds)?;
+    }
+    show(&vm);
+    Ok(())
+}
+
+// What came in, and what didn't: credentials, and a kernel this host lacks.
+fn report_import(name: &str, done: &import::Imported) {
+    let m = &done.manifest;
+    let n = m.checkpoints.len();
+    let s = if n == 1 { "" } else { "s" };
+    let src = &m.name;
+    eprintln!("runner: imported {src}'s export as {name}: its disk and {n} checkpoint{s}");
+    if m.creds.iter().any(|c| !done.creds.contains(c)) {
+        let mut both = done.creds.clone();
+        both.extend(&m.creds);
+        both.sort();
+        both.dedup();
+        eprintln!(
+            "runner: {name} gets {}; {src} had {}: `runner creds {name} {}` gives them back",
+            names(&done.creds),
+            names(&m.creds),
+            names(&both)
+        );
+    }
+    if let Some(kernel) = &done.kernel_missing {
+        eprintln!(
+            "runner: {name}'s kernel {} isn't on this host, so it won't boot until it is",
+            kernel.display()
+        );
+    }
+}
+
+// Reads until `buf` is full or the stream ends.
+fn fill(from: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match from.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
 }
 
 // A terminal on stdout would get the disks typed out on it. The stream goes
@@ -908,7 +1006,7 @@ fn export_to_stdout(
         )
         .into());
     }
-    let out = std::fs::File::from(stdout.as_fd().try_clone_to_owned()?);
+    let out = File::from(stdout.as_fd().try_clone_to_owned()?);
     Ok(export::export(store, name, checkpoints, out)?)
 }
 

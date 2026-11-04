@@ -1,7 +1,8 @@
 // `runner export`, end to end through the CLI: a stopped VM as one tar
 // stream, a manifest first, then each disk, sparse, which GNU tar reads.
-// systemctl is faked, so neither systemd nor KVM is needed; the disks are
-// sparse files, so a 2 GiB one costs what's on it.
+// Then `runner import` of that stream, as a new VM. systemctl is faked, so
+// neither systemd nor KVM is needed; the disks are sparse files, so a 2 GiB
+// one costs what's on it.
 mod common;
 
 use chrono::Utc;
@@ -12,6 +13,7 @@ use nix::unistd::{Whence, lseek};
 use proptest::prelude::*;
 use runner::creds::Cred;
 use runner::export::{self, FORMAT, Manifest};
+use runner::import;
 use runner::store::{Checkpoint, Maker, Slept, Store};
 use runner::url::Setting;
 use std::collections::BTreeSet;
@@ -20,6 +22,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const MIB: u64 = 1 << 20;
@@ -94,6 +98,46 @@ impl Host {
     fn current(&self, vm: &str) -> PathBuf {
         let store = self.store();
         store.disk(vm, store.get(vm).unwrap().generation).unwrap()
+    }
+
+    // `runner import <args>`, with stdin from `stdin` if given.
+    fn import(&self, args: &[&str], stdin: Option<&Path>) -> Output {
+        let mut argv = vec!["import"];
+        argv.extend(args);
+        let mut cmd = self.runner(&argv);
+        if let Some(path) = stdin {
+            cmd.stdin(File::open(path).unwrap());
+        }
+        cmd.output().unwrap()
+    }
+
+    // Its stdout and stderr.
+    fn imported(&self, args: &[&str], stdin: Option<&Path>) -> (String, String) {
+        let out = self.import(args, stdin);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        (text(&out.stdout), text(&out.stderr))
+    }
+
+    // A failed import of `bytes` from stdin as dev2, which left no dev2
+    // and nothing staged.
+    fn refused_import(&self, bytes: &[u8]) -> String {
+        let path = self.path("refused.tar");
+        fs::write(&path, bytes).unwrap();
+        let out = self.import(&["dev2", "-"], Some(&path));
+        assert!(!out.status.success(), "{}", text(&out.stdout));
+        assert!(self.store().get("dev2").is_err(), "dev2 is there");
+        assert_eq!(self.staged(), Vec::<String>::new());
+        text(&out.stderr)
+    }
+
+    // What's under vms/ that isn't a VM: a create or import left staged.
+    fn staged(&self) -> Vec<String> {
+        let vms = self.root().join("vms");
+        let Ok(entries) = fs::read_dir(vms) else {
+            return Vec::new();
+        };
+        let names = entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
+        names.filter(|n| n.starts_with('.')).collect()
     }
 }
 
@@ -573,5 +617,458 @@ proptest! {
             fs::read(out.join("dev/disk.ext4")).unwrap(),
             fs::read(&src).unwrap()
         );
+    }
+}
+
+// Import: an export back as a new VM.
+
+#[test]
+fn an_import_gives_back_each_disk_sparse_with_my_checkpoints_and_settings() {
+    let host = Host::new();
+    let (first, second) = dev(&host);
+    let store = host.store();
+    let tar = host.path("dev.tar");
+    host.exported(&["dev"], &tar);
+    let asked = host.sd.calls().len();
+
+    let (out, err) = host.imported(&["dev2", &tar.display().to_string()], None);
+    // Its current disk goes past every checkpoint's id.
+    let now = second.id.max(first.id) + 1;
+    assert_eq!(out, format!("dev2  gen {now}  {} bytes\n", 2 * GIB));
+    assert!(
+        err.contains("imported dev's export as dev2: its disk and 2 checkpoints"),
+        "{err}"
+    );
+    // A new VM: nothing to ask systemd.
+    assert_eq!(host.sd.calls().len(), asked, "{:?}", host.sd.calls());
+
+    // Every disk byte for byte, still sparse.
+    let theirs = host.current("dev");
+    let mine = host.current("dev2");
+    same(&mine, &theirs);
+    assert!(
+        allocated(&mine) < 20 * MIB,
+        "{} allocated",
+        allocated(&mine)
+    );
+    for c in [&first, &second] {
+        let mine = store.disk("dev2", c.id).unwrap();
+        same(&mine, &store.disk("dev", c.id).unwrap());
+        assert_eq!(fs::metadata(&mine).unwrap().len(), 2 * GIB);
+        assert!(
+            allocated(&mine) < 20 * MIB,
+            "{} allocated",
+            allocated(&mine)
+        );
+    }
+
+    // My checkpoints under the same ids, times and comments, and nothing
+    // else: not the agent's or the run's, and nothing for undo.
+    let listed = store.checkpoints("dev2").unwrap();
+    let rows: Vec<_> = listed
+        .iter()
+        .map(|c| (c.id, c.auto, c.agent, c.run, c.current))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (now, true, false, false, true),
+            (second.id, false, false, false, false),
+            (first.id, false, false, false, false),
+        ]
+    );
+    let kept = |c: &Checkpoint| (c.id, c.time, c.comment.clone());
+    assert_eq!(kept(&listed[1]), kept(&second));
+    assert_eq!(kept(&listed[2]), kept(&first));
+    assert_eq!(listed[0].comment.as_deref(), Some("import of dev's export"));
+    let undo = host.runner(&["undo", "dev2"]).output().unwrap();
+    assert!(!undo.status.success());
+    assert!(text(&undo.stderr).contains("no earlier generation"));
+
+    // Its settings, a slot of its own, and claude only, as a fork gets.
+    assert_eq!(store.config("dev2").unwrap(), store.config("dev").unwrap());
+    let slot = |vm| store.net(vm).unwrap().slot;
+    assert_ne!(slot("dev2"), slot("dev"));
+    assert_eq!(store.creds("dev2").unwrap(), [Cred::Claude]);
+    assert!(
+        err.contains("dev had claude github: `runner creds dev2 claude github`"),
+        "{err}"
+    );
+    assert!(store.sleeping("dev2").unwrap().is_none());
+    let dir = host.root().join("vms/dev2");
+    assert!(!dir.join("runs").exists());
+    assert!(!dir.join("creds").exists());
+    assert_eq!(host.staged(), Vec::<String>::new());
+}
+
+#[test]
+fn creds_on_import_set_the_allowlist_and_stdin_takes_an_export() {
+    let host = Host::new();
+    dev(&host);
+    let tar = host.path("dev.tar");
+    host.exported(&["dev"], &tar);
+    let (_, err) = host.imported(&["dev2", "-", "--creds", "claude,github"], Some(&tar));
+    let store = host.store();
+    assert_eq!(store.creds("dev2").unwrap(), [Cred::Claude, Cred::Github]);
+    assert!(!err.contains("runner creds"), "{err}");
+    same(&host.current("dev2"), &host.current("dev"));
+}
+
+#[test]
+fn a_name_taken_here_is_refused_before_the_stream_is_read() {
+    let host = Host::new();
+    let src = host.path("src.ext4");
+    sparse(&src, MIB, &[(0, MIB)], 1);
+    host.ok(&["import", "dev", &src.display().to_string()]);
+    let mut child = host
+        .runner(&["import", "dev", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open and never written: a read would wait for ever.
+    let _stdin = child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("import read stdin");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("a VM named dev already exists"), "{err}");
+}
+
+#[test]
+fn replace_takes_only_a_raw_disk() {
+    let host = Host::new();
+    dev(&host);
+    let tar = host.path("dev.tar");
+    host.exported(&["dev"], &tar);
+    let before = host.store().get("dev").unwrap();
+    let out = host.import(&["--replace", "dev", &tar.display().to_string()], None);
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("an export comes in only as a new VM"), "{err}");
+    assert_eq!(host.store().get("dev").unwrap(), before);
+}
+
+// A tar's entries, each its header and bytes, in order.
+fn apart(bytes: &[u8]) -> Vec<(tar::Header, Vec<u8>)> {
+    let mut archive = tar::Archive::new(bytes);
+    let entries = archive.entries().unwrap();
+    entries
+        .map(|e| {
+            let mut e = e.unwrap();
+            let mut data = Vec::new();
+            e.read_to_end(&mut data).unwrap();
+            (e.header().clone(), data)
+        })
+        .collect()
+}
+
+// And back together, as headers say, ended as tar ends.
+fn together(entries: &[(tar::Header, Vec<u8>)]) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    for (header, data) in entries {
+        tar.append(header, data.as_slice()).unwrap();
+    }
+    tar.into_inner().unwrap()
+}
+
+// A small export of dev taken apart: a dense 64 KiB disk, so a plain entry,
+// and one checkpoint of mine.
+fn small(host: &Host) -> Vec<(tar::Header, Vec<u8>)> {
+    let src = host.path("small.ext4");
+    sparse(&src, 64 << 10, &[(0, 64 << 10)], 3);
+    host.ok(&["import", "dev", &src.display().to_string()]);
+    host.store().checkpoint("dev", Some("mine")).unwrap();
+    let tar = host.path("small.tar");
+    host.exported(&["dev"], &tar);
+    let entries = apart(&fs::read(&tar).unwrap());
+    let names: Vec<_> = entries.iter().map(|(h, _)| text(&h.path_bytes())).collect();
+    assert_eq!(
+        names,
+        [
+            "dev/manifest.json",
+            "dev/disk.ext4",
+            "dev/checkpoints/1.ext4"
+        ]
+    );
+    entries
+}
+
+// The entry `entries[i]` with its manifest's JSON edited by `edit`.
+fn edit_manifest(entries: &mut [(tar::Header, Vec<u8>)], edit: impl Fn(String) -> String) {
+    let (header, data) = &mut entries[0];
+    let json = edit(text(data));
+    *data = json.into_bytes();
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+}
+
+// Its name, as raw bytes, past what the tar crate lets a builder write.
+fn rename(header: &mut tar::Header, name: &str) {
+    let field = &mut header.as_old_mut().name;
+    field.fill(0);
+    field[..name.len()].copy_from_slice(name.as_bytes());
+    header.set_cksum();
+}
+
+#[test]
+fn a_small_export_taken_apart_and_put_back_imports() {
+    let host = Host::new();
+    let entries = small(&host);
+    let path = host.path("again.tar");
+    fs::write(&path, together(&entries)).unwrap();
+    host.imported(&["dev2", "-"], Some(&path));
+    same(&host.current("dev2"), &host.current("dev"));
+}
+
+#[test]
+fn an_unknown_format_is_refused() {
+    let host = Host::new();
+    let mut entries = small(&host);
+    edit_manifest(&mut entries, |j| {
+        let to = j.replacen(&format!("\"format\": {FORMAT}"), "\"format\": 99", 1);
+        assert_ne!(to, j);
+        to
+    });
+    let err = host.refused_import(&together(&entries));
+    assert!(err.contains("format 99"), "{err}");
+    assert!(err.contains(&format!("reads format {FORMAT}")), "{err}");
+}
+
+#[test]
+fn an_entry_the_manifest_does_not_name_is_refused() {
+    let host = Host::new();
+    let entries = small(&host);
+    let mut extra = entries[1].clone();
+    rename(&mut extra.0, "dev/extra");
+
+    // After the last disk.
+    let mut after = entries.clone();
+    after.push(extra.clone());
+    let err = host.refused_import(&together(&after));
+    assert!(err.contains("\"dev/extra\""), "{err}");
+    assert!(err.contains("the manifest doesn't name"), "{err}");
+
+    // Between two it names.
+    let mut between = entries.clone();
+    between.insert(2, extra);
+    let err = host.refused_import(&together(&between));
+    assert!(err.contains("\"dev/extra\""), "{err}");
+
+    // Out of order.
+    let mut swapped = entries.clone();
+    swapped.swap(1, 2);
+    host.refused_import(&together(&swapped));
+}
+
+#[test]
+fn a_dot_dot_name_is_refused() {
+    let host = Host::new();
+    let mut entries = small(&host);
+    rename(&mut entries[1].0, "dev/../dev/disk.ext4");
+    let err = host.refused_import(&together(&entries));
+    assert!(err.contains("\"dev/../dev/disk.ext4\""), "{err}");
+    // Nor in the manifest.
+    let mut entries = small(&Host::new());
+    edit_manifest(&mut entries, |j| {
+        j.replace("\"dev/disk.ext4\"", "\"../disk.ext4\"")
+    });
+    rename(&mut entries[1].0, "../disk.ext4");
+    host.refused_import(&together(&entries));
+}
+
+#[test]
+fn a_symlink_or_a_hard_link_is_refused() {
+    let host = Host::new();
+    let entries = small(&host);
+    for kind in [tar::EntryType::Symlink, tar::EntryType::Link] {
+        let mut linked = entries.clone();
+        let (header, data) = &mut linked[1];
+        header.set_entry_type(kind);
+        header.set_link_name("/etc/passwd").unwrap();
+        header.set_size(0);
+        header.set_cksum();
+        data.clear();
+        let err = host.refused_import(&together(&linked));
+        assert!(err.contains("dev/disk.ext4"), "{err}");
+        assert!(err.contains("isn't a file"), "{err}");
+    }
+}
+
+#[test]
+fn a_disk_of_another_size_than_the_manifest_says_is_refused() {
+    let host = Host::new();
+    let mut entries = small(&host);
+    let (header, data) = &mut entries[1];
+    data.truncate(32 << 10);
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+    let err = host.refused_import(&together(&entries));
+    assert!(err.contains("dev/disk.ext4"), "{err}");
+    assert!(err.contains(&format!("{} bytes", 64 << 10)), "{err}");
+}
+
+#[test]
+fn a_stream_cut_at_an_entry_or_before_tar_s_end_is_refused() {
+    let host = Host::new();
+    let entries = small(&host);
+    // Without the last checkpoint, ended as tar ends: GNU tar takes it.
+    let err = host.refused_import(&together(&entries[..2]));
+    assert!(err.contains("dev/checkpoints/1.ext4"), "{err}");
+    // Each entry whole, but not tar's end: a cut at each block of it.
+    let whole = together(&entries);
+    for less in [1024, 512, 1] {
+        let err = host.refused_import(&whole[..whole.len() - less]);
+        assert!(err.contains("cut off"), "{less}: {err}");
+    }
+    // Something past the end that isn't tar's zeros.
+    let mut more = whole.clone();
+    more.extend_from_slice(b"more");
+    host.refused_import(&more);
+    // Zeros past it, as GNU tar pads a record, are fine.
+    more.truncate(whole.len());
+    more.resize(whole.len() + 10240, 0);
+    let path = host.path("padded.tar");
+    fs::write(&path, &more).unwrap();
+    host.imported(&["dev2", "-"], Some(&path));
+}
+
+#[test]
+fn a_kernel_this_host_lacks_is_kept_and_named() {
+    let host = Host::new();
+    let mut entries = small(&host);
+    edit_manifest(&mut entries, |j| {
+        let to = j.replacen(
+            "\"config\": {}",
+            "\"config\": {\"kernel\": \"/no/such/vmlinux\", \"cpus\": 4}",
+            1,
+        );
+        assert_ne!(to, j);
+        to
+    });
+    let path = host.path("kernel.tar");
+    fs::write(&path, together(&entries)).unwrap();
+    let (_, err) = host.imported(&["dev2", "-"], Some(&path));
+    assert!(err.contains("/no/such/vmlinux isn't on this host"), "{err}");
+    assert!(err.contains("won't boot until it is"), "{err}");
+    let config = host.store().config("dev2").unwrap();
+    assert_eq!(config.kernel, Some(PathBuf::from("/no/such/vmlinux")));
+    assert_eq!(config.cpus, Some(4));
+}
+
+#[test]
+fn a_raw_disk_from_a_path_or_stdin_still_imports_as_one() {
+    let host = Host::new();
+    // A disk whose first block looks nothing like a tar header.
+    let src = host.path("raw.ext4");
+    sparse(&src, MIB, &[(0, MIB)], 2);
+    host.ok(&["import", "base", &src.display().to_string()]);
+    same(&host.current("base"), &src);
+    host.imported(&["raw", "-"], Some(&src));
+    same(&host.current("raw"), &src);
+    // A raw disk takes --creds too.
+    host.imported(&["raw2", "-", "--creds", "github"], Some(&src));
+    assert_eq!(host.store().creds("raw2").unwrap(), [Cred::Github]);
+}
+
+// A real export of dev: disks of 96 blocks of 4 KiB with six extents, past
+// the four a sparse header holds, and two checkpoints of mine.
+fn real() -> &'static [u8] {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("root"));
+        let src = dir.path().join("src.ext4");
+        let b = 4096;
+        let extents = [
+            (0, b),
+            (2 * b, b),
+            (5 * b, 2 * b),
+            (20 * b, b),
+            (40 * b, b),
+            (95 * b, b),
+        ];
+        sparse(&src, 96 * b, &extents, 4);
+        store.import("dev", &src).unwrap();
+        store.checkpoint("dev", Some("one")).unwrap();
+        let run = store.begin_run("dev").unwrap();
+        sparse_over(&run.disk, &[(60 * b, b)], 6);
+        run.commit().unwrap();
+        store.checkpoint("dev", None).unwrap();
+        let mut out = Vec::new();
+        export::write("dev", store.open_disks("dev", true).unwrap(), &mut out).unwrap();
+        out
+    })
+}
+
+#[test]
+fn a_real_export_imports_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("root"));
+    let got = import::import(&store, "dev2", real(), None).unwrap();
+    assert_eq!(got.manifest.checkpoints.len(), 2);
+    assert_eq!(store.checkpoints("dev2").unwrap().len(), 3);
+}
+
+#[derive(Debug, Clone)]
+enum Harm {
+    Cut(usize),
+    Flip(usize, u8),
+}
+
+fn harm() -> impl Strategy<Value = Harm> {
+    let len = real().len();
+    let flip =
+        |range: std::ops::Range<usize>| (range, 1..=255u8).prop_map(|(at, x)| Harm::Flip(at, x));
+    prop_oneof![
+        (0..len).prop_map(Harm::Cut),
+        flip(0..len),
+        // The manifest and the first disk's headers.
+        flip(0..4096),
+        // The last disk's tail and tar's end.
+        flip(len - 2048..len),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(160))]
+
+    // Any cut fails. A flipped byte fails, or lands in a disk's data or
+    // tar's padding and imports: format 1 has no checksum of the data.
+    // Either way, a failure leaves no VM and nothing staged.
+    #[test]
+    fn a_cut_or_a_flipped_byte_fails_whole_or_imports_whole(harm in harm()) {
+        let mut bytes = real().to_vec();
+        match harm {
+            Harm::Cut(n) => bytes.truncate(n),
+            Harm::Flip(at, x) => bytes[at] ^= x,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("root"));
+        let got = import::import(&store, "dev2", bytes.as_slice(), None);
+        if matches!(harm, Harm::Cut(_)) {
+            prop_assert!(got.is_err(), "a cut imported");
+        }
+        let left: Vec<String> = match fs::read_dir(dir.path().join("root/vms")) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        match got {
+            Ok(_) => {
+                prop_assert_eq!(left, ["dev2"]);
+                prop_assert_eq!(store.checkpoints("dev2").unwrap().len(), 3);
+            }
+            Err(_) => prop_assert!(left.is_empty(), "{:?} left", left),
+        }
     }
 }
