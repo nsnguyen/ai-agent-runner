@@ -53,28 +53,32 @@ pub type Result<T> = std::result::Result<T, Error>;
 // Far past any export's.
 const MAX_MANIFEST: u64 = 16 << 20;
 const BLOCK: u64 = 512;
+const MAX_ID: u64 = u32::MAX as u64;
 
-/// Whether a stream that starts with `head` is an export: its first block is
-/// a tar header, ustar's magic and a checksum that adds up. A raw ext4 disk
-/// starts with 1024 bytes of boot block, zeros as mkfs leaves them, then the
-/// superblock with its magic at 1080, so it never is one.
+/// Whether a stream that starts with `head` is an export: it starts as a
+/// tar header does, with ustar's magic at 257. Its checksum is the tar
+/// crate's to check, so a header with a byte flipped is refused, not taken
+/// for a disk. A raw ext4 disk starts with 1024 bytes of boot block, zeros
+/// as mkfs leaves them, then the superblock with its magic at 1080, so it
+/// never is one.
 pub fn is_export(head: &[u8]) -> bool {
-    let Some(block) = head.get(..BLOCK as usize) else {
-        return false;
-    };
-    if !matches!(&block[257..263], b"ustar\0" | b"ustar ") {
-        return false;
-    }
-    // As tar sums it: the checksum's own field counts as spaces.
-    let sum = block[..148]
+    matches!(head.get(257..263), Some(b"ustar\0" | b"ustar "))
+}
+
+/// What a stream that starts with `head` is compressed with, if it starts
+/// as gzip, zstd, xz or bzip2 does: an export or a disk to decompress
+/// first.
+pub fn compressed(head: &[u8]) -> Option<&'static str> {
+    const MAGIC: [(&[u8], &str); 4] = [
+        (&[0x1f, 0x8b], "gzip"),
+        (&[0x28, 0xb5, 0x2f, 0xfd], "zstd"),
+        (&[0xfd, b'7', b'z', b'X', b'Z', 0], "xz"),
+        (b"BZh", "bzip2"),
+    ];
+    MAGIC
         .iter()
-        .chain(&block[156..])
-        .map(|&b| u32::from(b))
-        .sum::<u32>()
-        + 8 * u32::from(b' ');
-    tar::Header::from_byte_slice(block)
-        .cksum()
-        .is_ok_and(|c| c == sum)
+        .find(|(magic, _)| head.starts_with(magic))
+        .map(|&(_, kind)| kind)
 }
 
 /// Reads the export on `stream` in as the new VM `name`, with the allowlist
@@ -205,12 +209,15 @@ impl Named {
             paths.push(want);
             bytes.push(c.bytes);
         }
-        let current = match ids.iter().max() {
-            None => 0,
-            Some(&top) => top
-                .checked_add(1)
-                .ok_or_else(|| refused(format!("checkpoint {top} leaves no id for the disk")))?,
-        };
+        // Generations count up from 0, one per run or checkpoint, so an id
+        // past this is no VM's, and would leave no room after it.
+        let top = ids.iter().max().copied();
+        if let Some(top) = top.filter(|&id| id > MAX_ID) {
+            return Err(refused(format!(
+                "the manifest names checkpoint {top}, past any VM's generations"
+            )));
+        }
+        let current = top.map_or(0, |top| top + 1);
         Ok(Named {
             paths,
             bytes,
@@ -269,13 +276,12 @@ fn end<R: Read>(entries: &mut Entries<Shared<R>>, shared: &Shared<R>) -> Result<
     const END: &str = "tar's end";
     let past = || refused("the stream goes on past the export's end with more than zeros");
     // A block that isn't one of tar's headers isn't its end either.
-    let after = entries
-        .next()
-        .transpose()
-        .map_err(|e| match shared.ended() {
+    let after = entries.next().transpose().map_err(|e| {
+        match shared.ended() || e.raw_os_error().is_some() {
             true => shared.failed(END, e),
             false => past(),
-        })?;
+        }
+    })?;
     if let Some(entry) = after {
         let got = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
         return Err(refused(format!("the manifest doesn't name {got:?}")));

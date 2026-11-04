@@ -919,9 +919,18 @@ fn import(
         let file = File::open(disk).map_err(|e| format!("{}: {e}", disk.display()))?;
         (disk.display().to_string(), Box::new(file))
     };
-    let mut head = vec![0; 512];
-    let n = fill(&mut from, &mut head).map_err(|e| format!("{what}: {e}"))?;
-    head.truncate(n);
+    let mut head = Vec::new();
+    from.by_ref()
+        .take(512)
+        .read_to_end(&mut head)
+        .map_err(|e| format!("{what}: {e}"))?;
+    if let Some(kind) = import::compressed(&head) {
+        return Err(format!(
+            "{what} is {kind}-compressed: decompress it first, as \
+             `zstd -dc dev.tar.zst | runner import {name} -`"
+        )
+        .into());
+    }
     let export = import::is_export(&head);
     let mut stream = BufReader::with_capacity(1 << 20, Cursor::new(head).chain(from));
     if export {
@@ -934,7 +943,7 @@ fn import(
         }
         let done = import::import(store, name, stream, creds)?;
         show(&done.vm);
-        report_import(name, &done);
+        report_import(name, &done, creds.is_some());
         return Ok(());
     }
     let regular = disk != Path::new("-") && std::fs::metadata(disk)?.is_file();
@@ -950,14 +959,15 @@ fn import(
     Ok(())
 }
 
-// What came in, and what didn't: credentials, and a kernel this host lacks.
-fn report_import(name: &str, done: &import::Imported) {
+// What came in, and what didn't: credentials, unless --creds chose them, and
+// a kernel this host lacks.
+fn report_import(name: &str, done: &import::Imported, chose_creds: bool) {
     let m = &done.manifest;
     let n = m.checkpoints.len();
     let s = if n == 1 { "" } else { "s" };
     let src = &m.name;
     eprintln!("runner: imported {src}'s export as {name}: its disk and {n} checkpoint{s}");
-    if m.creds.iter().any(|c| !done.creds.contains(c)) {
+    if !chose_creds && m.creds.iter().any(|c| !done.creds.contains(c)) {
         let mut both = done.creds.clone();
         both.extend(&m.creds);
         both.sort();
@@ -975,20 +985,6 @@ fn report_import(name: &str, done: &import::Imported) {
             kernel.display()
         );
     }
-}
-
-// Reads until `buf` is full or the stream ends.
-fn fill(from: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match from.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(n)
 }
 
 // A terminal on stdout would get the disks typed out on it. The stream goes

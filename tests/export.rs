@@ -1072,3 +1072,64 @@ proptest! {
         }
     }
 }
+
+// The CLI's look at the first block: a header with a byte flipped is still
+// an export, refused, not taken for a disk.
+#[test]
+fn an_export_whose_first_header_has_a_byte_flipped_is_refused_not_taken_for_a_disk() {
+    let host = Host::new();
+    let mut bytes = together(&small(&host));
+    // Its mtime: the checksum no longer adds up.
+    bytes[140] ^= 1;
+    let err = host.refused_import(&bytes);
+    assert!(err.contains("checksum"), "{err}");
+}
+
+#[test]
+fn a_compressed_stream_is_refused() {
+    let host = Host::new();
+    let tar = together(&small(&host));
+    let gzip = [&[0x1f, 0x8b, 0x08, 0x00][..], &tar].concat();
+    let err = host.refused_import(&gzip);
+    assert!(err.contains("stdin is gzip-compressed"), "{err}");
+    assert!(
+        err.contains("zstd -dc dev.tar.zst | runner import dev2 -"),
+        "{err}"
+    );
+    let zstd = [&[0x28, 0xb5, 0x2f, 0xfd][..], &tar].concat();
+    let path = host.path("dev.tar.zst");
+    fs::write(&path, zstd).unwrap();
+    let out = host.import(&["dev2", &path.display().to_string()], None);
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("dev.tar.zst is zstd-compressed"), "{err}");
+    assert!(host.store().get("dev2").is_err());
+}
+
+#[test]
+fn a_checkpoint_id_past_any_vm_s_is_refused() {
+    let host = Host::new();
+    let mut entries = small(&host);
+    let id = u64::MAX - 1;
+    edit_manifest(&mut entries, |j| {
+        let to = j
+            .replace("\"id\": 1,", &format!("\"id\": {id},"))
+            .replace("checkpoints/1.ext4", &format!("checkpoints/{id}.ext4"));
+        assert_ne!(to, j);
+        to
+    });
+    rename(&mut entries[2].0, &format!("dev/checkpoints/{id}.ext4"));
+    let err = host.refused_import(&together(&entries));
+    assert!(err.contains(&format!("checkpoint {id}, past any")), "{err}");
+}
+
+#[test]
+fn creds_chosen_on_import_get_no_hint() {
+    let host = Host::new();
+    dev(&host);
+    let tar = host.path("dev.tar");
+    host.exported(&["dev"], &tar);
+    let (_, err) = host.imported(&["dev2", "-", "--creds", "github"], Some(&tar));
+    assert_eq!(host.store().creds("dev2").unwrap(), [Cred::Github]);
+    assert!(!err.contains("runner creds"), "{err}");
+}
