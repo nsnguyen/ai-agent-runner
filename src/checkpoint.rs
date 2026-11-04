@@ -137,16 +137,17 @@ fn running(store: &Store, name: &str, comment: Option<&str>, by: Maker) -> Resul
     paused(store, name, &freezer, |f| f.freeze_by(comment, by))
 }
 
-// Syncs the guest, then freezes its disk with the VM paused. From the pause
-// to the resume, every way out resumes the VM. `runner halt` waits on the
-// freezer, then resumes the VM too, for one whose checkpoint was killed with
-// it paused.
-fn paused(
+/// Syncs the running VM's guest, then runs `freeze`, which copies its disk,
+/// with the VM paused: what a running VM's checkpoint does, and its export
+/// (export.rs). From the pause to the resume, every way out resumes the VM,
+/// and Ctrl-C and the like wait for it. `runner halt` waits on the freezer,
+/// then resumes the VM too, for one whose copy was killed with it paused.
+pub fn paused<T>(
     store: &Store,
     name: &str,
     freezer: &Freezer,
-    freeze: impl FnOnce(&Freezer) -> store::Result<Checkpoint>,
-) -> Result<Checkpoint> {
+    freeze: impl FnOnce(&Freezer) -> store::Result<T>,
+) -> Result<T> {
     sync(store, name)?;
     let api = Api::new(store.api_socket(name)?);
     let _held = HoldSignals::new();

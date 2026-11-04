@@ -2,7 +2,7 @@
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, whether it's a checkpoint and whose, and what an imported disk says it was built from (image.rs)
-//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done
+//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done; or its export's copy, unlinked once open
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
@@ -781,33 +781,9 @@ impl Store {
     pub fn open_disks(&self, name: &str, checkpoints: bool) -> Result<Disks> {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
-        let open = |id, note, current| -> Result<OpenDisk> {
-            let disk = disk_of(&dir, id);
-            let file = File::open(&disk).map_err(at(&disk))?;
-            let info = read_checkpoint(&dir, id, note, current)?;
-            Ok(OpenDisk { info, file })
-        };
         let now = current(&dir)?;
-        let current = open(now, read_note(&dir, now)?, true)?;
-        let mut mine = Vec::new();
-        if checkpoints {
-            let mut ids = generations(&dir)?;
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(note) = read_note(&dir, id)?
-                    && !(note.auto || note.agent || note.run)
-                {
-                    mine.push(open(id, Some(note), id == now)?);
-                }
-            }
-        }
-        let creds = read_creds(&dir.join("creds"))?.unwrap_or_else(|| DEFAULT.to_vec());
-        Ok(Disks {
-            config: read_config(&dir)?,
-            creds,
-            current,
-            checkpoints: mine,
-        })
+        let current = open_disk(&dir, now, read_note(&dir, now)?, true)?;
+        open_with(&dir, current, checkpoints)
     }
 
     /// Makes a copy of checkpoint `id` the current disk. The copy goes on the
@@ -1110,9 +1086,50 @@ impl Freezer {
         })
     }
 
-    // A copy of `from` under a new number, with its note.
-    fn copy(&self, from: Source, note: &Note) -> Result<u64> {
-        let gens = self.dir.join("gens");
+    /// A copy of the disk the VM's latest boot runs, as `freeze` makes one,
+    /// but open, and gone from the VM's directory before this returns: what
+    /// `runner export` streams of a running VM. Nothing is noted, so no
+    /// checkpoint or generation is left, however the export ends. Pause the
+    /// VM first, so the copy is of one moment. A copy killed before it's
+    /// unlinked leaves a part, which the next checkpoint or export clears.
+    pub fn open_copy(&self) -> Result<OpenDisk> {
+        let booted = read_booted(&self.dir)?;
+        let booted = booted.ok_or_else(|| Error::NeverBooted(self.name.clone()))?;
+        self.clear_parts()?;
+        // Made empty first, which takes the number from a boot starting
+        // meanwhile, as freeze's note does.
+        let part = part_of(&self.dir, next_generation(&self.dir)?);
+        File::create_new(&part).map_err(at(&part))?;
+        let opened = cp(&disk_of(&self.dir, booted.generation), &part)
+            .and_then(|()| File::open(&part).map_err(at(&part)));
+        let unlinked = fs::remove_file(&part).map_err(at(&part));
+        let file = opened?;
+        unlinked?;
+        let meta = file.metadata().map_err(at(&part))?;
+        let info = Checkpoint {
+            id: booted.generation,
+            time: Utc::now().trunc_subsecs(0),
+            comment: None,
+            auto: true,
+            agent: false,
+            run: false,
+            bytes: meta.len(),
+            current: true,
+        };
+        Ok(OpenDisk { info, file })
+    }
+
+    /// The VM's settings, and unless `checkpoints` is false, the owner's
+    /// checkpoints, oldest first, every disk open, with `current` as its
+    /// current disk: Store::open_disks, for a running VM, whose boot holds
+    /// its lock. A checkpoint is never written again, and only gc and a
+    /// delete, which need that lock, take one away.
+    pub fn open_disks(&self, current: OpenDisk, checkpoints: bool) -> Result<Disks> {
+        open_with(&self.dir, current, checkpoints)
+    }
+
+    // What a copy killed partway left.
+    fn clear_parts(&self) -> Result<()> {
         for left in numbered(&self.dir, PART)? {
             let part = part_of(&self.dir, left);
             fs::remove_file(&part).map_err(at(&part))?;
@@ -1120,6 +1137,13 @@ impl Freezer {
                 remove_if_there(&note_of(&self.dir, left))?;
             }
         }
+        Ok(())
+    }
+
+    // A copy of `from` under a new number, with its note.
+    fn copy(&self, from: Source, note: &Note) -> Result<u64> {
+        let gens = self.dir.join("gens");
+        self.clear_parts()?;
         let id = next_generation(&self.dir)?;
         write_note(&self.dir, id, note)?;
         let (part, disk) = (part_of(&self.dir, id), disk_of(&self.dir, id));
@@ -1632,6 +1656,39 @@ fn read_note(dir: &Path, generation: u64) -> Result<Option<Note>> {
     Ok(Some(note))
 }
 
+// Generation `id`'s disk, open, as `checkpoints` lists it.
+fn open_disk(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Result<OpenDisk> {
+    let disk = disk_of(dir, id);
+    let file = File::open(&disk).map_err(at(&disk))?;
+    let info = read_checkpoint(dir, id, note, current)?;
+    Ok(OpenDisk { info, file })
+}
+
+// `current`, with the VM's settings and, unless `checkpoints` is false, the
+// owner's checkpoints, oldest first, open.
+fn open_with(dir: &Path, current: OpenDisk, checkpoints: bool) -> Result<Disks> {
+    let mut mine = Vec::new();
+    if checkpoints {
+        let now = self::current(dir)?;
+        let mut ids = generations(dir)?;
+        ids.sort_unstable();
+        for id in ids {
+            if let Some(note) = read_note(dir, id)?
+                && !(note.auto || note.agent || note.run)
+            {
+                mine.push(open_disk(dir, id, Some(note), id == now)?);
+            }
+        }
+    }
+    let creds = read_creds(&dir.join("creds"))?.unwrap_or_else(|| DEFAULT.to_vec());
+    Ok(Disks {
+        config: read_config(dir)?,
+        creds,
+        current,
+        checkpoints: mine,
+    })
+}
+
 fn read_checkpoint(dir: &Path, id: u64, note: Option<Note>, current: bool) -> Result<Checkpoint> {
     let disk = disk_of(dir, id);
     let meta = fs::metadata(&disk).map_err(at(&disk))?;
@@ -1828,6 +1885,13 @@ fn fill(from: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
 // holes, so a sparse image stays small. Every generation is writable whatever
 // the source's mode, and synced before anything points at it.
 fn clone(from: &Path, to: &Path) -> Result<()> {
+    cp(from, to)?;
+    fs::set_permissions(to, fs::Permissions::from_mode(0o644)).map_err(at(to))?;
+    File::open(to).and_then(|f| f.sync_all()).map_err(at(to))
+}
+
+// Only the copy, as clone makes it: a reflink, else a sparse copy.
+fn cp(from: &Path, to: &Path) -> Result<()> {
     let out = Command::new("cp")
         .args(["--reflink=auto", "--sparse=always", "--"])
         .args([from, to])
@@ -1837,6 +1901,5 @@ fn clone(from: &Path, to: &Path) -> Result<()> {
         let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(at(to)(io::Error::other(why)));
     }
-    fs::set_permissions(to, fs::Permissions::from_mode(0o644)).map_err(at(to))?;
-    File::open(to).and_then(|f| f.sync_all()).map_err(at(to))
+    Ok(())
 }

@@ -1,25 +1,29 @@
-// `runner export`, end to end through the CLI: a stopped VM as one tar
-// stream, a manifest first, then each disk, sparse, which GNU tar reads.
-// systemctl is faked, so neither systemd nor KVM is needed; the disks are
-// sparse files, so a 2 GiB one costs what's on it.
+// `runner export`, end to end through the CLI: a VM as one tar stream, a
+// manifest first, then each disk, sparse, which GNU tar reads. systemctl is
+// faked, so neither systemd nor KVM is needed; the disks are sparse files,
+// so a 2 GiB one costs what's on it. A running VM's boot, its guest and
+// Firecracker's API are faked too, as in tests/checkpoint.rs.
 mod common;
 
 use chrono::Utc;
-use common::{FakeSystemd, text};
+use common::{FakeApi, FakeSystemd, FakeVsock, Guest, StandIn, text};
 use nix::errno::Errno;
 use nix::pty::{OpenptyResult, openpty};
 use nix::unistd::{Whence, lseek};
 use proptest::prelude::*;
 use runner::creds::Cred;
 use runner::export::{self, FORMAT, Manifest};
+use runner::sleep::Ask;
 use runner::store::{Checkpoint, Maker, Slept, Store};
 use runner::url::Setting;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 const MIB: u64 = 1 << 20;
@@ -367,31 +371,19 @@ fn no_checkpoints_holds_only_the_current_disk() {
 }
 
 #[test]
-fn a_running_or_sleeping_vm_is_refused() {
+fn a_booting_or_stopping_vm_is_refused() {
     let host = Host::new();
     let src = host.path("src.ext4");
     sparse(&src, 4 * MIB, &[(0, MIB)], 1);
     host.ok(&["import", "dev", &src.display().to_string()]);
 
-    host.sd.set_state("active");
-    let err = host.refused(&["dev"]);
-    assert!(err.contains("dev is running: stop it first"), "{err}");
-    assert!(err.contains("runner stop dev"), "{err}");
-
-    // Asleep, its unit stays active, with its snapshot noted.
-    let snapshot = host.store().snapshot("dev").unwrap();
-    snapshot.make_room().unwrap();
-    let slept = Slept {
-        generation: 0,
-        at: Utc::now(),
-    };
-    snapshot.note(&slept).unwrap();
-    let err = host.refused(&["dev"]);
-    assert!(err.contains("dev is sleeping: stop it first"), "{err}");
-
     host.sd.set_state("activating");
     let err = host.refused(&["dev"]);
-    assert!(err.contains("dev is booting: stop it first"), "{err}");
+    assert!(err.contains("dev is booting: try again once"), "{err}");
+
+    host.sd.set_state("deactivating");
+    let err = host.refused(&["dev"]);
+    assert!(err.contains("dev is stopping: try again once"), "{err}");
 }
 
 #[test]
@@ -574,4 +566,218 @@ proptest! {
             fs::read(&src).unwrap()
         );
     }
+}
+
+// dev, running: imported from a 64 MiB disk, with a checkpoint of mine,
+// and its boot (a stand-in, which holds the VM as a boot does and answers
+// sleep and wake) running a copy of it that the guest has since written
+// over. runner-guest, behind a fake vsock socket, takes the sync; the fake
+// API notes how far the guest had got at the pause, and at the resume
+// writes the disk over again, as the VM carrying on would.
+struct Running {
+    host: Host,
+    boot: StandIn,
+    api: FakeApi,
+    vsock: Arc<FakeVsock>,
+    /// The disk the boot runs.
+    live: PathBuf,
+    /// A copy of `live` as it was at the pause.
+    at_pause: PathBuf,
+    /// The checkpoint of mine.
+    mine: Checkpoint,
+    /// How many connections the guest had taken at the pause.
+    synced: Arc<Mutex<Option<usize>>>,
+    _guest: Guest,
+}
+
+fn running() -> Running {
+    let host = Host::new();
+    let src = host.path("src.ext4");
+    sparse(&src, 64 * MIB, &[(0, MIB), (40 * MIB + 7, MIB)], 1);
+    host.ok(&["import", "dev", &src.display().to_string()]);
+    let store = host.store();
+    let mine = store.checkpoint("dev", Some("mine")).unwrap();
+    let boot = StandIn::serve(&store, "dev");
+    host.sd.set_state("active");
+    let live = store
+        .disk("dev", store.booted("dev").unwrap().unwrap().generation)
+        .unwrap();
+    sparse_over(&live, &[(0, MIB), (20 * MIB, MIB)], 2);
+    let at_pause = host.path("at-pause.ext4");
+    let out = Command::new("cp")
+        .arg("--sparse=always")
+        .arg(&live)
+        .arg(&at_pause)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cp: {}", text(&out.stderr));
+
+    let guest = Guest::spawn(&host.path("guest.sock"));
+    let vsock = Arc::new(FakeVsock::serve(
+        &host.root().join("vms/dev/vsock.sock"),
+        &guest.sock,
+    ));
+    let synced = Arc::new(Mutex::new(None));
+    let (seen, conns, carried_on) = (synced.clone(), vsock.clone(), live.clone());
+    let api = FakeApi::serve(&host.root().join("vms/dev/api.sock"), move |req| {
+        if req.body == json!({"state": "Paused"}) {
+            *seen.lock().unwrap() = Some(conns.connects().len());
+        }
+        if req.body == json!({"state": "Resumed"}) {
+            sparse_over(&carried_on, &[(0, MIB)], 4);
+        }
+        (204, None)
+    });
+    Running {
+        host,
+        boot,
+        api,
+        vsock,
+        live,
+        at_pause,
+        mine,
+        synced,
+        _guest: guest,
+    }
+}
+
+impl Running {
+    fn states(&self) -> Vec<Value> {
+        self.api.calls().into_iter().map(|(_, b)| b).collect()
+    }
+
+    // Every file in the VM's gens/, by name.
+    fn gens(&self) -> BTreeSet<String> {
+        let gens = self.host.root().join("vms/dev/gens");
+        fs::read_dir(gens)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+}
+
+fn paused_once() -> Vec<Value> {
+    vec![json!({"state": "Paused"}), json!({"state": "Resumed"})]
+}
+
+#[test]
+fn a_running_vm_s_export_is_a_copy_made_paused_and_leaves_nothing_behind() {
+    let vm = running();
+    let gens = vm.gens();
+    let listed = vm.host.ok(&["checkpoints", "dev"]);
+    let tar = vm.host.path("dev.tar");
+    let said = vm.host.exported(&["dev"], &tar);
+    assert!(said.contains("exported dev: its disk and 1 checkpoint"), "{said}");
+
+    // Synced, then paused and resumed once, for the copy.
+    assert_eq!(vm.vsock.connects(), ["CONNECT 10022"]);
+    assert_eq!(*vm.synced.lock().unwrap(), Some(1));
+    assert_eq!(vm.states(), paused_once());
+    assert!(vm.boot.asked().is_empty(), "{:?}", vm.boot.asked());
+
+    let mine = format!("dev/checkpoints/{}.ext4", vm.mine.id);
+    assert_eq!(
+        listing(&tar),
+        ["dev/manifest.json", "dev/disk.ext4", mine.as_str()]
+    );
+    let out = vm.host.path("out");
+    extract(&tar, &out);
+    // The disk as it was at the pause, not as the VM has written it since.
+    same(&out.join("dev/disk.ext4"), &vm.at_pause);
+    let reads = |p: &Path| {
+        let mut b = vec![0; 64];
+        File::open(p).unwrap().read_exact(&mut b).unwrap();
+        b
+    };
+    assert_ne!(reads(&out.join("dev/disk.ext4")), reads(&vm.live));
+    same(
+        &out.join(&mine),
+        &vm.host.store().disk("dev", vm.mine.id).unwrap(),
+    );
+    let m = manifest(&out, "dev");
+    assert_eq!(m.disk.path, "dev/disk.ext4");
+    assert_eq!(m.disk.bytes, 64 * MIB);
+    let ids: Vec<u64> = m.checkpoints.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [vm.mine.id]);
+
+    // No copy, generation or checkpoint left, and dev still running.
+    assert_eq!(vm.gens(), gens);
+    assert_eq!(vm.host.ok(&["checkpoints", "dev"]), listed);
+    let status = vm.host.ok(&["status", "dev"]);
+    assert!(status.contains("  running"), "{status}");
+}
+
+#[test]
+fn a_running_vm_s_export_killed_mid_stream_leaves_nothing_behind() {
+    let vm = running();
+    let gens = vm.gens();
+    let mut child = vm
+        .host
+        .runner(&["export", "dev", "--no-checkpoints"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut head = vec![0; 2048];
+    stdout.read_exact(&mut head).unwrap();
+    // It blocks on the pipe, the copy open and streaming.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(vm.states(), paused_once());
+    assert_eq!(vm.gens(), gens);
+    let listed = vm.host.ok(&["checkpoints", "dev"]);
+    assert_eq!(listed.lines().count(), 2, "{listed}");
+}
+
+#[test]
+fn a_sleeping_vm_is_woken_then_exported_as_a_running_one() {
+    let vm = running();
+    vm.host.ok(&["sleep", "dev"]);
+    let status = vm.host.ok(&["status", "dev"]);
+    assert!(status.contains("  sleeping"), "{status}");
+    let gens = vm.gens();
+    let tar = vm.host.path("dev.tar");
+    vm.host.exported(&["dev", "--no-checkpoints"], &tar);
+    assert_eq!(vm.boot.asked(), [Ask::Sleep, Ask::Wake]);
+    assert_eq!(vm.vsock.connects(), ["CONNECT 10022"]);
+    assert_eq!(*vm.synced.lock().unwrap(), Some(1));
+    assert_eq!(vm.states(), paused_once());
+    assert_eq!(listing(&tar), ["dev/manifest.json", "dev/disk.ext4"]);
+    let out = vm.host.path("out");
+    extract(&tar, &out);
+    same(&out.join("dev/disk.ext4"), &vm.at_pause);
+    assert_eq!(vm.gens(), gens);
+}
+
+// A run's disk may roll back when it ends, so it's refused as restore and
+// sleep are, before anything is woken, synced or paused.
+#[test]
+fn a_running_vm_s_export_is_refused_while_a_run_is_going() {
+    let vm = running();
+    vm.host.ok(&["sleep", "dev"]);
+    // What `runner drive` holds for as long as its run goes on.
+    let runs = vm.host.store().runs("dev").unwrap();
+    fs::create_dir_all(&runs).unwrap();
+    let lock = File::create(runs.join("lock")).unwrap();
+    lock.lock().unwrap();
+    let err = vm.host.refused(&["dev"]);
+    assert!(err.contains("a run is starting in dev"), "{err}");
+    assert!(err.contains("export it once"), "{err}");
+    assert_eq!(vm.boot.asked(), [Ask::Sleep]);
+    assert!(vm.vsock.connects().is_empty());
+    assert!(vm.states().is_empty());
+}
+
+// Whatever goes wrong once the VM may be paused, it's resumed, and nothing
+// goes out.
+#[test]
+fn a_running_vm_s_failed_copy_still_resumes_it() {
+    let vm = running();
+    fs::remove_file(&vm.live).unwrap();
+    let gens = vm.gens();
+    let err = vm.host.refused(&["dev"]);
+    assert!(err.contains(&vm.live.display().to_string()), "{err}");
+    assert_eq!(vm.states(), paused_once());
+    assert_eq!(vm.gens(), gens);
 }
