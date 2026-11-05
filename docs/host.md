@@ -19,9 +19,13 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 
 ## A host aws.sh didn't make
 
-`client/aws.sh setup` sets up a host it launched (README.md, On AWS). Elsewhere, these are its steps by hand, from the laptop's checkout, with `admin` as your sudo login on the host:
+`client/aws.sh setup` sets up a host it launched (README.md, On AWS). Elsewhere, these are its steps by hand, from the laptop's checkout, with `admin` as your sudo login on the host and `kvm-host` as its name. Tailscale comes first here, so that name resolves for the rest:
 
-1. `/var/lib/runner` on XFS or btrfs. For a spare disk, found by its size, here 50 GiB. `blkid -p` prints nothing for an empty disk: never mkfs one it prints something for.
+1. Tailscale, on the host, under the name the laptop will use. Remove an old machine of that name from the tailnet first, or this one becomes `kvm-host-1`.
+   ```sh
+   curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname kvm-host
+   ```
+2. `/var/lib/runner` on XFS or btrfs. For a spare disk, found by its size, here 50 GiB. `blkid -p` prints nothing for an empty disk: never mkfs one it prints something for.
    ```sh
    disk=/dev/$(lsblk -dno NAME,SIZE | awk '$2 == "50G" {print $1}'); echo "$disk"
    sudo blkid -p "$disk"
@@ -29,16 +33,12 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
    echo "UUID=$(sudo blkid -p -s UUID -o value "$disk") /var/lib/runner xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
    sudo mkdir -p /var/lib/runner && sudo mount /var/lib/runner
    ```
-2. The checkout, since the repo is private, then Rust, `build-essential`, `podman`, and the install (README.md, Set up a host):
+3. The checkout, since the repo is private, then Rust, `build-essential`, `podman`, and the install (README.md, Set up a host):
    ```sh
    rsync -az --exclude target --exclude images/base/out ./ admin@kvm-host:ai-agent-runner/   # on the laptop
    cd ai-agent-runner && cargo build --release && sudo host/install.sh                       # on the host
    ```
-3. The base image and kernel, built with podman, not docker, which drops the VMs' forwarded traffic (README.md, Build the base image).
-4. Tailscale, under the name the laptop will use. Remove an old machine of that name from the tailnet first, or this one becomes `kvm-host-1`.
-   ```sh
-   curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname kvm-host
-   ```
+4. The base image and kernel, built with podman, not docker, which drops the VMs' forwarded traffic (README.md, Build the base image).
 5. The laptop's key (README.md, Add the laptop's key).
 6. The Claude token, as step 6 below says.
 7. `ssh runner@kvm-host runner doctor` from the laptop, every line `ok`; then nothing else in over SSH (README.md, Tailnet only).

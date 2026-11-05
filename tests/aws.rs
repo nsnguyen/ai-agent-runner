@@ -54,12 +54,16 @@ case "$1 $2" in
 esac
 "#;
 
-// The last ssh's argv, NUL-split, in $FAKE/ssh. A command for a host with a
-// directory in $FAKE/hosts runs there: in sh, as the user's home under it,
-// with $HOSTBIN first on PATH and /etc, /var/lib/runner and ~runner moved
-// under it. -n gives it no stdin, as ssh's does. Any other ssh only logs.
+// The last ssh's argv, NUL-split, in $FAKE/ssh. Each says on stderr that
+// it added the host's key, as ssh's accept-new does the first time. A
+// command for a host with a directory in $FAKE/hosts runs there: in sh, as
+// the user's home under it, with $HOSTBIN, the host's usr/bin, and then only
+// the system's, on PATH (not this machine's cargo), and /etc, /var/lib/runner
+// and ~runner moved under it. -n gives it no stdin, as ssh's does. Any other
+// ssh only logs.
 const FAKE_SSH: &str = r#"for arg; do printf '%s\0' "$arg"; done >"$FAKE/ssh"
 log ssh "$@"
+echo "Warning: Permanently added 'somewhere' (ED25519) to the list of known hosts." >&2
 none=
 while [ $# -gt 0 ]; do
   case $1 in
@@ -78,7 +82,7 @@ mkdir -p "$home"
 cmd=$(printf '%s' "$*" | sed -e "s#/etc/#$H/etc/#g" -e "s#/var/lib/runner#$H/var/lib/runner#g" -e "s#~runner/#$H/home/runner/#g")
 cd "$home" || exit 255
 [ -z "$none" ] || exec </dev/null
-HOST=$H WHO=${H##*/} HOME=$home PATH="$HOSTBIN:$PATH" exec sh -c "$cmd"
+HOST=$H WHO=${H##*/} HOME=$home PATH="$HOSTBIN:$H/usr/bin:/usr/bin:/bin" exec sh -c "$cmd"
 "#;
 
 // rsync to a fake host makes its checkout there: stubs of host/install.sh and
@@ -94,8 +98,9 @@ cp "$STUBS/build.sh" "$co/images/base/build.sh"
 "#;
 
 // The host's tools, each acting on files in $HOST: disk-fs (what's on the
-// 50 GiB disk), mounted, packages, tailnet-name (set by tailscale up, to
-// tailnet-gives if there is one), base, doctor (runner doctor's lines).
+// 50 GiB disk), mounted, packages, base, doctor (runner doctor's lines), and
+// reads-nothing, which makes sudo cat print nothing. curl's installers put
+// Rust in ~/.cargo and Tailscale in the host's usr/bin, from $PKGS.
 const HOST_TOOLS: &[(&str, &str)] = &[
     (
         "sudo",
@@ -108,7 +113,17 @@ while [ $# -gt 0 ]; do
   *) break ;;
   esac
 done
+[ "$1" != cat ] || [ ! -e "$HOST/reads-nothing" ] || exit 0
 exec "$@"
+"#,
+    ),
+    (
+        "curl",
+        r#"log curl "$@"
+case "$*" in
+*sh.rustup.rs*) printf '. "%s/rustup-init"\n' "$PKGS" ;;
+*tailscale.com/install.sh*) printf '. "%s/tailscale-install"\n' "$PKGS" ;;
+esac
 "#,
     ),
     (
@@ -161,6 +176,26 @@ case " $* " in *" install "*)
 esac
 "#,
     ),
+];
+
+// What curl's installers install, and the installers.
+const PKGS: &[(&str, &str)] = &[
+    ("cargo", "log cargo \"$@\"\n"),
+    ("rustup", "log rustup \"$@\"\n"),
+    (
+        "rustup-init",
+        r#"mkdir -p "$HOME/.cargo/bin"
+cp "$PKGS/cargo" "$PKGS/rustup" "$HOME/.cargo/bin/"
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >"$HOME/.cargo/env"
+"#,
+    ),
+    (
+        "tailscale-install",
+        r#"mkdir -p "$HOST/usr/bin"
+cp "$PKGS/tailscale" "$HOST/usr/bin/"
+"#,
+    ),
+    // tailnet-name is set by tailscale up, to tailnet-gives if there is one.
     (
         "tailscale",
         r#"log tailscale "$@"
@@ -177,9 +212,11 @@ up)
 esac
 "#,
     ),
-    (
-        "runner",
-        r#"log runner "$@"
+];
+
+const MORE_HOST_TOOLS: &[(&str, &str)] = &[(
+    "runner",
+    r#"log runner "$@"
 case $1 in
 status) [ -e "$HOST/base" ] ;;
 import) cat >/dev/null; touch "$HOST/base" ;;
@@ -189,11 +226,10 @@ doctor)
   fi ;;
 esac
 "#,
-    ),
-];
+)];
 
 // Host tools that only log.
-const LOGGERS: &[&str] = &["cargo", "rustup", "curl", "podman", "stty"];
+const LOGGERS: &[&str] = &["podman", "stty"];
 
 const STUB_INSTALL: &str = r#"log install.sh "$@"
 mkdir -p "$HOST/home/runner/.ssh"
@@ -252,8 +288,12 @@ impl Aws {
         script(&bin.join("ssh"), FAKE_SSH);
         script(&bin.join("rsync"), FAKE_RSYNC);
         let hostbin = dir.path().join("hostbin");
-        for (name, body) in HOST_TOOLS {
+        for (name, body) in HOST_TOOLS.iter().chain(MORE_HOST_TOOLS) {
             script(&hostbin.join(name), body);
+        }
+        fs::create_dir(dir.path().join("pkgs")).unwrap();
+        for (name, body) in PKGS {
+            script(&dir.path().join("pkgs").join(name), body);
         }
         for name in LOGGERS {
             script(&hostbin.join(name), &format!("log {name} \"$@\"\n"));
@@ -314,6 +354,7 @@ impl Aws {
             .env("FAKE", self.dir.path().join("fake"))
             .env("HOSTBIN", self.dir.path().join("hostbin"))
             .env("STUBS", self.dir.path().join("stubs"))
+            .env("PKGS", self.dir.path().join("pkgs"))
             .env("HOST_IP", HOST_IP)
             .env_remove("RUNNER_AWS_NAME")
             .env_remove("RUNNER_AWS_TYPE")
@@ -377,6 +418,11 @@ impl Aws {
             .split_terminator('\0')
             .map(str::to_string)
             .collect()
+    }
+
+    /// Whether SSH from the internet is open: the group has a rule.
+    fn open(&self) -> bool {
+        self.dir.path().join("fake/perms").exists()
     }
 
     /// Every fake's run, in order: who ran it, then its argv.
@@ -875,9 +921,13 @@ fn up_sets_the_host_up_in_order() {
         });
         let token = aws.at("token", |r| writes(r, h, "CLAUDE_CODE_OAUTH_TOKEN"));
         let doctor = aws.at("doctor", |r| ran(r, h, "runner") && r[2] == "doctor");
-        let close = aws.at("close", |r| {
-            ran(r, "laptop", "aws") && r[3] == "revoke-security-group-ingress"
-        });
+        // The last revoke: setup's open revokes the laptop's old address too.
+        let close = aws
+            .log()
+            .iter()
+            .rposition(|r| ran(r, "laptop", "aws") && r[3] == "revoke-security-group-ingress")
+            .unwrap();
+        assert!(!aws.open());
         let order = [
             mkfs, rsync, install, build, import, tailscale, key, token, doctor, close,
         ];
@@ -927,6 +977,14 @@ fn up_sets_the_host_up_in_order() {
         for pkg in ["build-essential", "podman", "e2fsprogs", "rsync"] {
             assert!(host.read("packages").unwrap().contains(pkg), "{pkg}");
         }
+        // Rust before the build, Tailscale before it's brought up.
+        let rust = aws.at("rustup", |r| ran(r, h, "curl") && says(r, "sh.rustup.rs"));
+        let cargo = aws.at("cargo build", |r| ran(r, h, "cargo") && r[2] == "build");
+        assert!(rust < rsync && cargo < install, "{rust} {cargo} {install}");
+        let ts = aws.at("tailscale's install", |r| {
+            ran(r, h, "curl") && says(r, "tailscale.com/install.sh")
+        });
+        assert!(ts < tailscale, "{ts} {tailscale}");
         assert!(
             out.contains(&format!("runner hosts add runner@{NEW}")),
             "{out}"
@@ -946,6 +1004,7 @@ fn a_rerun_redoes_nothing() {
         assert_eq!(aws.count(|r| ran(r, h, "runner") && r[2] == "import"), 1);
         assert_eq!(aws.count(|r| ran(r, h, "tailscale") && r[2] == "up"), 1);
         assert_eq!(aws.count(|r| ran(r, h, "apt-get") && says(r, "install")), 1);
+        assert_eq!(aws.count(|r| ran(r, h, "curl")), 2);
         assert_eq!(aws.count(|r| writes(r, h, "CLAUDE_CODE_OAUTH_TOKEN")), 1);
         assert_eq!(
             aws.count(|r| ran(r, "laptop", "aws") && r[3] == "run-instances"),
@@ -1017,7 +1076,7 @@ fn close_waits_for_an_all_ok_doctor() {
             "{err}"
         );
         assert!(err.contains("open"), "{err}");
-        assert_eq!(aws.call("revoke-security-group-ingress"), None);
+        assert!(aws.open(), "SSH was closed");
         assert!(aws.dir.path().join("fake/perms").exists());
     }
 }
@@ -1125,22 +1184,40 @@ fn an_empty_token_writes_nothing_and_fails() {
         assert!(err.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{err}");
         assert_eq!(host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"), None);
         assert_eq!(host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN.new"), None);
-        assert_eq!(aws.call("revoke-security-group-ingress"), None);
+        assert!(aws.open(), "SSH was closed");
     }
 }
 
 #[test]
 fn an_empty_copy_writes_nothing_and_fails() {
-    // The source said it had one, then gave nothing.
+    // The source says it has the token, then its read gives nothing.
+    for shell in SHELLS {
+        let (aws, host, from) = second_host();
+        from.has("reads-nothing", "");
+        let err = fails(&aws.run_as(shell, NEW, &["up"], ""));
+        assert!(err.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{err}");
+        assert!(err.contains("from kvm-host"), "{err}");
+        assert_eq!(
+            aws.count(|r| ran(r, "kvm-host", "sudo") && r[2] == "cat"),
+            1
+        );
+        assert_eq!(host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"), None);
+        assert_eq!(host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN.new"), None);
+        assert_eq!(aws.count(|r| ran(r, HOST_IP, "stty")), 0);
+        assert!(aws.open(), "SSH was closed");
+    }
+}
+
+#[test]
+fn an_empty_source_file_is_asked_for_instead() {
+    // test -s on the source passes only for a file with something in it.
     let (aws, host, from) = second_host();
     fs::write(from.dir.join("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"), "").unwrap();
-    from.has("etc/credstore/GH_TOKEN", "ghp_x\n");
-    // test -s on the source passes only for a file with something in it, so
-    // the empty Claude token isn't copied: it's asked for, and nothing typed.
-    let err = fails(&aws.run_as(&["sh"], NEW, &["up"], ""));
-    assert!(err.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{err}");
-    assert_eq!(host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN"), None);
-    assert_eq!(aws.call("revoke-security-group-ingress"), None);
+    ok(&aws.run_as(&["sh"], NEW, &["up"], "typed\n"));
+    assert_eq!(
+        host.read("etc/credstore/CLAUDE_CODE_OAUTH_TOKEN").unwrap(),
+        "typed\n"
+    );
 }
 
 #[test]
@@ -1153,7 +1230,7 @@ fn a_tailnet_name_not_its_own_stops_before_close() {
             err.contains("kvm-host-2-1") && err.contains("emove"),
             "{err}"
         );
-        assert_eq!(aws.call("revoke-security-group-ingress"), None);
+        assert!(aws.open(), "SSH was closed");
         assert_eq!(
             aws.count(|r| ran(r, HOST_IP, "runner") && r[2] == "doctor"),
             0
@@ -1175,6 +1252,43 @@ fn setup_alone_sets_up_a_running_host() {
     assert_eq!(aws.call("create-key-pair"), None);
     assert!(host.dir.join("mounted").exists());
     assert!(aws.call("revoke-security-group-ingress").is_some());
+}
+
+#[test]
+fn setup_lets_this_laptops_new_address_in_first() {
+    // Up ran at a café; SSH isn't closed yet.
+    let (aws, _, _) = second_host();
+    aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+    aws.has("has-sg", "");
+    let cafe = r#"[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "192.0.2.9/32"}]}]"#;
+    aws.has("perms", cafe);
+    ok(&aws.run_as(&["sh"], NEW, &["setup"], ""));
+    let rule = aws
+        .call("authorize-security-group-ingress")
+        .expect("no rule");
+    assert_eq!(after(&rule, "--cidr"), format!("{LAPTOP_IP}/32"));
+    let open = aws.at("the open", |r| {
+        ran(r, "laptop", "aws") && r[3] == "authorize-security-group-ingress"
+    });
+    let first = aws.at("the first ssh", |r| ran(r, "laptop", "ssh"));
+    assert!(open < first, "{open} {first}");
+}
+
+#[test]
+fn setup_on_a_closed_host_opens_nothing() {
+    // Over the tailnet, as a rerun after close goes.
+    let (aws, host, _) = second_host();
+    host.has_token();
+    aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+    aws.has("has-sg", "");
+    ok(&aws.run_as(&["sh"], NEW, &["setup"], ""));
+    assert_eq!(aws.call("authorize-security-group-ingress"), None);
+    let first = aws.at("the first ssh", |r| ran(r, "laptop", "ssh"));
+    assert!(
+        aws.log()[first].contains(&format!("ubuntu@{NEW}")),
+        "{:?}",
+        aws.log()[first]
+    );
 }
 
 #[test]
@@ -1202,7 +1316,7 @@ fn up_needs_the_laptops_key_before_it_launches() {
 
 #[test]
 fn a_name_the_tailnet_cant_take_is_refused() {
-    for name in ["kvm host", "kvm;rm", "-x", "kvm_host"] {
+    for name in ["kvm host", "kvm;rm", "-x", "kvm_host", "Kvm-2"] {
         let aws = Aws::new();
         let out = aws
             .cmd(&["sh"], &["up"])

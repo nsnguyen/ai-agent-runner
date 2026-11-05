@@ -74,10 +74,10 @@ usage() {
 }
 
 # A name that goes into commands run on the host, and is its tailnet name:
-# letters, digits and dashes.
+# lowercase letters, digits and dashes, as the tailnet's DNS name has it.
 tailnet_name() {
   case $1 in
-  '' | -* | *[!A-Za-z0-9-]*) return 1 ;;
+  '' | -* | *[!a-z0-9-]*) return 1 ;;
   esac
 }
 
@@ -243,8 +243,10 @@ echo "disk: $disk is XFS, at $mnt"
 EOF
 }
 
-# What the build needs, before the copy, which needs rsync there too. apt
-# waits out the lock that unattended-upgrades holds after a first boot.
+# What the build needs, before the copy, which needs rsync there too. After
+# a first boot, apt-daily and unattended-upgrades hold apt's locks for a few
+# minutes: install waits on dpkg's, and update, whose lists lock that doesn't
+# cover, is retried for up to 10 minutes.
 tools_sh() {
   cat <<'EOF'
 set -eu
@@ -254,7 +256,13 @@ for p in build-essential podman e2fsprogs rsync curl git; do
 done
 if [ -n "$missing" ]; then
   echo "tools: installing$missing"
-  sudo apt-get -o DPkg::Lock::Timeout=600 update -q
+  tries=0
+  until sudo apt-get -o DPkg::Lock::Timeout=600 update -q; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 60 ] || exit 1
+    echo "tools: apt is busy, trying again in 10 seconds"
+    sleep 10
+  done
   sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q $missing
 fi
 [ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
@@ -390,7 +398,7 @@ creds() {
     elif [ -n "$src" ] && on_from -n "ubuntu@$src" "sudo test -s /etc/credstore/$c"; then
       # Host to host: the laptop only passes it along.
       on_from -n "ubuntu@$src" "sudo cat /etc/credstore/$c" |
-        on_host "$at" "c=$c; $(cred_sh)" || stopped "copying $c from $src"
+        on_host "$at" "c=$c; $(cred_sh)" || stopped "$c from $src"
       say "credentials: $c copied from $src"
     elif [ "$c" = CLAUDE_CODE_OAUTH_TOKEN ]; then
       on_host -t "$at" "c=$c; prompt='Claude Code token for $name (claude setup-token makes one), then Enter'; $(cred_sh)" ||
@@ -401,13 +409,15 @@ creds() {
 }
 
 # runner doctor as the laptop will reach the host: runner@$name, over the
-# tailnet. Every line ok, or SSH stays open.
+# tailnet. Every line ok, or SSH stays open. Only its stdout is the report:
+# ssh's own notes, like the first connection's "Permanently added", go to
+# stderr.
 doctor() {
   report=$(ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
-    "runner@$name" runner doctor 2>&1) && code=0 || code=$?
+    "runner@$name" runner doctor) && code=0 || code=$?
   printf '%s\n' "$report"
   if [ "$code" -eq 255 ]; then
-    die "runner@$name doesn't answer over the tailnet, so SSH from the internet stays open: check Tailscale is up on this laptop, then rerun it with ${rerun}"
+    die "ssh to runner@$name over the tailnet failed, so SSH from the internet stays open. Check Tailscale is up on this laptop; if ssh says the host key changed, an older $name had it: ssh-keygen -R $name. Then rerun it with ${rerun}"
   fi
   bad=$(printf '%s\n' "$report" | awk 'NF && $1 != "ok"')
   if [ -n "$bad" ] || [ -z "$report" ] || [ "$code" -ne 0 ]; then
@@ -420,6 +430,9 @@ setup() {
   reach
   rerun="$0 setup"
   [ "$name" = kvm-host ] || rerun="RUNNER_AWS_NAME=$name $rerun"
+  # Until close, let this laptop in from where it is now, which may not be
+  # where up ran.
+  [ "$target" = "$name" ] || open_ssh
   at=ubuntu@$target
   say "Setting $name up, as $at"
 
@@ -497,8 +510,8 @@ up() {
 [ $# -gt 0 ] || usage
 case $1 in
 up | setup)
-  tailnet_name "$name" || die "RUNNER_AWS_NAME=$name: the host's tailnet name too, so letters, digits and dashes only"
-  [ -z "$from" ] || tailnet_name "$from" || die "RUNNER_AWS_TOKEN_FROM=$from: a tailnet name, so letters, digits and dashes only"
+  tailnet_name "$name" || die "RUNNER_AWS_NAME=$name: the host's tailnet name too, so lowercase letters, digits and dashes only"
+  [ -z "$from" ] || tailnet_name "$from" || die "RUNNER_AWS_TOKEN_FROM=$from: a tailnet name, so lowercase letters, digits and dashes only"
   ;;
 esac
 command -v aws >/dev/null || die "needs the AWS CLI: brew install awscli, then aws login"
