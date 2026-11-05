@@ -1,7 +1,8 @@
-// `runner mcp --peer …`: the first host's MCP reaching every host. Three
-// roots on this machine stand in for three hosts: this one, and kvm-host-2
-// and kvm-host-3 behind a fake ssh that runs `runner peer` on the peer's own
-// root, with SSH_ORIGINAL_COMMAND set, as sshd does for a peer's key line.
+// `runner mcp --name runner@kvm-host --peer …`: the first host's MCP
+// reaching every host. Three roots on this machine stand in for three hosts:
+// this one, kvm-host, and kvm-host-2 and kvm-host-3 behind a fake ssh that
+// runs `runner peer` on the peer's own root, with SSH_ORIGINAL_COMMAND set,
+// as sshd does for a peer's key line.
 mod common;
 
 use common::{FakeSystemd, FakeVsock, Guest, me, script, wait_for};
@@ -17,13 +18,14 @@ const PEERS: [&str; 2] = ["runner@kvm-host-2", "runner@kvm-host-3"];
 
 // ssh as far as the first host's runner sees it: options, then the target,
 // then the command. A host's directory under $FLEET is named for the
-// target's host part; one with `down` in it times out as ssh does. The rest
+// target's host part; one with `down` in it times out as ssh does, after two
+// seconds if it's `slow` too, as a real timeout takes a while. The rest
 // run `runner peer` there with a clean environment, so nothing of the first
 // host's, like RUNNER_USER, reaches it unless the command passes it.
 const SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
 while [ $# -gt 0 ]; do
   case $1 in
-  -o) shift 2 ;;
+  -o | -i) shift 2 ;;
   -*) shift ;;
   *) break ;;
   esac
@@ -36,6 +38,7 @@ if [ ! -d "$dir" ]; then
   exit 255
 fi
 if [ -e "$dir/down" ]; then
+  [ ! -e "$dir/slow" ] || sleep 2
   echo "ssh: connect to host ${target##*@} port 22: Connection timed out" >&2
   exit 255
 fi
@@ -94,10 +97,11 @@ impl Drop for Session {
     }
 }
 
-// This machine's name, which the first host goes by.
+// The first host as the laptop lists it, and what MCP calls it.
+const HERE: &str = "runner@kvm-host";
+
 fn here() -> String {
-    let name = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
-    name.trim().to_string()
+    "kvm-host".to_string()
 }
 
 // A host's directory: `root` its RUNNER_ROOT, with a fake systemd in
@@ -223,7 +227,7 @@ impl Fleet {
             .env("SYS_PATH", sys)
             .env("FLEET", self.dir.path().join("fleet"))
             .env("RUNNER", env!("CARGO_BIN_EXE_runner"))
-            .arg("mcp");
+            .args(["mcp", "--name", HERE]);
         for p in PEERS {
             cmd.args(["--peer", p]);
         }
@@ -329,6 +333,10 @@ fn list_vms_and_list_hosts_cover_every_host() {
     assert_eq!(log.len(), 2, "{log:?}");
     for (line, peer) in log.iter().zip(PEERS) {
         assert!(line.contains("BatchMode=yes"), "{line}");
+        assert!(
+            line.contains("IdentitiesOnly=yes -i ~/.ssh/id_ed25519"),
+            "{line}"
+        );
         assert!(line.contains("StrictHostKeyChecking=accept-new"), "{line}");
         let tail = format!(" {peer} runner mcp --user {}", me());
         assert!(line.ends_with(&tail), "{line}");
@@ -370,7 +378,10 @@ fn a_peer_s_vm_or_run_is_reached_on_its_root_only() {
     let runs = s.ok(5, "list_runs", json!({"name": "web"}));
     assert_eq!(runs["runs"][0]["prompt"], json!("say hi"), "{runs}");
     let why = s.fails(6, "cancel_run", json!({"run": "web.1"}));
-    assert!(why.contains("web.1"), "{why}");
+    assert!(
+        why.starts_with("web.1 has already ended: exited 0"),
+        "{why}"
+    );
 
     // This host's own VMs stay here.
     s.ok(7, "vm_status", json!({"name": "dev"}));
@@ -419,6 +430,8 @@ fn create_vm_places_by_free_memory_and_takes_a_host() {
     assert_eq!(on("d"), ["kvm-host-2"]);
     s.ok(6, "create_vm", json!({"name": "e", "host": here}));
     assert_eq!(on("e"), ["here"]);
+    s.ok(66, "create_vm", json!({"name": "e2", "host": HERE}));
+    assert_eq!(on("e2"), ["here"]);
     fleet.here.set_free(8 << 30);
     s.ok(7, "create_vm", json!({"name": "f", "cpus": 4}));
     assert_eq!(on("f"), ["here"]);
@@ -529,10 +542,7 @@ fn a_peer_whose_ssh_fails_is_named_while_the_rest_answer() {
     let pid = fs::read_to_string(fleet.three.dir.join("pid")).unwrap();
     let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
-    wait_for("the peer to go", || {
-        nix::sys::signal::kill(pid, None).is_err()
-            || fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
-    });
+    wait_for("the peer to go", || gone(pid));
     let why = s.fails(8, "vm_status", json!({"name": "old"}));
     assert!(
         why.contains("old is on kvm-host-3, which didn't answer"),
@@ -543,4 +553,88 @@ fn a_peer_whose_ssh_fails_is_named_while_the_rest_answer() {
         why.contains("kvm-host-3 has a VM named old already"),
         "{why}"
     );
+    let why = s.fails(10, "create_vm", json!({"name": "z", "from": "old"}));
+    let want = "old is on kvm-host-3, which didn't answer: ssh: connect";
+    assert!(why.starts_with(want), "{why}");
+}
+
+// A peer that went away while nothing was asked of it, and came back, as
+// after a reboot or a dropped tailnet: the next call dials it again.
+#[test]
+fn a_peer_whose_session_ended_while_idle_is_dialed_again() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    s.ok(2, "vm_status", json!({"name": "web"}));
+    let pid = peer_pid(&fleet.two);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    wait_for("the peer to go", || gone(pid));
+    let web = s.ok(3, "vm_status", json!({"name": "web"}));
+    assert_eq!(web["name"], json!("web"), "{web}");
+    let log = fleet.ssh_log();
+    let dials = log
+        .iter()
+        .filter(|l| l.contains(" runner@kvm-host-2 "))
+        .count();
+    assert_eq!(dials, 2, "{log:?}");
+}
+
+// A peer whose runner stops answering while its ssh stays up is named, in
+// the time a list waits, rather than holding every list up.
+#[test]
+fn a_peer_that_stops_answering_is_named_once_its_list_is_overdue() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    s.ok(2, "list_vms", json!({}));
+    let pid = peer_pid(&fleet.two);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+    let started = std::time::Instant::now();
+    let vms = s.ok(3, "list_vms", json!({}));
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(25));
+    assert_eq!(vms["unreachable"][0]["host"], json!("kvm-host-2"), "{vms}");
+    let why = vms["unreachable"][0]["error"].as_str().unwrap();
+    assert!(why.starts_with("no answer in"), "{why}");
+    assert!(listed(&vms).contains(&("old".to_string(), "kvm-host-3".to_string())));
+    // Going again, it answers again.
+    let vms = s.ok(4, "list_vms", json!({}));
+    assert!(vms.get("unreachable").is_none(), "{vms}");
+}
+
+// With a host down whose ssh takes its time to say so: a VM last listed on
+// another peer is reached without waiting on it, and calls that all need the
+// one that's down wait out one dial between them, not one each.
+#[test]
+fn a_slow_host_that_s_down_holds_up_only_what_needs_it() {
+    let fleet = Fleet::new();
+    fs::write(fleet.three.dir.join("slow"), "").unwrap();
+    fleet.down("kvm-host-3", true);
+    let mut s = fleet.serve();
+    s.ok(2, "list_vms", json!({}));
+    let started = std::time::Instant::now();
+    s.ok(3, "vm_status", json!({"name": "web"}));
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+    let started = std::time::Instant::now();
+    for id in 4..8 {
+        let call = json!({"name": "list_vms", "arguments": {}});
+        s.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": call}));
+    }
+    for id in 4..8 {
+        let got = s.reply(id)["result"]["structuredContent"].clone();
+        assert_eq!(got["unreachable"][0]["host"], json!("kvm-host-3"), "{got}");
+    }
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(3500), "{took:?}");
+}
+
+// The process a peer's ssh became: its `runner peer`.
+fn peer_pid(host: &Host) -> nix::unistd::Pid {
+    let pid = fs::read_to_string(host.dir.join("pid")).unwrap();
+    nix::unistd::Pid::from_raw(pid.trim().parse().unwrap())
+}
+
+// Whether a killed process has gone, or is only waiting to be reaped.
+fn gone(pid: nix::unistd::Pid) -> bool {
+    nix::sys::signal::kill(pid, None).is_err()
+        || fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
 }

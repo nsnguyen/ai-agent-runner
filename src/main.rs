@@ -352,6 +352,11 @@ enum Cmd {
         /// this host's key on first use, as `ssh <peer> runner mcp`.
         #[arg(long = "peer", value_name = "HOST", value_parser = peer_host)]
         peers: Vec<String>,
+        /// This host as the laptop lists it, like runner@kvm-host, which
+        /// MCP calls it by, less its user@: the laptop passes it with the
+        /// peers. Left out, it's the kernel's name for this machine.
+        #[arg(long, value_name = "HOST")]
+        name: Option<String>,
     },
     /// Run a VM until it shuts down: the unit's main process.
     #[command(hide = true)]
@@ -685,7 +690,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 .for_each(|c| println!("{}", c.row()));
         }
         Cmd::Restore { name, id } => show(&checkpoint::restore(&store, &name, id)?),
-        Cmd::Mcp { user, peers } => return Ok(serve(store, user, peers)),
+        Cmd::Mcp { user, peers, name } => return Ok(serve(store, user, peers, name)),
         Cmd::Boot {
             name,
             firecracker,
@@ -1071,12 +1076,12 @@ fn peer_host(host: &str) -> Result<String, String> {
     Ok(host.to_string())
 }
 
-fn serve(store: Store, user: String, peers: Vec<String>) -> ExitCode {
+fn serve(store: Store, user: String, peers: Vec<String>, name: Option<String>) -> ExitCode {
     let served = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(Into::into)
-        .and_then(|rt| rt.block_on(runner::mcp::serve(store, user, peers)));
+        .and_then(|rt| rt.block_on(runner::mcp::serve(store, user, peers, name)));
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

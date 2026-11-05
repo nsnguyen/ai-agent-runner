@@ -39,8 +39,11 @@ pub struct Tools {
     store: Store,
     /// Who exec runs commands as.
     user: String,
-    /// What this host is called: the kernel's name for it.
+    /// What this host is called: as the laptop lists it, less its user@,
+    /// else the kernel's name for it.
     name: String,
+    /// It as the laptop lists it, like runner@kvm-host, if it said.
+    listed: Option<String>,
     /// The other hosts, in the laptop's order. A peer's own MCP has none.
     peers: Arc<Vec<Remote>>,
     /// Which peer each VM was on when last listed, so a VM on a peer that
@@ -262,7 +265,9 @@ impl ServerHandler for Tools {
         if !self.peers.is_empty() {
             let there = match self.route(&request).await {
                 Ok(None) => None,
-                Ok(Some((i, request))) => Some(self.peers[i].call(request).await),
+                Ok(Some((i, request))) => {
+                    Some(self.peers[i].call(request).await.map_err(|g| g.to_string()))
+                }
                 Err(why) => Some(Err(why)),
             };
             if let Some(answer) = there {
@@ -292,7 +297,8 @@ impl Tools {
             })
             .collect();
         let mut unreachable = Vec::new();
-        for (peer, listed) in self.peers.iter().zip(self.survey().await) {
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        for (peer, listed) in self.peers.iter().zip(self.survey(&all).await) {
             match listed {
                 Ok(theirs) => vms.extend(theirs.into_iter().map(|vm| HostedVm {
                     vm,
@@ -313,7 +319,7 @@ impl Tools {
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
         // Another host's name took the call there (route).
         if let Some(host) = args.host.as_deref()
-            && host != self.name
+            && !self.is_me(host)
         {
             return Err(self.no_host(host));
         }
@@ -693,17 +699,22 @@ where
 
 /// Serves until the client closes stdin. exec runs commands as `user`, here
 /// and on each of `peers`, the other hosts as ssh takes them, which are
-/// dialed when first needed.
+/// dialed when first needed. `listed` is this host as the laptop lists it.
 pub async fn serve(
     store: Store,
     user: String,
     peers: Vec<String>,
+    listed: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let peers = peers.iter().map(|p| Remote::new(p, &user)).collect();
+    let name = listed.as_deref().map_or_else(hosts::hostname, |l| {
+        l.rsplit_once('@').map_or(l, |(_, h)| h).to_string()
+    });
     let tools = Tools {
         store,
         user,
-        name: hosts::hostname(),
+        name,
+        listed,
         peers: Arc::new(peers),
         seen: Arc::default(),
     };
@@ -737,15 +748,29 @@ impl Tools {
     }
 
     /// The peer that has `vm`, or None for this host: one that has it, or,
-    /// when every host answered and none has it, the one to say so.
+    /// when every host answered and none has it, the one to say so. The
+    /// peer it was last listed on is asked first, alone, so a VM there isn't
+    /// held up by a host that's down.
     async fn locate(&self, vm: &str) -> Result<Option<usize>, String> {
         if self.store.get(vm).is_ok() {
             return Ok(None);
         }
-        let lists = self.survey().await;
-        let has =
-            |l: &Result<Vec<Vm>, String>| l.as_ref().is_ok_and(|l| l.iter().any(|v| v.name == vm));
-        if let Some(i) = lists.iter().position(has) {
+        let has = |l: &Lists, i: usize| l[i].as_ref().is_ok_and(|l| l.iter().any(|v| v.name == vm));
+        let last = self.last_seen(vm);
+        let first: Vec<usize> = last.into_iter().collect();
+        let mut lists = self.survey(&first).await;
+        if let Some(i) = last
+            && has(&lists, i)
+        {
+            return Ok(Some(i));
+        }
+        let rest: Vec<usize> = (0..self.peers.len()).filter(|i| Some(*i) != last).collect();
+        for (i, list) in self.survey(&rest).await.into_iter().enumerate() {
+            if rest.contains(&i) {
+                lists[i] = list;
+            }
+        }
+        if let Some(i) = (0..lists.len()).find(|&i| has(&lists, i)) {
             return Ok(Some(i));
         }
         let down: Vec<(usize, &String)> = (lists.iter().enumerate())
@@ -754,23 +779,23 @@ impl Tools {
         if down.is_empty() {
             return Ok(None);
         }
-        let last = self
-            .seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(vm)
-            .copied();
-        if let Some((i, why)) = down.iter().find(|(i, _)| Some(*i) == last) {
-            return Err(format!(
-                "{vm} is on {}, which didn't answer: {why}",
-                self.peers[*i].name
-            ));
+        // Where it was last listed, if that's one that didn't answer now.
+        if let Some((i, why)) = down.iter().find(|(i, _)| Some(*i) == self.last_seen(vm)) {
+            let on = &self.peers[*i].name;
+            return Err(format!("{vm} is on {on}, which didn't answer: {why}"));
         }
-        let whys: Vec<&str> = down.iter().map(|(_, why)| why.as_str()).collect();
+        let whys: Vec<String> = (down.iter())
+            .map(|(i, why)| format!("{} didn't answer: {why}", self.peers[*i].name))
+            .collect();
         Err(format!(
             "no host that answered has a VM named {vm}, and {}",
             whys.join("; ")
         ))
+    }
+
+    fn last_seen(&self, vm: &str) -> Option<usize> {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.get(vm).copied()
     }
 
     /// Where create_vm makes its VM, as the laptop's `runner create` places
@@ -789,14 +814,15 @@ impl Tools {
         };
         let host = match text("host") {
             None => None,
-            Some(h) if h == self.name => Some(None),
+            Some(h) if self.is_me(h) => Some(None),
             Some(h) => match self.peers.iter().position(|p| p.is(h)) {
                 Some(i) => Some(Some(i)),
                 None => return Err(self.no_host(h)),
             },
         };
         let here = self.store.list().map_err(|e| e.to_string())?;
-        let lists = self.survey().await;
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        let lists = self.survey(&all).await;
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // The host that has `vm`: Some(None) for this one.
         let holder = |vm: &str| {
@@ -840,7 +866,7 @@ impl Tools {
 
     // The host with the most free memory, this one first among equals, of
     // this one and the peers whose lists came.
-    async fn most_free(&self, lists: &[Result<Vec<Vm>, String>]) -> Result<Option<usize>, String> {
+    async fn most_free(&self, lists: &Lists) -> Result<Option<usize>, String> {
         let up: Vec<usize> = (0..lists.len()).filter(|&i| lists[i].is_ok()).collect();
         let answers = self.ask("list_hosts", &up).await;
         let mut best: Option<(Option<usize>, u64)> =
@@ -858,16 +884,21 @@ impl Tools {
         })
     }
 
-    /// Every peer's VMs, or why it didn't answer, in order, all asked at once,
-    /// and where each VM is noted for when its peer stops answering.
-    async fn survey(&self) -> Vec<Result<Vec<Vm>, String>> {
-        let all: Vec<usize> = (0..self.peers.len()).collect();
-        let answers = self.ask("list_vms", &all).await;
-        let lists: Vec<Result<Vec<Vm>, String>> = (answers.into_iter().zip(self.peers.iter()))
-            .map(|(answer, peer)| {
-                let list: VmList = serde_json::from_value(answer?)
-                    .map_err(|e| format!("{}'s list_vms: {e}", peer.name))?;
-                Ok(list.vms.into_iter().map(|v| v.vm).collect())
+    /// The VMs of each peer `which` picks, or why it didn't answer, in
+    /// order, all asked at once, and where each VM is noted for when its
+    /// peer stops answering. A peer's `host` on each, which a runner from
+    /// before peers doesn't give, is left: this host names them.
+    async fn survey(&self, which: &[usize]) -> Lists {
+        #[derive(Deserialize)]
+        struct Listed {
+            vms: Vec<Vm>,
+        }
+        let answers = self.ask("list_vms", which).await;
+        let lists: Lists = (answers.into_iter())
+            .map(|answer| {
+                let list: Listed = serde_json::from_value(answer?)
+                    .map_err(|e| format!("its list_vms gave {e}"))?;
+                Ok(list.vms)
             })
             .collect();
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -883,7 +914,9 @@ impl Tools {
     }
 
     /// `tool`, with no arguments, on each of the peers `which` picks, at
-    /// once: each one's structured answer, or why there's none, in order.
+    /// once: each one's structured answer, or why there's none, in order,
+    /// within ASK_WAIT, so a peer that has stopped answering holds no list
+    /// up for longer.
     async fn ask(&self, tool: &'static str, which: &[usize]) -> Vec<Result<Value, String>> {
         let mut asked = tokio::task::JoinSet::new();
         for &i in which {
@@ -891,12 +924,15 @@ impl Tools {
             asked.spawn(async move {
                 let mut call = CallToolRequestParams::new(tool);
                 call.arguments = Some(Default::default());
-                let peer = &peers[i];
-                (i, structured(peer.call(call).await, &peer.name))
+                let answer = tokio::time::timeout(ASK_WAIT, peers[i].call(call)).await;
+                let answer = answer
+                    .map_err(|_| format!("no answer in {} seconds", ASK_WAIT.as_secs()))
+                    .and_then(|a| a.map_err(|gone| gone.why));
+                (i, answer.and_then(structured))
             });
         }
         let mut answers: Vec<Result<Value, String>> = (0..self.peers.len())
-            .map(|i| Err(format!("{} wasn't asked", self.peers[i].name)))
+            .map(|_| Err("it wasn't asked".to_string()))
             .collect();
         while let Some(done) = asked.join_next().await {
             match done {
@@ -907,6 +943,11 @@ impl Tools {
         answers
     }
 
+    /// Whether `host` names this one: as listed, or by its name.
+    fn is_me(&self, host: &str) -> bool {
+        host == self.name || self.listed.as_deref() == Some(host)
+    }
+
     fn no_host(&self, host: &str) -> String {
         let mut names = vec![self.name.as_str()];
         names.extend(self.peers.iter().map(|p| p.name.as_str()));
@@ -914,22 +955,28 @@ impl Tools {
     }
 }
 
+/// How long list_vms and list_hosts wait on a peer, past its dial
+/// (peers::HELLO), before naming it as not answering.
+const ASK_WAIT: Duration = Duration::from_secs(20);
+
+/// Each peer's VMs, in order, or why there are none.
+type Lists = Vec<Result<Vec<Vm>, String>>;
+
 // A peer's answer as data, or its error's text.
-fn structured(answer: Result<CallToolResult, String>, peer: &str) -> Result<Value, String> {
-    let result = answer?;
+fn structured(result: CallToolResult) -> Result<Value, String> {
     if result.is_error == Some(true) {
         let text = result.content.iter().find_map(|c| c.as_text());
         let text = text.map_or("an error with no text", |t| t.text.as_str());
-        return Err(format!("{peer}: {text}"));
+        return Err(text.to_string());
     }
-    (result.structured_content).ok_or_else(|| format!("{peer} answered with no data"))
+    (result.structured_content).ok_or_else(|| "it answered with no data".to_string())
 }
 
 // A peer's own row from its list_hosts, under the name this host calls it.
 fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {
     let list: HostList =
-        serde_json::from_value(answer.clone()).map_err(|e| format!("{peer}'s list_hosts: {e}"))?;
-    let mut row = (list.hosts.into_iter().next()).ok_or_else(|| format!("{peer} gave no row"))?;
+        serde_json::from_value(answer.clone()).map_err(|e| format!("its list_hosts gave {e}"))?;
+    let mut row = (list.hosts.into_iter().next()).ok_or("it gave no row")?;
     row.name = peer.to_string();
     Ok(row)
 }

@@ -319,7 +319,8 @@ check_mcp_hosts() {
   [ -z "$down" ] && pass "MCP list_hosts: no host unreachable" || fail "MCP list_hosts: unreachable: ${down#*:}"
   got=$(reply 4)
   printf '%s' "$got" | grep -q '"isError":false' && pass "MCP create_vm: $vm2 made on $other" || fail "MCP create_vm: $vm2 on $other: ${got:-no reply}"
-  got=$(reply 5 | grep -o "{\"name\":\"$vm2\"[^}]*}")
+  # One VM's object, its keys in any order.
+  got=$(reply 5 | grep -o "{[^{}]*\"name\":\"$vm2\"[^{}]*}")
   case $got in
   *"\"host\":\"$other\""*) pass "MCP list_vms: $vm2 is on $other" ;;
   '') fail "MCP list_vms: $vm2 isn't listed" ;;

@@ -786,7 +786,8 @@ fn mcp_passes_the_other_hosts_as_peers() {
     for shell in SHELLS {
         let fleet = Fleet::new();
         ok(&fleet.run(shell, &["mcp"]));
-        let peers = "runner mcp --peer runner@kvm-host-2 --peer runner@kvm-host-3";
+        let peers =
+            "runner mcp --name runner@kvm-host --peer runner@kvm-host-2 --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
             [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
@@ -796,7 +797,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
 
         fleet.forget_calls();
         ok(&fleet.run(shell, &["mcp", "--user", "bob", "--host", "kvm-host-2"]));
-        let peers = "runner mcp --user bob --peer runner@kvm-host --peer runner@kvm-host-3";
+        let peers = "runner mcp --user bob --name runner@kvm-host-2 --peer runner@kvm-host --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
             [["-T", "-o", "BatchMode=yes", HOSTS[1], peers]],
@@ -811,7 +812,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
         )
         .unwrap();
         ok(&fleet.run(shell, &["mcp"]));
-        let peers = "runner mcp --peer runner@kvm-host-2";
+        let peers = "runner mcp --name runner@kvm-host --peer runner@kvm-host-2";
         assert_eq!(
             fleet.ssh_calls(),
             [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
