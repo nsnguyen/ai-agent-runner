@@ -1011,3 +1011,45 @@ fn clap_options_that_take_a_value() -> Vec<String> {
     all.dedup();
     all
 }
+
+#[test]
+fn claude_on_a_new_vm_makes_it_where_create_would() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["claude", "fresh"]));
+        assert_eq!(fleet.commands("kvm-host-2"), ["claude fresh"], "{shell:?}");
+        assert!(fleet.commands("kvm-host").is_empty(), "{shell:?}");
+        // One that exists goes to its host, and --from a VM other than base
+        // to that VM's.
+        ok(&fleet.run(shell, &["claude", "dev", "--", "--continue"]));
+        assert_eq!(
+            fleet.commands("kvm-host"),
+            ["claude dev -- --continue"],
+            "{shell:?}"
+        );
+        ok(&fleet.run(shell, &["claude", "fresh2", "--from", "dev"]));
+        assert_eq!(
+            fleet.commands("kvm-host"),
+            ["claude dev -- --continue", "claude fresh2 --from dev"],
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hosts_file_of_one_host_runs_as_one_host_always_has() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fs::write(fleet.hosts_file(), "# mine\nrunner@kvm-host-2\n").unwrap();
+        ok(&fleet.run(shell, &["list"]));
+        ok(&fleet.run(shell, &["exec", "web", "--", "true"]));
+        assert_eq!(
+            fleet.ssh_calls(),
+            [
+                vec!["runner@kvm-host-2", "runner list"],
+                vec!["runner@kvm-host-2", "runner exec web -- true"]
+            ],
+            "{shell:?}"
+        );
+    }
+}

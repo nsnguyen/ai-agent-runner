@@ -930,6 +930,33 @@ fn without_aws_shs_key_ssh_uses_its_own() {
     }
 }
 
+// With several hosts, the first in ~/.config/runner/hosts, as for MCP.
+#[test]
+fn with_a_hosts_file_the_checks_go_to_its_first_host() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let conf = laptop.home().join(".config/runner");
+        fs::create_dir_all(&conf).unwrap();
+        fs::write(conf.join("host"), "runner@kvm-host\n").unwrap();
+        fs::write(
+            conf.join("hosts"),
+            "# the first is MCP's\nrunner@kvm-host-2\nrunner@kvm-host\n",
+        )
+        .unwrap();
+        let out = laptop
+            .check(shell, &[])
+            .env_remove("RUNNER_HOST")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{shell:?}: {}", says(&out));
+        let ssh = laptop.ssh_calls();
+        assert!(!ssh.is_empty());
+        for call in &ssh {
+            assert_eq!(call[0], "RUNNER_HOST=runner@kvm-host-2", "{call:?}");
+        }
+    }
+}
+
 #[test]
 fn without_a_host_it_says_where_to_set_one_and_runs_nothing() {
     let laptop = Laptop::new();

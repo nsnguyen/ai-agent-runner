@@ -14,9 +14,9 @@
 #         deleted at the end, after a FAIL too, unless KEEP=1. laptop_checks,
 #         below, lists them in order.
 #
-# The host is RUNNER_HOST, else the first line of ~/.config/runner/host, as
-# client/runner has it, and every laptop check runs with RUNNER_HOST set to
-# it. The copy and host/check.sh go in as ubuntu@ that host's name, with
+# The host is RUNNER_HOST, else the first host in ~/.config/runner/hosts,
+# else the first line of ~/.config/runner/host, as client/runner has it, and
+# every laptop check runs with RUNNER_HOST set to it. The copy and host/check.sh go in as ubuntu@ that host's name, with
 # client/aws.sh's key (RUNNER_AWS_KEY, else ~/.ssh/kvm-host.pem) when it's
 # there; RUNNER_ADMIN names another login.
 #
@@ -60,7 +60,11 @@ case $# in
 esac
 
 host=${RUNNER_HOST-}
-if [ -z "$host" ] && [ -r "$HOME/.config/runner/host" ]; then
+if [ -z "$host" ] && [ -e "$HOME/.config/runner/hosts" ]; then
+  while read -r host _ || [ -n "$host" ]; do
+    case $host in '' | '#'*) ;; *) break ;; esac
+  done <"$HOME/.config/runner/hosts"
+elif [ -z "$host" ] && [ -r "$HOME/.config/runner/host" ]; then
   read -r host <"$HOME/.config/runner/host"
 fi
 case $host in

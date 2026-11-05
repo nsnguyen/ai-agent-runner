@@ -201,7 +201,25 @@ git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
 client/install.sh runner@kvm-host
 ```
 
-It installs `runner` to `~/.local/bin` and saves the host to `~/.config/runner/host`; `RUNNER_HOST` overrides that. The host is anything `ssh` takes, so an alias from `~/.ssh/config` works. Arguments reach the host as typed, spaces and quotes included, and the host's exit code comes back. It asks for a terminal only when stdin and stdout are both one (for `export`, when stdout is), so `runner list | grep dev` gets plain lines and `echo hi | runner exec dev -- cat` works. Rerun `client/install.sh` after a `git pull` to upgrade.
+It installs `runner` to `~/.local/bin` and saves the host to `~/.config/runner/host`; `RUNNER_HOST` overrides that. More hosts go in `~/.config/runner/hosts` (Several hosts). The host is anything `ssh` takes, so an alias from `~/.ssh/config` works. Arguments reach the host as typed, spaces and quotes included, and the host's exit code comes back. It asks for a terminal only when stdin and stdout are both one (for `export`, when stdout is), so `runner list | grep dev` gets plain lines and `echo hi | runner exec dev -- cat` works. Rerun `client/install.sh` after a `git pull` to upgrade.
+
+### Several hosts
+
+```sh
+runner hosts add runner@kvm-host-2      # checks it answers, then lists it in ~/.config/runner/hosts
+runner hosts                            # each host: its VMs, how many are up, its free memory
+runner list                             # every host's VMs, each line led by its host
+runner create dev2                      # on the host with the most free memory
+runner create dev2 --host kvm-host-2    # or on that one
+runner exec dev2 -- hostname            # wherever dev2 is
+runner hosts rm kvm-host-2              # out of the list; its VMs stay on it
+```
+
+`~/.config/runner/hosts` lists one host a line, as ssh takes it; the first is the one `runner mcp` goes to, and `client/install.sh <host>` puts that host first. The first `hosts add` starts the list from `~/.config/runner/host`. `--host` takes a host as listed or by its name, `kvm-host-2`, sends any command there, and never reaches the host. `RUNNER_HOST` still means one host alone, and with one host every command goes there as it always has, with no host column.
+
+A command naming a VM goes to its host, `proxy` included, since every host gives out the same addresses. The laptop keeps where each VM was in `~/.cache/runner/vms`, asks that host whether it still has the VM (`runner ip`, with no stdin, so nothing piped in is lost), and if it hasn't, or the VM isn't in the cache, asks every host for its list at once and goes to the one that has it. A VM no host has goes to the first, which says so. A run id (`output`, `result` and `cancel dev.1`, and `--run dev.1`) goes to the host of the VM before its last dot. Names are one per VM across hosts: `create` and `import` refuse one any host has. `base` is the exception, on every host, and a command naming it goes to the first host unless `--host` says. A fork of a VM other than base goes to that VM's host, `import` places as `create` does, and `runner claude dev` making a new dev puts it where `create` would. `gc` with no VM and `doctor` run on every host, each line led by its host; other commands that name no VM go to the first.
+
+Asking every host is ssh with BatchMode, no stdin and a 5-second ConnectTimeout, all at once. A host that doesn't answer is named on stderr: `list`, `hosts`, `doctor` and `gc` show the rest and exit 1, and `create` places on the rest but still refuses a name that host had when last listed. BatchMode can't ask to accept a new host's key, so add a host with `runner hosts add`, which can. Free memory is MemAvailable, which counts a running VM's memory only as far as its guest has used it, so a host of idle VMs looks freer than it is once they all get busy. With several hosts, each command naming a VM takes one more SSH connection, for the check; `ControlMaster auto` and `ControlPersist 10m` for the hosts in `~/.ssh/config` make that quick. MCP sees only the first host for now: its `list_hosts` gives that host's row.
 
 ### Claude Code in the cloud
 
@@ -333,7 +351,7 @@ Import reads the stream itself, never with tar: only the entries the manifest na
 
 ### MCP clients
 
-`runner mcp` is `ssh -T -o BatchMode=yes runner@kvm-host runner mcp`: no terminal, so stdout carries only JSON-RPC, and no prompts, so the SSH key has to load without one (from the agent, or with no passphrase). Run `runner list` once from a terminal first, so ssh can ask you to accept the host's key.
+`runner mcp` is `ssh -T -o BatchMode=yes runner@kvm-host runner mcp`, to the first host (Several hosts): no terminal, so stdout carries only JSON-RPC, and no prompts, so the SSH key has to load without one (from the agent, or with no passphrase). Run `runner list` once from a terminal first, so ssh can ask you to accept the host's key.
 
 Claude Code, in every project:
 

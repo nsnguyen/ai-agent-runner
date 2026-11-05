@@ -6,7 +6,7 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 
 ## Words
 
-- **Server (host):** the one EC2 machine that runs everything, `kvm-host`.
+- **Server (host):** the EC2 machine that runs everything, `kvm-host`. You can add more (section 9).
 - **VM:** a small virtual machine on the server, one per agent, with its own Linux. You give each a name, like `dev`.
 - **base:** the VM every new VM is copied from: Ubuntu with Claude Code.
 - **Checkpoint:** a saved copy of a VM's disk that you can go back to.
@@ -139,7 +139,20 @@ demo carries on while it's exported: the disk is a copy made with demo paused fo
 
 `import` brings your checkpoints back under the same ids, so `runner restore demo2 4` is the checkpoint 4 demo had. A cut-off download is refused and leaves no `demo2`, so just run it again.
 
-## 9. When you're done
+## 9. More than one server
+
+```sh
+runner hosts add runner@kvm-host-2   # once the second server is set up
+runner hosts                         # each server: its VMs, how many are up, its free memory
+runner create demo3                  # goes to the server with the most free memory
+runner list                          # every server's VMs, each line led by its server
+runner shell demo3                   # finds demo3's server for you
+runner create demo4 --host kvm-host  # or pick the server yourself
+```
+
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed.
+
+## 10. When you're done
 
 ```sh
 runner stop demo       # saves its disk
