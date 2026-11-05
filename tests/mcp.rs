@@ -124,6 +124,7 @@ fn lists_its_tools() {
             "exec",
             "kill_session",
             "list_checkpoints",
+            "list_hosts",
             "list_runs",
             "list_services",
             "list_sessions",
@@ -229,6 +230,44 @@ fn start_status_and_stop_through_systemd() {
         why.contains("Job for firecracker@base.service failed."),
         "{why}"
     );
+}
+
+// This host only, until #140 reaches the rest: its VMs, the ones up, and
+// MemAvailable, as `runner hosts` counts them.
+#[test]
+fn list_hosts_gives_this_host_s_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+    store.fork("base", "dev").unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    sd.set_vm_state("dev", "active");
+    let meminfo = dir.path().join("meminfo");
+    fs::write(&meminfo, "MemTotal: 8000000 kB\nMemAvailable: 4194304 kB\n").unwrap();
+
+    let path = sd.path();
+    let mut s = start_with_env(
+        dir.path(),
+        &[
+            ("PATH", &path),
+            ("RUNNER_MEMINFO", meminfo.to_str().unwrap()),
+        ],
+    );
+    let got = s.call(2, "list_hosts", json!({}));
+    assert_eq!(got["isError"], json!(false), "{got}");
+    let name = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    assert_eq!(
+        got["structuredContent"],
+        json!({"hosts": [{"name": name.trim(), "vms": 2, "up": 1, "mem_available": 4u64 << 30}]})
+    );
+
+    fs::write(&meminfo, "MemTotal: 8000000 kB\n").unwrap();
+    let got = s.call(3, "list_hosts", json!({}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    let why = got["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("MemAvailable"), "{why}");
 }
 
 // Through the VM's boot (src/sleep.rs), which a stand-in plays here.

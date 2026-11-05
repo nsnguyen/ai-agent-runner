@@ -756,3 +756,74 @@ fn url_prints_turns_off_and_on_and_sets_the_vm_side_port() {
     assert!(!run(&["url", "nope"]).status.success());
     assert_eq!(store.url("dev").unwrap().guest_port(), 3000);
 }
+
+// `runner hosts` on a host: the row the laptop's `runner hosts` shows for it.
+fn meminfo(dir: &Path, available_kib: u64) -> std::path::PathBuf {
+    let path = dir.join("meminfo");
+    fs::write(
+        &path,
+        format!(
+            "MemTotal:        8000000 kB\nMemFree:          123456 kB\n\
+             MemAvailable:   {available_kib:>8} kB\nBuffers:           4096 kB\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn hosts_counts_the_vms_the_ones_up_and_the_free_memory() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    runner(dir.path(), &["create", "dev"]);
+    runner(dir.path(), &["create", "web"]);
+    runner(dir.path(), &["create", "old"]);
+    sd.set_vm_state("dev", "active");
+    sd.set_vm_state("web", "activating");
+    sd.set_vm_state("old", "failed");
+    let out = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .env("RUNNER_MEMINFO", meminfo(dir.path(), 6_291_456))
+        .arg("hosts")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // base, dev, web and old; dev and web up; 6 GiB available.
+    assert_eq!(text(&out.stdout), "4 VMs  2 up  6442450944 bytes free\n");
+}
+
+#[test]
+fn hosts_on_a_host_with_one_vm_says_vm() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .env("RUNNER_MEMINFO", meminfo(dir.path(), 1))
+        .arg("hosts")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "1 VM  0 up  1024 bytes free\n");
+}
+
+#[test]
+fn hosts_fails_saying_why_without_memavailable() {
+    let dir = with_base();
+    let sd = FakeSystemd::new(dir.path());
+    let bad = dir.path().join("meminfo");
+    fs::write(&bad, "MemTotal: 8000000 kB\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .env("PATH", sd.path())
+        .env("RUNNER_MEMINFO", &bad)
+        .arg("hosts")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = text(&out.stderr);
+    assert!(err.contains("MemAvailable"), "{err}");
+    assert!(err.contains(bad.to_str().unwrap()), "{err}");
+}

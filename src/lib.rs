@@ -12,6 +12,7 @@ pub mod export;
 pub mod firecracker;
 pub mod guest;
 pub mod host;
+pub mod hosts;
 pub mod idle;
 pub mod image;
 pub mod import;
