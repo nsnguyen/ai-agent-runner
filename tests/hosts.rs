@@ -1143,18 +1143,35 @@ fn import_replace_with_host_refuses_a_name_another_host_has() {
         let fleet = Fleet::new();
         let out = fleet.run(
             shell,
-            &["import", "--replace", "dev", "/tmp/disk", "--host", "kvm-host-2"],
+            &[
+                "import",
+                "--replace",
+                "dev",
+                "/tmp/disk",
+                "--host",
+                "kvm-host-2",
+            ],
         );
         assert_eq!(out.status.code(), Some(1), "{shell:?}");
         let err = text(&out.stderr);
-        assert!(err.contains("kvm-host has a VM named dev"), "{shell:?} {err}");
+        assert!(
+            err.contains("kvm-host has a VM named dev"),
+            "{shell:?} {err}"
+        );
         assert!(fleet.commands("kvm-host-2").is_empty(), "{shell:?}");
         assert_eq!(fleet.vms("kvm-host-2"), ["base", "web"], "{shell:?}");
 
         // On its own host, --host is fine, and base is on every host.
         ok(&fleet.run(
             shell,
-            &["import", "--replace", "dev", "/tmp/disk", "--host", "kvm-host"],
+            &[
+                "import",
+                "--replace",
+                "dev",
+                "/tmp/disk",
+                "--host",
+                "kvm-host",
+            ],
         ));
         assert_eq!(
             fleet.commands("kvm-host"),
@@ -1163,7 +1180,14 @@ fn import_replace_with_host_refuses_a_name_another_host_has() {
         );
         ok(&fleet.run(
             shell,
-            &["import", "--replace", "base", "/tmp/disk", "--host", "kvm-host-3"],
+            &[
+                "import",
+                "--replace",
+                "base",
+                "/tmp/disk",
+                "--host",
+                "kvm-host-3",
+            ],
         ));
         assert_eq!(
             fleet.commands("kvm-host-3"),
