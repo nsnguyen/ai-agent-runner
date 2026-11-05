@@ -2,10 +2,11 @@
 # runner on the laptop: every command but proxy and hosts runs on a KVM host
 # over SSH (docs/design.md). A host is anything ssh takes, like runner@kvm-host
 # or an alias in ~/.ssh/config. The hosts are the lines of
-# ~/.config/runner/hosts, the first the one MCP uses; without that file, the
-# first line of ~/.config/runner/host is the only one; RUNNER_HOST names one
-# host alone. With several, a command naming a VM goes to the host that has it
-# (README.md, Several hosts). POSIX sh only, since macOS's /bin/sh runs it.
+# ~/.config/runner/hosts, the first the one MCP goes to, which reaches the
+# rest as its peers; without that file, the first line of
+# ~/.config/runner/host is the only one; RUNNER_HOST names one host alone.
+# With several, a command naming a VM goes to the host that has it (README.md,
+# Several hosts). POSIX sh only, since macOS's /bin/sh runs it.
 
 # No argument or host name is ever a glob.
 set -f
@@ -23,7 +24,7 @@ ask="-n -o BatchMode=yes -o ConnectTimeout=$wait -o ServerAliveInterval=$wait -o
 # next argument is that value and not the VM. tests/hosts.rs checks that
 # every one clap has is here. --n and --run are for #147 and #160; --host is
 # the laptop's own.
-valued=" --root --keep --creds --from --cpus --mem --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --host "
+valued=" --root --keep --creds --from --cpus --mem --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --peer --host "
 
 hosts_usage="usage: runner hosts [add <host> | rm <host>]
   runner hosts                         each host: its VMs, how many are up, its free memory
@@ -851,6 +852,17 @@ done
 
 # One host: everything goes there, as it always has.
 [ -n "$several" ] || go "$host"
+
+# MCP is one session, to the first host or the one --host names, whose
+# runner reaches every other host as a peer (README.md, MCP clients).
+if [ "$cmd" = mcp ]; then
+  for h in $hosts; do
+    [ "$h" != "$host" ] || continue
+    quote "$h"
+    remote="$remote --peer $arg"
+  done
+  go "$host"
+fi
 
 case $cmd in
 list)

@@ -6,7 +6,18 @@
 // <vm> -`, each with its own flags, run, in this process and never through a
 // shell. So one host drives another's VMs but gets no shell there
 // (docs/design.md, Hosts trust each other).
+//
+// And the other end: `Remote`, a peer that the first host's `runner mcp
+// --peer …` dials with this host's key, as one `ssh <peer> runner mcp`,
+// kept open for every call after.
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult};
+use rmcp::service::{Peer, RoleClient, RunningService, ServiceError};
 use std::ffi::OsStr;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Where sshd leaves the command a key's forced command stands in for.
 pub const ORIGINAL: &str = "SSH_ORIGINAL_COMMAND";
@@ -100,4 +111,167 @@ fn import(rest: &[&str]) -> bool {
         }
     }
     matches!(positional.as_slice(), [vm, "-"] if *vm != "-")
+}
+
+/// ssh's options for a peer: no prompt, the peer's host key taken on first
+/// sight (the tailnet already vouches for the node), and keepalives, so a
+/// peer that stops answering ends its session, and its calls fail, in
+/// about 15 seconds.
+pub const SSH: [&str; 11] = [
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
+];
+
+/// How long a peer gets to answer MCP's initialize once ssh has started.
+const HELLO: Duration = Duration::from_secs(20);
+
+/// How long ssh gets to say why it failed, once its session has.
+const LAST_WORDS: Duration = Duration::from_secs(2);
+
+/// Another host's runner, reached as `ssh <target> runner mcp --user <user>`
+/// on first use, and again after its session ends.
+pub struct Remote {
+    /// The host as the laptop's hosts file lists it, like runner@kvm-host-2.
+    pub target: String,
+    /// What MCP calls it: the target without its user@, as the laptop does.
+    pub name: String,
+    user: String,
+    conn: tokio::sync::Mutex<Option<Conn>>,
+    // Each session's number, so a call that saw one end drops only that one.
+    dialed: std::sync::atomic::AtomicU64,
+}
+
+struct Conn {
+    n: u64,
+    service: RunningService<RoleClient, ()>,
+    // ssh's last line on stderr, which says why when it fails.
+    said: Arc<Mutex<String>>,
+    _ssh: tokio::process::Child,
+}
+
+impl Remote {
+    /// `user` is who the peer's exec runs commands as, as here.
+    pub fn new(target: &str, user: &str) -> Remote {
+        let name = target.rsplit_once('@').map_or(target, |(_, h)| h);
+        Remote {
+            target: target.to_string(),
+            name: name.to_string(),
+            user: user.to_string(),
+            conn: tokio::sync::Mutex::new(None),
+            dialed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether `host` names this one: as listed, or by its name.
+    pub fn is(&self, host: &str) -> bool {
+        host == self.target || host == self.name
+    }
+
+    /// A tool call, sent on as it came, and the peer's result as it gave it.
+    /// Err says why the peer didn't answer, naming it.
+    pub async fn call(&self, params: CallToolRequestParams) -> Result<CallToolResult, String> {
+        let (n, peer) = self.peer().await?;
+        match peer.call_tool_once(params).await {
+            Ok(CallToolResponse::Complete(result)) => Ok(result),
+            Ok(_) => Err(format!("{} gave an answer runner doesn't take", self.name)),
+            Err(ServiceError::McpError(e)) => Err(format!("{}: {}", self.name, e.message)),
+            // The session is gone: the next call dials again. Not this one,
+            // which may have run there.
+            Err(e) => Err(self.hung_up(n, e.to_string()).await),
+        }
+    }
+
+    // The open session, or a new one if there's none or it has ended.
+    async fn peer(&self) -> Result<(u64, Peer<RoleClient>), String> {
+        let mut conn = self.conn.lock().await;
+        if let Some(c) = conn.as_ref()
+            && !c.service.is_closed()
+        {
+            return Ok((c.n, c.service.peer().clone()));
+        }
+        *conn = None;
+        let made = self.dial().await?;
+        let got = (made.n, made.service.peer().clone());
+        *conn = Some(made);
+        Ok(got)
+    }
+
+    async fn dial(&self) -> Result<Conn, String> {
+        let mut ssh = tokio::process::Command::new("ssh")
+            .args(SSH)
+            .arg(&self.target)
+            .args(["runner", "mcp", "--user", &self.user])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| self.down(format!("running ssh: {e}")))?;
+        let (Some(stdout), Some(stdin), Some(stderr)) =
+            (ssh.stdout.take(), ssh.stdin.take(), ssh.stderr.take())
+        else {
+            return Err(self.down("ssh came without its pipes".into()));
+        };
+        // Passed on to this runner's stderr, a line at a time, under the
+        // peer's name; stdout here is the laptop's protocol.
+        let said = Arc::new(Mutex::new(String::new()));
+        let (last, name) = (said.clone(), self.name.clone());
+        let reading = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("runner: {name}: {line}");
+                if !line.trim().is_empty() {
+                    *last.lock().unwrap_or_else(|e| e.into_inner()) = line;
+                }
+            }
+        });
+        let why = match tokio::time::timeout(HELLO, ().serve((stdout, stdin))).await {
+            Ok(Ok(service)) => {
+                let n = self
+                    .dialed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(Conn {
+                    n,
+                    service,
+                    said,
+                    _ssh: ssh,
+                });
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer in {} seconds", HELLO.as_secs()),
+        };
+        let _ = ssh.start_kill();
+        let _ = tokio::time::timeout(LAST_WORDS, reading).await;
+        Err(self.down(last_words(&said).unwrap_or(why)))
+    }
+
+    // Why session n ended, once ssh has had its say, and it's dropped.
+    async fn hung_up(&self, n: u64, why: String) -> String {
+        let mut conn = self.conn.lock().await;
+        let Some(c) = conn.take_if(|c| c.n == n) else {
+            return self.down(why);
+        };
+        drop(c.service);
+        let mut ssh = c._ssh;
+        let _ = tokio::time::timeout(LAST_WORDS, ssh.wait()).await;
+        self.down(last_words(&c.said).unwrap_or(why))
+    }
+
+    fn down(&self, why: String) -> String {
+        format!("{} didn't answer: {why}", self.name)
+    }
+}
+
+fn last_words(said: &Mutex<String>) -> Option<String> {
+    let said = said.lock().unwrap_or_else(|e| e.into_inner());
+    (!said.is_empty()).then(|| said.clone())
 }

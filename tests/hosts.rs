@@ -772,15 +772,80 @@ fn doctor_and_gc_without_a_vm_go_to_every_host() {
 fn commands_naming_no_vm_go_to_the_first_host_unless_host_says() {
     for shell in SHELLS {
         let fleet = Fleet::new();
-        ok(&fleet.run(shell, &["mcp"]));
         ok(&fleet.run(shell, &["unit"]));
-        assert_eq!(fleet.calls("kvm-host"), ["mcp", "unit"], "{shell:?}");
+        assert_eq!(fleet.calls("kvm-host"), ["unit"], "{shell:?}");
         ok(&fleet.run(shell, &["list", "--host", "kvm-host-2"]));
         assert_eq!(fleet.calls("kvm-host-2"), ["list"], "{shell:?}");
-        let mcp = &fleet.ssh_calls()[0];
+    }
+}
+
+// MCP is one SSH session, to the first host, or the one --host names, whose
+// runner reaches the rest of the list as its peers (README.md, MCP clients).
+#[test]
+fn mcp_passes_the_other_hosts_as_peers() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["mcp"]));
+        let peers = "runner mcp --peer runner@kvm-host-2 --peer runner@kvm-host-3";
         assert_eq!(
-            mcp,
-            &["-T", "-o", "BatchMode=yes", HOSTS[0], "runner mcp"],
+            fleet.ssh_calls(),
+            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
+            "{shell:?}"
+        );
+        assert_eq!(fleet.calls("kvm-host"), [&peers[7..]], "{shell:?}");
+
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["mcp", "--user", "bob", "--host", "kvm-host-2"]));
+        let peers = "runner mcp --user bob --peer runner@kvm-host --peer runner@kvm-host-3";
+        assert_eq!(
+            fleet.ssh_calls(),
+            [["-T", "-o", "BatchMode=yes", HOSTS[1], peers]],
+            "{shell:?}"
+        );
+
+        // Each host as the hosts file lists it, without the line's comment.
+        fleet.forget_calls();
+        fs::write(
+            fleet.hosts_file(),
+            "runner@kvm-host\nrunner@kvm-host-2 # the second\n",
+        )
+        .unwrap();
+        ok(&fleet.run(shell, &["mcp"]));
+        let peers = "runner mcp --peer runner@kvm-host-2";
+        assert_eq!(
+            fleet.ssh_calls(),
+            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
+            "{shell:?}"
+        );
+
+        // One host, or RUNNER_HOST, has no peers.
+        fleet.forget_calls();
+        fs::write(fleet.hosts_file(), "runner@kvm-host-2\n").unwrap();
+        ok(&fleet.run(shell, &["mcp"]));
+        let out = fleet
+            .runner(shell, &["mcp"])
+            .env("RUNNER_HOST", "runner@kvm-host-3")
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            fleet.ssh_calls(),
+            [
+                [
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "runner@kvm-host-2",
+                    "runner mcp"
+                ],
+                [
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "runner@kvm-host-3",
+                    "runner mcp"
+                ]
+            ],
             "{shell:?}"
         );
     }

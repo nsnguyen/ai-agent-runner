@@ -1,10 +1,11 @@
 // This host's row in the laptop's `runner hosts`: its VMs, how many are up,
 // and its free memory. The laptop asks every host for its row at once, and
-// `runner create` there places a new VM on the host with the most free memory.
+// `runner create` there places a new VM on the host with the most free
+// memory, as MCP's create_vm does from the first host.
 use crate::store::{self, Store};
 use crate::systemd::{self, State};
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,7 +17,7 @@ pub enum Error {
     Mem(std::io::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HostRow {
     /// The host's own name for itself.
     pub name: String,
@@ -58,8 +59,9 @@ pub fn row(store: &Store) -> Result<HostRow, Error> {
     })
 }
 
-// The kernel's name for this machine, or empty if it won't say.
-fn hostname() -> String {
+/// The kernel's name for this machine, or empty if it won't say: what MCP
+/// calls this host.
+pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|h| h.trim().to_string())
         .unwrap_or_default()

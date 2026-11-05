@@ -23,12 +23,12 @@ ext4-view = { version = "1", features = ["std"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "net", "poll", "process", "signal", "socket", "term", "user"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
-rmcp = { version = "3.8", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.8", features = ["client", "server", "macros", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "io-std"] }
+tokio = { version = "1", features = ["rt", "io-std", "io-util", "process", "sync", "time"] }
 vsock = "0.5"
 
 [dev-dependencies]

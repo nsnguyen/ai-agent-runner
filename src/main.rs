@@ -347,6 +347,11 @@ enum Cmd {
         /// The user MCP's exec runs commands as.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
+        /// Another host to reach, as ssh takes it, like runner@kvm-host-2:
+        /// the laptop passes every host but this one. Each is dialed with
+        /// this host's key on first use, as `ssh <peer> runner mcp`.
+        #[arg(long = "peer", value_name = "HOST", value_parser = peer_host)]
+        peers: Vec<String>,
     },
     /// Run a VM until it shuts down: the unit's main process.
     #[command(hide = true)]
@@ -680,7 +685,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 .for_each(|c| println!("{}", c.row()));
         }
         Cmd::Restore { name, id } => show(&checkpoint::restore(&store, &name, id)?),
-        Cmd::Mcp { user } => return Ok(serve(store, user)),
+        Cmd::Mcp { user, peers } => return Ok(serve(store, user, peers)),
         Cmd::Boot {
             name,
             firecracker,
@@ -1056,12 +1061,22 @@ fn names(creds: &[Cred]) -> String {
     names.join(" ")
 }
 
-fn serve(store: Store, user: String) -> ExitCode {
+// A peer as ssh takes it, never as one of its options.
+fn peer_host(host: &str) -> Result<String, String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!(
+            "{host:?} isn't a host: give it as ssh takes it, like runner@kvm-host-2"
+        ));
+    }
+    Ok(host.to_string())
+}
+
+fn serve(store: Store, user: String, peers: Vec<String>) -> ExitCode {
     let served = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(Into::into)
-        .and_then(|rt| rt.block_on(runner::mcp::serve(store, user)));
+        .and_then(|rt| rt.block_on(runner::mcp::serve(store, user, peers)));
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

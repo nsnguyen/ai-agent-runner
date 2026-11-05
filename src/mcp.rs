@@ -1,30 +1,51 @@
 // The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
 // it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
 // protocol: log to stderr only.
+//
+// With several hosts the laptop passes the rest as `--peer`s, and this one
+// reaches them (docs/design.md, MCP across hosts): list_vms and list_hosts
+// ask every host, create_vm places a VM as the laptop's `runner create`
+// does, and a call naming a VM or a run goes, as it came, to the VM's host,
+// through one `ssh <peer> runner mcp` each (peers::Remote).
 use crate::checkpoint;
 use crate::claude;
 use crate::creds;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::hosts::{self, HostRow};
+use crate::peers::Remote;
 use crate::proto::Request;
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
 use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
 use crate::systemd::{self, VmStatus};
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ServerCapabilities, ServerConfig,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ErrorData, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Tools {
     store: Store,
     /// Who exec runs commands as.
     user: String,
+    /// What this host is called: the kernel's name for it.
+    name: String,
+    /// The other hosts, in the laptop's order. A peer's own MCP has none.
+    peers: Arc<Vec<Remote>>,
+    /// Which peer each VM was on when last listed, so a VM on a peer that
+    /// has stopped answering is named as there.
+    seen: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -43,6 +64,9 @@ pub struct CreateArgs {
     /// "90s", "10m", "2h", or "never". Defaults to the source VM's, else 10
     /// minutes.
     idle: Option<String>,
+    /// The host to make it on, as list_hosts names it. Left out, it goes
+    /// where the VM it forks is, else to the host with the most free memory.
+    host: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -51,9 +75,28 @@ pub struct NameArg {
     name: String,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VmList {
-    vms: Vec<Vm>,
+    vms: Vec<HostedVm>,
+    /// The hosts that didn't answer, so their VMs aren't listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unreachable: Vec<Unreachable>,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HostedVm {
+    #[serde(flatten)]
+    vm: Vm,
+    /// The host it's on, as list_hosts names it.
+    host: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Unreachable {
+    /// The host, as list_hosts would name it.
+    host: String,
+    /// Why it didn't answer, like what ssh said.
+    error: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -188,9 +231,12 @@ pub struct RunOutputArgs {
     wait_secs: Option<u64>,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HostList {
     hosts: Vec<HostRow>,
+    /// The hosts that didn't answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unreachable: Vec<Unreachable>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -206,6 +252,28 @@ impl ServerHandler for Tools {
         let me = Implementation::new("runner", env!("CARGO_PKG_VERSION"));
         ServerConfig::new(tools).with_server_info(me)
     }
+
+    // A call for a VM or run on a peer goes there; the rest run here.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if !self.peers.is_empty() {
+            let there = match self.route(&request).await {
+                Ok(None) => None,
+                Ok(Some((i, request))) => Some(self.peers[i].call(request).await),
+                Err(why) => Some(Err(why)),
+            };
+            if let Some(answer) = there {
+                let result = answer
+                    .unwrap_or_else(|why| CallToolResult::error(vec![ContentBlock::text(why)]));
+                return Ok(CallToolResponse::Complete(result));
+            }
+        }
+        let call = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(call).await
+    }
 }
 
 // Tool errors are strings, so a bad call becomes an error result the client
@@ -213,17 +281,42 @@ impl ServerHandler for Tools {
 #[tool_router]
 impl Tools {
     #[tool(
-        description = "List the VMs on this host, each one's current disk generation, and the space its disks use (allocated blocks, not apparent size)."
+        description = "List the VMs on every host this runner reaches, each with its host, its current disk generation, and the space its disks use (allocated blocks, not apparent size). A host that doesn't answer is named in `unreachable`, with why."
     )]
-    fn list_vms(&self) -> Result<Json<VmList>, String> {
-        let vms = self.store.list().map_err(|e| e.to_string())?;
-        Ok(Json(VmList { vms }))
+    async fn list_vms(&self) -> Result<Json<VmList>, String> {
+        let here = self.store.list().map_err(|e| e.to_string())?;
+        let mut vms: Vec<HostedVm> = (here.into_iter())
+            .map(|vm| HostedVm {
+                vm,
+                host: self.name.clone(),
+            })
+            .collect();
+        let mut unreachable = Vec::new();
+        for (peer, listed) in self.peers.iter().zip(self.survey().await) {
+            match listed {
+                Ok(theirs) => vms.extend(theirs.into_iter().map(|vm| HostedVm {
+                    vm,
+                    host: peer.name.clone(),
+                })),
+                Err(error) => unreachable.push(Unreachable {
+                    host: peer.name.clone(),
+                    error,
+                }),
+            }
+        }
+        Ok(Json(VmList { vms, unreachable }))
     }
 
     #[tool(
-        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others. It sleeps once unused for its idle time, and any tool that needs its guest wakes it."
+        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
     )]
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
+        // Another host's name took the call there (route).
+        if let Some(host) = args.host.as_deref()
+            && host != self.name
+        {
+            return Err(self.no_host(host));
+        }
         let from = args.from.as_deref().unwrap_or(BASE);
         let mem_mib = args.mem.as_deref().map(parse_mem).transpose();
         let config = Config {
@@ -316,11 +409,30 @@ impl Tools {
     }
 
     #[tool(
-        description = "List the hosts this runner reaches, each with its name, how many VMs it has (base included), how many are up (booting, running, sleeping or stopping), and its free memory in bytes (MemAvailable). For now that's this host only."
+        description = "List the hosts this runner reaches, this one first, each with its name, how many VMs it has (base included), how many are up (booting, running, sleeping or stopping), and its free memory in bytes (MemAvailable). A host that doesn't answer is named in `unreachable`, with why."
     )]
-    fn list_hosts(&self) -> Result<Json<HostList>, String> {
-        let row = hosts::row(&self.store).map_err(|e| e.to_string())?;
-        Ok(Json(HostList { hosts: vec![row] }))
+    async fn list_hosts(&self) -> Result<Json<HostList>, String> {
+        // systemd is asked about each VM here while the peers are asked.
+        let store = self.store.clone();
+        let here = tokio::task::spawn_blocking(move || hosts::row(&store));
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        let answers = self.ask("list_hosts", &all).await;
+        let mut row = here
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        row.name = self.name.clone();
+        let (mut hosts, mut unreachable) = (vec![row], Vec::new());
+        for (peer, answer) in self.peers.iter().zip(answers) {
+            match answer.and_then(|v| peer_row(&v, &peer.name)) {
+                Ok(row) => hosts.push(row),
+                Err(error) => unreachable.push(Unreachable {
+                    host: peer.name.clone(),
+                    error,
+                }),
+            }
+        }
+        Ok(Json(HostList { hosts, unreachable }))
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]
@@ -579,14 +691,245 @@ where
     }
 }
 
-/// Serves until the client closes stdin. exec runs commands as `user`.
+/// Serves until the client closes stdin. exec runs commands as `user`, here
+/// and on each of `peers`, the other hosts as ssh takes them, which are
+/// dialed when first needed.
 pub async fn serve(
     store: Store,
     user: String,
+    peers: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let running = Tools { store, user }
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let peers = peers.iter().map(|p| Remote::new(p, &user)).collect();
+    let tools = Tools {
+        store,
+        user,
+        name: hosts::hostname(),
+        peers: Arc::new(peers),
+        seen: Arc::default(),
+    };
+    let running = tools.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
+}
+
+// Where a call goes, past this host's own.
+impl Tools {
+    /// None to run here, or the peer to send it to, as it should arrive.
+    async fn route(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<(usize, CallToolRequestParams)>, String> {
+        let arg = |k: &str| {
+            let args = request.arguments.as_ref();
+            args.and_then(|a| a.get(k)).and_then(Value::as_str)
+        };
+        let vm = match request.name.as_ref() {
+            "list_vms" | "list_hosts" | "doctor" => return Ok(None),
+            "create_vm" => return self.place(request).await,
+            // A run is its VM's, the part before the last dot.
+            "run_output" | "cancel_run" => arg("run")
+                .and_then(|r| r.rsplit_once('.'))
+                .map(|(vm, _)| vm),
+            _ => arg("name"),
+        };
+        let Some(vm) = vm else { return Ok(None) };
+        Ok(self.locate(vm).await?.map(|i| (i, request.clone())))
+    }
+
+    /// The peer that has `vm`, or None for this host: one that has it, or,
+    /// when every host answered and none has it, the one to say so.
+    async fn locate(&self, vm: &str) -> Result<Option<usize>, String> {
+        if self.store.get(vm).is_ok() {
+            return Ok(None);
+        }
+        let lists = self.survey().await;
+        let has =
+            |l: &Result<Vec<Vm>, String>| l.as_ref().is_ok_and(|l| l.iter().any(|v| v.name == vm));
+        if let Some(i) = lists.iter().position(has) {
+            return Ok(Some(i));
+        }
+        let down: Vec<(usize, &String)> = (lists.iter().enumerate())
+            .filter_map(|(i, l)| l.as_ref().err().map(|why| (i, why)))
+            .collect();
+        if down.is_empty() {
+            return Ok(None);
+        }
+        let last = self
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(vm)
+            .copied();
+        if let Some((i, why)) = down.iter().find(|(i, _)| Some(*i) == last) {
+            return Err(format!(
+                "{vm} is on {}, which didn't answer: {why}",
+                self.peers[*i].name
+            ));
+        }
+        let whys: Vec<&str> = down.iter().map(|(_, why)| why.as_str()).collect();
+        Err(format!(
+            "no host that answered has a VM named {vm}, and {}",
+            whys.join("; ")
+        ))
+    }
+
+    /// Where create_vm makes its VM, as the laptop's `runner create` places
+    /// one: on `host`; base here; a fork where the VM it forks is; else on
+    /// the host with the most free memory. A name another host has, or had
+    /// when last listed if it doesn't answer now, is refused, base aside.
+    async fn place(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<(usize, CallToolRequestParams)>, String> {
+        let args = request.arguments.clone().unwrap_or_default();
+        let text = |k: &str| args.get(k).and_then(Value::as_str);
+        // Arguments that don't parse are the tool's to refuse, here.
+        let Some(name) = text("name") else {
+            return Ok(None);
+        };
+        let host = match text("host") {
+            None => None,
+            Some(h) if h == self.name => Some(None),
+            Some(h) => match self.peers.iter().position(|p| p.is(h)) {
+                Some(i) => Some(Some(i)),
+                None => return Err(self.no_host(h)),
+            },
+        };
+        let here = self.store.list().map_err(|e| e.to_string())?;
+        let lists = self.survey().await;
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The host that has `vm`: Some(None) for this one.
+        let holder = |vm: &str| {
+            if here.iter().any(|v| v.name == vm) {
+                return Some(None);
+            }
+            let listed = |(i, l): (usize, &Result<Vec<Vm>, String>)| match l {
+                Ok(l) => l.iter().any(|v| v.name == vm).then_some(i),
+                Err(_) => (seen.get(vm) == Some(&i)).then_some(i),
+            };
+            lists.iter().enumerate().find_map(listed).map(Some)
+        };
+        if name != BASE
+            && let Some(at) = holder(name)
+        {
+            let on = at.map_or(self.name.as_str(), |i| self.peers[i].name.as_str());
+            return Err(format!(
+                "{on} has a VM named {name} already: VM names are one per name across hosts"
+            ));
+        }
+        let from = text("from").filter(|f| *f != BASE);
+        let at = match (host, from.and_then(holder)) {
+            (Some(at), _) => at,
+            _ if name == BASE => None,
+            (None, Some(Some(i))) if lists[i].is_err() => {
+                let why = lists[i].as_ref().err().map_or("", String::as_str);
+                let (from, on) = (from.unwrap_or_default(), &self.peers[i].name);
+                return Err(format!("{from} is on {on}, which didn't answer: {why}"));
+            }
+            (None, Some(at)) => at,
+            (None, None) => self.most_free(&lists).await?,
+        };
+        let Some(i) = at else { return Ok(None) };
+        // The peer makes it on itself, whatever this host calls it.
+        let mut there = request.clone();
+        if let Some(args) = there.arguments.as_mut() {
+            args.remove("host");
+        }
+        Ok(Some((i, there)))
+    }
+
+    // The host with the most free memory, this one first among equals, of
+    // this one and the peers whose lists came.
+    async fn most_free(&self, lists: &[Result<Vec<Vm>, String>]) -> Result<Option<usize>, String> {
+        let up: Vec<usize> = (0..lists.len()).filter(|&i| lists[i].is_ok()).collect();
+        let answers = self.ask("list_hosts", &up).await;
+        let mut best: Option<(Option<usize>, u64)> =
+            crate::host::mem_available().ok().map(|free| (None, free));
+        for (i, answer) in answers.into_iter().enumerate() {
+            let Ok(row) = answer.and_then(|v| peer_row(&v, &self.peers[i].name)) else {
+                continue;
+            };
+            if best.is_none_or(|(_, most)| row.mem_available > most) {
+                best = Some((Some(i), row.mem_available));
+            }
+        }
+        best.map(|(at, _)| at).ok_or_else(|| {
+            "no host said how much memory it has free, so the VM has nowhere to go".into()
+        })
+    }
+
+    /// Every peer's VMs, or why it didn't answer, in order, all asked at once,
+    /// and where each VM is noted for when its peer stops answering.
+    async fn survey(&self) -> Vec<Result<Vec<Vm>, String>> {
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        let answers = self.ask("list_vms", &all).await;
+        let lists: Vec<Result<Vec<Vm>, String>> = (answers.into_iter().zip(self.peers.iter()))
+            .map(|(answer, peer)| {
+                let list: VmList = serde_json::from_value(answer?)
+                    .map_err(|e| format!("{}'s list_vms: {e}", peer.name))?;
+                Ok(list.vms.into_iter().map(|v| v.vm).collect())
+            })
+            .collect();
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, list) in lists.iter().enumerate() {
+            if let Ok(vms) = list {
+                seen.retain(|_, at| *at != i);
+                for vm in vms.iter().filter(|v| v.name != BASE) {
+                    seen.insert(vm.name.clone(), i);
+                }
+            }
+        }
+        lists
+    }
+
+    /// `tool`, with no arguments, on each of the peers `which` picks, at
+    /// once: each one's structured answer, or why there's none, in order.
+    async fn ask(&self, tool: &'static str, which: &[usize]) -> Vec<Result<Value, String>> {
+        let mut asked = tokio::task::JoinSet::new();
+        for &i in which {
+            let peers = self.peers.clone();
+            asked.spawn(async move {
+                let mut call = CallToolRequestParams::new(tool);
+                call.arguments = Some(Default::default());
+                let peer = &peers[i];
+                (i, structured(peer.call(call).await, &peer.name))
+            });
+        }
+        let mut answers: Vec<Result<Value, String>> = (0..self.peers.len())
+            .map(|i| Err(format!("{} wasn't asked", self.peers[i].name)))
+            .collect();
+        while let Some(done) = asked.join_next().await {
+            match done {
+                Ok((i, answer)) => answers[i] = answer,
+                Err(e) => eprintln!("runner: asking a peer: {e}"),
+            }
+        }
+        answers
+    }
+
+    fn no_host(&self, host: &str) -> String {
+        let mut names = vec![self.name.as_str()];
+        names.extend(self.peers.iter().map(|p| p.name.as_str()));
+        format!("no host named {host}: the hosts are {}", names.join(", "))
+    }
+}
+
+// A peer's answer as data, or its error's text.
+fn structured(answer: Result<CallToolResult, String>, peer: &str) -> Result<Value, String> {
+    let result = answer?;
+    if result.is_error == Some(true) {
+        let text = result.content.iter().find_map(|c| c.as_text());
+        let text = text.map_or("an error with no text", |t| t.text.as_str());
+        return Err(format!("{peer}: {text}"));
+    }
+    (result.structured_content).ok_or_else(|| format!("{peer} answered with no data"))
+}
+
+// A peer's own row from its list_hosts, under the name this host calls it.
+fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {
+    let list: HostList =
+        serde_json::from_value(answer.clone()).map_err(|e| format!("{peer}'s list_hosts: {e}"))?;
+    let mut row = (list.hosts.into_iter().next()).ok_or_else(|| format!("{peer} gave no row"))?;
+    row.name = peer.to_string();
+    Ok(row)
 }

@@ -167,16 +167,35 @@ fn create_then_list() {
     let dev = json!({"name": "dev", "generation": 0, "bytes": 6, "used": used(dir.path(), "dev")});
     assert_eq!(made["structuredContent"], dev);
 
+    // Each VM with its host, this one, by the kernel's name for it.
+    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    let here = |vm: &Value| {
+        let mut vm = vm.clone();
+        vm["host"] = json!(host.trim());
+        vm
+    };
     let listed = s.call(3, "list_vms", json!({}));
     let base =
         json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base")});
-    assert_eq!(listed["structuredContent"], json!({"vms": [base, dev]}));
+    assert_eq!(
+        listed["structuredContent"],
+        json!({"vms": [here(&base), here(&dev)]})
+    );
 
     let gone = s.call(4, "delete_vm", json!({"name": "dev"}));
     assert_eq!(gone["isError"], json!(false), "{gone}");
     assert_eq!(gone["structuredContent"], dev);
     let listed = s.call(5, "list_vms", json!({}));
-    assert_eq!(listed["structuredContent"], json!({"vms": [base]}));
+    assert_eq!(listed["structuredContent"], json!({"vms": [here(&base)]}));
+    // Without peers, only this host is a host.
+    let made = s.call(6, "create_vm", json!({"name": "x", "host": host.trim()}));
+    assert_eq!(made["isError"], json!(false), "{made}");
+    let bad = s.call(7, "create_vm", json!({"name": "y", "host": "kvm-host-2"}));
+    let why = bad["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        why,
+        format!("no host named kvm-host-2: the hosts are {}", host.trim())
+    );
 }
 
 #[test]
@@ -232,8 +251,8 @@ fn start_status_and_stop_through_systemd() {
     );
 }
 
-// This host only, until #140 reaches the rest: its VMs, the ones up, and
-// MemAvailable, as `runner hosts` counts them.
+// With no peers, this host only: its VMs, the ones up, and MemAvailable, as
+// `runner hosts` counts them. tests/mcp_hosts.rs has the rest.
 #[test]
 fn list_hosts_gives_this_host_s_row() {
     let dir = tempfile::tempdir().unwrap();
