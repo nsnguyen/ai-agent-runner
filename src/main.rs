@@ -8,6 +8,7 @@ use runner::export;
 use runner::idle::Idle;
 use runner::image;
 use runner::import;
+use runner::peers;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
@@ -364,6 +365,11 @@ enum Cmd {
     /// tunnel, so the VM doesn't idle-sleep under it.
     #[command(hide = true)]
     Hold { name: String },
+    /// Run what another host's key may run here, from SSH_ORIGINAL_COMMAND:
+    /// `runner mcp` or `runner import <vm> -`, and nothing else. The forced
+    /// command of every host's key line on the others (src/peers.rs).
+    #[command(hide = true)]
+    Peer,
     /// Drive a run to its end: what `runner run` starts.
     #[command(hide = true)]
     Drive {
@@ -688,8 +694,27 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
         Cmd::Hold { name } => exec::hold(&store, &name, std::io::stdout())?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
+        Cmd::Peer => return peer(root, store),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// What a peer host asked for, if peers::vet lets it through, as clap reads
+// it, on this host's root: a peer can't pick another, nor --keep.
+fn peer(root: &Path, store: Store) -> Result<ExitCode, Box<dyn Error>> {
+    let argv = peers::vet(std::env::var_os(peers::ORIGINAL).as_deref())?;
+    let cmd = match Cli::try_parse_from(&argv) {
+        Ok(cli) => cli.cmd,
+        Err(e) => {
+            let _ = e.print();
+            return Ok(ExitCode::from(2));
+        }
+    };
+    match cmd {
+        Cmd::Mcp { .. } => run(root, store, cmd),
+        Cmd::Import { ref disk, .. } if disk == Path::new("-") => run(root, store, cmd),
+        _ => Err(format!("peers::vet let {argv:?} through").into()),
+    }
 }
 
 fn service(store: &Store, cmd: ServiceCmd) -> Result<ExitCode, Box<dyn Error>> {

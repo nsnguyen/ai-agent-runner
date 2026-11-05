@@ -18,6 +18,7 @@ pub mod image;
 pub mod import;
 pub mod mcp;
 pub mod net;
+pub mod peers;
 pub mod proto;
 pub mod result;
 pub mod runs;
