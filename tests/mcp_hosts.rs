@@ -5,47 +5,14 @@
 // as sshd does for a peer's key line.
 mod common;
 
-use common::{FakeSystemd, FakeVsock, Guest, me, script, wait_for};
-use runner::store::Store;
+use common::{FakeVsock, Guest, PEER_SSH, PeerHost as Host, me, script, wait_for};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 const PEERS: [&str; 2] = ["runner@kvm-host-2", "runner@kvm-host-3"];
-
-// ssh as far as the first host's runner sees it: options, then the target,
-// then the command. A host's directory under $FLEET is named for the
-// target's host part; one with `down` in it times out as ssh does, after two
-// seconds if it's `slow` too, as a real timeout takes a while. The rest
-// run `runner peer` there with a clean environment, so nothing of the first
-// host's, like RUNNER_USER, reaches it unless the command passes it.
-const SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
-while [ $# -gt 0 ]; do
-  case $1 in
-  -o | -i) shift 2 ;;
-  -*) shift ;;
-  *) break ;;
-  esac
-done
-target=$1
-shift
-dir=$FLEET/${target##*@}
-if [ ! -d "$dir" ]; then
-  echo "ssh: Could not resolve hostname ${target##*@}: Name or service not known" >&2
-  exit 255
-fi
-if [ -e "$dir/down" ]; then
-  [ ! -e "$dir/slow" ] || sleep 2
-  echo "ssh: connect to host ${target##*@} port 22: Connection timed out" >&2
-  exit 255
-fi
-echo $$ >"$dir/pid"
-exec env -i PATH="$dir/root/bin:$SYS_PATH" RUNNER_ROOT="$dir/root" \
-  RUNNER_MEMINFO="$dir/meminfo" SSH_ORIGINAL_COMMAND="$*" "$RUNNER" peer
-"#;
 
 struct Session {
     child: Child,
@@ -104,57 +71,6 @@ fn here() -> String {
     "kvm-host".to_string()
 }
 
-// A host's directory: `root` its RUNNER_ROOT, with a fake systemd in
-// root/bin, and `meminfo` its free memory.
-struct Host {
-    dir: PathBuf,
-    sd: FakeSystemd,
-}
-
-impl Host {
-    fn new(dir: PathBuf, vms: &[&str], free: u64) -> Host {
-        let root = dir.join("root");
-        fs::create_dir_all(&root).unwrap();
-        let disk = dir.join("rootfs.ext4");
-        fs::write(&disk, b"rootfs").unwrap();
-        let store = Store::new(&root);
-        store.import("base", &disk).unwrap();
-        for vm in vms {
-            store.fork("base", vm).unwrap();
-        }
-        let host = Host {
-            sd: FakeSystemd::new(&root),
-            dir,
-        };
-        host.set_free(free);
-        host
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.join("root")
-    }
-
-    fn store(&self) -> Store {
-        Store::new(self.root())
-    }
-
-    fn has(&self, vm: &str) -> bool {
-        self.store().get(vm).is_ok()
-    }
-
-    fn set_free(&self, bytes: u64) {
-        let kib = bytes / 1024;
-        let meminfo = format!("MemTotal: 16000000 kB\nMemAvailable: {kib} kB\n");
-        fs::write(self.dir.join("meminfo"), meminfo).unwrap();
-    }
-
-    // Whether systemctl here was asked anything about `vm`.
-    fn asked_about(&self, vm: &str) -> bool {
-        let unit = format!("firecracker@{vm}.service");
-        self.sd.calls().iter().any(|c| c.contains(&unit))
-    }
-}
-
 // This host has base and dev, with 2 GiB free; kvm-host-2 base and web,
 // 4 GiB; kvm-host-3 base and old, 6 GiB. web has a guest, and a run that's
 // over.
@@ -172,7 +88,7 @@ impl Fleet {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        script(&bin.join("ssh"), SSH);
+        script(&bin.join("ssh"), PEER_SSH);
         let fleet = dir.path().join("fleet");
         let here = Host::new(dir.path().join("here"), &["dev"], 2 << 30);
         let two = Host::new(fleet.join("kvm-host-2"), &["web"], 4 << 30);
@@ -599,6 +515,62 @@ fn a_vm_deleted_on_a_peer_frees_its_name_while_that_peer_is_down() {
     );
     s.ok(4, "create_vm", json!({"name": "old"}));
     assert!(fleet.two.has("old"), "4 GiB free beats this host's 2");
+}
+
+// move_vm through the first host: web goes from kvm-host-2 to kvm-host-3,
+// host to host, and every call after finds it there; dev from here to
+// kvm-host-2. Its own host, or one that isn't listed, is refused first.
+#[test]
+fn move_vm_moves_a_vm_between_any_two_hosts() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    let before = fleet.two.store().get("web").unwrap();
+    let moved = s.ok(2, "move_vm", json!({"name": "web", "host": "kvm-host-3"}));
+    assert_eq!(moved["name"], json!("web"), "{moved}");
+    assert_eq!(moved["host"], json!("kvm-host-3"), "{moved}");
+    assert_eq!(moved["state"], json!("stopped"), "{moved}");
+    assert_eq!(moved["checkpoints"], json!(0), "{moved}");
+    assert!(!fleet.two.has("web") && fleet.three.has("web"));
+    assert_eq!(fleet.three.store().get("web").unwrap().bytes, before.bytes);
+    // kvm-host-2 dialed kvm-host-3 itself, with its own key.
+    let log = fleet.ssh_log();
+    let import = log.iter().find(|l| l.contains(" runner import ")).unwrap();
+    assert!(
+        import.ends_with(" runner@kvm-host-3 runner import web - --creds claude"),
+        "{import}"
+    );
+    s.ok(3, "vm_status", json!({"name": "web"}));
+    assert!(fleet.three.asked_about("web"));
+    let vms = s.ok(4, "list_vms", json!({}));
+    assert!(listed(&vms).contains(&("web".to_string(), "kvm-host-3".to_string())));
+
+    let moved = s.ok(
+        5,
+        "move_vm",
+        json!({"name": "dev", "host": "runner@kvm-host-2"}),
+    );
+    assert_eq!(moved["host"], json!("kvm-host-2"), "{moved}");
+    assert!(!fleet.here.has("dev") && fleet.two.has("dev"));
+    // Found there at once, as the move left it, with kvm-host-3 down.
+    fleet.down("kvm-host-3", true);
+    s.ok(6, "vm_status", json!({"name": "dev"}));
+    assert!(fleet.two.asked_about("dev"));
+    fleet.down("kvm-host-3", false);
+
+    let why = s.fails(7, "move_vm", json!({"name": "web", "host": "kvm-host-3"}));
+    assert_eq!(why, "web is on kvm-host-3 already");
+    let why = s.fails(8, "move_vm", json!({"name": "dev", "host": "kvm-host-9"}));
+    assert!(why.starts_with("no host named kvm-host-9"), "{why}");
+    // Names are one per name across hosts, but one made behind MCP's back
+    // still isn't overwritten.
+    fleet.here.store().fork("base", "twin").unwrap();
+    fleet.three.store().fork("base", "twin").unwrap();
+    let why = s.fails(9, "move_vm", json!({"name": "twin", "host": "kvm-host-3"}));
+    assert_eq!(
+        why,
+        "kvm-host-3 has a VM named twin already: VM names are one per name across hosts"
+    );
+    assert!(fleet.here.has("twin"));
 }
 
 // A peer's ssh fails from now on, and the session it had ends.

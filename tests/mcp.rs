@@ -129,6 +129,7 @@ fn lists_its_tools() {
             "list_services",
             "list_sessions",
             "list_vms",
+            "move_vm",
             "read_session",
             "remove_service",
             "restore_vm",

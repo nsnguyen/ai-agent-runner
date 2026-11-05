@@ -17,6 +17,7 @@ pub mod idle;
 pub mod image;
 pub mod import;
 pub mod mcp;
+pub mod moves;
 pub mod net;
 pub mod peers;
 pub mod proto;

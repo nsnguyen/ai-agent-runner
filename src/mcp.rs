@@ -13,7 +13,8 @@ use crate::creds;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::hosts::{self, HostRow};
-use crate::peers::Remote;
+use crate::moves::{self, Moved};
+use crate::peers::{Remote, structured};
 use crate::proto::Request;
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
@@ -100,6 +101,14 @@ pub struct Unreachable {
     host: String,
     /// Why it didn't answer, like what ssh said.
     error: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MoveArgs {
+    /// The VM's name.
+    name: String,
+    /// The host to move it to, as list_hosts names it.
+    host: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -267,11 +276,15 @@ impl ServerHandler for Tools {
                 Ok(None) => None,
                 Ok(Some((i, request))) => {
                     let changes = self.changes(&request);
+                    let moves_to = self.moves_to(&request);
                     let answer = self.peers[i].call(request).await;
                     if let (Ok(result), Some((vm, made))) = (&answer, changes)
                         && result.is_error != Some(true)
                     {
                         self.note(&vm, i, made);
+                        if let Some((vm, j)) = moves_to {
+                            self.note(&vm, j, true);
+                        }
                     }
                     Some(answer.map_err(|g| g.to_string()))
                 }
@@ -446,6 +459,37 @@ impl Tools {
             }
         }
         Ok(Json(HostList { hosts, unreachable }))
+    }
+
+    #[tool(
+        description = "Move a VM to another host, as list_hosts names it, under the same name: its disk, your checkpoints, its settings, services and allowlist. A running or sleeping VM is stopped, which ends its processes and sessions, moved, and started there, awake. Its address and URL change, and its runs stay behind. The disks stream host to host; the VM is deleted here only once the other host has taken it, and a move that fails leaves it where it was, as it was. Fails while a run is going, when the VM is on that host already, and when that host has a VM by that name. Returns the VM as its new host has it."
+    )]
+    async fn move_vm(
+        &self,
+        Parameters(MoveArgs { name, host }): Parameters<MoveArgs>,
+    ) -> Result<Json<Moved>, String> {
+        // A VM on a peer went there (route), with the host as listed.
+        if self.is_me(&host) {
+            return Err(format!("{name} is on {} already", self.name));
+        }
+        let at = self.peers.iter().position(|p| p.is(&host));
+        let dialed;
+        let to = match at {
+            Some(i) => &self.peers[i],
+            None if !self.peers.is_empty() => return Err(self.no_host(&host)),
+            // A peer's own MCP has no peers: the first host gave it the
+            // host as ssh takes it.
+            None => {
+                dialed = Remote::new(&host, &self.user);
+                &dialed
+            }
+        };
+        let moved = moves::move_vm(&self.store, &name, to, &self.name).await;
+        let moved = moved.map_err(|e| e.to_string())?;
+        if let Some(i) = at {
+            self.note(&name, i, true);
+        }
+        Ok(Json(moved))
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]
@@ -751,7 +795,47 @@ impl Tools {
             _ => arg("name"),
         };
         let Some(vm) = vm else { return Ok(None) };
-        Ok(self.locate(vm).await?.map(|i| (i, request.clone())))
+        let Some(i) = self.locate(vm).await? else {
+            return Ok(None);
+        };
+        if request.name == "move_vm" {
+            return self.move_from(i, vm, request).map(Some);
+        }
+        Ok(Some((i, request.clone())))
+    }
+
+    /// move_vm for a VM on peer `i`, with its host as ssh takes it, which
+    /// that peer's MCP, having no peers, dials as it is: a peer as listed,
+    /// or this host as the laptop listed it.
+    fn move_from(
+        &self,
+        i: usize,
+        vm: &str,
+        request: &CallToolRequestParams,
+    ) -> Result<(usize, CallToolRequestParams), String> {
+        let args = request.arguments.as_ref();
+        let host = args.and_then(|a| a.get("host")).and_then(Value::as_str);
+        // Arguments that don't parse are the peer's tool's to refuse.
+        let Some(host) = host else {
+            return Ok((i, request.clone()));
+        };
+        let target = if self.is_me(host) {
+            self.listed.clone().ok_or_else(|| {
+                let me = &self.name;
+                format!("{me} wasn't given as the laptop lists it (--name), so {vm}'s host can't reach it")
+            })?
+        } else {
+            match self.peers.iter().position(|p| p.is(host)) {
+                Some(j) if j == i => return Err(format!("{vm} is on {host} already")),
+                Some(j) => self.peers[j].target.clone(),
+                None => return Err(self.no_host(host)),
+            }
+        };
+        let mut there = request.clone();
+        if let Some(args) = there.arguments.as_mut() {
+            args.insert("host".into(), Value::String(target));
+        }
+        Ok((i, there))
     }
 
     /// The peer that has `vm`, or None for this host: one that has it, or,
@@ -806,16 +890,30 @@ impl Tools {
     }
 
     /// The VM a call makes, (vm, true), or deletes, (vm, false), base aside:
-    /// what a peer that does it has then, before the next list says so.
+    /// what a peer that does it has then, before the next list says so. A
+    /// move deletes it there and makes it on its host (moved).
     fn changes(&self, request: &CallToolRequestParams) -> Option<(String, bool)> {
         let made = match request.name.as_ref() {
             "create_vm" => true,
-            "delete_vm" => false,
+            "delete_vm" | "move_vm" => false,
             _ => return None,
         };
         let args = request.arguments.as_ref();
         let vm = args.and_then(|a| a.get("name")).and_then(Value::as_str)?;
         (vm != BASE).then(|| (vm.to_string(), made))
+    }
+
+    /// The VM a move sends to another peer, and that peer, to note it there
+    /// once it's done. One moved here isn't noted: locate asks here first.
+    fn moves_to(&self, request: &CallToolRequestParams) -> Option<(String, usize)> {
+        let args = request.arguments.as_ref();
+        let text = |k: &str| args.and_then(|a| a.get(k)).and_then(Value::as_str);
+        if request.name != "move_vm" {
+            return None;
+        }
+        let host = text("host")?;
+        let j = self.peers.iter().position(|p| p.is(host))?;
+        Some((text("name")?.to_string(), j))
     }
 
     /// Notes `vm` at peer `i`, which made it, or drops it there, which
@@ -994,16 +1092,6 @@ const ASK_WAIT: Duration = Duration::from_secs(20);
 
 /// Each peer's VMs, in order, or why there are none.
 type Lists = Vec<Result<Vec<Vm>, String>>;
-
-// A peer's answer as data, or its error's text.
-fn structured(result: CallToolResult) -> Result<Value, String> {
-    if result.is_error == Some(true) {
-        let text = result.content.iter().find_map(|c| c.as_text());
-        let text = text.map_or("an error with no text", |t| t.text.as_str());
-        return Err(text.to_string());
-    }
-    (result.structured_content).ok_or_else(|| "it answered with no data".to_string())
-}
 
 // A peer's own row from its list_hosts, under the name this host calls it.
 fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {
