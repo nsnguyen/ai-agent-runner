@@ -542,11 +542,7 @@ fn a_peer_whose_ssh_fails_is_named_while_the_rest_answer() {
 
     // Its connection dropped and down again: its VM, last seen there, is
     // named as there.
-    fleet.down("kvm-host-3", true);
-    let pid = fs::read_to_string(fleet.three.dir.join("pid")).unwrap();
-    let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
-    wait_for("the peer to go", || gone(pid));
+    cut(&fleet, "kvm-host-3");
     let why = s.fails(8, "vm_status", json!({"name": "old"}));
     assert!(
         why.contains("old is on kvm-host-3, which didn't answer"),

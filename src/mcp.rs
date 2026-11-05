@@ -46,8 +46,8 @@ pub struct Tools {
     listed: Option<String>,
     /// The other hosts, in the laptop's order. A peer's own MCP has none.
     peers: Arc<Vec<Remote>>,
-    /// Which peer each VM was on when last listed, so a VM on a peer that
-    /// has stopped answering is named as there.
+    /// Which peer each VM was on when last listed, or made there since, so
+    /// a VM on a peer that has stopped answering is named as there.
     seen: Arc<Mutex<HashMap<String, usize>>>,
 }
 
@@ -266,9 +266,9 @@ impl ServerHandler for Tools {
             let there = match self.route(&request).await {
                 Ok(None) => None,
                 Ok(Some((i, request))) => {
-                    let made = self.made(&request);
+                    let changes = self.changes(&request);
                     let answer = self.peers[i].call(request).await;
-                    if let (Ok(result), Some((vm, made))) = (&answer, made)
+                    if let (Ok(result), Some((vm, made))) = (&answer, changes)
                         && result.is_error != Some(true)
                     {
                         self.note(&vm, i, made);
@@ -756,8 +756,8 @@ impl Tools {
 
     /// The peer that has `vm`, or None for this host: one that has it, or,
     /// when every host answered and none has it, the one to say so. The
-    /// peer it was last listed on is asked first, alone, so a VM there isn't
-    /// held up by a host that's down.
+    /// peer it was last listed or made on is asked first, alone, so a VM
+    /// there isn't held up by a host that's down.
     async fn locate(&self, vm: &str) -> Result<Option<usize>, String> {
         if self.store.get(vm).is_ok() {
             return Ok(None);
@@ -807,7 +807,7 @@ impl Tools {
 
     /// The VM a call makes, (vm, true), or deletes, (vm, false), base aside:
     /// what a peer that does it has then, before the next list says so.
-    fn made(&self, request: &CallToolRequestParams) -> Option<(String, bool)> {
+    fn changes(&self, request: &CallToolRequestParams) -> Option<(String, bool)> {
         let made = match request.name.as_ref() {
             "create_vm" => true,
             "delete_vm" => false,
@@ -833,7 +833,8 @@ impl Tools {
     /// Where create_vm makes its VM, as the laptop's `runner create` places
     /// one: on `host`; base here; a fork where the VM it forks is; else on
     /// the host with the most free memory. A name another host has, or had
-    /// when last listed if it doesn't answer now, is refused, base aside.
+    /// when last listed or made there if it doesn't answer now, is refused,
+    /// base aside.
     async fn place(
         &self,
         request: &CallToolRequestParams,
