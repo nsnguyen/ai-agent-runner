@@ -94,9 +94,11 @@ ip) has "$2" || no "$2"; echo 172.16.0.6 ;;
 start) has "$2" || no "$2"; echo "$2  gen 1  running" ;;
 hold) has "$2" || no "$2" ;;
 create | import)
-  if has "$name"; then echo "runner: a VM named $name already exists" >&2; exit 1; fi
+  # import --replace takes the place of a VM of that name, if there is one.
+  case " $* " in *" --replace "*) replace=1 ;; esac
+  if has "$name" && [ -z "${replace-}" ]; then echo "runner: a VM named $name already exists" >&2; exit 1; fi
   [ "$1" = create ] || cat >"$HOST_DIR/stdin"
-  echo "$name" >>"$HOST_DIR/vms"
+  has "$name" || echo "$name" >>"$HOST_DIR/vms"
   echo "$name  gen 0  6 bytes"
   ;;
 delete)
@@ -1131,6 +1133,44 @@ fn import_replace_of_a_name_no_host_has_is_placed() {
         fleet.commands("kvm-host-2"),
         ["import --replace fresh /tmp/disk"]
     );
+}
+
+// --replace imports on top of the VM where it is, so --host can't make a
+// second of one another host has.
+#[test]
+fn import_replace_with_host_refuses_a_name_another_host_has() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        let out = fleet.run(
+            shell,
+            &["import", "--replace", "dev", "/tmp/disk", "--host", "kvm-host-2"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("kvm-host has a VM named dev"), "{shell:?} {err}");
+        assert!(fleet.commands("kvm-host-2").is_empty(), "{shell:?}");
+        assert_eq!(fleet.vms("kvm-host-2"), ["base", "web"], "{shell:?}");
+
+        // On its own host, --host is fine, and base is on every host.
+        ok(&fleet.run(
+            shell,
+            &["import", "--replace", "dev", "/tmp/disk", "--host", "kvm-host"],
+        ));
+        assert_eq!(
+            fleet.commands("kvm-host"),
+            ["import --replace dev /tmp/disk"],
+            "{shell:?}"
+        );
+        ok(&fleet.run(
+            shell,
+            &["import", "--replace", "base", "/tmp/disk", "--host", "kvm-host-3"],
+        ));
+        assert_eq!(
+            fleet.commands("kvm-host-3"),
+            ["import --replace base /tmp/disk"],
+            "{shell:?}"
+        );
+    }
 }
 
 #[test]

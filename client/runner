@@ -243,6 +243,23 @@ locate() {
   cached "$1"
 }
 
+# held VM: sets $at to the host that has VM, as locate does, for a command
+# that makes VM when no host has it. --host can't make a second of one
+# another host has, so that's refused; base is on every host, so --host
+# says which. Empty if no host has it.
+held() {
+  given=$via
+  via=
+  locate "$1"
+  via=$given
+  [ -n "$at" ] || return 0
+  if [ -n "$via" ] && [ "$at" != "$via" ] && [ "$1" != base ]; then
+    echo "runner: $(name_of "$at") has a VM named $1 already: VM names are one per name across hosts" >&2
+    exit 1
+  fi
+  at=${via:-$at}
+}
+
 # pick NAME: sets $at to the host a new VM NAME goes to: the one --host
 # names, the first for base, the host of a VM other than base it forks, else
 # the one with the most free memory. Refuses a name any host has, counting
@@ -664,7 +681,7 @@ create | import)
   [ -n "$vm" ] || go "$host"
   if [ "$cmd" = import ] && [ -n "$replace" ]; then
     # On top of the VM where it is; a name no host has is imported anew.
-    locate "$vm"
+    held "$vm"
     [ -z "$at" ] || go "$at"
   fi
   pick "$vm"
@@ -687,19 +704,9 @@ claude)
     go "${at:-$first}"
   fi
   [ -n "$vm" ] || go "$host"
-  # A new VM, which claude makes, goes where create would put it, and
-  # --host can't make a second of one another host has.
-  given=$via
-  via=
-  locate "$vm"
-  via=$given
-  if [ -n "$at" ]; then
-    if [ -n "$via" ] && [ "$at" != "$via" ] && [ "$vm" != base ]; then
-      echo "runner: $(name_of "$at") has a VM named $vm already: VM names are one per name across hosts" >&2
-      exit 1
-    fi
-    go "${via:-$at}"
-  fi
+  # A new VM, which claude makes, goes where create would put it.
+  held "$vm"
+  [ -z "$at" ] || go "$at"
   pick "$vm"
   go "$at"
   ;;
