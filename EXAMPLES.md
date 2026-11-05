@@ -148,9 +148,12 @@ runner create demo3                  # goes to the server with the most free mem
 runner list                          # every server's VMs, each line led by its server
 runner shell demo3                   # finds demo3's server for you
 runner create demo4 --host kvm-host  # or pick the server yourself
+runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
 ```
 
 A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed.
+
+`move` keeps the name, your checkpoints, its settings, services and credentials. A running demo3 is shut down first, which ends what runs in it, and started again on the new server; its address and URL change, so it prints the new URL. The copy goes straight from server to server, and demo3 leaves the old one only once the new one has it all, so a move cut off halfway leaves it where it was.
 
 ## 10. When you're done
 
