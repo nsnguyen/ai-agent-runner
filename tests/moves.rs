@@ -354,6 +354,32 @@ fn an_import_whose_answer_was_lost_from_a_host_gone_quiet_says_to_check_both() {
     assert!(pair.here.sd.calls().contains(&start));
 }
 
+// The whole stream went and nothing there took it, but ssh lost its answer,
+// and that host said no at once, then stopped answering: an import may
+// finish after its connection drops, so its no says nothing now.
+#[test]
+fn a_no_then_silence_after_a_lost_answer_says_to_check_both() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
+    fs::write(pair.there.dir.join("swallow"), "").unwrap();
+    // Down before the second ask, a second after the first.
+    fs::write(pair.there.dir.join("vanish"), "0.7").unwrap();
+    let err = pair.refused(&["dev", TARGET]);
+    assert!(
+        err.contains("dev is here as it was, and running again"),
+        "{err}"
+    );
+    assert!(
+        err.contains("kvm-host-2 didn't say whether it took dev"),
+        "{err}"
+    );
+    assert!(!err.contains("doesn't have it"), "{err}");
+    assert!(pair.here.has("dev"));
+}
+
 // The whole stream went, but nothing there took it: dev is here as it was.
 #[test]
 fn a_stream_that_went_whole_but_wasn_t_taken_leaves_the_vm_here() {

@@ -385,8 +385,9 @@ impl FakeVsock {
 /// turn. A host with `cut` in it drops the connection once an import there
 /// has read that many bytes, as a network that fails mid-stream does, even
 /// when that's all of it; one with `swallow` drops it once the stream has
-/// gone, without an import; one with `vanish` as well as `cut` goes `down`
-/// once that import is over, every session to it ending; one with `pause`
+/// gone, without an import; one with `vanish` as well as `cut` or `swallow`
+/// goes `down` that many seconds after the stream is over (none if it's
+/// empty), every session to it ending; one with `pause`
 /// touches `importing` and waits a second before an import starts.
 pub const PEER_SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
 while [ $# -gt 0 ]; do
@@ -414,17 +415,24 @@ peer() {
     RUNNER_MEMINFO="$dir/meminfo" FLEET="$FLEET" RUNNER="$RUNNER" SYS_PATH="$SYS_PATH" \
     SSH_ORIGINAL_COMMAND="$*" "$RUNNER" peer
 }
-if [ -e "$dir/cut" ] && [ "$1 $2" = "runner import" ]; then
-  head -c "$(cat "$dir/cut")" | peer "$@"
-  if [ -e "$dir/vanish" ]; then
+vanish() {
+  [ -e "$dir/vanish" ] || return 0
+  (
+    sleep "$(cat "$dir/vanish")" 2>/dev/null
     touch "$dir/down"
     while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$dir/pids"
-  fi
+  ) </dev/null >/dev/null 2>&1 &
+  [ -s "$dir/vanish" ] || wait
+}
+if [ -e "$dir/cut" ] && [ "$1 $2" = "runner import" ]; then
+  head -c "$(cat "$dir/cut")" | peer "$@"
+  vanish
   echo "Connection to ${target##*@} closed by remote host." >&2
   exit 255
 fi
 if [ -e "$dir/swallow" ] && [ "$1 $2" = "runner import" ]; then
   cat >/dev/null
+  vanish
   echo "Connection to ${target##*@} closed by remote host." >&2
   exit 255
 fi

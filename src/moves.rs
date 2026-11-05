@@ -295,18 +295,19 @@ async fn lost(
     why: String,
     exported: Exported,
 ) -> std::result::Result<Exported, String> {
-    // Whether any ask got an answer: one that didn't says nothing either way.
-    let mut answered = false;
+    // Whether the last ask got a no. A no before an ask that failed says
+    // nothing, since the import may have finished in between.
+    let mut no = false;
     for wait in LOST {
         tokio::time::sleep(wait).await;
         match ask(to).await.and_then(|listed| has(listed, name)) {
             Ok(true) => return Ok(exported),
-            Ok(false) => answered = true,
-            Err(_) => {}
+            Ok(false) => no = true,
+            Err(_) => no = false,
         }
     }
     let host = &to.name;
-    Err(match answered {
+    Err(match no {
         true => format!("{why}, and {host} doesn't have it"),
         false => format!(
             "{why}, and {host} didn't say whether it took {name}: if `runner list` \
