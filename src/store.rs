@@ -830,11 +830,22 @@ impl Store {
     /// while they stream, and a delete or gc can't take an open one away.
     /// `Busy` if something holds the VM, its boot included.
     pub fn open_disks(&self, name: &str, checkpoints: bool) -> Result<Disks> {
+        self.lock(name)?.open_disks(checkpoints)
+    }
+
+    /// The VM's lock, held until the Locked is dropped, so nothing boots or
+    /// changes the VM meanwhile: what a move holds from its stop to its
+    /// delete (moves.rs). `Busy` if something holds the VM, its boot
+    /// included.
+    pub fn lock(&self, name: &str) -> Result<Locked> {
         let dir = self.existing(name)?;
-        let _lock = take_lock(&dir, name)?;
-        let now = current(&dir)?;
-        let current = open_disk(&dir, now, read_note(&dir, now)?, true)?;
-        open_with(&dir, current, checkpoints)
+        let lock = take_lock(&dir, name)?;
+        Ok(Locked {
+            name: name.to_string(),
+            dir,
+            vms: self.vms(),
+            _lock: lock,
+        })
     }
 
     /// Makes a copy of checkpoint `id` the current disk. The copy goes on the
@@ -929,21 +940,43 @@ impl Store {
     /// Removes a VM and all its disk generations. Forks of it are unaffected:
     /// each has a disk of its own.
     pub fn delete(&self, name: &str) -> Result<Vm> {
-        let dir = self.existing(name)?;
-        let _lock = take_lock(&dir, name)?;
-        let vm = read_vm(name, &dir)?;
+        self.lock(name)?.delete()
+    }
+}
+
+/// A VM whose lock this process holds (Store::lock), until it's dropped.
+#[derive(Debug)]
+pub struct Locked {
+    name: String,
+    dir: PathBuf,
+    vms: PathBuf,
+    _lock: File,
+}
+
+impl Locked {
+    /// As Store::open_disks, under this lock, which stays held.
+    pub fn open_disks(&self, checkpoints: bool) -> Result<Disks> {
+        let dir = &self.dir;
+        let now = current(dir)?;
+        let current = open_disk(dir, now, read_note(dir, now)?, true)?;
+        open_with(dir, current, checkpoints)
+    }
+
+    /// Removes the VM and all its disk generations, as Store::delete does.
+    pub fn delete(self) -> Result<Vm> {
+        let (name, dir, vms) = (&self.name, &self.dir, &self.vms);
+        let vm = read_vm(name, dir)?;
         // Renamed first, so the VM is gone at once and the name is free; a
         // delete killed partway leaves a dot-directory that the next create
         // from a new process sweeps away. The lock goes with the rename, still held until we return.
-        let vms = self.vms();
         // The nanos keep a leftover from colliding with the next delete of the
         // same name in a long-lived `runner mcp`, whose pid never goes away.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let doomed = vms.join(format!(".del-{name}-{nanos}-{}", std::process::id()));
-        fs::rename(&dir, &doomed).map_err(at(&dir))?;
-        sync_dir(&vms)?;
+        fs::rename(dir, &doomed).map_err(at(dir))?;
+        sync_dir(vms)?;
         // The VM is gone either way, so a failed removal is a warning, not a
         // failure a caller would retry into "no such VM".
         if let Err(e) = fs::remove_dir_all(&doomed) {
