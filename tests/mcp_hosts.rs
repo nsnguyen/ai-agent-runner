@@ -331,7 +331,11 @@ fn list_vms_and_list_hosts_cover_every_host() {
     s.ok(7, "vm_status", json!({"name": "web"}));
     let log = fleet.ssh_log();
     assert_eq!(log.len(), 2, "{log:?}");
-    for (line, peer) in log.iter().zip(PEERS) {
+    for peer in PEERS {
+        let line = log
+            .iter()
+            .find(|l| l.contains(&format!(" {peer} ")))
+            .unwrap();
         assert!(line.contains("BatchMode=yes"), "{line}");
         assert!(
             line.contains("IdentitiesOnly=yes -i ~/.ssh/id_ed25519"),
@@ -633,8 +637,18 @@ fn peer_pid(host: &Host) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(pid.trim().parse().unwrap())
 }
 
-// Whether a killed process has gone, or is only waiting to be reaped.
+// Whether a killed process has gone, or is only waiting to be reaped: a
+// zombie whose other threads have gone too, so its pipes have closed. Its
+// first thread shows as a zombie while the rest are still on their way out.
 fn gone(pid: nix::unistd::Pid) -> bool {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let line = |key: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_default()
+            .to_string()
+    };
     nix::sys::signal::kill(pid, None).is_err()
-        || fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+        || (line("State:").contains("zombie") && line("Threads:").ends_with("\t1"))
 }
