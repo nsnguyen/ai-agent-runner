@@ -36,6 +36,8 @@ command -v nft >/dev/null || missing+=(nftables)
 [[ -x /usr/sbin/ip ]] || missing+=(iproute2)
 command -v curl >/dev/null || missing+=(curl)
 command -v pkaction >/dev/null || missing+=(polkit)
+# It makes runner's SSH key.
+command -v ssh-keygen >/dev/null || missing+=(openssh-client)
 if ((${#missing[@]})); then
   say "installing ${missing[*]}"
   if command -v apt-get >/dev/null; then
@@ -43,8 +45,9 @@ if ((${#missing[@]})); then
     # Debian and Ubuntu ship the polkit daemon as polkitd.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]/#polkit/polkitd}"
   elif command -v dnf >/dev/null; then
-    # Fedora calls it iproute.
-    dnf install -y -q "${missing[@]/#iproute2/iproute}"
+    # Fedora calls them iproute and openssh-clients.
+    pkgs=("${missing[@]/#iproute2/iproute}")
+    dnf install -y -q "${pkgs[@]/#openssh-client/openssh-clients}"
   else
     die "install ${missing[*]} first: there's no apt-get or dnf here"
   fi
@@ -98,6 +101,18 @@ home=$(getent passwd runner | cut -d: -f6)
 install -d -o runner -g runner -m 0700 "$home/.ssh"
 if [[ ! -e $home/.ssh/authorized_keys ]]; then
   install -o runner -g runner -m 0600 /dev/null "$home/.ssh/authorized_keys"
+fi
+# Hosts drive each other's runners with this key, which `runner hosts add` on
+# the laptop shares with every other host. Made as runner, so runner owns it.
+key=$home/.ssh/id_ed25519
+if [[ ! -s $key ]]; then
+  say "making runner's SSH key, $key"
+  rm -f "$key" "$key.pub"
+  runuser -u runner -- ssh-keygen -q -t ed25519 -N '' -C "runner@$(hostname -s)" -f "$key"
+elif [[ ! -s $key.pub ]]; then
+  say "rewriting $key.pub from $key"
+  runuser -u runner -- ssh-keygen -y -f "$key" >"$tmp/id_ed25519.pub"
+  install -o runner -g runner -m 0644 "$tmp/id_ed25519.pub" "$key.pub"
 fi
 
 say "/var/lib/runner"
