@@ -98,7 +98,7 @@ cargo build --release
 sudo host/install.sh
 ```
 
-VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/install.sh`, which reruns remember (`/etc/runner/net`). VMs reach the internet but not the tailnet, the LAN, cloud metadata (169.254.0.0/16) or each other, except for DNS (port 53), since they use the host's resolvers. Nor the host itself: it drops any connection a VM opens to it, to its sshd or anything else, on any of its addresses, IPv6 included, while replies to what the host opens, like a URL's connection to the VM, come back. So a resolver on one of the host's own addresses (a local dnsmasq, say) won't answer VMs; one on loopback isn't offered to them anyway. The rules, `host/nat.nft`, go by each VM's tap, not its source address, and drop what a tap brings in from outside the range, so a VM that forges a source outside the range gets no further. Docker and firewalld drop forwarded traffic by default, so on a host running either, allow the VM range there; `runner doctor` warns when one is active, or when the host's rules don't keep VMs off it. It installs the pinned Firecracker (hash-checked, `host/firecracker.pin`) and `runner` into `/usr/local/bin`, makes the `runner` user, lets it start and stop `firecracker@<vm>` units through polkit, and sets up NAT for the VMs. It's safe to rerun, and rerunning it after a `git pull` and a build is how to upgrade. It ends with `runner doctor`, run as the runner user, which says what's still missing: usually a guest kernel at `/var/lib/runner/kernel/vmlinux`, the base disk (`sudo -u runner runner import --replace base - <path/to/base.ext4`), and the laptop's key. Run it again any time with `ssh runner@kvm-host runner doctor`.
+VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/install.sh`, which reruns remember (`/etc/runner/net`). VMs reach the internet but not the tailnet, the LAN, cloud metadata (169.254.0.0/16) or each other, except for DNS (port 53), since they use the host's resolvers. Nor the host itself: it drops any connection a VM opens to it, to its sshd or anything else, on any of its addresses, IPv6 included, while replies to what the host opens, like a URL's connection to the VM, come back. So a resolver on one of the host's own addresses (a local dnsmasq, say) won't answer VMs; one on loopback isn't offered to them anyway. The rules, `host/nat.nft`, go by each VM's tap, not its source address, and drop what a tap brings in from outside the range, so a VM that forges a source outside the range gets no further. Docker and firewalld drop forwarded traffic by default, so on a host running either, allow the VM range there; `runner doctor` warns when one is active, or when the host's rules don't keep VMs off it. It installs the pinned Firecracker (hash-checked, `host/firecracker.pin`) and `runner` into `/usr/local/bin`, makes the `runner` user and its SSH key (Keys between hosts), lets it start and stop `firecracker@<vm>` units through polkit, and sets up NAT for the VMs. It's safe to rerun, and rerunning it after a `git pull` and a build is how to upgrade. It ends with `runner doctor`, run as the runner user, which says what's still missing: usually a guest kernel at `/var/lib/runner/kernel/vmlinux`, the base disk (`sudo -u runner runner import --replace base - <path/to/base.ext4`), and the laptop's key. Run it again any time with `ssh runner@kvm-host runner doctor`.
 
 ### Add the laptop's key
 
@@ -112,6 +112,16 @@ ssh -t admin@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict
 - `restrict` turns off port, agent and X11 forwarding.
 - `pty` gives back the terminal `restrict` takes away, so `ssh -t` works for `runner shell`.
 - `port-forwarding` gives back `ssh -L`, for `runner proxy`, and with it `-R` and socket forwarding. It reaches nothing new: the key already runs any command on the host as runner. A key line from before `runner proxy` lacks it: edit the line in `~runner/.ssh/authorized_keys` to add it.
+
+### Keys between hosts
+
+Each host's runner user has an SSH key, `~runner/.ssh/id_ed25519`, which `host/install.sh` makes if it's missing; `runner doctor` warns when there's none. With several hosts, `runner hosts add` on the laptop (Several hosts) puts each host's public key in every other host's `~runner/.ssh/authorized_keys`, ending in the host's name:
+
+```
+from="100.64.0.0/10,fd7a:115c:a1e0::/48",restrict,command="/usr/local/bin/runner peer" ssh-ed25519 AAAA… kvm-host-2
+```
+
+So one host reaches another only over the tailnet, with no terminal or forwarding, and whatever it asks for, sshd runs `runner peer`. That runs `runner mcp`, or `runner import <vm> -` with import's own flags, and refuses anything else, a shell or `runner exec` included, without running it. A host that's taken over can drive every host's VMs through MCP, but can't log in to another host or run anything else there. Your laptop's key is still the only one that can. `runner hosts rm` takes a host's line out of the others, and theirs out of it. A line `hosts add` didn't write, like the laptop's, is never touched.
 
 ### Tailnet only
 
@@ -196,16 +206,16 @@ It installs `runner` to `~/.local/bin` and saves the host to `~/.config/runner/h
 ### Several hosts
 
 ```sh
-runner hosts add runner@kvm-host-2      # checks it answers, then lists it in ~/.config/runner/hosts
+runner hosts add runner@kvm-host-2      # checks it answers, lists it in ~/.config/runner/hosts, shares keys
 runner hosts                            # each host: its VMs, how many are up, its free memory
 runner list                             # every host's VMs, each line led by its host
 runner create dev2                      # on the host with the most free memory
 runner create dev2 --host kvm-host-2    # or on that one
 runner exec dev2 -- hostname            # wherever dev2 is
-runner hosts rm kvm-host-2              # out of the list; its VMs stay on it
+runner hosts rm kvm-host-2              # out of the list, and its key out of the others; its VMs stay on it
 ```
 
-`~/.config/runner/hosts` lists one host a line, as ssh takes it; the first is the one `runner mcp` goes to, and `client/install.sh <host>` puts that host first. The first `hosts add` starts the list from `~/.config/runner/host`. `--host` takes a host as listed or by its name, `kvm-host-2`, sends any command there, and never reaches the host; a program's own, as in `runner exec dev vite --host`, does. `RUNNER_HOST` still means one host alone, and with one host every command goes there as it always has, with no host column.
+`~/.config/runner/hosts` lists one host a line, as ssh takes it; the first is the one `runner mcp` goes to, and `client/install.sh <host>` puts that host first. The first `hosts add` starts the list from `~/.config/runner/host`. Every `hosts add`, of a new host or one listed already, then puts every listed host's key on every other host (Keys between hosts): each host that answers gets a line for each other host whose key came, in place of any it had for that host or that key, and loses the line of any host that isn't listed. A host that doesn't answer, or has no key, is named and keeps what it had, and `hosts add` exits 1; once it's fixed, `hosts add` again finishes the job. `hosts rm` takes the host off the list first, then its line out of every host that answers, and theirs out of it. List the hosts by their tailnet names, like `runner@kvm-host-2`, not `~/.ssh/config` aliases: those names are what the hosts are to reach each other by. `--host` takes a host as listed or by its name, `kvm-host-2`, sends any command there, and never reaches the host; a program's own, as in `runner exec dev vite --host`, does. `RUNNER_HOST` still means one host alone, and with one host every command goes there as it always has, with no host column.
 
 A command naming a VM goes to its host, `proxy` included, since every host gives out the same addresses. The laptop keeps where each VM was in `~/.cache/runner/vms`, asks that host whether it still has the VM (`runner ip`, with no stdin, so nothing piped in is lost), and if it hasn't, or the VM isn't in the cache, asks every host for its list at once and goes to the one that has it. A VM no host has goes to the first, which says so. A run id (`output`, `result` and `cancel dev.1`, and `--run dev.1`) goes to the host of the VM before its last dot. Names are one per VM across hosts: `create` and `import` refuse one any host has. `base` is the exception, on every host, and a command naming it goes to the first host unless `--host` says. A fork of a VM other than base goes to that VM's host, `import` places as `create` does, and `runner claude dev` making a new dev puts it where `create` would. `gc` with no VM and `doctor` run on every host, each line led by its host; other commands that name no VM go to the first.
 

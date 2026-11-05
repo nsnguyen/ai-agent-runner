@@ -3,6 +3,7 @@
 // hosts. Each host is a directory: `vms` lists its VMs, `free` its free
 // memory, `calls` what its runner got, and `down` makes ssh time out on it.
 // No network and no host.
+use runner::peers;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -40,7 +41,8 @@ fn ok(out: &Output) {
 
 // Every ssh run is logged, its arguments ended by \x1f, one record each,
 // written at once, since the hosts are asked at once. The host
-// is the argument before the command. A host that's down times out, as
+// is the argument before the command, which runs in the host's directory
+// as its home, where its ~/.ssh is. A host that's down times out, as
 // ConnectTimeout makes ssh do, with ssh's own words and exit code. Without
 // -n, ssh reads stdin as it comes, whether or not the far end wants it, so
 // the fake reads it all before the command starts.
@@ -58,7 +60,7 @@ if [ -e "$dir/down" ]; then
   echo "ssh: connect to host ${host##*@} port 22: Connection timed out" >&2
   exit 255
 fi
-export HOST_DIR="$dir"
+export HOST_DIR="$dir" HOME="$dir"
 [ ! -e "$dir/slow" ] || sleep 1
 [ "$1" != -n ] || exec bash -c "$cmd" </dev/null
 read_in=$(mktemp)
@@ -118,6 +120,28 @@ gc) while read -r v; do echo "$v  nothing to free"; done <"$HOST_DIR/vms" ;;
 esac
 "#;
 
+// The laptop's key line, as README.md's Add the laptop's key writes it.
+const LAPTOP: &str = r#"from="100.64.0.0/10,fd7a:115c:a1e0::/48",restrict,pty,port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIlaptopAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA nguyen@laptop"#;
+
+// A host's own key, an ed25519 one in shape, told apart by its name.
+fn key(name: &str) -> String {
+    format!("AAAAC3NzaC1lZDI1NTE5AAAAI{:A<43}", name.replace('-', ""))
+}
+
+// The line another host's key gets on a host, as `runner hosts add` writes it.
+fn peer_line(name: &str, key: &str) -> String {
+    format!("{} ssh-ed25519 {key} {name}", peers::OPTIONS)
+}
+
+// A host's authorized_keys: the laptop's line, then each of these hosts'.
+fn trusting(peers: &[&str]) -> String {
+    let mut want = format!("{LAPTOP}\n");
+    for p in peers {
+        want += &format!("{}\n", peer_line(p, &key(p)));
+    }
+    want
+}
+
 struct Fleet {
     dir: tempfile::TempDir,
 }
@@ -147,6 +171,50 @@ impl Fleet {
         let vms: String = vms.iter().map(|v| format!("{v}\n")).collect();
         fs::write(dir.join("vms"), vms).unwrap();
         fs::write(dir.join("free"), free.to_string()).unwrap();
+        // As host/install.sh leaves it, with the laptop's key added.
+        let ssh = dir.join(".ssh");
+        if !ssh.exists() {
+            fs::create_dir(&ssh).unwrap();
+            fs::write(ssh.join("authorized_keys"), format!("{LAPTOP}\n")).unwrap();
+            self.set_key(
+                name,
+                Some(&format!("ssh-ed25519 {} runner@{name}", key(name))),
+            );
+        }
+    }
+
+    /// What `name`'s ~/.ssh/id_ed25519.pub holds, or that it has none.
+    fn set_key(&self, name: &str, pub_line: Option<&str>) {
+        let path = self
+            .dir
+            .path()
+            .join("fleet")
+            .join(name)
+            .join(".ssh/id_ed25519.pub");
+        match pub_line {
+            Some(line) => fs::write(path, format!("{line}\n")).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+    }
+
+    fn authorized_keys(&self, name: &str) -> String {
+        let path = self
+            .dir
+            .path()
+            .join("fleet")
+            .join(name)
+            .join(".ssh/authorized_keys");
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn set_authorized_keys(&self, name: &str, keys: &str) {
+        let path = self
+            .dir
+            .path()
+            .join("fleet")
+            .join(name)
+            .join(".ssh/authorized_keys");
+        fs::write(path, keys).unwrap();
     }
 
     fn down(&self, name: &str) {
@@ -839,7 +907,9 @@ fn hosts_rm_takes_a_host_out_by_its_name() {
             "runner@kvm-host\nrunner@kvm-host-3\n",
             "{shell:?}"
         );
-        assert!(fleet.ssh_calls().is_empty(), "{shell:?}");
+        for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            assert!(fleet.calls(host).is_empty(), "{shell:?} {host}");
+        }
         let out = fleet.run(shell, &["hosts", "rm", "runner@kvm-host"]);
         ok(&out);
         assert_eq!(
@@ -1298,4 +1368,250 @@ fn every_host_is_asked_at_once() {
             "{call:?}"
         );
     }
+}
+
+// #139: every host's key on every other, once, so each host drives the
+// others' runners through `runner peer` and nothing more.
+#[test]
+fn hosts_add_puts_each_host_s_key_on_every_other_once() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fs::write(fleet.hosts_file(), "runner@kvm-host\nrunner@kvm-host-2\n").unwrap();
+        // A line edited by hand, with no newline, stays as it is.
+        fleet.set_authorized_keys("kvm-host", LAPTOP);
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]);
+        ok(&out);
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-2", "kvm-host-3"]),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-2"),
+            trusting(&["kvm-host", "kvm-host-3"]),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-3"),
+            trusting(&["kvm-host", "kvm-host-2"]),
+            "{shell:?}"
+        );
+        // As runner left it: only runner reads or writes it.
+        let path = fleet.dir.path().join("fleet/kvm-host/.ssh/authorized_keys");
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{shell:?}: {mode:o}");
+        // No runner command ran for it.
+        for host in ["kvm-host", "kvm-host-2"] {
+            assert!(fleet.calls(host).is_empty(), "{shell:?} {host}");
+        }
+
+        // Again changes nothing.
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]));
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host"]));
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-2"),
+            trusting(&["kvm-host", "kvm-host-3"]),
+            "{shell:?}"
+        );
+
+        // A host with a new key, from a reinstall, is trusted by that key alone.
+        let new = key("kvmhost2new");
+        fleet.set_key(
+            "kvm-host-2",
+            Some(&format!("ssh-ed25519 {new} runner@kvm-host-2")),
+        );
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-2"]));
+        for host in ["kvm-host", "kvm-host-3"] {
+            let keys = fleet.authorized_keys(host);
+            assert!(
+                keys.contains(&peer_line("kvm-host-2", &new)),
+                "{shell:?} {host}: {keys}"
+            );
+            assert!(
+                !keys.contains(&key("kvm-host-2")),
+                "{shell:?} {host}: {keys}"
+            );
+            assert_eq!(keys.lines().count(), 3, "{shell:?} {host}: {keys}");
+        }
+    }
+}
+
+#[test]
+fn hosts_add_names_a_host_it_can_t_get_a_key_from_and_shares_the_rest() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host"]));
+        // kvm-host-2 lost its key, and kvm-host-3 is down.
+        fleet.set_key("kvm-host-2", None);
+        fleet.down("kvm-host-3");
+        let before = fleet.authorized_keys("kvm-host-3");
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("kvm-host-2 has no SSH key"), "{err}");
+        assert!(err.contains("host/install.sh"), "{err}");
+        assert!(err.contains("kvm-host-3 didn't answer"), "{err}");
+        // What couldn't be asked again stays as it was, in any order.
+        let sorted = |keys: String| {
+            let mut lines: Vec<String> = keys.lines().map(String::from).collect();
+            lines.sort();
+            lines
+        };
+        assert_eq!(
+            sorted(fleet.authorized_keys("kvm-host")),
+            sorted(trusting(&["kvm-host-2", "kvm-host-3"])),
+            "{shell:?}"
+        );
+        assert_eq!(
+            sorted(fleet.authorized_keys("kvm-host-2")),
+            sorted(trusting(&["kvm-host", "kvm-host-3"])),
+            "{shell:?}"
+        );
+        assert_eq!(fleet.authorized_keys("kvm-host-3"), before, "{shell:?}");
+    }
+}
+
+// A host's key comes from that host, which can't be trusted to send one: only
+// a bare ed25519 key goes in, behind the runner peer options the laptop adds.
+#[test]
+fn hosts_add_shares_nothing_but_a_plain_ed25519_key() {
+    let k = key("kvm-host-2");
+    let bad = [
+        String::new(),
+        format!("command=\"sh\" ssh-ed25519 {k} x"),
+        format!("ssh-rsa {k} x"),
+        format!("ssh-ed25519 {k};touch${{IFS}}pwned x"),
+        format!("ssh-ed25519 {k}\",pty x"),
+        "ssh-ed25519 AAAAB3NzaC1yc2EAAAADAQABAAABAQ x".to_string(),
+        format!("ssh-ed25519 {k}'$(touch pwned)' x"),
+    ];
+    for shell in SHELLS {
+        for pub_line in &bad {
+            let fleet = Fleet::new();
+            fleet.set_key("kvm-host-2", Some(pub_line));
+            let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host"]);
+            assert_eq!(out.status.code(), Some(1), "{shell:?} {pub_line:?}");
+            assert!(
+                text(&out.stderr).contains("kvm-host-2 has no SSH key"),
+                "{pub_line:?}"
+            );
+            for host in ["kvm-host", "kvm-host-3"] {
+                let keys = fleet.authorized_keys(host);
+                assert!(
+                    !keys.contains("kvm-host-2"),
+                    "{shell:?} {pub_line:?}: {keys}"
+                );
+            }
+            assert_eq!(fleet.authorized_keys("kvm-host"), trusting(&["kvm-host-3"]));
+            assert!(!fleet.dir.path().join("fleet/kvm-host/pwned").exists());
+        }
+    }
+}
+
+#[test]
+fn hosts_rm_takes_the_host_s_key_lines_out() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host"]));
+        let out = fleet.run(shell, &["hosts", "rm", "kvm-host-2"]);
+        ok(&out);
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-3"]),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-3"),
+            trusting(&["kvm-host"]),
+            "{shell:?}"
+        );
+        // And the host that left drives no host, nor does any host drive it.
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-2"),
+            trusting(&[]),
+            "{shell:?}"
+        );
+
+        // One that's gone for good: the rest still drop its line, and it's named.
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-2"]));
+        fleet.down("kvm-host-2");
+        let out = fleet.run(shell, &["hosts", "rm", "kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        assert!(
+            text(&out.stderr).contains("kvm-host-2 didn't answer"),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(fleet.hosts_file()).unwrap(),
+            "runner@kvm-host\nrunner@kvm-host-3\n",
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-3"]),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-3"),
+            trusting(&["kvm-host"]),
+            "{shell:?}"
+        );
+    }
+}
+
+// A host that was down for a `hosts rm` still has the line of the host that
+// left. The next `hosts add` takes it out: a host trusts only listed hosts.
+#[test]
+fn a_line_left_by_a_host_that_was_down_goes_at_the_next_add() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host"]));
+        fleet.down("kvm-host-3");
+        let out = fleet.run(shell, &["hosts", "rm", "kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("kvm-host-3 didn't answer"), "{err}");
+        assert!(err.contains("runner hosts add"), "{err}");
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-3"]),
+            "{shell:?}"
+        );
+
+        fs::remove_file(fleet.dir.path().join("fleet/kvm-host-3/down")).unwrap();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]));
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-3"),
+            trusting(&["kvm-host"]),
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn hosts_add_and_rm_refuse_a_listed_host_that_looks_like_an_ssh_option() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.hosts_file(),
+        "runner@kvm-host\n-oProxyCommand=touch\n",
+    )
+    .unwrap();
+    let out = fleet.run(SHELLS[0], &["hosts", "add", "runner@kvm-host-2"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("-oProxyCommand"));
+    assert!(fleet.ssh_calls().is_empty(), "{:?}", fleet.ssh_calls());
+    // Taking it out works, and never hands it to ssh.
+    ok(&fleet.run(SHELLS[0], &["hosts", "rm", "-oProxyCommand=touch"]));
+    assert_eq!(
+        fs::read_to_string(fleet.hosts_file()).unwrap(),
+        "runner@kvm-host\n"
+    );
+    assert!(
+        fleet
+            .ssh_calls()
+            .iter()
+            .all(|c| !c.iter().any(|a| a.starts_with("-oProxy"))),
+        "{:?}",
+        fleet.ssh_calls()
+    );
 }
