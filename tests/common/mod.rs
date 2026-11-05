@@ -383,7 +383,9 @@ impl FakeVsock {
 /// nothing of the calling host's, like RUNNER_USER, reaches it unless the
 /// command passes it, but with this ssh on PATH, so it reaches the others in
 /// turn. A host with `cut` in it drops the connection once an import there
-/// has read that many bytes, as a network that fails mid-stream does.
+/// has read that many bytes, as a network that fails mid-stream does, even
+/// when that's all of it; one with `swallow` drops it once the stream has
+/// gone, without an import.
 pub const PEER_SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
 while [ $# -gt 0 ]; do
   case $1 in
@@ -412,6 +414,11 @@ peer() {
 }
 if [ -e "$dir/cut" ] && [ "$1 $2" = "runner import" ]; then
   head -c "$(cat "$dir/cut")" | peer "$@"
+  echo "Connection to ${target##*@} closed by remote host." >&2
+  exit 255
+fi
+if [ -e "$dir/swallow" ] && [ "$1 $2" = "runner import" ]; then
+  cat >/dev/null
   echo "Connection to ${target##*@} closed by remote host." >&2
   exit 255
 fi

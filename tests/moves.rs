@@ -269,6 +269,40 @@ fn a_target_that_fails_mid_stream_leaves_the_vm_here_as_it_was() {
     }
 }
 
+// The whole stream went and the import there took it, but ssh lost its
+// answer: the move asks that host, finds dev there, and finishes.
+#[test]
+fn an_import_whose_answer_was_lost_is_asked_after() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    fs::write(pair.there.dir.join("cut"), "100000000000").unwrap();
+    let (out, err) = pair.moved(&["dev", TARGET]);
+    assert!(err.contains("Connection to kvm-host-2 closed"), "{err}");
+    assert!(!pair.here.has("dev"));
+    assert!(pair.there.has("dev"));
+    assert!(out.ends_with("  running  on kvm-host-2\n"), "{out}");
+}
+
+// The whole stream went, but nothing there took it: dev is here as it was.
+#[test]
+fn a_stream_that_went_whole_but_wasn_t_taken_leaves_the_vm_here() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    fs::write(pair.there.dir.join("swallow"), "").unwrap();
+    let err = pair.refused(&["dev", TARGET]);
+    assert!(
+        err.contains("dev is here as it was, and running again"),
+        "{err}"
+    );
+    assert!(err.contains("kvm-host-2 doesn't have it"), "{err}");
+    assert!(pair.here.has("dev"));
+    assert!(!pair.there.has("dev"));
+}
+
 #[test]
 fn a_run_going_refuses_it_before_anything_is_stopped_or_sent() {
     let pair = Pair::new();

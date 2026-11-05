@@ -21,7 +21,7 @@ use crate::export::{self, Exported};
 use crate::idle::InUse;
 use crate::peers::{self, Remote};
 use crate::runs;
-use crate::store::{self, Disks, Store, Vm};
+use crate::store::{self, Disks, Locked, Store, Vm};
 use crate::systemd::{self, State, VmStatus};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,17 @@ pub async fn move_vm(store: &Store, name: &str, to: &Remote, here: &str) -> Resu
         return Err(Error::Taken { vm, host });
     }
     let (s, n, target, h) = (store.clone(), vm.clone(), to.target.clone(), host.clone());
-    let carried = blocking(move || carry(&s, &n, &target, &h)).await?;
+    let sent = blocking(move || send(&s, &n, &target, &h)).await?;
+    let Sent { up, locked, sent } = sent;
+    let sent = match sent {
+        Err(Unsent {
+            why,
+            whole: Some(exported),
+        }) => lost(to, name, why, *exported).await,
+        sent => sent.map_err(|u| u.why),
+    };
+    let (s, n, h) = (store.clone(), vm.clone(), host.clone());
+    let carried = blocking(move || settle(&s, &n, &h, up, locked, sent)).await?;
     drop(held);
     let args = json!({ "name": name });
     let status = match carried.up {
@@ -195,15 +205,30 @@ fn status_of(answer: Value) -> std::result::Result<VmStatus, String> {
     serde_json::from_value(answer).map_err(|e| format!("it gave {e}"))
 }
 
-// What carry did: whether the VM was up, and what went out.
+// What settle did: whether the VM was up, and what went out.
 struct Carried {
     up: bool,
     exported: Exported,
 }
 
-// The VM, stopped if it's up, streamed to `target` and deleted here, all
-// under its lock; or, if the import there fails, left as it was.
-fn carry(store: &Store, name: &str, target: &str, host: &str) -> Result<Carried> {
+// What send did: whether the VM was up, its lock, still held, and whether
+// the import there took it.
+struct Sent {
+    up: bool,
+    locked: Locked,
+    sent: std::result::Result<Exported, Unsent>,
+}
+
+// Why an import didn't take, and the export, if the whole of it went out
+// before ssh failed, so the import may have taken it after all.
+struct Unsent {
+    why: String,
+    whole: Option<Box<Exported>>,
+}
+
+// The VM, stopped if it's up, streamed to `target` under its lock, which it
+// keeps holding.
+fn send(store: &Store, name: &str, target: &str, host: &str) -> Result<Sent> {
     let vm = name.to_string();
     let state = systemd::status(store, name)?.state;
     // A stopping VM was asked to stop, so it stays down, as a restore has it.
@@ -221,7 +246,60 @@ fn carry(store: &Store, name: &str, target: &str, host: &str) -> Result<Carried>
         e => e.into(),
     })?;
     let disks = locked.open_disks(true)?;
-    match stream(name, disks, target, host) {
+    let sent = stream(name, disks, target, host);
+    Ok(Sent { up, locked, sent })
+}
+
+// Whether the import there took the VM, when the whole export went out but
+// ssh failed before it said: the other host has the VM now if it did, since
+// an import renames it in last and the name was free. Asked a few times, as
+// an import whose connection dropped takes a moment to finish.
+async fn lost(
+    to: &Remote,
+    name: &str,
+    why: String,
+    exported: Exported,
+) -> std::result::Result<Exported, String> {
+    let mut said = None;
+    for wait in LOST {
+        tokio::time::sleep(wait).await;
+        let asked = tokio::time::timeout(ASK_WAIT, to.answer("list_vms", json!({}))).await;
+        match asked.map(|a| a.and_then(|listed| has(listed, name))) {
+            Ok(Ok(true)) => return Ok(exported),
+            Ok(Ok(false)) => said = Some(format!("{} doesn't have it", to.name)),
+            Ok(Err(e)) => said = said.or(Some(e)),
+            Err(_) => {}
+        }
+    }
+    let host = &to.name;
+    Err(match said {
+        Some(said) => format!("{why}, and {said}"),
+        None => format!(
+            "{why}, and {host} didn't say whether it took {name}: if `runner list` \
+             shows it there too, delete one"
+        ),
+    })
+}
+
+/// When `lost` asks: at once, then twice more as an import finishes.
+const LOST: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
+// The VM deleted here, if the import there took it; else, its lock let go,
+// left as it was, and started again if it was up.
+fn settle(
+    store: &Store,
+    name: &str,
+    host: &str,
+    up: bool,
+    locked: Locked,
+    sent: std::result::Result<Exported, String>,
+) -> Result<Carried> {
+    let vm = name.to_string();
+    match sent {
         Ok(exported) => {
             let source = |source| Error::NotDeleted {
                 vm: vm.clone(),
@@ -254,7 +332,8 @@ fn stream(
     disks: Disks,
     target: &str,
     host: &str,
-) -> std::result::Result<Exported, String> {
+) -> std::result::Result<Exported, Unsent> {
+    let unsent = |why| Unsent { why, whole: None };
     let creds: Vec<&str> = disks.creds.iter().map(|c| c.name()).collect();
     let mut cmd = Command::new("ssh");
     cmd.args(peers::SSH)
@@ -272,11 +351,11 @@ fn stream(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("running ssh: {e}"))?;
+        .map_err(|e| unsent(format!("running ssh: {e}")))?;
     let (Some(mut stdin), Some(stderr)) = (ssh.stdin.take(), ssh.stderr.take()) else {
         let _ = ssh.kill();
         let _ = ssh.wait();
-        return Err("ssh came without its pipes".into());
+        return Err(unsent("ssh came without its pipes".into()));
     };
     let said = relay(stderr, host.to_string());
     let written = export::write(name, disks, &mut stdin);
@@ -289,16 +368,22 @@ fn stream(
         None => format!("{host}'s import failed: ssh exited {code}"),
     };
     match (written, exited) {
-        (_, Err(e)) => Err(format!("waiting for ssh: {e}")),
+        (_, Err(e)) => Err(unsent(format!("waiting for ssh: {e}"))),
         (Ok(exported), Ok(code)) if code.success() => Ok(exported),
         // One that hung up first broke the pipe: why is theirs to say.
         (Err(export::Error::Stream { source, .. }), Ok(code))
             if source.kind() == io::ErrorKind::BrokenPipe =>
         {
-            Err(theirs(code))
+            Err(unsent(theirs(code)))
         }
-        (Err(e), Ok(_)) => Err(e.to_string()),
-        (Ok(_), Ok(code)) => Err(theirs(code)),
+        (Err(e), Ok(_)) => Err(unsent(e.to_string())),
+        // ssh's own failure, past the whole stream: the import there may
+        // have finished. A runner that fails exits 1, or 2 for its usage.
+        (Ok(exported), Ok(code)) if code.code() == Some(255) => Err(Unsent {
+            why: theirs(code),
+            whole: Some(Box::new(exported)),
+        }),
+        (Ok(_), Ok(code)) => Err(unsent(theirs(code))),
     }
 }
 
