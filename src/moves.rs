@@ -295,19 +295,20 @@ async fn lost(
     why: String,
     exported: Exported,
 ) -> std::result::Result<Exported, String> {
-    let mut said = None;
+    // Whether any ask got an answer: one that didn't says nothing either way.
+    let mut answered = false;
     for wait in LOST {
         tokio::time::sleep(wait).await;
         match ask(to).await.and_then(|listed| has(listed, name)) {
             Ok(true) => return Ok(exported),
-            Ok(false) => said = Some(format!("{} doesn't have it", to.name)),
-            Err(e) => said = said.or(Some(e)),
+            Ok(false) => answered = true,
+            Err(_) => {}
         }
     }
     let host = &to.name;
-    Err(match said {
-        Some(said) => format!("{why}, and {said}"),
-        None => format!(
+    Err(match answered {
+        true => format!("{why}, and {host} doesn't have it"),
+        false => format!(
             "{why}, and {host} didn't say whether it took {name}: if `runner list` \
              shows it there too, delete one"
         ),

@@ -385,8 +385,9 @@ impl FakeVsock {
 /// turn. A host with `cut` in it drops the connection once an import there
 /// has read that many bytes, as a network that fails mid-stream does, even
 /// when that's all of it; one with `swallow` drops it once the stream has
-/// gone, without an import; one with `pause` touches `importing` and waits
-/// a second before an import starts.
+/// gone, without an import; one with `vanish` as well as `cut` goes `down`
+/// once that import is over, every session to it ending; one with `pause`
+/// touches `importing` and waits a second before an import starts.
 pub const PEER_SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
 while [ $# -gt 0 ]; do
   case $1 in
@@ -415,6 +416,10 @@ peer() {
 }
 if [ -e "$dir/cut" ] && [ "$1 $2" = "runner import" ]; then
   head -c "$(cat "$dir/cut")" | peer "$@"
+  if [ -e "$dir/vanish" ]; then
+    touch "$dir/down"
+    while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$dir/pids"
+  fi
   echo "Connection to ${target##*@} closed by remote host." >&2
   exit 255
 fi

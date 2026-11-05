@@ -324,6 +324,36 @@ fn an_import_whose_answer_was_lost_is_asked_after() {
     assert!(out.ends_with("  running  on kvm-host-2\n"), "{out}");
 }
 
+// The whole stream went and the import there took it, but ssh lost its
+// answer, and then that host stopped answering at all: it may have dev, so
+// dev is started again here, and the message says both hosts may have it.
+#[test]
+fn an_import_whose_answer_was_lost_from_a_host_gone_quiet_says_to_check_both() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
+    fs::write(pair.there.dir.join("cut"), "100000000000").unwrap();
+    fs::write(pair.there.dir.join("vanish"), "").unwrap();
+    let err = pair.refused(&["dev", TARGET]);
+    assert!(
+        err.contains("dev is here as it was, and running again"),
+        "{err}"
+    );
+    assert!(
+        err.contains("kvm-host-2 didn't say whether it took dev"),
+        "{err}"
+    );
+    assert!(err.contains("shows it there too, delete one"), "{err}");
+    assert!(!err.contains("doesn't have it"), "{err}");
+    // As the message warns: the import there finished, so both have it.
+    assert!(pair.here.has("dev"));
+    assert!(pair.there.has("dev"));
+    let start = "systemctl start firecracker@dev.service".to_string();
+    assert!(pair.here.sd.calls().contains(&start));
+}
+
 // The whole stream went, but nothing there took it: dev is here as it was.
 #[test]
 fn a_stream_that_went_whole_but_wasn_t_taken_leaves_the_vm_here() {
