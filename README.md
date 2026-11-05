@@ -90,7 +90,7 @@ The host needs:
 - On the tailnet, with no other way in over SSH (see Tailnet only).
 - `/var/lib/runner` on XFS or btrfs. On ext4 every fork and run is a full copy of the disk.
 
-On AWS, `client/aws.sh` makes one (see On AWS). Install, from a checkout:
+On AWS, `client/aws.sh up` makes one and does all of this (see On AWS). Elsewhere, install from a checkout:
 
 ```sh
 git clone https://github.com/nsnguyen/ai-agent-runner && cd ai-agent-runner
@@ -121,41 +121,31 @@ This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailsc
 
 ### On AWS
 
-`client/aws.sh`, run on the laptop, makes a host on EC2 with the AWS CLI: an `m7i-flex.large` with nested virtualization on, which gives it `/dev/kvm` at a regular instance's price (a `.metal` costs dollars an hour), running Ubuntu 24.04, with a 50 GiB second disk for `/var/lib/runner`.
+`client/aws.sh`, run on the laptop, makes a host on EC2 with the AWS CLI and sets it up: an `m7i-flex.large` with nested virtualization on, which gives it `/dev/kvm` at a regular instance's price (a `.metal` costs dollars an hour), running Ubuntu 24.04, with a 50 GiB second disk for `/var/lib/runner`. From this checkout, which it copies there (the repo is private, so the host can't clone it):
 
 ```sh
 brew install awscli
 aws configure set region us-west-2
 aws login
-client/aws.sh up
-client/aws.sh ssh ls -l /dev/kvm
+client/aws.sh up                                # kvm-host; most of the time goes on building base
+RUNNER_AWS_NAME=kvm-host-2 client/aws.sh up     # another host, with kvm-host's tokens
 ```
 
-If `aws login` refuses because the default profile already holds access keys, `aws login --profile runner` and `export AWS_PROFILE=runner` keep the two apart. If `up` says the CLI doesn't know `NestedVirtualization`, `brew upgrade awscli`.
+If `aws login` refuses because the default profile already holds access keys, `aws login --profile runner` and `export AWS_PROFILE=runner` keep the two apart. If `up` says the CLI doesn't know `NestedVirtualization`, `brew upgrade awscli`. It needs `~/.ssh/id_ed25519.pub` (`ssh-keygen -t ed25519`), the key the laptop's `runner` logs in with, and Tailscale connected on the laptop.
 
-`up` waits a few minutes, until the host has booted. Until it's on the tailnet, only the laptop's address gets in over SSH, as `ubuntu` with the key `up` saves in `~/.ssh/kvm-host.pem`; after the laptop's address changes, `client/aws.sh open` lets in the new one and no other. On the host, put the second disk on XFS before installing. NVMe disks on EC2 aren't named in a fixed order, so find it by its size:
+`up` launches the host if it isn't there, waits until it has booted, and lets in only this laptop's address over SSH, as `ubuntu` with the key it saves in `~/.ssh/<name>.pem`. Then it sets the host up over SSH, a `==>` line for each step:
 
-```sh
-disk=/dev/$(lsblk -dno NAME,SIZE | awk '$2 == "50G" {print $1}'); echo "$disk"
-sudo mkfs.xfs "$disk"
-echo "UUID=$(sudo blkid -s UUID -o value "$disk") /var/lib/runner xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
-sudo mkdir -p /var/lib/runner && sudo mount /var/lib/runner
-```
+1. XFS on the 50 GiB disk, mounted at `/var/lib/runner`. It finds the disk by its size, since EC2 doesn't name NVMe disks in a fixed order, and never formats one that holds anything but XFS.
+2. This checkout, by rsync; Rust, the build tools and podman; `cargo build --release && sudo host/install.sh`.
+3. The base image and kernel, built there with podman (docker drops the VMs' forwarded traffic), imported as `base` and installed.
+4. Tailscale, as the host's name. **It stops for the login link it prints: open it and add the host.** A tailnet that already has a machine of that name calls this one `kvm-host-2-1`, say, and the setup stops there: remove the old one in the admin console, rename this one, and rerun.
+5. The laptop's key line in `~runner/.ssh/authorized_keys`, as Add the laptop's key writes it.
+6. The credentials. The Claude token comes from the host `RUNNER_AWS_TOKEN_FROM` names (`kvm-host`), host to host through one pipe, with `~/.ssh/<that name>.pem`, so it never lands in an argument, a variable, a file or on the screen on the laptop; `GH_TOKEN` and `ANTHROPIC_API_KEY` come the same way when that host has them. With no such host, or for `kvm-host` itself, **it asks for the token**: paste it (`claude setup-token` makes one), then Enter. It's read on the host with echo off. An empty one writes nothing and stops the setup.
+7. `runner doctor` as `runner@<name>`, over the tailnet, as the laptop's `runner` will reach it, and only once every line is `ok`, `close`: from then on nothing gets in from the internet. A line that isn't leaves SSH open and says which.
 
-Then install as above. The repo is private, so copy the laptop's checkout over rather than clone it, and build the base image there with podman, not docker, which drops the VMs' forwarded traffic:
+Each step checks first, so after a failure, fix what it says and rerun `client/aws.sh setup` (with the same `RUNNER_AWS_NAME`): it redoes nothing that's done, and `up` on a host that's there does the same. Until `close`, each run first lets in this laptop's address as it is now, as `open` does; after it, the run goes over the tailnet. The name is the host's tailnet name too, so lowercase letters, digits and dashes. It ends with the next step on the laptop, `runner hosts add runner@<name>`; the first host goes in with `client/install.sh runner@kvm-host` (Use it from the laptop). The same steps by hand, for a host elsewhere, are in docs/host.md (A host aws.sh didn't make).
 
-```sh
-rsync -az --exclude target --exclude images/base/out -e "ssh -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes" ./ "ubuntu@$(client/aws.sh ip):ai-agent-runner/"
-```
-
-Put the host on the tailnet as `kvm-host`, so the name the steps above use resolves (with MagicDNS, which a new tailnet has on; remove an old `kvm-host` from the tailnet first, or the new one becomes `kvm-host-1`), then add the laptop's key through `ubuntu`, the sudo account on AWS:
-
-```sh
-curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname kvm-host   # on the host
-ssh -t -i ~/.ssh/kvm-host.pem -o IdentitiesOnly=yes ubuntu@kvm-host "echo 'from=\"100.64.0.0/10,fd7a:115c:a1e0::/48\",restrict,pty,port-forwarding $(cat ~/.ssh/id_ed25519.pub)' | sudo -u runner tee -a ~runner/.ssh/authorized_keys"   # on the laptop
-```
-
-Then `client/aws.sh close`: from then on nothing gets in from the internet. `client/aws.sh ssh` then goes over the tailnet, as `kvm-host`, and `client/check.sh` upgrades and checks the host (After merging a change). `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
+Once closed, `client/aws.sh ssh` goes over the tailnet, as `kvm-host`, and `client/check.sh` upgrades and checks the host (After merging a change). After the laptop's address changes, `client/aws.sh open` lets in the new one and no other, until the next `close`. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
 
 ## Build the base image
 
