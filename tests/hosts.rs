@@ -59,6 +59,7 @@ if [ -e "$dir/down" ]; then
   exit 255
 fi
 export HOST_DIR="$dir"
+[ ! -e "$dir/slow" ] || sleep 1
 [ "$1" != -n ] || exec bash -c "$cmd" </dev/null
 read_in=$(mktemp)
 cat >"$read_in"
@@ -1050,6 +1051,172 @@ fn a_hosts_file_of_one_host_runs_as_one_host_always_has() {
                 vec!["runner@kvm-host-2", "runner exec web -- true"]
             ],
             "{shell:?}"
+        );
+    }
+}
+
+// From review: a program's own --host, in exec's or service add's argv, or
+// a prompt or session that is `--host`, is the host's to parse, not the
+// laptop's.
+#[test]
+fn a_program_s_own_host_option_reaches_the_host() {
+    let cases: &[&[&str]] = &[
+        &["exec", "web", "uvicorn", "--host", "0.0.0.0"],
+        &["exec", "web", "--dir", "/w", "vite", "--host=0.0.0.0"],
+        &[
+            "service", "add", "web", "srv", "python3", "app.py", "--host", "kvm-host",
+        ],
+        &["run", "web", "--host"],
+        &["kill", "web", "--host"],
+    ];
+    for shell in SHELLS {
+        for args in cases {
+            // One host, as on main: exactly as typed.
+            let fleet = Fleet::new();
+            let out = fleet
+                .runner(shell, args)
+                .env("RUNNER_HOST", "runner@kvm-host-2")
+                .output()
+                .unwrap();
+            ok(&out);
+            let mut want = "runner".to_string();
+            for a in *args {
+                want = format!("{want} {a}");
+            }
+            assert_eq!(
+                fleet.ssh_calls(),
+                [["runner@kvm-host-2", want.as_str()]],
+                "{shell:?}"
+            );
+            // Several: to web's host, still as typed.
+            let fleet = Fleet::new();
+            ok(&fleet.run(shell, &["list"]));
+            fleet.forget_calls();
+            ok(&fleet.run(shell, args));
+            assert_eq!(
+                fleet.commands("kvm-host-2"),
+                [args.join(" ")],
+                "{shell:?} {args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_vm_after_a_double_dash_is_still_found() {
+    let fleet = Fleet::new();
+    ok(&fleet.run(SHELLS[0], &["exec", "--", "web", "true"]));
+    assert_eq!(fleet.commands("kvm-host-2"), ["exec -- web true"]);
+}
+
+#[test]
+fn claude_with_host_refuses_a_name_another_host_has() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        let out = fleet.run(shell, &["claude", "dev", "--host", "kvm-host-3"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        assert!(text(&out.stderr).contains("kvm-host has a VM named dev"));
+        assert!(fleet.commands("kvm-host-3").is_empty(), "{shell:?}");
+        // On its own host, --host is fine.
+        ok(&fleet.run(shell, &["claude", "dev", "--host", "kvm-host"]));
+        assert_eq!(fleet.commands("kvm-host"), ["claude dev"], "{shell:?}");
+    }
+}
+
+#[test]
+fn import_replace_of_a_name_no_host_has_is_placed() {
+    let fleet = Fleet::new();
+    ok(&fleet.run(SHELLS[0], &["import", "--replace", "fresh", "/tmp/disk"]));
+    assert_eq!(
+        fleet.commands("kvm-host-2"),
+        ["import --replace fresh /tmp/disk"]
+    );
+}
+
+#[test]
+fn hosts_add_refuses_another_login_to_a_listed_host() {
+    let fleet = Fleet::new();
+    let out = fleet.run(SHELLS[0], &["hosts", "add", "ubuntu@kvm-host-2"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("runner@kvm-host-2"));
+    assert_eq!(
+        fs::read_to_string(fleet.hosts_file()).unwrap(),
+        HOSTS.join("\n") + "\n"
+    );
+}
+
+#[test]
+fn hosts_add_and_rm_keep_the_file_s_comments() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        let with = "# MCP's\nrunner@kvm-host\n\n# spare\nrunner@kvm-host-2\n";
+        fs::write(fleet.hosts_file(), with).unwrap();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]));
+        assert_eq!(
+            fs::read_to_string(fleet.hosts_file()).unwrap(),
+            format!("{with}runner@kvm-host-3\n"),
+            "{shell:?}"
+        );
+        ok(&fleet.run(shell, &["hosts", "rm", "kvm-host-2"]));
+        assert_eq!(
+            fs::read_to_string(fleet.hosts_file()).unwrap(),
+            "# MCP's\nrunner@kvm-host\n\n# spare\nrunner@kvm-host-3\n",
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn install_keeps_the_hosts_file_s_comments() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.hosts_file(),
+        "# MCP's first\nrunner@kvm-host\nrunner@kvm-host-2\n",
+    )
+    .unwrap();
+    let out = Command::new("sh")
+        .arg("client/install.sh")
+        .arg("runner@kvm-host-2")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("HOME", fleet.home())
+        .output()
+        .unwrap();
+    ok(&out);
+    assert_eq!(
+        fs::read_to_string(fleet.hosts_file()).unwrap(),
+        "runner@kvm-host-2\n# MCP's first\nrunner@kvm-host\n"
+    );
+}
+
+#[test]
+fn with_every_host_removed_it_says_to_add_one() {
+    let fleet = Fleet::new();
+    for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+        ok(&fleet.run(SHELLS[0], &["hosts", "rm", host]));
+    }
+    let out = fleet.run(SHELLS[0], &["list"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("runner hosts add"), "{err}");
+    assert!(err.contains("~/.config/runner/hosts"), "{err}");
+}
+
+// Every host is asked at once, so the slowest sets the pace, not their sum,
+// and each ask has keepalives, so a host that stops answering mid-way ends.
+#[test]
+fn every_host_is_asked_at_once() {
+    let fleet = Fleet::new();
+    for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+        fs::write(fleet.dir.path().join("fleet").join(host).join("slow"), "").unwrap();
+    }
+    let started = std::time::Instant::now();
+    ok(&fleet.run(SHELLS[0], &["list"]));
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(2500), "{took:?}");
+    for call in fleet.ssh_calls() {
+        assert!(
+            call.iter().any(|a| a.starts_with("ServerAliveInterval=")),
+            "{call:?}"
         );
     }
 }

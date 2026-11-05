@@ -35,15 +35,18 @@ if [ $# -gt 0 ]; then
   if [ -e "$conf/hosts" ]; then
     {
       printf '%s\n' "$1"
-      while read -r h _ || [ -n "$h" ]; do
-        [ "$h" = "$1" ] || printf '%s\n' "$h"
+      # Every other line as it was, comments too.
+      while IFS= read -r line || [ -n "$line" ]; do
+        # shellcheck disable=SC2086 # its first word is the host.
+        h=$(set -f && set -- $line && printf '%s' "${1-}")
+        [ "$h" = "$1" ] || printf '%s\n' "$line"
       done <"$conf/hosts"
     } >"$conf/hosts.new"
     mv -f "$conf/hosts.new" "$conf/hosts"
   fi
 fi
 if [ -e "$conf/hosts" ]; then
-  echo "Hosts, the first for MCP: $(tr '\n' ' ' <"$conf/hosts")"
+  echo "Hosts, the first for MCP: $(grep -v '^[[:space:]]*#' "$conf/hosts" | tr '\n' ' ')"
 elif [ -r "$conf/host" ]; then
   echo "Host: $(cat "$conf/host")"
 else

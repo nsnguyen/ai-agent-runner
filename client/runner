@@ -13,8 +13,11 @@ conf=$HOME/.config/runner
 hosts_file=$conf/hosts
 # Where each VM was when every host was last asked: "<vm> <host>" a line.
 cache=$HOME/.cache/runner/vms
-# Seconds a host gets to answer when every host is asked at once.
+# Seconds a host gets to answer when every host is asked at once, and ssh's
+# options for those asks: no stdin, no prompt, and keepalives, so a host that
+# stops answering part way is dropped too.
 wait=5
+ask="-n -o BatchMode=yes -o ConnectTimeout=$wait -o ServerAliveInterval=$wait -o ServerAliveCountMax=2"
 
 # Options of the host's runner that take a value, so the scan below knows the
 # next argument is that value and not the VM. tests/hosts.rs checks that
@@ -67,7 +70,14 @@ saved_hosts() {
   fi
 }
 
-# Writes the hosts file from stdin, a host a line, in one move.
+# The host a line of the hosts file names: its first word, unless a comment.
+host_in() {
+  # shellcheck disable=SC2086 # split into words, never globbed (set -f).
+  set -- $1
+  case ${1-} in '#'*) ;; *) printf '%s' "${1-}" ;; esac
+}
+
+# Writes the hosts file from stdin, in one move.
 save_hosts() {
   mkdir -p "$conf" &&
     cat >"$hosts_file.new.$$" &&
@@ -89,7 +99,11 @@ named() {
 # Scratch space for every host's answers, and its removal however this ends;
 # an exec ends without traps, so `clean` goes first.
 tmp=
+pids=
 clean() {
+  # shellcheck disable=SC2086 # pids are numbers, split.
+  [ -z "$pids" ] || kill $pids 2>/dev/null
+  pids=
   [ -z "$tmp" ] || rm -rf "$tmp"
   tmp=
 }
@@ -109,12 +123,17 @@ survey() {
   i=0
   for h in $hosts; do
     i=$((i + 1))
-    {
-      ssh -n -o BatchMode=yes -o ConnectTimeout="$wait" "$h" "$1" >"$tmp/$i.out" 2>"$tmp/$i.err"
-      echo $? >"$tmp/$i.rc"
-    } &
+    # shellcheck disable=SC2086,SC2029 # $ask is options, split; $1 is for the host.
+    ssh $ask "$h" "$1" >"$tmp/$i.out" 2>"$tmp/$i.err" &
+    pids="$pids $!"
   done
-  wait
+  i=0
+  for pid in $pids; do
+    i=$((i + 1))
+    wait "$pid"
+    echo $? >"$tmp/$i.rc"
+  done
+  pids=
 }
 
 # answered CMD: after a survey of CMD, passes on each host's stderr, names
@@ -213,8 +232,8 @@ locate() {
   if [ -n "$at" ]; then
     # Apart from the command and with no stdin, so a miss takes none of it.
     quote "$1"
-    # shellcheck disable=SC2029 # $arg is quoted for the host's shell, here.
-    if ssh -n -o BatchMode=yes -o ConnectTimeout="$wait" "$at" "runner ip $arg" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086,SC2029 # $ask is options, split; $arg is quoted for the host.
+    if ssh $ask "$at" "runner ip $arg" >/dev/null 2>&1; then
       return
     fi
   fi
@@ -345,12 +364,23 @@ if [ "${1-}" = hosts ]; then
         echo "runner: $3 is on the list already"
         exit 0
       fi
+      if named "$(name_of "$3")"; then
+        echo "runner: $(name_of "$3") is on the list already, as $match: \`runner hosts rm $match\` first to change it" >&2
+        exit 1
+      fi
       # Prompts allowed, so ssh can ask to take a new host's key.
       if ! row=$(ssh -n -o ConnectTimeout="$wait" "$3" "runner hosts"); then
         echo "runner: $3 didn't answer \`runner hosts\`, so it isn't added" >&2
         exit 1
       fi
-      { [ -z "$hosts" ] || printf '%s\n' "$hosts"; printf '%s\n' "$3"; } | save_hosts || exit 1
+      {
+        if [ -e "$hosts_file" ]; then
+          cat "$hosts_file"
+        elif [ -n "$hosts" ]; then
+          printf '%s\n' "$hosts"
+        fi
+        printf '%s\n' "$3"
+      } | save_hosts || exit 1
       echo "added $3: $row"
       exit 0
       ;;
@@ -359,9 +389,15 @@ if [ "${1-}" = hosts ]; then
         echo "runner: no host $3 in ~/.config/runner/hosts" >&2
         exit 1
       fi
-      for h in $hosts; do
-        [ "$h" = "$match" ] || printf '%s\n' "$h"
-      done | save_hosts || exit 1
+      if [ -e "$hosts_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          [ "$(host_in "$line")" = "$match" ] || printf '%s\n' "$line"
+        done <"$hosts_file"
+      else
+        for h in $hosts; do
+          [ "$h" = "$match" ] || printf '%s\n' "$h"
+        done
+      fi | save_hosts || exit 1
       echo "removed $match"
       exit 0
       ;;
@@ -375,15 +411,30 @@ fi
 # The command, the VM it names, and the laptop's --host, found past options
 # and their values, and up to a `--`, after which every argument is the
 # command's own. --host comes out: the host's runner hasn't got it.
-cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended=''
+cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra=''
 n=$#
 while [ "$n" -gt 0 ]; do
   a=$1
   shift
   n=$((n - 1))
   if [ -n "$ended" ]; then
+    # A VM can come after a `--` too, as clap has it.
+    if [ "$ended" = 1 ] && [ -z "$vm" ] && [ -n "$cmd" ] && { [ "$cmd" != service ] || [ -n "$sub" ]; }; then
+      vm=$a
+    fi
+    ended=2
     set -- "$@" "$a"
     continue
+  fi
+  # What follows a VM for run, attach and kill takes hyphens as it comes,
+  # so a prompt or session of --host is theirs.
+  if [ -n "$vm" ] && [ -z "$extra" ] && [ -z "$takes" ]; then
+    case $cmd:$a in run:--host | run:--host=* | attach:--host | attach:--host=* | kill:--host | kill:--host=*)
+      extra=1
+      set -- "$@" "$a"
+      continue
+      ;;
+    esac
   fi
   if [ -n "$takes" ]; then
     case $takes in
@@ -439,6 +490,13 @@ while [ "$n" -gt 0 ]; do
       sub=$a
     elif [ -z "$vm" ]; then
       vm=$a
+    else
+      # exec's program, and service add's after the service's name, take
+      # every argument after them as theirs, --host included.
+      extra=$((extra + 1))
+      if [ "$cmd" = exec ] || { [ "$cmd:$sub" = service:add ] && [ "$extra" -ge 2 ]; }; then
+        ended=2
+      fi
     fi
     ;;
   esac
@@ -467,6 +525,10 @@ else
     esac
     if [ -z "$first" ]; then first=$h; else several=1; fi
   done
+fi
+if [ -z "$first" ] && [ -z "${RUNNER_HOST-}" ] && [ -e "$hosts_file" ]; then
+  echo "runner: no host in ~/.config/runner/hosts: \`runner hosts add <host>\` adds one" >&2
+  exit 2
 fi
 case $first in
 '' | -*)
@@ -601,8 +663,9 @@ doctor | gc)
 create | import)
   [ -n "$vm" ] || go "$host"
   if [ "$cmd" = import ] && [ -n "$replace" ]; then
+    # On top of the VM where it is; a name no host has is imported anew.
     locate "$vm"
-    go "${at:-$first}"
+    [ -z "$at" ] || go "$at"
   fi
   pick "$vm"
   go "$at" keep
@@ -624,9 +687,20 @@ claude)
     go "${at:-$first}"
   fi
   [ -n "$vm" ] || go "$host"
-  # A new VM, which claude makes, goes where create would put it.
+  # A new VM, which claude makes, goes where create would put it, and
+  # --host can't make a second of one another host has.
+  given=$via
+  via=
   locate "$vm"
-  [ -n "$at" ] || pick "$vm"
+  via=$given
+  if [ -n "$at" ]; then
+    if [ -n "$via" ] && [ "$at" != "$via" ] && [ "$vm" != base ]; then
+      echo "runner: $(name_of "$at") has a VM named $vm already: VM names are one per name across hosts" >&2
+      exit 1
+    fi
+    go "${via:-$at}"
+  fi
+  pick "$vm"
   go "$at"
   ;;
 output | result | cancel)
