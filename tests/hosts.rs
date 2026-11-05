@@ -1206,6 +1206,21 @@ fn hosts_add_and_rm_keep_the_file_s_comments() {
     }
 }
 
+// The file is edited by hand too, so its last line may have no newline.
+#[test]
+fn hosts_add_keeps_a_last_line_with_no_newline() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fs::write(fleet.hosts_file(), "runner@kvm-host\nrunner@kvm-host-2").unwrap();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]));
+        assert_eq!(
+            fs::read_to_string(fleet.hosts_file()).unwrap(),
+            HOSTS.join("\n") + "\n",
+            "{shell:?}"
+        );
+    }
+}
+
 #[test]
 fn install_keeps_the_hosts_file_s_comments() {
     let fleet = Fleet::new();

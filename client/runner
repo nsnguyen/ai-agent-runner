@@ -391,8 +391,11 @@ if [ "${1-}" = hosts ]; then
         exit 1
       fi
       {
+        # A line at a time, since a last line edited by hand may have no newline.
         if [ -e "$hosts_file" ]; then
-          cat "$hosts_file"
+          while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+          done <"$hosts_file"
         elif [ -n "$hosts" ]; then
           printf '%s\n' "$hosts"
         fi
