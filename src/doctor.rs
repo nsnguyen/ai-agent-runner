@@ -428,9 +428,10 @@ fn key(host: &impl Host) -> Verdict {
     let fix = format!(
         "so this host can't drive the other hosts' runners: rerun {INSTALL}, then `runner hosts add` on the laptop"
     );
-    for path in [key.clone(), home.join(".ssh/id_ed25519.pub")] {
+    let public = home.join(".ssh/id_ed25519.pub");
+    for path in [&key, &public] {
         let at = path.display();
-        match host.file_len(&path) {
+        match host.file_len(path) {
             Ok(0) => return warn(format!("{at} is empty, {fix}")),
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -439,8 +440,31 @@ fn key(host: &impl Host) -> Verdict {
             Err(e) => return warn(format!("{at}: {e}")),
         }
     }
+    match host.read(&public) {
+        Ok(line) if bare_ed25519(&line) => {}
+        Ok(_) => {
+            let at = public.display();
+            return warn(format!(
+                "{at} isn't a plain ed25519 key, which is all `runner hosts add` shares, {fix}"
+            ));
+        }
+        Err(e) => return warn(format!("{}: {e}", public.display())),
+    }
     ok(format!(
         "{}, which `runner hosts add` shares with the other hosts",
         key.display()
     ))
+}
+
+// What `runner hosts add` takes from a host's id_ed25519.pub: its first line
+// an ed25519 key's type and base64, before any comment.
+fn bare_ed25519(public: &str) -> bool {
+    let mut words = public.lines().next().unwrap_or("").split_whitespace();
+    let (Some("ssh-ed25519"), Some(key)) = (words.next(), words.next()) else {
+        return false;
+    };
+    key.starts_with("AAAAC3NzaC1lZDI1NTE5")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
 }

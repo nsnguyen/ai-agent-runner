@@ -41,29 +41,60 @@ peer_opts='from="100.64.0.0/10,fd7a:115c:a1e0::/48",restrict,command="/usr/local
 nl='
 '
 
-# What reconcile runs on a host, with $p the options above, then a space;
-# $keep the names of the hosts whose lines stay, and $fresh the keys whose
-# lines go, a word each between spaces; and $add the lines to add. Its
-# authorized_keys loses each peer line whose host $keep doesn't name or
-# whose key is in $fresh, keeps every other line, like the laptop's, as it
-# is, then gets $add, in one move.
+# What reconcile runs on a host, with $p the options above; $keep the names
+# of the hosts whose lines stay, and $fresh the keys whose lines go, a word
+# each between spaces; and $add the lines to add. Its authorized_keys loses
+# each peer line whose host $keep doesn't name or whose key is in $fresh,
+# keeps every other line, like the laptop's, as it is, then gets $add, in
+# one move. A peer line is one sshd reads as one: blanks may lead it, and
+# tabs part its words. A line of $add whose key another line here has, like
+# the laptop's, isn't added, and the edit exits 3 after saying so, since that
+# line would lock the other's key into runner peer once it came first.
 # shellcheck disable=SC2016 # for the host's shell to expand.
 edit='k=$HOME/.ssh/authorized_keys
 [ -e "$k" ] || [ -n "$add" ] || exit 0
+from=$k
+[ -e "$k" ] || from=/dev/null
+export add
 umask 077
 new=$k.new.$$
-{
-  if [ -e "$k" ]; then
-    awk -v p="$p" -v keep="$keep" -v fresh="$fresh" '\''
-      index($0, p) == 1 {
-        split(substr($0, length(p) + 1), f, " ")
-        if (f[3] == "" || !index(keep, " " f[3] " ") || index(fresh, " " f[2] " ")) next
+awk -v p="$p" -v keep="$keep" -v fresh="$fresh" -v sq="\047" '\''
+  function peer(line,  f, rest) {
+    sub(/^[ \t]+/, "", line)
+    if (index(line, p) != 1) return 0
+    rest = substr(line, length(p) + 1)
+    if (rest !~ /^[ \t]/) return 0
+    split(rest, f)
+    key = f[2]
+    name = f[3]
+    return 1
+  }
+  {
+    if (peer($0)) {
+      if (name == "" || !index(keep, " " name " ") || index(fresh, " " key " ")) next
+    } else {
+      n = split($0, w)
+      for (i = 1; i <= n; i++) taken[w[i]] = 1
+    }
+    print
+  }
+  END {
+    n = split(ENVIRON["add"], lines, "\n")
+    for (i = 1; i <= n; i++) {
+      if (!peer(lines[i])) continue
+      if (key in taken) {
+        print "runner: " name sq "s key is on another line here, like the laptop" sq "s, so it gets no runner peer line" | "cat 1>&2"
+        refused = 1
+        continue
       }
-      { print }'\'' "$k"
-  fi >"$new" &&
-    if [ -n "$add" ]; then printf "%s\n" "$add" >>"$new"; fi &&
-    mv -f "$new" "$k"
-} || { rm -f "$new"; exit 1; }'
+      print lines[i]
+    }
+    exit refused ? 3 : 0
+  }'\'' "$from" >"$new"
+rc=$?
+if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then rm -f "$new"; exit 1; fi
+mv -f "$new" "$k" || { rm -f "$new"; exit 1; }
+exit "$rc"'
 
 # ssh hands the remote shell one string, so each argument is quoted for it:
 # bare when it's only safe characters, else in single quotes, with ' as '\''.
@@ -382,12 +413,13 @@ go() {
 }
 
 # reconcile HOST KEEP FRESH ADD: `edit` on HOST with those, BatchMode and
-# with no stdin, passing on what it says. Names HOST and returns 1 if it
-# didn't answer or failed, saying what's left as it was: $left.
+# with no stdin, passing on what it says. Returns 1 if it didn't answer or
+# failed, naming HOST and what's left as it was, $left, or if it refused a
+# line.
 reconcile() {
   # Not a host, so there's nothing on it to change.
   case $1 in -*) return 0 ;; esac
-  quote "$peer_opts "
+  quote "$peer_opts"
   c="p=$arg"
   quote " $2 "
   c="$c keep=$arg"
@@ -399,6 +431,8 @@ reconcile() {
   ssh $ask "$1" "$c"
   case $? in
   0) return 0 ;;
+  # It said why, and changed the rest.
+  3) ;;
   255) echo "runner: $(name_of "$1") didn't answer, so $left" >&2 ;;
   *) echo "runner: $(name_of "$1") couldn't change ~runner/.ssh/authorized_keys, so $left" >&2 ;;
   esac
@@ -443,6 +477,23 @@ share() {
       echo "runner: $(name_of "$h") has no SSH key in ~runner/.ssh/id_ed25519.pub that's a plain ed25519 one, so the others can't trust it: rerun host/install.sh there, then \`runner hosts add $h\`" >&2
       failed=1
     done
+    # One key for two hosts, say one cloned from the other's disk, can't
+    # tell them apart, so neither would get a line for the other.
+    i=0
+    for h in $hosts; do
+      i=$((i + 1))
+      [ -r "$tmp/$i.key" ] || continue
+      read -r a <"$tmp/$i.key"
+      j=0
+      for p in $hosts; do
+        j=$((j + 1))
+        if [ "$j" -le "$i" ] || [ ! -r "$tmp/$j.key" ]; then continue; fi
+        read -r b <"$tmp/$j.key"
+        [ "$a" = "$b" ] || continue
+        echo "runner: $(name_of "$h") and $(name_of "$p") have the same key, so neither can trust the other by it: if they're two hosts, give one a new key (remove ~runner/.ssh/id_ed25519 there and rerun host/install.sh), then \`runner hosts add\` again" >&2
+        failed=1
+      done
+    done
   fi
   left="its authorized_keys is as it was: \`runner hosts add\` again once it answers"
   i=0
@@ -462,7 +513,7 @@ share() {
       if [ -r "$tmp/$j.key" ]; then
         read -r k <"$tmp/$j.key"
         fresh="$fresh $k"
-        # The same host listed twice needs no line for itself.
+        # No line for its own key: the same host listed twice.
         [ "$k" = "$mine" ] || add="${add:+$add$nl}$peer_opts ssh-ed25519 $k $(name_of "$p")"
       else
         keep="$keep $(name_of "$p")"
@@ -567,7 +618,6 @@ if [ "${1-}" = hosts ]; then
       # The rest drop its line, keeping each other's; then it drops theirs.
       gone=$match
       hosts=$(saved_hosts)
-      sane
       failed=
       keep=
       for h in $hosts; do keep="$keep $(name_of "$h")"; done

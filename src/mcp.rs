@@ -309,7 +309,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Check this host can run VMs: KVM, the pinned Firecracker, reflink under the VM root, the guest kernel, the base VM, NAT, and the systemd unit. `ok` is false if any check fails; warnings don't fail."
+        description = "Check this host can run VMs: KVM, the pinned Firecracker, reflink under the VM root, the guest kernel, the base VM, NAT, the systemd unit, and the SSH key other hosts trust this one by. `ok` is false if any check fails; warnings don't fail."
     )]
     fn doctor(&self) -> Result<Json<Report>, String> {
         Ok(Json(doctor::check(&System, &self.store)))

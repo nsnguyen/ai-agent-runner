@@ -1615,3 +1615,95 @@ fn hosts_add_and_rm_refuse_a_listed_host_that_looks_like_an_ssh_option() {
         fleet.ssh_calls()
     );
 }
+
+// From review: two hosts that report one key, say one cloned from the
+// other's disk, can't be told apart by it, so neither would trust the other.
+#[test]
+fn two_hosts_with_one_key_are_named() {
+    let fleet = Fleet::new();
+    let k = key("kvm-host-2");
+    fleet.set_key(
+        "kvm-host-3",
+        Some(&format!("ssh-ed25519 {k} runner@kvm-host-3")),
+    );
+    let out = fleet.run(SHELLS[0], &["hosts", "add", "runner@kvm-host"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("kvm-host-2 and kvm-host-3 have the same key"),
+        "{err}"
+    );
+    assert!(!text(&out.stdout).contains("shared keys"));
+}
+
+// From review: a host that says its key is the laptop's gets no peer line for
+// it, which would come before a laptop line added after it and lock the
+// laptop into runner peer.
+#[test]
+fn a_host_can_t_pass_off_another_line_s_key_as_its_own() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        let laptop = LAPTOP.split_whitespace().nth(2).unwrap();
+        fleet.set_key(
+            "kvm-host-2",
+            Some(&format!("ssh-ed25519 {laptop} runner@kvm-host-2")),
+        );
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("kvm-host-2's key"), "{err}");
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-3"]),
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host-3"),
+            trusting(&["kvm-host"]),
+            "{shell:?}"
+        );
+    }
+}
+
+// From review: a listed line that isn't a host doesn't stop rm from taking
+// the lines out of the hosts that are.
+#[test]
+fn hosts_rm_takes_lines_out_past_a_listed_line_that_isn_t_a_host() {
+    let fleet = Fleet::new();
+    ok(&fleet.run(SHELLS[0], &["hosts", "add", "runner@kvm-host"]));
+    fs::write(
+        fleet.hosts_file(),
+        "runner@kvm-host\nrunner@kvm-host-2\n-oProxyCommand=x\n",
+    )
+    .unwrap();
+    fleet.forget_calls();
+    let out = fleet.run(SHELLS[0], &["hosts", "rm", "kvm-host-2"]);
+    ok(&out);
+    assert_eq!(fleet.authorized_keys("kvm-host"), trusting(&[]));
+    assert!(
+        fleet
+            .ssh_calls()
+            .iter()
+            .all(|c| !c.iter().any(|a| a.starts_with("-oProxy"))),
+        "{:?}",
+        fleet.ssh_calls()
+    );
+}
+
+// From review: sshd takes a peer line with blanks before it, or a tab before
+// its key, so those are peer lines for rm to take out too.
+#[test]
+fn a_peer_line_reformatted_by_hand_still_goes() {
+    let fleet = Fleet::new();
+    ok(&fleet.run(SHELLS[0], &["hosts", "add", "runner@kvm-host"]));
+    let k = key("kvm-host-2");
+    let opts = peers::OPTIONS;
+    fleet.set_authorized_keys(
+        "kvm-host",
+        &format!(
+            "{LAPTOP}\n  {opts} ssh-ed25519 {k} kvm-host-2\n{opts}\tssh-ed25519\t{k}  kvm-host-2\n"
+        ),
+    );
+    ok(&fleet.run(SHELLS[0], &["hosts", "rm", "kvm-host-2"]));
+    assert_eq!(fleet.authorized_keys("kvm-host"), trusting(&[]));
+}

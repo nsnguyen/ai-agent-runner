@@ -106,6 +106,9 @@ fn key() -> String {
     format!("{HOME}/.ssh/id_ed25519")
 }
 
+// An ed25519 public key's base64: its type's name first.
+const ED25519: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIK3nBk4m9Oe5Tq2xsVdN2xTqgZrW6Wl4y8m3m6d2r5Xq";
+
 fn public_key() -> String {
     format!("{}.pub", key())
 }
@@ -142,7 +145,7 @@ impl Fake {
             ),
             (
                 public_key().into(),
-                Ok("ssh-ed25519 AAAA runner@host\n".to_string()),
+                Ok(format!("ssh-ed25519 {ED25519} runner@host\n")),
             ),
         ];
         let runs = [
@@ -513,6 +516,18 @@ fn key_warns_when_runner_has_no_key() {
         assert!(detail.contains(&key()), "{detail}");
         assert!(detail.contains("runner hosts add"), "{detail}");
         assert!(report.ok);
+    }
+
+    // From review: one `runner hosts add` wouldn't share, since it takes
+    // only a bare ed25519 key.
+    for not_one in [
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ runner@host\n".to_string(),
+        format!("command=\"sh\" ssh-ed25519 {ED25519} runner@host\n"),
+        format!("ssh-ed25519 {ED25519};id runner@host\n"),
+    ] {
+        let fake = fake().file(public_key(), Ok(&not_one));
+        let report = assert_verdict(fake, &store, "key", Status::Warn, "ed25519");
+        assert!(verdict(&report, "key").1.contains("host/install.sh"));
     }
 
     // Anything else warns too, with the error.
