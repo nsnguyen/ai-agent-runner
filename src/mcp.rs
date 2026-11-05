@@ -266,7 +266,14 @@ impl ServerHandler for Tools {
             let there = match self.route(&request).await {
                 Ok(None) => None,
                 Ok(Some((i, request))) => {
-                    Some(self.peers[i].call(request).await.map_err(|g| g.to_string()))
+                    let made = self.made(&request);
+                    let answer = self.peers[i].call(request).await;
+                    if let (Ok(result), Some((vm, made))) = (&answer, made)
+                        && result.is_error != Some(true)
+                    {
+                        self.note(&vm, i, made);
+                    }
+                    Some(answer.map_err(|g| g.to_string()))
                 }
                 Err(why) => Some(Err(why)),
             };
@@ -796,6 +803,31 @@ impl Tools {
     fn last_seen(&self, vm: &str) -> Option<usize> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.get(vm).copied()
+    }
+
+    /// The VM a call makes, (vm, true), or deletes, (vm, false), base aside:
+    /// what a peer that does it has then, before the next list says so.
+    fn made(&self, request: &CallToolRequestParams) -> Option<(String, bool)> {
+        let made = match request.name.as_ref() {
+            "create_vm" => true,
+            "delete_vm" => false,
+            _ => return None,
+        };
+        let args = request.arguments.as_ref();
+        let vm = args.and_then(|a| a.get("name")).and_then(Value::as_str)?;
+        (vm != BASE).then(|| (vm.to_string(), made))
+    }
+
+    /// Notes `vm` at peer `i`, which made it, or drops it there, which
+    /// deleted it, as the laptop's `runner create` and `delete` keep its
+    /// cache: so a name stays taken, or is freed, while that peer is down.
+    fn note(&self, vm: &str, i: usize, made: bool) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if made {
+            seen.insert(vm.to_string(), i);
+        } else if seen.get(vm) == Some(&i) {
+            seen.remove(vm);
+        }
     }
 
     /// Where create_vm makes its VM, as the laptop's `runner create` places

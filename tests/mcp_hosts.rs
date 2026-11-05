@@ -562,6 +562,57 @@ fn a_peer_whose_ssh_fails_is_named_while_the_rest_answer() {
     assert!(why.starts_with(want), "{why}");
 }
 
+// A VM create_vm makes on a peer is noted there at once, so with that peer
+// down before anything lists it again, its name stays taken and the VM is
+// named as there.
+#[test]
+fn a_vm_made_on_a_peer_keeps_its_name_while_that_peer_is_down() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    s.ok(2, "create_vm", json!({"name": "dup", "host": "kvm-host-3"}));
+    assert!(fleet.three.has("dup"));
+    cut(&fleet, "kvm-host-3");
+
+    let why = s.fails(3, "create_vm", json!({"name": "dup"}));
+    assert!(
+        why.contains("kvm-host-3 has a VM named dup already"),
+        "{why}"
+    );
+    assert!(!fleet.two.has("dup") && !fleet.here.has("dup"));
+    let why = s.fails(4, "vm_status", json!({"name": "dup"}));
+    assert!(
+        why.contains("dup is on kvm-host-3, which didn't answer"),
+        "{why}"
+    );
+}
+
+// A VM delete_vm deletes on a peer is dropped from what was noted there, so
+// with that peer down its name is free and the VM isn't named as there.
+#[test]
+fn a_vm_deleted_on_a_peer_frees_its_name_while_that_peer_is_down() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    s.ok(2, "delete_vm", json!({"name": "old"}));
+    assert!(!fleet.three.has("old"));
+    cut(&fleet, "kvm-host-3");
+
+    let why = s.fails(3, "vm_status", json!({"name": "old"}));
+    assert!(
+        why.starts_with("no host that answered has a VM named old"),
+        "{why}"
+    );
+    s.ok(4, "create_vm", json!({"name": "old"}));
+    assert!(fleet.two.has("old"), "4 GiB free beats this host's 2");
+}
+
+// A peer's ssh fails from now on, and the session it had ends.
+fn cut(fleet: &Fleet, name: &str) {
+    fleet.down(name, true);
+    let pid = peer_pid(fleet.host(name));
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    wait_for("the peer to go", || gone(pid));
+}
+
 // A peer that went away while nothing was asked of it, and came back, as
 // after a reboot or a dropped tailnet: the next call dials it again.
 #[test]
