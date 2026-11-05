@@ -155,6 +155,28 @@ fn lists_its_tools() {
     assert!(said.contains(&keep), "{said}");
 }
 
+// A peer's own MCP has no peers, and takes move_vm's host as ssh takes it:
+// never as one of ssh's options, which would run a command.
+#[test]
+fn move_vm_refuses_a_host_ssh_would_take_for_an_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+    store.fork("base", "dev").unwrap();
+    let ran = dir.path().join("ran");
+    let host = format!("-oProxyCommand=touch {}", ran.display());
+
+    let mut s = start(dir.path());
+    let got = s.call(2, "move_vm", json!({"name": "dev", "host": host}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    let why = got["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("isn't a host"), "{why}");
+    assert!(!ran.exists(), "ssh ran its option");
+    assert!(store.get("dev").is_ok());
+}
+
 #[test]
 fn create_then_list() {
     let dir = tempfile::tempdir().unwrap();

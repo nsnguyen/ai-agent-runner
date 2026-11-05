@@ -18,7 +18,7 @@ use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, Cursor, IsTerminal, Read};
+use std::io::{BufReader, Cursor, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1091,33 +1091,35 @@ fn names(creds: &[Cred]) -> String {
 
 // A peer as ssh takes it, never as one of its options.
 fn peer_host(host: &str) -> Result<String, String> {
-    if host.is_empty() || host.starts_with('-') {
-        return Err(format!(
-            "{host:?} isn't a host: give it as ssh takes it, like runner@kvm-host-2"
-        ));
-    }
+    peers::check_host(host)?;
     Ok(host.to_string())
 }
 
 // The move, then the VM as it is there, and its URL there if it's on.
+// Once begun, it goes to its end: Ctrl-C or a dropped connection partway
+// would leave the VM stopped, here or there. So both are ignored, by ssh
+// too, and what it says goes nowhere once the terminal has.
 fn move_vm(store: Store, name: &str, host: &str) -> Result<(), Box<dyn Error>> {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    for sig in [Signal::SIGINT, Signal::SIGHUP] {
+        // SAFETY: SIG_IGN runs no handler, and no other thread is running yet.
+        let _ = unsafe { signal(sig, SigHandler::SigIgn) };
+    }
     let user = std::env::var("RUNNER_USER").unwrap_or_else(|_| exec::USER.to_string());
-    let to = peers::Remote::new(host, &user);
     let here = runner::hosts::hostname();
-    let moved = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(runner::moves::move_vm(&store, name, &to, &here))?;
+    let moved = runner::moves::move_vm(&store, name, host, &user, &here)?;
     let (status, there) = (&moved.status, &moved.host);
     let n = moved.checkpoints;
     let s = if n == 1 { "" } else { "s" };
-    eprintln!(
-        "runner: moved {name} to {there}: its disk and {n} checkpoint{s}, {} bytes",
-        moved.bytes
+    let sent = moved.sent;
+    let _ = writeln!(
+        std::io::stderr(),
+        "runner: moved {name} to {there}: its disk and {n} checkpoint{s}, {sent} bytes"
     );
-    println!("{}  {}  on {there}", line(&status.vm), status.state);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}  {}  on {there}", line(&status.vm), status.state);
     if let Some(url) = &status.url {
-        println!("{url}");
+        let _ = writeln!(out, "{url}");
     }
     Ok(())
 }

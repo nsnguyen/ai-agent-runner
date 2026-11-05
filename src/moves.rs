@@ -16,7 +16,13 @@
 //
 // An import builds its VM aside and renames it in last (import.rs), so one
 // that fails leaves nothing there, and the VM here is as it was, started
-// again if it was up.
+// again if it was up. So does anything else that goes wrong once it's
+// stopped, but a stop that wasn't clean: what the VM wrote since it booted
+// wasn't committed, so it stays here, stopped, for a look.
+//
+// It all runs in one thread, with a runtime of its own for the other host's
+// MCP, so a move once begun goes to its end: `runner mcp` waits for it as
+// it shuts down, and `runner move` ignores the terminal going away.
 use crate::export::{self, Exported};
 use crate::idle::InUse;
 use crate::peers::{self, Remote};
@@ -27,7 +33,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -41,8 +47,8 @@ pub struct Moved {
     pub host: String,
     /// How many of the owner's checkpoints went with it.
     pub checkpoints: usize,
-    /// The export's length, which went host to host.
-    pub bytes: u64,
+    /// The export's length in bytes, which went host to host.
+    pub sent: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +59,8 @@ pub enum Error {
     Systemd(#[from] systemd::Error),
     #[error(transparent)]
     Runs(#[from] runs::Error),
+    #[error("{0}")]
+    BadHost(String),
     #[error("{vm} is on {host} already")]
     There { vm: String, host: String },
     #[error("run {run} is going in {vm}: move it once the run is over")]
@@ -69,8 +77,15 @@ pub enum Error {
     Unasked(String),
     #[error("{vm} is {state}: move it once it's running or stopped")]
     NotNow { vm: String, state: State },
-    #[error("{0} was started again as it stopped, so it stays here: move it once that's over")]
-    Restarted(String),
+    #[error(
+        "{vm} didn't shut down cleanly, so what it wrote since it booted wasn't \
+         committed, and it stays here, stopped{kept}. `runner logs {vm}` says why"
+    )]
+    Unclean {
+        vm: String,
+        /// Where what it wrote is, if its boot said.
+        kept: String,
+    },
     #[error("{vm} is here as it was{again}: {why}")]
     Failed {
         vm: String,
@@ -99,8 +114,8 @@ pub enum Error {
         host: String,
         why: String,
     },
-    #[error("{0}")]
-    Lost(String),
+    #[error("starting the move's runtime: {0}")]
+    Runtime(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -109,46 +124,45 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// (peers::HELLO), before the move is refused.
 const ASK_WAIT: Duration = Duration::from_secs(20);
 
-/// Moves `name` from this host, which MCP calls `here`, to the one `to`
-/// reaches. Refused before anything stops while a run is going, when `to`
-/// is this host or has a VM by that name, or doesn't answer.
-pub async fn move_vm(store: &Store, name: &str, to: &Remote, here: &str) -> Result<Moved> {
-    let vm = name.to_string();
-    let host = to.name.clone();
+/// Moves `name` from this host, which MCP calls `here`, to `target`, a host
+/// as ssh takes it, whose MCP runs exec as `user`. Refused before anything
+/// stops while a run is going, when `target` is this host or has a VM by
+/// that name, or doesn't answer. Blocks until it's done, so call it off an
+/// async runtime.
+pub fn move_vm(store: &Store, name: &str, target: &str, user: &str, here: &str) -> Result<Moved> {
+    peers::check_host(target).map_err(Error::BadHost)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Runtime)?;
+    // Its session ends, and is dropped, within the runtime.
+    let _in = rt.enter();
+    let to = Remote::new(target, user);
+    let (vm, host) = (name.to_string(), to.name.clone());
     if to.is(here) {
         return Err(Error::There { vm, host });
     }
-    let (s, n) = (store.clone(), vm.clone());
-    let held = blocking(move || hold(&s, &n)).await?;
+    let held = hold(store, name)?;
     // Before anything is stopped. A VM made there since fails the import,
     // which leaves this one as it was.
-    let asked = tokio::time::timeout(ASK_WAIT, to.answer("list_vms", json!({}))).await;
-    let listed = asked.unwrap_or_else(|_| {
-        let secs = ASK_WAIT.as_secs();
-        Err(format!("{host} didn't answer in {secs} seconds"))
-    });
-    if has(listed.map_err(Error::Unasked)?, name).map_err(Error::Unasked)? {
+    let listed = rt.block_on(ask(&to)).map_err(Error::Unasked)?;
+    if has(listed, name).map_err(Error::Unasked)? {
         return Err(Error::Taken { vm, host });
     }
-    let (s, n, target, h) = (store.clone(), vm.clone(), to.target.clone(), host.clone());
-    let sent = blocking(move || send(&s, &n, &target, &h)).await?;
-    let Sent { up, locked, sent } = sent;
+    let Sent { up, locked, sent } = send(store, name, target, &host)?;
     let sent = match sent {
         Err(Unsent {
             why,
             whole: Some(exported),
-        }) => lost(to, name, why, *exported).await,
+        }) => rt.block_on(lost(&to, name, why, *exported)),
         sent => sent.map_err(|u| u.why),
     };
-    let (s, n, h) = (store.clone(), vm.clone(), host.clone());
-    let carried = blocking(move || settle(&s, &n, &h, up, locked, sent)).await?;
+    let exported = settle(store, name, &host, up, locked, sent)?;
     drop(held);
     let args = json!({ "name": name });
-    let status = match carried.up {
-        true => to.answer("start_vm", args).await.and_then(status_of),
-        false => to.answer("vm_status", args).await.and_then(status_of),
-    };
-    let status = status.map_err(|why| match carried.up {
+    let tool = if up { "start_vm" } else { "vm_status" };
+    let status = rt.block_on(to.answer(tool, args)).and_then(status_of);
+    let status = status.map_err(|why| match up {
         true => Error::NotStarted {
             vm: vm.clone(),
             host: host.clone(),
@@ -163,8 +177,8 @@ pub async fn move_vm(store: &Store, name: &str, to: &Remote, here: &str) -> Resu
     Ok(Moved {
         status,
         host,
-        checkpoints: carried.exported.manifest.checkpoints.len(),
-        bytes: carried.exported.bytes,
+        checkpoints: exported.manifest.checkpoints.len(),
+        sent: exported.bytes,
     })
 }
 
@@ -190,6 +204,18 @@ fn hold(store: &Store, name: &str) -> Result<Held> {
     })
 }
 
+// The other host's VMs, within ASK_WAIT.
+async fn ask(to: &Remote) -> std::result::Result<Value, String> {
+    match tokio::time::timeout(ASK_WAIT, to.answer("list_vms", json!({}))).await {
+        Ok(answer) => answer,
+        Err(_) => Err(format!(
+            "{} didn't answer in {} seconds",
+            to.name,
+            ASK_WAIT.as_secs()
+        )),
+    }
+}
+
 // Whether a list_vms answer names `vm`.
 fn has(listed: Value, vm: &str) -> std::result::Result<bool, String> {
     #[derive(Deserialize)]
@@ -203,12 +229,6 @@ fn has(listed: Value, vm: &str) -> std::result::Result<bool, String> {
 
 fn status_of(answer: Value) -> std::result::Result<VmStatus, String> {
     serde_json::from_value(answer).map_err(|e| format!("it gave {e}"))
-}
-
-// What settle did: whether the VM was up, and what went out.
-struct Carried {
-    up: bool,
-    exported: Exported,
 }
 
 // What send did: whether the VM was up, its lock, still held, and whether
@@ -230,6 +250,8 @@ struct Unsent {
 // keeps holding.
 fn send(store: &Store, name: &str, target: &str, host: &str) -> Result<Sent> {
     let vm = name.to_string();
+    // Before the look, so a stop that commits as it's looked at counts.
+    let before = store.get(name)?.generation;
     let state = systemd::status(store, name)?.state;
     // A stopping VM was asked to stop, so it stays down, as a restore has it.
     let up = match state {
@@ -237,15 +259,28 @@ fn send(store: &Store, name: &str, target: &str, host: &str) -> Result<Sent> {
         State::Running | State::Sleeping => true,
         state => return Err(Error::NotNow { vm, state }),
     };
-    // A sleeping VM is woken to shut down (boot::halt).
     if state != State::Stopped {
+        // A sleeping VM is woken to shut down (boot::halt).
         systemd::stop(store, name)?;
+        // A clean shutdown commits the disk the boot ran, which is then
+        // current; one killed at the stop's timeout, or a crash, leaves it
+        // aside, and the current disk is older than what the VM ran.
+        if store.get(name)?.generation == before {
+            let booted = store.booted(name).ok().flatten();
+            let kept = booted.map_or(String::new(), |b| {
+                format!(", with that in generation {} for a look", b.generation)
+            });
+            return Err(Error::Unclean { vm, kept });
+        }
     }
-    let locked = store.lock(name).map_err(|e| match e {
-        store::Error::Busy(vm) if up => Error::Restarted(vm),
-        e => e.into(),
-    })?;
-    let disks = locked.open_disks(true)?;
+    let locked = store.lock(name).map_err(|e| back(store, name, up, e))?;
+    let disks = match locked.open_disks(true) {
+        Ok(disks) => disks,
+        Err(e) => {
+            drop(locked);
+            return Err(back(store, name, up, e));
+        }
+    };
     let sent = stream(name, disks, target, host);
     Ok(Sent { up, locked, sent })
 }
@@ -263,12 +298,10 @@ async fn lost(
     let mut said = None;
     for wait in LOST {
         tokio::time::sleep(wait).await;
-        let asked = tokio::time::timeout(ASK_WAIT, to.answer("list_vms", json!({}))).await;
-        match asked.map(|a| a.and_then(|listed| has(listed, name))) {
-            Ok(Ok(true)) => return Ok(exported),
-            Ok(Ok(false)) => said = Some(format!("{} doesn't have it", to.name)),
-            Ok(Err(e)) => said = said.or(Some(e)),
-            Err(_) => {}
+        match ask(to).await.and_then(|listed| has(listed, name)) {
+            Ok(true) => return Ok(exported),
+            Ok(false) => said = Some(format!("{} doesn't have it", to.name)),
+            Err(e) => said = said.or(Some(e)),
         }
     }
     let host = &to.name;
@@ -297,29 +330,38 @@ fn settle(
     up: bool,
     locked: Locked,
     sent: std::result::Result<Exported, String>,
-) -> Result<Carried> {
-    let vm = name.to_string();
+) -> Result<Exported> {
     match sent {
         Ok(exported) => {
             let source = |source| Error::NotDeleted {
-                vm: vm.clone(),
+                vm: name.to_string(),
                 host: host.to_string(),
                 source,
             };
             locked.delete().map_err(source)?;
-            Ok(Carried { up, exported })
+            Ok(exported)
         }
         Err(why) => {
             drop(locked);
-            let again = match up {
-                false => String::new(),
-                true => match systemd::start(store, name) {
-                    Ok(status) => format!(", and {} again", status.state),
-                    Err(e) => format!(", but didn't start again ({e})"),
-                },
-            };
-            Err(Error::Failed { vm, why, again })
+            Err(back(store, name, up, why))
         }
+    }
+}
+
+// A move that stopped short, once the VM was down: started again if it was
+// up, and why.
+fn back(store: &Store, name: &str, up: bool, why: impl ToString) -> Error {
+    let again = match up {
+        false => String::new(),
+        true => match systemd::start(store, name) {
+            Ok(status) => format!(", and {} again", status.state),
+            Err(e) => format!(", but didn't start again ({e})"),
+        },
+    };
+    Error::Failed {
+        vm: name.to_string(),
+        why: why.to_string(),
+        again,
     }
 }
 
@@ -389,7 +431,8 @@ fn stream(
 
 // Passes on each line `stderr` gives under `host`'s name, less a runner's
 // own `runner: `, and gives back the last that wasn't blank, without its
-// full stop, to say why.
+// full stop, to say why. A stderr that has gone, like a terminal closed,
+// stops none of it.
 fn relay(
     stderr: impl Read + Send + 'static,
     host: String,
@@ -399,19 +442,11 @@ fn relay(
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
             let said = line.strip_prefix("runner: ").unwrap_or(&line).trim_end();
-            eprintln!("runner: {host}: {said}");
+            let _ = writeln!(io::stderr(), "runner: {host}: {said}");
             if !said.is_empty() {
                 last = Some(said.trim_end_matches('.').to_string());
             }
         }
         last
     })
-}
-
-// Off the async runtime, which `runner mcp` serves every call on.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(done) => done,
-        Err(e) => Err(Error::Lost(e.to_string())),
-    }
 }

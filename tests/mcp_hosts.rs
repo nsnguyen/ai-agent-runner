@@ -530,6 +530,12 @@ fn move_vm_moves_a_vm_between_any_two_hosts() {
     assert_eq!(moved["host"], json!("kvm-host-3"), "{moved}");
     assert_eq!(moved["state"], json!("stopped"), "{moved}");
     assert_eq!(moved["checkpoints"], json!(0), "{moved}");
+    assert_eq!(
+        moved["bytes"],
+        json!(before.bytes),
+        "the disk's size: {moved}"
+    );
+    assert!(moved["sent"].as_u64().unwrap() > 0, "{moved}");
     assert!(!fleet.two.has("web") && fleet.three.has("web"));
     assert_eq!(fleet.three.store().get("web").unwrap().bytes, before.bytes);
     // kvm-host-2 dialed kvm-host-3 itself, with its own key.
@@ -551,11 +557,8 @@ fn move_vm_moves_a_vm_between_any_two_hosts() {
     );
     assert_eq!(moved["host"], json!("kvm-host-2"), "{moved}");
     assert!(!fleet.here.has("dev") && fleet.two.has("dev"));
-    // Found there at once, as the move left it, with kvm-host-3 down.
-    fleet.down("kvm-host-3", true);
     s.ok(6, "vm_status", json!({"name": "dev"}));
     assert!(fleet.two.asked_about("dev"));
-    fleet.down("kvm-host-3", false);
 
     let why = s.fails(7, "move_vm", json!({"name": "web", "host": "kvm-host-3"}));
     assert_eq!(why, "web is on kvm-host-3 already");
@@ -571,6 +574,42 @@ fn move_vm_moves_a_vm_between_any_two_hosts() {
         "kvm-host-3 has a VM named twin already: VM names are one per name across hosts"
     );
     assert!(fleet.here.has("twin"));
+}
+
+// Where a move took a VM is noted at once, before any list says so, so with
+// that host down, a call to the VM says it's there.
+#[test]
+fn a_moved_vm_is_named_on_its_new_host_while_that_host_is_down() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    s.ok(2, "move_vm", json!({"name": "web", "host": "kvm-host-3"}));
+    cut_all(&fleet, "kvm-host-3");
+    let why = s.fails(3, "vm_status", json!({"name": "web"}));
+    assert!(
+        why.starts_with("web is on kvm-host-3, which didn't answer"),
+        "{why}"
+    );
+    fleet.down("kvm-host-3", false);
+
+    s.ok(4, "move_vm", json!({"name": "dev", "host": "kvm-host-2"}));
+    cut_all(&fleet, "kvm-host-2");
+    let why = s.fails(5, "vm_status", json!({"name": "dev"}));
+    assert!(
+        why.starts_with("dev is on kvm-host-2, which didn't answer"),
+        "{why}"
+    );
+}
+
+// A host's ssh fails from now on, and every session to it ends, whoever
+// opened it.
+fn cut_all(fleet: &Fleet, name: &str) {
+    fleet.down(name, true);
+    let pids = fs::read_to_string(fleet.host(name).dir.join("pids")).unwrap();
+    for pid in pids.lines() {
+        let pid = nix::unistd::Pid::from_raw(pid.parse().unwrap());
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        wait_for("the peer to go", || gone(pid));
+    }
 }
 
 // A peer's ssh fails from now on, and the session it had ends.

@@ -115,6 +115,17 @@ fn import(rest: &[&str]) -> bool {
     matches!(positional.as_slice(), [vm, "-"] if *vm != "-")
 }
 
+/// A host as ssh takes it, never as one of ssh's options, which could run
+/// a command: what `--peer` and a move's host are held to.
+pub fn check_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!(
+            "{host:?} isn't a host: give it as ssh takes it, like runner@kvm-host-2"
+        ));
+    }
+    Ok(())
+}
+
 /// ssh's options for a peer: this host's own key alone, so an agent's keys
 /// never stand in for it; no prompt; the peer's host key taken on first
 /// sight (the tailnet already vouches for the node); and keepalives, so a

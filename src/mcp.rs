@@ -473,23 +473,26 @@ impl Tools {
             return Err(format!("{name} is on {} already", self.name));
         }
         let at = self.peers.iter().position(|p| p.is(&host));
-        let dialed;
-        let to = match at {
-            Some(i) => &self.peers[i],
+        let target = match at {
+            Some(i) => self.peers[i].target.clone(),
             None if !self.peers.is_empty() => return Err(self.no_host(&host)),
             // A peer's own MCP has no peers: the first host gave it the
-            // host as ssh takes it.
-            None => {
-                dialed = Remote::new(&host, &self.user);
-                &dialed
-            }
+            // host as ssh takes it, which the move holds to that.
+            None => host,
         };
-        let moved = moves::move_vm(&self.store, &name, to, &self.name).await;
-        let moved = moved.map_err(|e| e.to_string())?;
+        let (store, user, here, vm) = (
+            self.store.clone(),
+            self.user.clone(),
+            self.name.clone(),
+            name.clone(),
+        );
+        // On a thread the runtime waits for as it shuts down, so a session
+        // that ends partway doesn't end the move.
+        let moved = blocking(move || moves::move_vm(&store, &vm, &target, &user, &here)).await?;
         if let Some(i) = at {
             self.note(&name, i, true);
         }
-        Ok(Json(moved))
+        Ok(moved)
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]

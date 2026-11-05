@@ -147,6 +147,7 @@ idle) there; echo "$3" >"$vm/idle"; echo "$name  idle $3" ;;
 ip) here; echo 172.16.0.6 ;;
 list) if [ -d "$vm" ] && [ "$(cat "$vm/on")" = "$FAKE_DEST" ]; then echo "$(line)  4096 bytes used"; else echo "no VMs yet"; fi ;;
 move)
+  [ "$2" != --help ] || { wrong move-missing && exit 2; exit 0; }
   here
   ! wrong move-fails || { echo "runner: $name is here as it was, and running again: ${3##*@}'s import failed: Connection to ${3##*@} closed by remote host" >&2; exit 1; }
   wrong move-stays || echo "${3##*@}" >"$vm/on"
@@ -1033,7 +1034,12 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
             let moving = last == "runner list" || last.starts_with("runner move client-check ");
             if moving || (last == "runner ip client-check" && call[0] == "RUNNER_HOST=") {
                 assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
-            } else if last == "runner exec client-check -- cat /home/agent/moved" {
+            } else if [
+                "runner exec client-check -- cat /home/agent/moved",
+                "runner move --help",
+            ]
+            .contains(&last.as_str())
+            {
                 // Then on the host it went to.
                 assert_eq!(call[0], "RUNNER_HOST=runner@kvm-host", "{call:?}");
             } else if last.contains(" --peer ") {
@@ -1093,7 +1099,9 @@ fn with_two_hosts_mcp_reaches_the_other_through_the_one_checked() {
         let moved: Vec<_> = (laptop.host_calls().into_iter())
             .filter(|c| c.starts_with("move "))
             .collect();
-        assert_eq!(moved, ["move client-check runner@kvm-host-2"], "{shell:?}");
+        // Once the other host says it has move.
+        let want = ["move --help", "move client-check runner@kvm-host-2"];
+        assert_eq!(moved, want, "{shell:?}");
         assert!(!laptop.vm2_is_there(), "{shell:?}");
         assert!(!laptop.vm_is_there(), "{shell:?}");
     }
@@ -1173,6 +1181,7 @@ fn a_move_between_hosts_fails_when_a_host_answers_it_wrong() {
             &["move: client-check's file on kvm-host-2"],
         ),
         ("mcp-move-fails", &["MCP move_vm: client-check to kvm-host"]),
+        ("move-missing", &["move: kvm-host-2's runner has no move"]),
     ];
     for shell in SHELLS {
         for (key, want) in cases {

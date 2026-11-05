@@ -487,16 +487,13 @@ check_url() {
   [ "$got" = 200 ] && pass "url on: $url answers again" || fail "url on: $url gives HTTP $got"
 }
 
-# The checks in order: each leaves the VM as the next expects. About 15
-# minutes, most of it waiting out idle times, with two short headless runs,
-# and one more with two hosts or more.
 # A real move between hosts, when ~/.config/runner/hosts lists the host
 # checked and another: the scratch VM, running, with a file written in it,
 # goes to the next host by `runner move` through the hosts file, as typed day
 # to day, arrives running with the file, and is gone from the first; then it
 # comes back by MCP's move_vm, running, for the checks after, or by `runner
 # move` if that fails. A move that fails leaves it where it was, so the rest
-# are skipped.
+# are skipped, and so is all of it if the other host's runner has no move.
 check_move() {
   others
   if [ -z "$listed" ] || [ -z "$peers" ]; then
@@ -508,6 +505,12 @@ check_move() {
   other=${1##*@}
   here=${host##*@}
   step "Move between hosts: $vm, $here to $other and back"
+  # The copy installs this build on $host alone, and the way back runs on
+  # $other: one from before move would strand the VM there.
+  if ! RUNNER_HOST=$1 "$runner" move --help </dev/null >/dev/null 2>&1; then
+    fail "move: $other's runner has no move: install this build there (README.md, After merging a change), then check again"
+    return
+  fi
   r exec "$vm" -- sh -c 'echo carried >/home/agent/moved' || {
     fail "move: couldn't write a file in $vm first"
     return
@@ -540,6 +543,10 @@ check_move() {
     fail "move: $vm is left on $other: RUNNER_HOST='' client/runner move $vm $here"
 }
 
+# The checks in order: each leaves the VM as the next expects. About 15
+# minutes, most of it waiting out idle times, with two short headless runs;
+# with two hosts or more, one more minute for MCP across them and a few for
+# the move there and back.
 laptop_checks() {
   check_exec
   check_mcp

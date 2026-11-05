@@ -8,12 +8,14 @@ mod common;
 
 use chrono::Utc;
 use common::{PEER_SSH, PeerHost, script, text};
+use nix::sys::signal::Signal;
 use runner::creds::Cred;
 use runner::store::{Checkpoint, Config, Maker, Store};
 use runner::url::Setting;
 use serde_json::json;
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -38,21 +40,24 @@ impl Pair {
     }
 
     // `runner move <args>` on this host, as the runner user runs it.
-    fn mv(&self, args: &[&str]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let sys = std::env::var("PATH").unwrap();
         let bin = self.dir.path().join("bin");
         let path = format!("{}:{}", bin.display(), self.here.sd.path());
-        Command::new(env!("CARGO_BIN_EXE_runner"))
-            .env("RUNNER_ROOT", self.here.root())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.env("RUNNER_ROOT", self.here.root())
             .env("PATH", path)
             .env("SYS_PATH", sys)
             .env("FLEET", self.dir.path().join("fleet"))
             .env("RUNNER", env!("CARGO_BIN_EXE_runner"))
             .arg("move")
             .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    fn mv(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     fn moved(&self, args: &[&str]) -> (String, String) {
@@ -126,6 +131,23 @@ fn rewrite(store: &Store, seed: u8) {
     let file = fs::OpenOptions::new().write(true).open(&run.disk).unwrap();
     file.write_all_at(&[seed; 4096], 0).unwrap();
     run.commit().unwrap();
+}
+
+// A clean shutdown, as a VM's boot commits it: a new generation, a copy of
+// the current disk, on top of history. The fake systemd runs it at a stop.
+fn clean_stops(host: &PeerHost, vm: &str) {
+    let dir = host.root().join("vms").join(vm);
+    let on_stop = format!(
+        r#"cd "{}" || exit 1
+cur=$(tail -n 1 history)
+new=$(ls gens | sed -n 's/\.ext4$//p' | sort -n | tail -n 1)
+new=$((new + 1))
+cp --sparse=always "gens/$cur.ext4" "gens/$new.ext4"
+echo "$new" >>history
+"#,
+        dir.display()
+    );
+    script(&host.sd.bin.join("on-stop"), &on_stop);
 }
 
 fn current(store: &Store, vm: &str) -> PathBuf {
@@ -226,10 +248,15 @@ fn a_running_vm_is_stopped_moved_and_started_there() {
     let here = pair.here.store();
     dev(&here, &pair.here.dir);
     pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
+    let before = here.get("dev").unwrap().generation;
 
     let (out, err) = pair.moved(&["dev", TARGET]);
     assert!(!pair.here.has("dev"));
     assert!(pair.there.has("dev"));
+    // What the clean stop committed is what went.
+    let mine = mine(&pair.there.store(), "dev");
+    assert!(mine.iter().all(|(id, ..)| *id < before), "{mine:?}");
     let stop = "systemctl stop firecracker@dev.service".to_string();
     assert!(pair.here.sd.calls().contains(&stop), "{err}");
     let start = "systemctl start firecracker@dev.service".to_string();
@@ -248,18 +275,29 @@ fn a_target_that_fails_mid_stream_leaves_the_vm_here_as_it_was() {
         dev(&here, &pair.here.dir);
         if up {
             pair.here.sd.set_state("active");
+            clean_stops(&pair.here, "dev");
         }
+        // Past a pipe's 64 KiB, so the stream breaks here too.
+        let big = here
+            .disk("dev", here.get("dev").unwrap().generation)
+            .unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&big).unwrap();
+        file.write_all_at(&vec![5; MIB as usize], 8 * MIB).unwrap();
         let before = here.get("dev").unwrap();
         let kept = mine(&here, "dev");
-        let disk = bytes(&current(&here, "dev"));
+        let disk = bytes(&big);
         fs::write(pair.there.dir.join("cut"), "20000").unwrap();
 
         let err = pair.refused(&["dev", TARGET]);
         assert!(err.contains("kvm-host-2"), "{err}");
         assert!(err.contains("dev is here as it was"), "{err}");
+        // Cut short, so there's no need to ask whether it was taken.
+        assert!(!err.contains("doesn't have it"), "{err}");
         assert!(!pair.there.has("dev"));
         assert_eq!(pair.there.staged(), Vec::<String>::new());
-        assert_eq!(here.get("dev").unwrap().generation, before.generation);
+        // Its clean stop committed, if it was up.
+        let now = here.get("dev").unwrap().generation;
+        assert_eq!(now != before.generation, up, "{now}");
         assert_eq!(mine(&here, "dev"), kept);
         assert_eq!(bytes(&current(&here, "dev")), disk);
         let calls = pair.here.sd.calls();
@@ -277,6 +315,7 @@ fn an_import_whose_answer_was_lost_is_asked_after() {
     let here = pair.here.store();
     dev(&here, &pair.here.dir);
     pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
     fs::write(pair.there.dir.join("cut"), "100000000000").unwrap();
     let (out, err) = pair.moved(&["dev", TARGET]);
     assert!(err.contains("Connection to kvm-host-2 closed"), "{err}");
@@ -292,6 +331,7 @@ fn a_stream_that_went_whole_but_wasn_t_taken_leaves_the_vm_here() {
     let here = pair.here.store();
     dev(&here, &pair.here.dir);
     pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
     fs::write(pair.there.dir.join("swallow"), "").unwrap();
     let err = pair.refused(&["dev", TARGET]);
     assert!(
@@ -301,6 +341,88 @@ fn a_stream_that_went_whole_but_wasn_t_taken_leaves_the_vm_here() {
     assert!(err.contains("kvm-host-2 doesn't have it"), "{err}");
     assert!(pair.here.has("dev"));
     assert!(!pair.there.has("dev"));
+}
+
+// A VM killed at its stop, or that crashed, committed nothing since it
+// booted: its current disk is older than what it ran, so it isn't moved.
+#[test]
+fn a_vm_that_didn_t_stop_cleanly_stays_here_stopped() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    let before = here.get("dev").unwrap().generation;
+    let err = pair.refused(&["dev", TARGET]);
+    assert!(err.contains("dev didn't shut down cleanly"), "{err}");
+    assert!(err.contains("stays here, stopped"), "{err}");
+    assert_eq!(here.get("dev").unwrap().generation, before);
+    assert!(!pair.ssh_log().iter().any(|l| l.contains(" runner import ")));
+    assert!(
+        !pair
+            .here
+            .sd
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("systemctl start"))
+    );
+    assert!(!pair.there.has("dev"));
+}
+
+// Something else holds dev once it's down, say a gc: nothing goes, and a
+// dev that was up is started again.
+#[test]
+fn a_vm_held_once_it_s_down_is_started_again_here() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
+    let lock = File::open(pair.here.root().join("vms/dev/lock")).unwrap();
+    lock.lock().unwrap();
+    let err = pair.refused(&["dev", TARGET]);
+    assert!(
+        err.contains("dev is here as it was, and running again"),
+        "{err}"
+    );
+    assert!(err.contains("dev is busy"), "{err}");
+    let start = "systemctl start firecracker@dev.service".to_string();
+    assert!(pair.here.sd.calls().contains(&start));
+    assert!(!pair.there.has("dev"));
+}
+
+// Ctrl-C at the laptop, or the laptop going away, reaches every process on
+// the host's terminal: the move, and its ssh, carry on to the end.
+#[test]
+fn ctrl_c_or_a_hangup_partway_doesn_t_stop_a_move() {
+    let pair = Pair::new();
+    let here = pair.here.store();
+    dev(&here, &pair.here.dir);
+    pair.here.sd.set_state("active");
+    clean_stops(&pair.here, "dev");
+    fs::write(pair.there.dir.join("pause"), "").unwrap();
+    let child = pair
+        .command(&["dev", TARGET])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let importing = pair.there.dir.join("importing");
+    common::wait_for("the import to start", || importing.exists());
+    let group = nix::unistd::Pid::from_raw(child.id() as i32);
+    for sig in [Signal::SIGINT, Signal::SIGHUP] {
+        nix::sys::signal::killpg(group, sig).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{:?}: {}",
+        out.status,
+        text(&out.stderr)
+    );
+    assert!(!pair.here.has("dev") && pair.there.has("dev"));
+    let start = "systemctl start firecracker@dev.service".to_string();
+    assert!(pair.there.sd.calls().contains(&start));
 }
 
 #[test]
