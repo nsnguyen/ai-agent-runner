@@ -241,10 +241,13 @@ check_exec() {
   [ "$got" = bar ] && pass "exec -e FOO=bar: passes through" || fail "exec -e FOO=bar: got '$got'"
 }
 
+init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-check","version":"1"}}}'
+ready='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+# call ID TOOL ARGS: a tools/call line, ARGS as JSON.
+call() { printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$1" "$2" "$3"; }
+
 check_mcp() {
   step "MCP exec over SSH keeps both ends of long output"
-  init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-check","version":"1"}}}'
-  ready='{"jsonrpc":"2.0","method":"notifications/initialized"}'
   long='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec","arguments":{"name":"'$vm'","argv":["seq","1","40000"]}}}'
   cred='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec","arguments":{"name":"'$vm'","argv":["true"],"env":{"GH_TOKEN":"x"}}}}'
   # runner mcp ends at the end of its stdin, so that's held open while it answers.
@@ -262,6 +265,73 @@ check_mcp() {
   got=$(printf '%s\n' "$mcp" | grep '"id":3,')
   printf '%s' "$got" | grep -q '"isError":true' && printf '%s' "$got" | grep -q 'GH_TOKEN is a credential' &&
     pass "MCP exec with env GH_TOKEN: refused" || fail "MCP exec with env GH_TOKEN: ${got:-no reply}"
+}
+
+# MCP across hosts, when ~/.config/runner/hosts lists the host checked and
+# another: its runner mcp, given the rest as peers, as `runner mcp` gives
+# them, dials each with its own key. Every peer answers list_hosts, and a VM
+# made on the first peer is listed there, answers vm_status from there and
+# is deleted there, without booting. The calls go a batch at a time, since
+# the server answers each as soon as it can.
+check_mcp_hosts() {
+  peers=
+  listed=
+  if [ -e "$HOME/.config/runner/hosts" ]; then
+    while read -r h _ || [ -n "$h" ]; do
+      case $h in
+      '' | '#'*) ;;
+      "$host") listed=1 ;;
+      *) peers="$peers $h" ;;
+      esac
+    done <"$HOME/.config/runner/hosts"
+  fi
+  if [ -z "$listed" ] || [ -z "$peers" ]; then
+    step "MCP across hosts: not checked, since ~/.config/runner/hosts doesn't list $host and another host"
+    return
+  fi
+  step "MCP across hosts, through $host"
+  # shellcheck disable=SC2086 # the hosts, split into words.
+  set -- $peers
+  other=${1##*@}
+  vm2=$vm-2
+  echo "asking runner mcp on $host, with$peers as its peers; about a minute"
+  mcp=$({
+    printf '%s\n' "$init" "$ready"
+    call 2 list_hosts '{}'
+    # One left by an earlier check.
+    call 3 delete_vm '{"name":"'$vm2'"}'
+    sleep 20
+    call 4 create_vm '{"name":"'"$vm2"'","host":"'"$other"'"}'
+    sleep 20
+    call 5 list_vms '{}'
+    call 6 vm_status '{"name":"'$vm2'"}'
+    call 7 vm_status '{"name":"'$vm'"}'
+    sleep 15
+    call 8 delete_vm '{"name":"'$vm2'"}'
+    sleep 10
+  } | RUNNER_HOST='' "$runner" mcp --host "$host" 2>/dev/null)
+  reply() { printf '%s\n' "$mcp" | grep "\"id\":$1,"; }
+  got=$(reply 2)
+  for p; do
+    printf '%s' "$got" | grep -q "\"name\":\"${p##*@}\"" && pass "MCP list_hosts: ${p##*@} answers" || fail "MCP list_hosts: no ${p##*@}: ${got:-no reply}"
+  done
+  down=$(printf '%s' "$got" | grep -o '"unreachable":\[[^]]*\]')
+  [ -z "$down" ] && pass "MCP list_hosts: no host unreachable" || fail "MCP list_hosts: unreachable: ${down#*:}"
+  got=$(reply 4)
+  printf '%s' "$got" | grep -q '"isError":false' && pass "MCP create_vm: $vm2 made on $other" || fail "MCP create_vm: $vm2 on $other: ${got:-no reply}"
+  # One VM's object, its keys in any order.
+  got=$(reply 5 | grep -o "{[^{}]*\"name\":\"$vm2\"[^{}]*}")
+  case $got in
+  *"\"host\":\"$other\""*) pass "MCP list_vms: $vm2 is on $other" ;;
+  '') fail "MCP list_vms: $vm2 isn't listed" ;;
+  *) fail "MCP list_vms: $vm2 isn't listed on $other: $got" ;;
+  esac
+  got=$(reply 6)
+  printf '%s' "$got" | grep -q '"state":"stopped"' && pass "MCP vm_status: $vm2 answers from $other" || fail "MCP vm_status: $vm2: ${got:-no reply}"
+  got=$(reply 7)
+  printf '%s' "$got" | grep -q '"state":"running"' && pass "MCP vm_status: $vm still answers from $host" || fail "MCP vm_status: $vm: ${got:-no reply}"
+  got=$(reply 8)
+  printf '%s' "$got" | grep -q '"isError":false' && pass "MCP delete_vm: $vm2 is gone from $other" || fail "MCP delete_vm: $vm2: ${got:-no reply}; if it's there, RUNNER_HOST=$1 client/runner delete $vm2"
 }
 
 # A run that joins a VM in use and is cancelled leaves it running, its
@@ -413,10 +483,12 @@ check_url() {
 }
 
 # The checks in order: each leaves the VM as the next expects. About 15
-# minutes, most of it waiting out idle times, with two short headless runs.
+# minutes, most of it waiting out idle times, with two short headless runs,
+# and one more with two hosts or more.
 laptop_checks() {
   check_exec
   check_mcp
+  check_mcp_hosts
   check_joined
   check_result
   check_proxy

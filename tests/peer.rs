@@ -222,6 +222,10 @@ fn anything_else_is_refused_without_running_it() {
         "runner mcp --user=",
         "runner mcp --user --help",
         "runner mcp extra",
+        // A peer's own MCP forwards nothing, so it takes no peers.
+        "runner mcp --peer runner@kvm-host-2",
+        "runner mcp --peer=runner@kvm-host-2",
+        "runner mcp --user agent --peer runner@kvm-host-2",
         "/usr/local/bin/runner mcp",
         "RUNNER_ROOT=/tmp runner mcp",
         "runner --root /tmp import y -",

@@ -93,7 +93,7 @@ pub(crate) fn at(path: &Path) -> impl FnOnce(io::Error) -> Error + use<> {
     move |source| Error::Io { path, source }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Vm {
     pub name: String,
     /// The disk generation the next boot starts from.

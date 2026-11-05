@@ -314,10 +314,51 @@ url)
     echo http://100.64.0.1:10001
   fi ;;
 mcp)
+  # Its peers, by the names MCP gives them, and a second VM, $FAKE/vm2, made
+  # on the first of them. Objects' keys come sorted, as serde_json's do.
+  peers=
+  while [ $# -gt 0 ]; do
+    [ "$1" != --peer ] || peers="$peers ${2##*@}"
+    shift
+  done
+  first=${peers# }
+  first=${first%% *}
+  ok() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"{}"}],"structuredContent":%s,"isError":false}}\n' "$id" "$1"; }
+  err() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":true}}\n' "$id" "$1"; }
+  vm2='{"bytes":4096,"generation":0,"name":"client-check-2","used":4096}'
   while IFS= read -r req; do
     printf '%s\n' "$req" >>"$FAKE/mcp-in"
     id=$(printf '%s' "$req" | sed -n 's/^.*"id":\([0-9]*\),.*$/\1/p')
     case $req in
+    *'"name":"list_hosts"'*)
+      rows='{"mem_available":1,"name":"kvm-host","up":1,"vms":2}'
+      down=
+      for p in $peers; do
+        if wrong mcp-peer-down; then down=$p; continue; fi
+        rows="$rows,{\"mem_available\":1,\"name\":\"$p\",\"up\":0,\"vms\":1}"
+      done
+      [ -z "$down" ] || rows="$rows],\"unreachable\":[{\"error\":\"ssh: connect to host $down port 22: Connection timed out\",\"host\":\"$down\"}"
+      ok "{\"hosts\":[$rows]}" ;;
+    *'"name":"create_vm"'*'"name":"client-check-2","host":"'"$first"'"'*)
+      if wrong mcp-create-fails || [ -d "$FAKE/vm2" ]; then
+        err "$first didn't answer: Transport closed"
+      else
+        mkdir "$FAKE/vm2"
+        ok "$vm2"
+      fi ;;
+    *'"name":"list_vms"'*)
+      on=$first
+      ! wrong mcp-wrong-host || on=kvm-host
+      vms=
+      [ ! -d "$vm" ] || vms="{\"bytes\":4096,\"generation\":1,\"host\":\"kvm-host\",\"name\":\"client-check\",\"used\":4096}"
+      [ ! -d "$FAKE/vm2" ] || vms="${vms:+$vms,}{\"bytes\":4096,\"generation\":0,\"host\":\"$on\",\"name\":\"client-check-2\",\"used\":4096}"
+      ok "{\"vms\":[$vms]}" ;;
+    *'"name":"vm_status"'*'"name":"client-check-2"'*)
+      if [ -d "$FAKE/vm2" ]; then ok '{"address":"172.16.0.10","bytes":4096,"generation":0,"name":"client-check-2","state":"stopped","used":4096}'; else err "no VM named client-check-2"; fi ;;
+    *'"name":"vm_status"'*'"name":"client-check"'*)
+      ok "{\"address\":\"172.16.0.6\",\"bytes\":4096,\"generation\":1,\"name\":\"client-check\",\"state\":\"$(state)\",\"used\":4096}" ;;
+    *'"name":"delete_vm"'*'"name":"client-check-2"'*)
+      if [ -d "$FAKE/vm2" ] && ! wrong mcp-delete-fails; then rm -r "$FAKE/vm2"; ok "$vm2"; else err "no VM named client-check-2"; fi ;;
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"runner","version":"0.1.0"}}}\n' "$id" ;;
     *'"env":{"GH_TOKEN":"x"}'*)
@@ -461,6 +502,18 @@ impl Laptop {
     fn wrong(&self, key: &str) -> &Laptop {
         fs::write(self.fake().join("wrong"), format!("{key}\n")).unwrap();
         self
+    }
+
+    /// ~/.config/runner/hosts with the host being checked and another.
+    fn two_hosts(&self) -> &Laptop {
+        let conf = self.home().join(".config/runner");
+        fs::create_dir_all(&conf).unwrap();
+        fs::write(conf.join("hosts"), "runner@kvm-host\nrunner@kvm-host-2\n").unwrap();
+        self
+    }
+
+    fn vm2_is_there(&self) -> bool {
+        self.fake().join("vm2").exists()
     }
 
     fn down(&self) -> &Laptop {
@@ -952,7 +1005,113 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
         let ssh = laptop.ssh_calls();
         assert!(!ssh.is_empty());
         for call in &ssh {
-            assert_eq!(call[0], "RUNNER_HOST=runner@kvm-host-2", "{call:?}");
+            let last = call.last().unwrap();
+            if last.contains(" --peer ") {
+                // MCP across hosts: the hosts file's, to the host checked.
+                assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
+                assert_eq!(call[call.len() - 2], "runner@kvm-host-2", "{call:?}");
+                let want = "runner mcp --name runner@kvm-host-2 --peer runner@kvm-host";
+                assert_eq!(last, want, "{call:?}");
+            } else {
+                assert_eq!(call[0], "RUNNER_HOST=runner@kvm-host-2", "{call:?}");
+            }
+        }
+        let says = text(&out.stdout);
+        assert!(
+            says.contains("PASS  MCP list_hosts: kvm-host answers"),
+            "{says}"
+        );
+    }
+}
+
+// MCP across hosts, when the hosts file lists the host checked and another:
+// the checked host's MCP reaches the other, and a VM made there through it
+// is listed, reached and deleted there.
+#[test]
+fn with_two_hosts_mcp_reaches_the_other_through_the_one_checked() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        laptop.two_hosts();
+        let out = laptop.run(shell, &["laptop"]);
+        assert_eq!(out.status.code(), Some(0), "{shell:?}: {}", says(&out));
+        let stdout = text(&out.stdout);
+        for want in [
+            "PASS  MCP list_hosts: kvm-host-2 answers",
+            "PASS  MCP list_hosts: no host unreachable",
+            "PASS  MCP create_vm: client-check-2 made on kvm-host-2",
+            "PASS  MCP list_vms: client-check-2 is on kvm-host-2",
+            "PASS  MCP vm_status: client-check-2 answers from kvm-host-2",
+            "PASS  MCP vm_status: client-check still answers from runner@kvm-host",
+            "PASS  MCP delete_vm: client-check-2 is gone from kvm-host-2",
+        ] {
+            assert!(stdout.contains(want), "{shell:?} {want}: {stdout}");
+        }
+        let mcp = laptop.ssh_calls();
+        let mcp: Vec<_> = mcp
+            .iter()
+            .filter(|c| c.last().unwrap().contains("--peer"))
+            .collect();
+        assert_eq!(mcp.len(), 1, "{shell:?} {mcp:?}");
+        assert_eq!(mcp[0][mcp[0].len() - 2], HOST, "{shell:?}");
+        assert!(!laptop.vm2_is_there(), "{shell:?}");
+        assert!(!laptop.vm_is_there(), "{shell:?}");
+    }
+}
+
+#[test]
+fn with_one_host_mcp_across_hosts_says_it_isn_t_checked() {
+    let laptop = Laptop::new();
+    let out = laptop.run(SHELLS[0], &["laptop"]);
+    assert_eq!(out.status.code(), Some(0), "{}", says(&out));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("MCP across hosts: not checked"), "{stdout}");
+    assert!(!stdout.contains("PASS  MCP list_hosts"), "{stdout}");
+}
+
+#[test]
+fn mcp_across_hosts_fails_when_a_host_answers_it_wrong() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "mcp-peer-down",
+            &[
+                "MCP list_hosts: no kvm-host-2",
+                "MCP list_hosts: unreachable",
+            ],
+        ),
+        (
+            "mcp-create-fails",
+            &[
+                "MCP create_vm: client-check-2 on kvm-host-2",
+                "MCP list_vms: client-check-2 isn't listed",
+                "MCP vm_status: client-check-2",
+                "MCP delete_vm: client-check-2",
+            ],
+        ),
+        (
+            "mcp-wrong-host",
+            &["MCP list_vms: client-check-2 isn't listed on kvm-host-2"],
+        ),
+        ("mcp-delete-fails", &["MCP delete_vm: client-check-2"]),
+    ];
+    for shell in SHELLS {
+        for (key, want) in cases {
+            let laptop = Laptop::new();
+            laptop.two_hosts().wrong(key);
+            let out = laptop.run(shell, &["laptop"]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{shell:?} {key}: {}",
+                says(&out)
+            );
+            let fails = fails(&out);
+            assert_eq!(fails.len(), want.len(), "{shell:?} {key}: {fails:?}");
+            for (got, want) in fails.iter().zip(want.iter()) {
+                assert!(
+                    got.starts_with(&format!("FAIL  laptop: {want}")),
+                    "{shell:?} {key}: {got:?} isn't {want:?}"
+                );
+            }
         }
     }
 }
