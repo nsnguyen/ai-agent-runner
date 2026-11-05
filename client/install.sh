@@ -1,7 +1,8 @@
 #!/bin/sh
 # Installs the laptop's runner to ~/.local/bin. Pass the host, as ssh takes it,
-# to save it to ~/.config/runner/host; a rerun without one keeps it. Rerun after
-# a git pull to upgrade.
+# to save it to ~/.config/runner/host, and with several hosts in
+# ~/.config/runner/hosts (`runner hosts add`), to put it first there, the one
+# MCP uses; a rerun without one keeps them. Rerun after a git pull to upgrade.
 #
 #   client/install.sh runner@kvm-host
 set -eu
@@ -31,8 +32,19 @@ echo "Installed $bin/runner"
 if [ $# -gt 0 ]; then
   mkdir -p "$conf"
   printf '%s\n' "$1" >"$conf/host"
+  if [ -e "$conf/hosts" ]; then
+    {
+      printf '%s\n' "$1"
+      while read -r h _ || [ -n "$h" ]; do
+        [ "$h" = "$1" ] || printf '%s\n' "$h"
+      done <"$conf/hosts"
+    } >"$conf/hosts.new"
+    mv -f "$conf/hosts.new" "$conf/hosts"
+  fi
 fi
-if [ -r "$conf/host" ]; then
+if [ -e "$conf/hosts" ]; then
+  echo "Hosts, the first for MCP: $(tr '\n' ' ' <"$conf/hosts")"
+elif [ -r "$conf/host" ]; then
   echo "Host: $(cat "$conf/host")"
 else
   echo "No host yet: rerun with one, like client/install.sh runner@kvm-host"
