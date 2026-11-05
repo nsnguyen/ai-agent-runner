@@ -76,7 +76,7 @@ fn without_ip6(rules: &str) -> String {
     format!("{}{}", &rules[..start], &rules[end..])
 }
 
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 8] = [
     "kvm",
     "firecracker",
     "reflink",
@@ -84,17 +84,33 @@ const NAMES: [&str; 7] = [
     "base",
     "nat",
     "unit",
+    "key",
 ];
+
+// The faked user's home, where its SSH key is.
+const HOME: &str = "/home/runner";
 
 struct Fake {
     files: HashMap<PathBuf, Result<String, ErrorKind>>,
     runs: HashMap<String, Result<Ran, ErrorKind>>,
     reflink: Result<bool, ErrorKind>,
+    home: Result<PathBuf, ErrorKind>,
 }
 
 // By full path: sshd gives the runner user a PATH without /usr/sbin.
 fn version() -> String {
     format!("{} --version", host::FIRECRACKER)
+}
+
+fn key() -> String {
+    format!("{HOME}/.ssh/id_ed25519")
+}
+
+// An ed25519 public key's base64: its type's name first.
+const ED25519: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIK3nBk4m9Oe5Tq2xsVdN2xTqgZrW6Wl4y8m3m6d2r5Xq";
+
+fn public_key() -> String {
+    format!("{}.pub", key())
 }
 
 fn list_nat() -> String {
@@ -123,6 +139,14 @@ impl Fake {
             (host::IP_FORWARD.into(), Ok("1\n".to_string())),
             (host::UNIT_PATH.into(), Ok(host::UNIT.to_string())),
             (host::NAT_RULES.into(), Ok(host::nat_rules(&DEFAULT_SUBNET))),
+            (
+                key().into(),
+                Ok("-----BEGIN OPENSSH PRIVATE KEY-----\n".to_string()),
+            ),
+            (
+                public_key().into(),
+                Ok(format!("ssh-ed25519 {ED25519} runner@host\n")),
+            ),
         ];
         let runs = [
             (version(), ran(true, &pinned, "")),
@@ -137,6 +161,7 @@ impl Fake {
             files: files.into_iter().collect(),
             runs: runs.into_iter().collect(),
             reflink: Ok(true),
+            home: Ok(HOME.into()),
         }
     }
 
@@ -179,6 +204,10 @@ impl Host for Fake {
 
     fn reflinks(&self, _dir: &Path) -> io::Result<bool> {
         self.reflink.map_err(io::Error::from)
+    }
+
+    fn home(&self) -> io::Result<PathBuf> {
+        self.home.clone().map_err(io::Error::from)
     }
 }
 
@@ -466,6 +495,47 @@ fn unit_fails_when_missing_or_stale() {
     assert_verdict(missing, &store, "unit", Status::Fail, "isn't installed");
     let stale = fake().file(host::UNIT_PATH, Ok("[Service]\nExecStart=/bin/true\n"));
     assert_verdict(stale, &store, "unit", Status::Fail, "rerun host/install.sh");
+}
+
+// Hosts drive each other's runners with the runner user's key, which
+// `runner hosts add` shares. VMs still run without one, so it only warns.
+#[test]
+fn key_warns_when_runner_has_no_key() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let report = assert_verdict(fake(), &store, "key", Status::Ok, &key());
+    assert!(verdict(&report, "key").1.contains("runner hosts add"));
+
+    let no_key = fake().file(key(), Err(ErrorKind::NotFound));
+    let no_pub = fake().file(public_key(), Err(ErrorKind::NotFound));
+    let empty = fake().file(key(), Ok(""));
+    let empty_pub = fake().file(public_key(), Ok(""));
+    for lacking in [no_key, no_pub, empty, empty_pub] {
+        let report = assert_verdict(lacking, &store, "key", Status::Warn, "host/install.sh");
+        let detail = verdict(&report, "key").1;
+        assert!(detail.contains(&key()), "{detail}");
+        assert!(detail.contains("runner hosts add"), "{detail}");
+        assert!(report.ok);
+    }
+
+    // From review: one `runner hosts add` wouldn't share, since it takes
+    // only a bare ed25519 key.
+    for not_one in [
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ runner@host\n".to_string(),
+        format!("command=\"sh\" ssh-ed25519 {ED25519} runner@host\n"),
+        format!("ssh-ed25519 {ED25519};id runner@host\n"),
+    ] {
+        let fake = fake().file(public_key(), Ok(&not_one));
+        let report = assert_verdict(fake, &store, "key", Status::Warn, "ed25519");
+        assert!(verdict(&report, "key").1.contains("host/install.sh"));
+    }
+
+    // Anything else warns too, with the error.
+    let unreadable = fake().file(key(), Err(ErrorKind::PermissionDenied));
+    assert_verdict(unreadable, &store, "key", Status::Warn, "permission denied");
+    let mut homeless = fake();
+    homeless.home = Err(ErrorKind::NotFound);
+    assert_verdict(homeless, &store, "key", Status::Warn, "not found");
 }
 
 #[test]

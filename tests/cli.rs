@@ -645,6 +645,7 @@ fn doctor_prints_a_line_per_check_and_fails_on_any_failure() {
         "base",
         "nat",
         "unit",
+        "key",
     ];
     assert_eq!(names, all, "{stdout}");
     for l in &lines {

@@ -7,7 +7,7 @@ use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +63,8 @@ pub trait Host {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Ran>;
     /// Whether a disk under `dir` can be forked by reflink.
     fn reflinks(&self, dir: &Path) -> io::Result<bool>;
+    /// This user's home directory.
+    fn home(&self) -> io::Result<PathBuf>;
 }
 
 /// The machine this runs on.
@@ -105,6 +107,20 @@ impl Host for System {
     fn reflinks(&self, dir: &Path) -> io::Result<bool> {
         reflinks(dir)
     }
+
+    // From the passwd database, not $HOME, which sudo may leave as the
+    // caller's.
+    fn home(&self) -> io::Result<PathBuf> {
+        let uid = nix::unistd::geteuid();
+        match nix::unistd::User::from_uid(uid) {
+            Ok(Some(user)) => Ok(user.dir),
+            Ok(None) => Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("uid {uid} isn't in the passwd database"),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Whether files in `dir` can be cloned by reflink, tried with the same GNU
@@ -137,6 +153,7 @@ pub fn check(host: &impl Host, store: &Store) -> Report {
         named("base", base(store)),
         named("nat", nat(host)),
         named("unit", unit(host)),
+        named("key", key(host)),
     ];
     let ok = checks.iter().all(|c| c.status != Status::Fail);
     Report { ok, checks }
@@ -155,6 +172,10 @@ fn named(name: &str, (status, detail): Verdict) -> Check {
 
 fn ok(detail: impl Into<String>) -> Verdict {
     (Status::Ok, detail.into())
+}
+
+fn warn(detail: impl Into<String>) -> Verdict {
+    (Status::Warn, detail.into())
 }
 
 fn fail(detail: impl Into<String>) -> Verdict {
@@ -394,4 +415,56 @@ fn unit(host: &impl Host) -> Verdict {
         }
         Err(e) => fail(format!("{path}: {e}")),
     }
+}
+
+// Hosts drive each other's `runner peer` over SSH with this user's key, which
+// `runner hosts add` shares. VMs still run without one, so it only warns.
+fn key(host: &impl Host) -> Verdict {
+    let home = match host.home() {
+        Ok(home) => home,
+        Err(e) => return warn(format!("no home directory to find an SSH key in: {e}")),
+    };
+    let key = home.join(".ssh/id_ed25519");
+    let fix = format!(
+        "so this host can't drive the other hosts' runners: rerun {INSTALL}, then `runner hosts add` on the laptop"
+    );
+    let public = home.join(".ssh/id_ed25519.pub");
+    for path in [&key, &public] {
+        let at = path.display();
+        match host.file_len(path) {
+            Ok(0) => return warn(format!("{at} is empty, {fix}")),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return warn(format!("no SSH key at {at}, {fix}"));
+            }
+            Err(e) => return warn(format!("{at}: {e}")),
+        }
+    }
+    match host.read(&public) {
+        Ok(line) if bare_ed25519(&line) => {}
+        Ok(_) => {
+            let at = public.display();
+            return warn(format!(
+                "{at} isn't a plain ed25519 key, which is all `runner hosts add` shares, {fix}"
+            ));
+        }
+        Err(e) => return warn(format!("{}: {e}", public.display())),
+    }
+    ok(format!(
+        "{}, which `runner hosts add` shares with the other hosts",
+        key.display()
+    ))
+}
+
+// What `runner hosts add` takes from a host's id_ed25519.pub: its first line
+// an ed25519 key's type and base64, before any comment.
+fn bare_ed25519(public: &str) -> bool {
+    let mut words = public.lines().next().unwrap_or("").split_whitespace();
+    let (Some("ssh-ed25519"), Some(key)) = (words.next(), words.next()) else {
+        return false;
+    };
+    key.starts_with("AAAAC3NzaC1lZDI1NTE5")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
 }
