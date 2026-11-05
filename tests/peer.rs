@@ -142,6 +142,10 @@ fn import_of_a_stream_on_stdin_runs() {
     let out = host.run("runner import --creds=github w -", b"w's disk");
     ok(&out);
     assert_eq!(host.store().creds("w").unwrap(), [Cred::Github]);
+    // A move of a VM with none keeps it at none.
+    let out = host.run("runner import v - --no-creds", b"v's disk");
+    ok(&out);
+    assert_eq!(host.store().creds("v").unwrap(), []);
     let out = host.run("runner import --replace x -", b"x's new disk");
     ok(&out);
     assert_eq!(text(&out.stdout), "x  gen 1  12 bytes\n");
@@ -243,6 +247,7 @@ fn anything_else_is_refused_without_running_it() {
         "runner import y - --creds",
         "runner import y - --creds --replace",
         "runner import y - --creds=",
+        "runner import y - --no-creds=claude",
         "runner import y -; id",
         "runner import y - <(id)",
         "runner import y '-'",
@@ -303,6 +308,7 @@ fn vm_name() -> impl Strategy<Value = String> {
 fn import_flags() -> impl Strategy<Value = Vec<String>> {
     let flag = prop_oneof![
         Just("--replace".to_string()),
+        Just("--no-creds".to_string()),
         "(claude|github)(,(claude|github))?".prop_map(|c| format!("--creds {c}")),
         "(claude|github)".prop_map(|c| format!("--creds={c}")),
     ];

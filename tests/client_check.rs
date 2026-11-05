@@ -55,7 +55,9 @@ fi
 case $dest in *@*) user=${dest%%@*} ;; *) user=runner ;; esac
 mkdir -p "$FAKE/home-$user" && cd "$FAKE/home-$user" || exit 255
 PATH=$HOST_BIN:$PATH
-export PATH
+# Which host it is, for the host runner's VM to be on one at a time.
+FAKE_DEST=${dest#*@}
+export PATH FAKE_DEST
 if [ -n "$tunnel" ]; then
   eval "set -- $cmd"
   exec "$@"
@@ -106,6 +108,8 @@ const FAKE_RUNNER: &str = r##"{ printf 'runner'; for arg; do printf '\037%s' "$a
 vm=$FAKE/vm
 name=${2-}
 there() { [ -d "$vm" ] || { echo "runner: no VM named $name" >&2; exit 1; }; }
+# The VM is on the host that made it, until a move takes it elsewhere.
+here() { there; [ "$(cat "$vm/on")" = "$FAKE_DEST" ] || { echo "runner: no VM named $name" >&2; exit 1; }; }
 line() { printf '%s  gen 1  4096 bytes' "$(cat "$vm/name")"; }
 # A VM a proxy has let go sleeps unless its idle time is never.
 state() {
@@ -127,6 +131,7 @@ create)
   ! wrong create-fails || { echo "runner: no VM named base" >&2; exit 1; }
   mkdir -p "$vm" "$FAKE/runs"
   echo "$name" >"$vm/name"
+  echo "$FAKE_DEST" >"$vm/on"
   echo stopped >"$vm/state"
   echo 10m >"$vm/idle"
   line; echo ;;
@@ -139,7 +144,15 @@ delete)
   echo "deleted $(line)"
   rm -rf "$vm" ;;
 idle) there; echo "$3" >"$vm/idle"; echo "$name  idle $3" ;;
-ip) there; echo 172.16.0.6 ;;
+ip) here; echo 172.16.0.6 ;;
+list) if [ -d "$vm" ] && [ "$(cat "$vm/on")" = "$FAKE_DEST" ]; then echo "$(line)  4096 bytes used"; else echo "no VMs yet"; fi ;;
+move)
+  [ "$2" != --help ] || { wrong move-missing && exit 2; exit 0; }
+  here
+  ! wrong move-fails || { echo "runner: $name is here as it was, and running again: ${3##*@}'s import failed: Connection to ${3##*@} closed by remote host" >&2; exit 1; }
+  wrong move-stays || echo "${3##*@}" >"$vm/on"
+  ! wrong move-loses-file || rm -f "$vm/moved"
+  echo "$(line)  $(state)  on ${3##*@}" ;;
 hold)
   there
   trap 'kill $t; rm -f "$FAKE/holding"; echo "let go" >>"$FAKE/held"; touch "$vm/let-go"; exit 0' TERM
@@ -165,9 +178,11 @@ exec)
       } ;;
     esac
   done
-  there
+  here
   up
   case $* in
+  "sh -c echo carried >/home/agent/moved") touch "$vm/moved" ;;
+  "cat /home/agent/moved") [ -e "$vm/moved" ] && echo carried ;;
   "touch /tmp/client-check-ran") touch "$vm/ran" ;;
   "test ! -e /tmp/client-check-ran") [ ! -e "$vm/ran" ] ;;
   "printenv FOO")
@@ -357,6 +372,14 @@ mcp)
       if [ -d "$FAKE/vm2" ]; then ok '{"address":"172.16.0.10","bytes":4096,"generation":0,"name":"client-check-2","state":"stopped","used":4096}'; else err "no VM named client-check-2"; fi ;;
     *'"name":"vm_status"'*'"name":"client-check"'*)
       ok "{\"address\":\"172.16.0.6\",\"bytes\":4096,\"generation\":1,\"name\":\"client-check\",\"state\":\"$(state)\",\"used\":4096}" ;;
+    *'"name":"move_vm"'*'"name":"client-check"'*)
+      to=$(printf '%s' "$req" | sed -n 's/^.*"host":"\([^"]*\)".*$/\1/p')
+      if wrong mcp-move-fails; then
+        err "client-check is on kvm-host-2 now, but didn't start there: kvm-host-2 didn't answer: Transport closed"
+      else
+        echo "$to" >"$vm/on"
+        ok "{\"address\":\"172.16.0.6\",\"bytes\":4096,\"checkpoints\":0,\"generation\":1,\"host\":\"$to\",\"name\":\"client-check\",\"state\":\"$(state)\",\"used\":4096}"
+      fi ;;
     *'"name":"delete_vm"'*'"name":"client-check-2"'*)
       if [ -d "$FAKE/vm2" ] && ! wrong mcp-delete-fails; then rm -r "$FAKE/vm2"; ok "$vm2"; else err "no VM named client-check-2"; fi ;;
     *'"method":"initialize"'*)
@@ -1006,7 +1029,20 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
         assert!(!ssh.is_empty());
         for call in &ssh {
             let last = call.last().unwrap();
-            if last.contains(" --peer ") {
+            // The move goes through the hosts file, finding the VM's host,
+            // which `runner ip` asks as the checks do.
+            let moving = last == "runner list" || last.starts_with("runner move client-check ");
+            if moving || (last == "runner ip client-check" && call[0] == "RUNNER_HOST=") {
+                assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
+            } else if [
+                "runner exec client-check -- cat /home/agent/moved",
+                "runner move --help",
+            ]
+            .contains(&last.as_str())
+            {
+                // Then on the host it went to.
+                assert_eq!(call[0], "RUNNER_HOST=runner@kvm-host", "{call:?}");
+            } else if last.contains(" --peer ") {
                 // MCP across hosts: the hosts file's, to the host checked.
                 assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
                 assert_eq!(call[call.len() - 2], "runner@kvm-host-2", "{call:?}");
@@ -1043,6 +1079,10 @@ fn with_two_hosts_mcp_reaches_the_other_through_the_one_checked() {
             "PASS  MCP vm_status: client-check-2 answers from kvm-host-2",
             "PASS  MCP vm_status: client-check still answers from runner@kvm-host",
             "PASS  MCP delete_vm: client-check-2 is gone from kvm-host-2",
+            "PASS  move: client-check is running on kvm-host-2",
+            "PASS  move: client-check's file came along",
+            "PASS  move: client-check is gone from kvm-host",
+            "PASS  MCP move_vm: client-check is back on kvm-host, running",
         ] {
             assert!(stdout.contains(want), "{shell:?} {want}: {stdout}");
         }
@@ -1051,8 +1091,17 @@ fn with_two_hosts_mcp_reaches_the_other_through_the_one_checked() {
             .iter()
             .filter(|c| c.last().unwrap().contains("--peer"))
             .collect();
-        assert_eq!(mcp.len(), 1, "{shell:?} {mcp:?}");
-        assert_eq!(mcp[0][mcp[0].len() - 2], HOST, "{shell:?}");
+        assert_eq!(mcp.len(), 2, "{shell:?} {mcp:?}");
+        for call in mcp {
+            assert_eq!(call[call.len() - 2], HOST, "{shell:?}");
+        }
+        // The move went to the VM's host, with the other as listed.
+        let moved: Vec<_> = (laptop.host_calls().into_iter())
+            .filter(|c| c.starts_with("move "))
+            .collect();
+        // Once the other host says it has move.
+        let want = ["move --help", "move client-check runner@kvm-host-2"];
+        assert_eq!(moved, want, "{shell:?}");
         assert!(!laptop.vm2_is_there(), "{shell:?}");
         assert!(!laptop.vm_is_there(), "{shell:?}");
     }
@@ -1112,6 +1161,49 @@ fn mcp_across_hosts_fails_when_a_host_answers_it_wrong() {
                     "{shell:?} {key}: {got:?} isn't {want:?}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn a_move_between_hosts_fails_when_a_host_answers_it_wrong() {
+    let cases: &[(&str, &[&str])] = &[
+        ("move-fails", &["move: client-check to kvm-host-2"]),
+        (
+            "move-stays",
+            &[
+                "move: client-check's file on kvm-host-2",
+                "move: client-check is still on kvm-host",
+            ],
+        ),
+        (
+            "move-loses-file",
+            &["move: client-check's file on kvm-host-2"],
+        ),
+        ("mcp-move-fails", &["MCP move_vm: client-check to kvm-host"]),
+        ("move-missing", &["move: kvm-host-2's runner has no move"]),
+    ];
+    for shell in SHELLS {
+        for (key, want) in cases {
+            let laptop = Laptop::new();
+            laptop.two_hosts().wrong(key);
+            let out = laptop.run(shell, &["laptop"]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{shell:?} {key}: {}",
+                says(&out)
+            );
+            let fails = fails(&out);
+            assert_eq!(fails.len(), want.len(), "{shell:?} {key}: {fails:?}");
+            for (got, want) in fails.iter().zip(want.iter()) {
+                assert!(
+                    got.starts_with(&format!("FAIL  laptop: {want}")),
+                    "{shell:?} {key}: {got:?} isn't {want:?}"
+                );
+            }
+            // Back where the checks after look, and deleted at the end.
+            assert!(!laptop.vm_is_there(), "{shell:?} {key}");
         }
     }
 }

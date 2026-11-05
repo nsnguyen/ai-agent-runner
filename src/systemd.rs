@@ -8,7 +8,7 @@ use crate::boot::RESTART;
 use crate::creds::Cred;
 use crate::store::{Store, Vm};
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -49,7 +49,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     Stopped,
@@ -89,7 +89,8 @@ impl fmt::Display for State {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+// Deserialize too, for another host's, which a move gets (moves.rs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VmStatus {
     #[serde(flatten)]
     pub vm: Vm,

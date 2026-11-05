@@ -109,6 +109,15 @@ delete)
   mv "$HOST_DIR/vms.new" "$HOST_DIR/vms"
   echo "deleted $2  gen 0  6 bytes"
   ;;
+move)
+  # The target is last, as ssh takes it; its name is its directory.
+  has "$name" || no "$name"
+  for to; do :; done
+  grep -vx -- "$name" "$HOST_DIR/vms" >"$HOST_DIR/vms.new"
+  mv "$HOST_DIR/vms.new" "$HOST_DIR/vms"
+  echo "$name" >>"$FLEET/${to##*@}/vms"
+  echo "moved $name to ${to##*@}"
+  ;;
 exec)
   # Some argument names a VM here, a run id's VM included.
   for a; do has "$a" && found=1; done
@@ -733,6 +742,145 @@ fn delete_takes_the_vm_out_of_the_cache() {
     ok(&fleet.run(SHELLS[0], &["delete", "web"]));
     assert_eq!(fleet.vms("kvm-host-2"), ["base"]);
     assert!(!fleet.cache().contains("web "), "{}", fleet.cache());
+}
+
+// #141: move goes to the VM's host, whose runner reaches the target by ssh,
+// so it gets the target as listed; the cache follows the VM.
+#[test]
+fn move_goes_to_the_vm_s_host_with_the_target_as_listed() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["list"]));
+        fleet.forget_calls();
+        let out = fleet.run(shell, &["move", "web", "kvm-host-3"]);
+        ok(&out);
+        assert_eq!(text(&out.stdout), "moved web to kvm-host-3\n", "{shell:?}");
+        assert_eq!(
+            fleet.commands("kvm-host-2"),
+            ["move web runner@kvm-host-3"],
+            "{shell:?}"
+        );
+        assert!(fleet.commands("kvm-host").is_empty(), "{shell:?}");
+        assert!(fleet.commands("kvm-host-3").is_empty(), "{shell:?}");
+        let cache = fleet.cache();
+        assert!(cache.contains("web runner@kvm-host-3\n"), "{cache}");
+        assert!(!cache.contains("web runner@kvm-host-2"), "{cache}");
+
+        // Then web's commands go straight to its new host: no host is surveyed.
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["exec", "web", "--", "true"]));
+        assert_eq!(
+            fleet.calls("kvm-host-3"),
+            ["ip web", "exec web -- true"],
+            "{shell:?}"
+        );
+        assert!(fleet.calls("kvm-host").is_empty(), "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+    }
+}
+
+// The target is the argument where it stands, so an option's value that
+// reads as a host stays as typed, and --host coming out moves nothing.
+#[test]
+fn move_s_target_is_found_where_it_stands() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["move", "dev", "runner@kvm-host-3"],
+            "move dev runner@kvm-host-3",
+        ),
+        (
+            &["--root", "kvm-host-3", "move", "dev", "kvm-host-3"],
+            "--root kvm-host-3 move dev runner@kvm-host-3",
+        ),
+        (
+            &["move", "--host", "kvm-host", "dev", "kvm-host-3"],
+            "move dev runner@kvm-host-3",
+        ),
+        (
+            &["move", "--", "dev", "kvm-host-3"],
+            "move -- dev runner@kvm-host-3",
+        ),
+        (
+            &["move", "dev", "--", "kvm-host-3"],
+            "move dev -- runner@kvm-host-3",
+        ),
+    ];
+    for shell in SHELLS {
+        for (args, got) in cases {
+            let fleet = Fleet::new();
+            ok(&fleet.run(shell, &["list"]));
+            fleet.forget_calls();
+            ok(&fleet.run(shell, args));
+            assert_eq!(fleet.commands("kvm-host"), [*got], "{shell:?} {args:?}");
+            assert!(
+                fleet.commands("kvm-host-2").is_empty(),
+                "{shell:?} {args:?}"
+            );
+            assert!(
+                fleet.commands("kvm-host-3").is_empty(),
+                "{shell:?} {args:?}"
+            );
+            let cache = fleet.cache();
+            assert!(
+                cache.contains("dev runner@kvm-host-3\n"),
+                "{args:?} {cache}"
+            );
+        }
+    }
+}
+
+#[test]
+fn move_refuses_a_target_that_isn_t_listed_or_is_the_vm_s_own_host() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["list"]));
+        fleet.forget_calls();
+        let out = fleet.run(shell, &["move", "web", "elsewhere"]);
+        assert_eq!(out.status.code(), Some(2), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains(
+                "runner: elsewhere isn't one of the hosts: kvm-host kvm-host-2 kvm-host-3"
+            ),
+            "{err}"
+        );
+        for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            assert!(fleet.commands(host).is_empty(), "{shell:?} {host}");
+        }
+
+        let out = fleet.run(shell, &["move", "web", "kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("runner: web is on kvm-host-2 already"),
+            "{err}"
+        );
+        for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            let calls = fleet.calls(host);
+            assert!(
+                calls.iter().all(|c| !c.starts_with("move")),
+                "{shell:?} {host}: {calls:?}"
+            );
+        }
+        assert_eq!(fleet.vms("kvm-host-2"), ["base", "web"], "{shell:?}");
+
+        // A VM no host has goes to the first host, which says so; one with
+        // no target, there as typed, for its runner to say what's missing.
+        fleet.forget_calls();
+        let out = fleet.run(shell, &["move", "nope", "kvm-host-3"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        assert!(text(&out.stderr).contains("no VM named nope"), "{shell:?}");
+        assert_eq!(
+            fleet.commands("kvm-host"),
+            ["move nope kvm-host-3"],
+            "{shell:?}"
+        );
+        fleet.forget_calls();
+        let _ = fleet.run(shell, &["move", "web"]);
+        assert_eq!(fleet.calls("kvm-host"), ["move web"], "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+    }
 }
 
 #[test]

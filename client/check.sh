@@ -267,6 +267,21 @@ check_mcp() {
     pass "MCP exec with env GH_TOKEN: refused" || fail "MCP exec with env GH_TOKEN: ${got:-no reply}"
 }
 
+# others: sets $peers to the other hosts ~/.config/runner/hosts lists, a
+# word each, and $listed if it lists the host checked.
+others() {
+  peers=
+  listed=
+  [ -e "$HOME/.config/runner/hosts" ] || return 0
+  while read -r h _ || [ -n "$h" ]; do
+    case $h in
+    '' | '#'*) ;;
+    "$host") listed=1 ;;
+    *) peers="$peers $h" ;;
+    esac
+  done <"$HOME/.config/runner/hosts"
+}
+
 # MCP across hosts, when ~/.config/runner/hosts lists the host checked and
 # another: its runner mcp, given the rest as peers, as `runner mcp` gives
 # them, dials each with its own key. Every peer answers list_hosts, and a VM
@@ -274,17 +289,7 @@ check_mcp() {
 # is deleted there, without booting. The calls go a batch at a time, since
 # the server answers each as soon as it can.
 check_mcp_hosts() {
-  peers=
-  listed=
-  if [ -e "$HOME/.config/runner/hosts" ]; then
-    while read -r h _ || [ -n "$h" ]; do
-      case $h in
-      '' | '#'*) ;;
-      "$host") listed=1 ;;
-      *) peers="$peers $h" ;;
-      esac
-    done <"$HOME/.config/runner/hosts"
-  fi
+  others
   if [ -z "$listed" ] || [ -z "$peers" ]; then
     step "MCP across hosts: not checked, since ~/.config/runner/hosts doesn't list $host and another host"
     return
@@ -482,13 +487,71 @@ check_url() {
   [ "$got" = 200 ] && pass "url on: $url answers again" || fail "url on: $url gives HTTP $got"
 }
 
+# A real move between hosts, when ~/.config/runner/hosts lists the host
+# checked and another: the scratch VM, running, with a file written in it,
+# goes to the next host by `runner move` through the hosts file, as typed day
+# to day, arrives running with the file, and is gone from the first; then it
+# comes back by MCP's move_vm, running, for the checks after, or by `runner
+# move` if that fails. A move that fails leaves it where it was, so the rest
+# are skipped, and so is all of it if the other host's runner has no move.
+check_move() {
+  others
+  if [ -z "$listed" ] || [ -z "$peers" ]; then
+    step "Move between hosts: not checked, since ~/.config/runner/hosts doesn't list $host and another host"
+    return
+  fi
+  # shellcheck disable=SC2086 # the hosts, split into words.
+  set -- $peers
+  other=${1##*@}
+  here=${host##*@}
+  step "Move between hosts: $vm, $here to $other and back"
+  # The copy installs this build on $host alone, and the way back runs on
+  # $other: one from before move would strand the VM there.
+  if ! RUNNER_HOST=$1 "$runner" move --help </dev/null >/dev/null 2>&1; then
+    fail "move: $other's runner has no move: install this build there (README.md, After merging a change), then check again"
+    return
+  fi
+  r exec "$vm" -- sh -c 'echo carried >/home/agent/moved' || {
+    fail "move: couldn't write a file in $vm first"
+    return
+  }
+  echo "moving $vm to $other and back; a few minutes, its disk going host to host"
+  got=$(RUNNER_HOST='' "$runner" move "$vm" "$other" </dev/null 2>&1)
+  case $got in
+  *"  running  on $other"*) pass "move: $vm is running on $other" ;;
+  *)
+    fail "move: $vm to $other: $(printf '%s' "$got" | tail -n 1)"
+    return
+    ;;
+  esac
+  got=$(RUNNER_HOST=$1 "$runner" exec "$vm" -- cat /home/agent/moved </dev/null 2>&1)
+  [ "$got" = carried ] && pass "move: $vm's file came along" || fail "move: $vm's file on $other: '$got'"
+  r ip "$vm" >/dev/null 2>&1 && fail "move: $vm is still on $here" || pass "move: $vm is gone from $here"
+  mcp=$({
+    printf '%s\n' "$init" "$ready"
+    call 2 move_vm '{"name":"'"$vm"'","host":"'"$here"'"}'
+    sleep 180
+  } | RUNNER_HOST='' "$runner" mcp --host "$host" 2>/dev/null)
+  got=$(printf '%s\n' "$mcp" | grep '"id":2,')
+  if printf '%s' "$got" | grep -q '"isError":false' && printf '%s' "$got" | grep -q '"state":"running"'; then
+    pass "MCP move_vm: $vm is back on $here, running"
+    return
+  fi
+  fail "MCP move_vm: $vm to $here: ${got:-no reply in 3 minutes}"
+  # So the checks after have it where they look.
+  r ip "$vm" >/dev/null 2>&1 || RUNNER_HOST='' "$runner" move "$vm" "$here" </dev/null >/dev/null ||
+    fail "move: $vm is left on $other: RUNNER_HOST='' client/runner move $vm $here"
+}
+
 # The checks in order: each leaves the VM as the next expects. About 15
-# minutes, most of it waiting out idle times, with two short headless runs,
-# and one more with two hosts or more.
+# minutes, most of it waiting out idle times, with two short headless runs;
+# with two hosts or more, one more minute for MCP across them and a few for
+# the move there and back.
 laptop_checks() {
   check_exec
   check_mcp
   check_mcp_hosts
+  check_move
   check_joined
   check_result
   check_proxy

@@ -13,6 +13,7 @@
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult};
 use rmcp::service::{Peer, RoleClient, RunningService, ServiceError};
+use serde_json::Value;
 use std::ffi::OsStr;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,7 @@ pub enum Error {
 
 /// The runner arguments a peer's command is, `runner` first, if it's one a
 /// peer may run: `runner mcp`, with `--user`, or `runner import <vm> -`, with
-/// `--creds` and `--replace`, as words of only the characters VM names,
+/// `--creds`, `--no-creds` and `--replace`, as words of only the characters VM names,
 /// credential lists and these flags take, so there's no quoting to undo and
 /// nothing a shell would read. clap parses them after, as for any command.
 pub fn vet(original: Option<&OsStr>) -> Result<Vec<String>, Error> {
@@ -87,13 +88,14 @@ fn mcp(rest: &[&str]) -> bool {
     true
 }
 
-// import's own flags, --creds and --replace, around the VM's name and `-`.
+// import's own flags, --creds, --no-creds and --replace, around the VM's
+// name and `-`.
 fn import(rest: &[&str]) -> bool {
     let mut positional = Vec::new();
     let mut words = rest.iter();
     while let Some(w) = words.next() {
         let fine = match *w {
-            "--replace" => true,
+            "--replace" | "--no-creds" => true,
             "--creds" => value(words.next()),
             "-" => {
                 positional.push("-");
@@ -111,6 +113,17 @@ fn import(rest: &[&str]) -> bool {
         }
     }
     matches!(positional.as_slice(), [vm, "-"] if *vm != "-")
+}
+
+/// A host as ssh takes it, never as one of ssh's options, which could run
+/// a command: what `--peer` and a move's host are held to.
+pub fn check_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!(
+            "{host:?} isn't a host: give it as ssh takes it, like runner@kvm-host-2"
+        ));
+    }
+    Ok(())
 }
 
 /// ssh's options for a peer: this host's own key alone, so an agent's keys
@@ -212,6 +225,18 @@ impl Remote {
     /// Whether `host` names this one: as listed, or by its name.
     pub fn is(&self, host: &str) -> bool {
         host == self.target || host == self.name
+    }
+
+    /// `tool` with `args`, and its structured answer, or why there's none:
+    /// the peer's error, or why it didn't answer.
+    pub async fn answer(&self, tool: &'static str, args: Value) -> Result<Value, String> {
+        let mut call = CallToolRequestParams::new(tool);
+        call.arguments = match args {
+            Value::Object(args) => Some(args),
+            _ => Some(Default::default()),
+        };
+        let result = self.call(call).await.map_err(|gone| gone.to_string())?;
+        structured(result)
     }
 
     /// A tool call, sent on as it came, and the peer's result as it gave it.
@@ -342,4 +367,14 @@ impl Remote {
 fn last_words(said: &Mutex<String>) -> Option<String> {
     let said = said.lock().unwrap_or_else(|e| e.into_inner());
     (!said.is_empty()).then(|| said.clone())
+}
+
+/// A peer's answer as data, or its error's text.
+pub fn structured(result: CallToolResult) -> Result<Value, String> {
+    if result.is_error == Some(true) {
+        let text = result.content.iter().find_map(|c| c.as_text());
+        let text = text.map_or("an error with no text", |t| t.text.as_str());
+        return Err(text.to_string());
+    }
+    (result.structured_content).ok_or_else(|| "it answered with no data".to_string())
 }

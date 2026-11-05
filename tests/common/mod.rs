@@ -375,6 +375,137 @@ impl FakeVsock {
     }
 }
 
+/// ssh as a host's runner sees it, standing in for the other hosts: options,
+/// then the target, then the command. A host's directory under $FLEET is
+/// named for the target's host part; one with `down` in it times out as ssh
+/// does, after two seconds if it's `slow` too, as a real timeout takes a
+/// while. The rest run `runner peer` there with a clean environment, so
+/// nothing of the calling host's, like RUNNER_USER, reaches it unless the
+/// command passes it, but with this ssh on PATH, so it reaches the others in
+/// turn. A host with `cut` in it drops the connection once an import there
+/// has read that many bytes, as a network that fails mid-stream does, even
+/// when that's all of it; one with `swallow` drops it once the stream has
+/// gone, without an import; one with `vanish` as well as `cut` or `swallow`
+/// goes `down` that many seconds after the stream is over (none if it's
+/// empty), every session to it ending; one with `pause`
+/// touches `importing` and waits a second before an import starts.
+pub const PEER_SSH: &str = r#"printf '%s\n' "$*" >>"$FLEET/ssh-log"
+while [ $# -gt 0 ]; do
+  case $1 in
+  -o | -i) shift 2 ;;
+  -*) shift ;;
+  *) break ;;
+  esac
+done
+target=$1
+shift
+dir=$FLEET/${target##*@}
+if [ ! -d "$dir" ]; then
+  echo "ssh: Could not resolve hostname ${target##*@}: Name or service not known" >&2
+  exit 255
+fi
+if [ -e "$dir/down" ]; then
+  [ ! -e "$dir/slow" ] || sleep 2
+  echo "ssh: connect to host ${target##*@} port 22: Connection timed out" >&2
+  exit 255
+fi
+# Run in place of this shell, so the pid it notes is the peer's own.
+peer() {
+  exec env -i PATH="$dir/root/bin:${0%/*}:$SYS_PATH" RUNNER_ROOT="$dir/root" \
+    RUNNER_MEMINFO="$dir/meminfo" FLEET="$FLEET" RUNNER="$RUNNER" SYS_PATH="$SYS_PATH" \
+    SSH_ORIGINAL_COMMAND="$*" "$RUNNER" peer
+}
+vanish() {
+  [ -e "$dir/vanish" ] || return 0
+  (
+    sleep "$(cat "$dir/vanish")" 2>/dev/null
+    touch "$dir/down"
+    while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$dir/pids"
+  ) </dev/null >/dev/null 2>&1 &
+  [ -s "$dir/vanish" ] || wait
+}
+if [ -e "$dir/cut" ] && [ "$1 $2" = "runner import" ]; then
+  head -c "$(cat "$dir/cut")" | peer "$@"
+  vanish
+  echo "Connection to ${target##*@} closed by remote host." >&2
+  exit 255
+fi
+if [ -e "$dir/swallow" ] && [ "$1 $2" = "runner import" ]; then
+  cat >/dev/null
+  vanish
+  echo "Connection to ${target##*@} closed by remote host." >&2
+  exit 255
+fi
+if [ -e "$dir/pause" ] && [ "$1 $2" = "runner import" ]; then
+  touch "$dir/importing"
+  sleep 1
+fi
+echo $$ >"$dir/pid"
+echo $$ >>"$dir/pids"
+peer "$@"
+"#;
+
+/// A host behind PEER_SSH, at `dir`: `root` its RUNNER_ROOT, with a fake
+/// systemd in root/bin, and `meminfo` its free memory. It has base, and a
+/// fork of it for each of `vms`.
+pub struct PeerHost {
+    pub dir: PathBuf,
+    pub sd: FakeSystemd,
+}
+
+impl PeerHost {
+    pub fn new(dir: PathBuf, vms: &[&str], free: u64) -> PeerHost {
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let disk = dir.join("rootfs.ext4");
+        fs::write(&disk, b"rootfs").unwrap();
+        let store = runner::store::Store::new(&root);
+        store.import("base", &disk).unwrap();
+        for vm in vms {
+            store.fork("base", vm).unwrap();
+        }
+        let host = PeerHost {
+            sd: FakeSystemd::new(&root),
+            dir,
+        };
+        host.set_free(free);
+        host
+    }
+
+    pub fn root(&self) -> PathBuf {
+        self.dir.join("root")
+    }
+
+    pub fn store(&self) -> runner::store::Store {
+        runner::store::Store::new(self.root())
+    }
+
+    pub fn has(&self, vm: &str) -> bool {
+        self.store().get(vm).is_ok()
+    }
+
+    pub fn set_free(&self, bytes: u64) {
+        let kib = bytes / 1024;
+        let meminfo = format!("MemTotal: 16000000 kB\nMemAvailable: {kib} kB\n");
+        fs::write(self.dir.join("meminfo"), meminfo).unwrap();
+    }
+
+    /// Whether systemctl here was asked anything about `vm`.
+    pub fn asked_about(&self, vm: &str) -> bool {
+        let unit = format!("firecracker@{vm}.service");
+        self.sd.calls().iter().any(|c| c.contains(&unit))
+    }
+
+    /// What's under vms/ that isn't a VM: a create or import left staged.
+    pub fn staged(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.root().join("vms")) else {
+            return Vec::new();
+        };
+        let names = entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
+        names.filter(|n| n.starts_with('.')).collect()
+    }
+}
+
 /// The user running the tests, whom commands in the fake guest run as.
 pub fn me() -> String {
     nix::unistd::User::from_uid(nix::unistd::geteuid())

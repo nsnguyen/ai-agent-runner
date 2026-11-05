@@ -6,7 +6,8 @@
 # rest as its peers; without that file, the first line of
 # ~/.config/runner/host is the only one; RUNNER_HOST names one host alone.
 # With several, a command naming a VM goes to the host that has it (README.md,
-# Several hosts). POSIX sh only, since macOS's /bin/sh runs it.
+# Several hosts), and move's target is passed on as listed, since that host's
+# ssh reaches it. POSIX sh only, since macOS's /bin/sh runs it.
 
 # No argument or host name is ever a glob.
 set -f
@@ -642,17 +643,22 @@ fi
 
 # The command, the VM it names, and the laptop's --host, found past options
 # and their values, and up to a `--`, after which every argument is the
-# command's own. --host comes out: the host's runner hasn't got it.
-cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra=''
+# command's own. --host comes out: the host's runner hasn't got it. move's
+# target is $to, and $spot its place among the arguments kept, so only it
+# becomes its listed form, not an option's value that reads the same.
+cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra='' to='' spot=''
 n=$#
 while [ "$n" -gt 0 ]; do
   a=$1
   shift
   n=$((n - 1))
   if [ -n "$ended" ]; then
-    # A VM can come after a `--` too, as clap has it.
+    # A VM can come after a `--` too, as clap has it, and so can a target.
     if [ "$ended" = 1 ] && [ -z "$vm" ] && [ -n "$cmd" ] && { [ "$cmd" != service ] || [ -n "$sub" ]; }; then
       vm=$a
+    elif [ "$cmd" = move ] && [ -n "$vm" ] && [ -z "$to" ]; then
+      to=$a
+      spot=$(($# - n + 1))
     fi
     ended=2
     set -- "$@" "$a"
@@ -723,6 +729,11 @@ while [ "$n" -gt 0 ]; do
     elif [ -z "$vm" ]; then
       vm=$a
     else
+      # $# - n arguments are kept so far, so this one is the next.
+      if [ "$cmd" = move ] && [ -z "$to" ]; then
+        to=$a
+        spot=$(($# - n + 1))
+      fi
       # exec's program, and service add's after the service's name, take
       # every argument after them as theirs, --host included.
       extra=$((extra + 1))
@@ -925,6 +936,33 @@ delete)
   go "${at:-$first}" keep
   rc=$?
   [ "$rc" != 0 ] || forget "$vm"
+  exit "$rc"
+  ;;
+move)
+  [ -n "$to" ] || go "$host"
+  if ! named "$to"; then
+    echo "runner: $to isn't one of the hosts: $(for h in $hosts; do printf '%s ' "$(name_of "$h")"; done)" >&2
+    exit 2
+  fi
+  to=$match
+  locate "$vm"
+  [ -n "$at" ] || go "$first"
+  if [ "$(name_of "$at")" = "$(name_of "$to")" ]; then
+    echo "runner: $vm is on $(name_of "$to") already" >&2
+    exit 1
+  fi
+  # The VM's host gets the target as listed, which its ssh reaches.
+  remote=runner
+  i=0
+  for a; do
+    i=$((i + 1))
+    [ "$i" != "$spot" ] || a=$to
+    quote "$a"
+    remote="$remote $arg"
+  done
+  go "$at" keep
+  rc=$?
+  [ "$rc" != 0 ] || remember "$vm" "$to"
   exit "$rc"
   ;;
 claude)

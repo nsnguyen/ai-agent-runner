@@ -18,7 +18,7 @@ use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, Cursor, IsTerminal, Read};
+use std::io::{BufReader, Cursor, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -69,6 +69,24 @@ enum Cmd {
         /// place of claude alone.
         #[arg(long, value_delimiter = ',', conflicts_with = "replace")]
         creds: Option<Vec<Cred>>,
+        /// No credentials at boot, in place of claude.
+        #[arg(long, conflicts_with_all = ["creds", "replace"])]
+        no_creds: bool,
+    },
+    /// Move a VM to another host, as ssh takes it, like runner@kvm-host-2:
+    /// its disk, your checkpoints, its settings, services and allowlist,
+    /// under the same name. A running or sleeping VM is stopped, which ends
+    /// its processes and sessions, moved, and started there, awake. Its
+    /// address and URL port change, and its runs stay behind. The export
+    /// streams host to host over ssh, with this host's key, into `runner
+    /// import` there; it's deleted here only once that import has worked,
+    /// and a failed one leaves it here as it was. Refused while a run is
+    /// going, and when that host has a VM by that name. On the laptop, the
+    /// host is one in ~/.config/runner/hosts (README.md, Back up and move).
+    Move {
+        name: String,
+        #[arg(value_parser = peer_host)]
+        host: String,
     },
     /// Write a VM to stdout as one tar stream, to keep anywhere: its current
     /// disk, your checkpoints, its settings and its allowlist's names, with a
@@ -455,7 +473,12 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             disk,
             replace,
             creds,
-        } => import(&store, &name, &disk, replace, creds.as_deref())?,
+            no_creds,
+        } => {
+            let creds = if no_creds { Some(Vec::new()) } else { creds };
+            import(&store, &name, &disk, replace, creds.as_deref())?
+        }
+        Cmd::Move { name, host } => move_vm(store, &name, &host)?,
         Cmd::Export {
             name,
             no_checkpoints,
@@ -1068,12 +1091,37 @@ fn names(creds: &[Cred]) -> String {
 
 // A peer as ssh takes it, never as one of its options.
 fn peer_host(host: &str) -> Result<String, String> {
-    if host.is_empty() || host.starts_with('-') {
-        return Err(format!(
-            "{host:?} isn't a host: give it as ssh takes it, like runner@kvm-host-2"
-        ));
-    }
+    peers::check_host(host)?;
     Ok(host.to_string())
+}
+
+// The move, then the VM as it is there, and its URL there if it's on.
+// Once begun, it goes to its end: Ctrl-C or a dropped connection partway
+// would leave the VM stopped, here or there. So both are ignored, by ssh
+// too, and what it says goes nowhere once the terminal has.
+fn move_vm(store: Store, name: &str, host: &str) -> Result<(), Box<dyn Error>> {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    for sig in [Signal::SIGINT, Signal::SIGHUP] {
+        // SAFETY: SIG_IGN runs no handler, and no other thread is running yet.
+        let _ = unsafe { signal(sig, SigHandler::SigIgn) };
+    }
+    let user = std::env::var("RUNNER_USER").unwrap_or_else(|_| exec::USER.to_string());
+    let here = runner::hosts::hostname();
+    let moved = runner::moves::move_vm(&store, name, host, &user, &here)?;
+    let (status, there) = (&moved.status, &moved.host);
+    let n = moved.checkpoints;
+    let s = if n == 1 { "" } else { "s" };
+    let sent = moved.sent;
+    let _ = writeln!(
+        std::io::stderr(),
+        "runner: moved {name} to {there}: its disk and {n} checkpoint{s}, {sent} bytes"
+    );
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}  {}  on {there}", line(&status.vm), status.state);
+    if let Some(url) = &status.url {
+        let _ = writeln!(out, "{url}");
+    }
+    Ok(())
 }
 
 fn serve(store: Store, user: String, peers: Vec<String>, name: Option<String>) -> ExitCode {
