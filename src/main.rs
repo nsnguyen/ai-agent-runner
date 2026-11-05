@@ -336,6 +336,11 @@ enum Cmd {
     Cancel { run: String },
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,
+    /// This host's row in the laptop's `runner hosts`: how many VMs it has,
+    /// how many are up, and its free memory, MemAvailable from /proc/meminfo.
+    /// On the laptop, `runner hosts` lists every host, and `hosts add` and
+    /// `hosts rm` change the list (README.md, Several hosts).
+    Hosts,
     /// Serve these commands as MCP tools on stdin and stdout.
     Mcp {
         /// The user MCP's exec runs commands as.
@@ -648,6 +653,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Cmd::Cancel { run } => println!("{}", run_row(&runs::cancel(&store, &run)?)),
+        Cmd::Hosts => println!("{}", runner::hosts::row(&store)?.line()),
         Cmd::Doctor => {
             let report = doctor::check(&System, &store);
             report.lines().for_each(|l| println!("{l}"));

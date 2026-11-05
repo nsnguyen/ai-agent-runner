@@ -6,6 +6,7 @@ use crate::claude;
 use crate::creds;
 use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
+use crate::hosts::{self, HostRow};
 use crate::proto::Request;
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
@@ -188,6 +189,11 @@ pub struct RunOutputArgs {
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
+pub struct HostList {
+    hosts: Vec<HostRow>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct RunList {
     runs: Vec<AgentRun>,
 }
@@ -307,6 +313,14 @@ impl Tools {
     )]
     fn doctor(&self) -> Result<Json<Report>, String> {
         Ok(Json(doctor::check(&System, &self.store)))
+    }
+
+    #[tool(
+        description = "List the hosts this runner reaches, each with its name, how many VMs it has (base included), how many are up (booting, running, sleeping or stopping), and its free memory in bytes (MemAvailable). For now that's this host only."
+    )]
+    fn list_hosts(&self) -> Result<Json<HostList>, String> {
+        let row = hosts::row(&self.store).map_err(|e| e.to_string())?;
+        Ok(Json(HostList { hosts: vec![row] }))
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]

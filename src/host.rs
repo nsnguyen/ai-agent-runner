@@ -1,5 +1,6 @@
 // What host/install.sh puts on the machine, for the code that relies on it.
 use crate::net::Subnet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// The systemd unit each VM runs under, as host/install.sh installs it.
@@ -45,4 +46,37 @@ pub fn firecracker_version() -> &'static str {
 /// The guest kernel every VM boots unless it names its own.
 pub fn kernel(root: &Path) -> PathBuf {
     root.join("kernel").join("vmlinux")
+}
+
+/// Where the host's memory figures are, unless RUNNER_MEMINFO names a fake.
+pub const MEMINFO: &str = "/proc/meminfo";
+
+/// This host's free memory in bytes: MemAvailable from /proc/meminfo, what the
+/// kernel reckons it can hand out without swapping. `runner hosts` reports it,
+/// and the laptop's `runner create` places a VM on the host with the most.
+pub fn mem_available() -> io::Result<u64> {
+    let path =
+        std::env::var_os("RUNNER_MEMINFO").map_or_else(|| PathBuf::from(MEMINFO), PathBuf::from);
+    mem_available_in(&path)
+}
+
+/// `mem_available`, from the meminfo file at `path`.
+pub fn mem_available_in(path: &Path) -> io::Result<u64> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    parse_mem_available(&text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no MemAvailable in {}", path.display()),
+        )
+    })
+}
+
+/// MemAvailable in bytes from meminfo's text, whose figures are in KiB.
+pub fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?;
+    let kib = line.trim().strip_suffix("kB").unwrap_or(line).trim();
+    kib.parse::<u64>().ok()?.checked_mul(1024)
 }

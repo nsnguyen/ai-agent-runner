@@ -218,7 +218,7 @@ exit "$code"
 
 /// systemctl and journalctl on PATH. systemctl logs its argv to `calls`,
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
-/// `start` never reads it empty, and fails with the text in `fail` if that
+/// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that
 /// file exists. A `stop` runs `on-stop` first if a test put one there, as the
 /// unit runs its ExecStop. journalctl logs its argv and prints one line.
 pub struct FakeSystemd {
@@ -239,7 +239,7 @@ case "$1" in
   start) echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
   stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" || exit 1; fi
     echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
-  show) cat "{d}/state" 2>/dev/null || echo inactive ;;
+  show) cat "{d}/state.$4" 2>/dev/null || cat "{d}/state" 2>/dev/null || echo inactive ;;
 esac
 "#
             ),
@@ -260,6 +260,12 @@ esac
 
     pub fn set_state(&self, state: &str) {
         fs::write(self.bin.join("state"), format!("{state}\n")).unwrap();
+    }
+
+    /// One VM's unit's ActiveState, over `set_state`'s for every unit.
+    pub fn set_vm_state(&self, vm: &str, state: &str) {
+        let unit = format!("state.firecracker@{vm}.service");
+        fs::write(self.bin.join(unit), format!("{state}\n")).unwrap();
     }
 
     pub fn fail_with(&self, stderr: &str) {
