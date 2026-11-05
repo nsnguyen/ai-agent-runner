@@ -547,6 +547,11 @@ fn up_launches_a_host_with_kvm_and_a_disk_for_vms() {
         assert_eq!(after(&rule, "--group-name"), "kvm-host");
         assert_eq!(after(&rule, "--port"), "22");
         assert_eq!(after(&rule, "--cidr"), format!("{LAPTOP_IP}/32"));
+        // Once: the setup doesn't open it again straight after.
+        assert_eq!(
+            aws.count(|r| ran(r, "laptop", "aws") && r[3] == "authorize-security-group-ingress"),
+            1
+        );
 
         // AWS lists a terminated instance for an hour after: it isn't the host.
         let find = aws.call("describe-instances").unwrap();

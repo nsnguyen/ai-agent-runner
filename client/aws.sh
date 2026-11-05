@@ -431,8 +431,8 @@ setup() {
   rerun="$0 setup"
   [ "$name" = kvm-host ] || rerun="RUNNER_AWS_NAME=$name $rerun"
   # Until close, let this laptop in from where it is now, which may not be
-  # where up ran.
-  [ "$target" = "$name" ] || open_ssh
+  # where up ran, unless up has just done that.
+  [ "$target" = "$name" ] || [ -n "${opened:-}" ] || open_ssh
   at=ubuntu@$target
   say "Setting $name up, as $at"
 
@@ -490,6 +490,7 @@ up() {
   fi
   keypair
   open_ssh
+  opened=1
   id=$(aws ec2 run-instances \
     --image-id "$ami" \
     --instance-type "$type" \
