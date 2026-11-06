@@ -225,13 +225,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             Ok(child) => resumed = Some((child, began)),
             Err(Unwoken::Asleep(why) | Unwoken::Lost(why)) => {
                 let kept = run.generation;
-                match run.unpark().and_then(|fresh| Ok((handed.clear(), fresh))) {
-                    Ok((cleared, fresh)) => {
-                        run = fresh;
-                        if let Err(e) = cleared {
-                            note(format_args!("{e}"));
-                        }
-                    }
+                run = match run.unpark() {
+                    Ok(fresh) => fresh,
                     Err(e) => {
                         drop(url);
                         drop(asks);
@@ -241,6 +236,10 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
                         drop(tap);
                         return Err(e.into());
                     }
+                };
+                // A cold boot, whose guest asks for its credentials again.
+                if let Err(e) = handed.clear() {
+                    note(format_args!("{e}"));
                 }
                 note(format_args!(
                     "{name} couldn't resume ({why}), so its snapshot is dropped: it boots \
@@ -769,7 +768,14 @@ impl Up<'_> {
         // Firecracker may have been upgraded while the VM slept.
         firecracker::check_version(self.bin).map_err(|e| asleep(&e))?;
         let began = Instant::now();
-        let mut child = load(self.bin, &self.api, self.api_sock, self.vsock, name, self.run)?;
+        let mut child = load(
+            self.bin,
+            &self.api,
+            self.api_sock,
+            self.vsock,
+            name,
+            self.run,
+        )?;
         self.epoch += 1;
         if let Err(e) = self.watch(&child) {
             let _ = child.kill();

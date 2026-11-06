@@ -220,8 +220,8 @@ fn systemd_stops_the_park_unit_before_each_vm() {
         .env("SYSTEMD_LOG_LEVEL", "debug")
         .output()
         .expect("systemd-analyze, from systemd, to be installed");
-    let dump = String::from_utf8_lossy(&out.stderr).into_owned()
-        + &String::from_utf8_lossy(&out.stdout);
+    let dump =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{dump}");
     // One unit's lines in the dump.
     let section = |unit: &str| -> Vec<String> {
@@ -234,15 +234,20 @@ fn systemd_stops_the_park_unit_before_each_vm() {
     };
     let park = section("runner-park.service");
     assert!(
-        park.iter().any(|l| l.starts_with("After: firecracker@dev.service")),
+        park.iter()
+            .any(|l| l.starts_with("After: firecracker@dev.service")),
         "{park:#?}"
     );
-    assert!(park.iter().any(|l| l.starts_with("Before: shutdown.target")));
+    assert!(
+        park.iter()
+            .any(|l| l.starts_with("Before: shutdown.target"))
+    );
     let stop = format!("Command Line: {} park --all", runner.display());
     assert!(park.contains(&stop), "{park:#?}");
     let dev = section("firecracker@dev.service");
     assert!(
-        dev.iter().any(|l| l.starts_with("Before: runner-park.service")),
+        dev.iter()
+            .any(|l| l.starts_with("Before: runner-park.service")),
         "{dev:#?}"
     );
 }

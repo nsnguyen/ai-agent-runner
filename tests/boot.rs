@@ -1371,7 +1371,10 @@ fn the_next_boot_loads_a_parked_snapshot_onto_its_disk() {
         )]
     );
     let net = h.store.net("dev").unwrap();
-    assert!(h.ip_calls().contains(&format!("tuntap add dev {} mode tap", net.tap)));
+    assert!(
+        h.ip_calls()
+            .contains(&format!("tuntap add dev {} mode tap", net.tap))
+    );
     // Its clock is set, as at a wake.
     let asked = up.asked.lock().unwrap().clone();
     assert_eq!(asked.len(), 1, "{asked:?}");
