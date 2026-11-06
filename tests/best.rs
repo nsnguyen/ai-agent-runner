@@ -966,10 +966,15 @@ fn a_try_whose_later_run_rolled_back_is_kept_with_its_work() {
     finish_third(&h, lock);
     commit_try(&h, "dev-1");
     let won = current(&h, "dev-1");
+    // dev-1.1's session is on dev-1's disk; dev-1.2's went with the disk it
+    // rolled back.
+    let init = |s: &str| format!(r#"{{"type":"system","subtype":"init","session_id":"{s}"}}"#);
     let runs = h.store.runs("dev-1").unwrap();
+    fs::write(runs.join("1/stream"), init(SESSION) + "\n").unwrap();
     fs::create_dir_all(runs.join("2")).unwrap();
     fs::copy(runs.join("1/ask.json"), runs.join("2/ask.json")).unwrap();
-    fs::write(runs.join("2/stream"), "").unwrap();
+    let gone = "bbbbbbbb-6f1d-4f43-9a7e-2d3c4b5a6978";
+    fs::write(runs.join("2/stream"), init(gone) + "\n").unwrap();
     let rolled_back = end("2026-11-06T10:00:00Z", 1, "rolled_back");
     fs::write(runs.join("2/end.json"), rolled_back.to_string()).unwrap();
     // dev-2's run rolled back, so it's still at the disk it forked.
@@ -980,10 +985,11 @@ fn a_try_whose_later_run_rolled_back_is_kept_with_its_work() {
     );
 
     let out = h.ok(&["keep", "dev-1"]);
-    assert!(
-        out.contains("dev-1.2 named no Claude Code session"),
-        "{out}"
+    let want = format!(
+        "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-1.1's conversation"
     );
+    assert!(out.contains(&want), "{out}");
+    assert!(!out.contains(gone), "{out}");
     assert!(current(&h, "dev") == won, "dev's disk isn't dev-1's");
     assert_eq!(h.vms(), ["dev"]);
 }

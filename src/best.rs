@@ -369,8 +369,9 @@ pub struct Kept {
     /// when none was kept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
-    /// The kept try's newest run, the one best of N started unless another
-    /// ran in it since.
+    /// The kept try's newest run whose work is on the disk kept: one that
+    /// committed, or joined it running. The one best of N started, unless
+    /// another committed in it or joined it since. Left out if none is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     /// That run's Claude Code session, which run_agent's resume takes to
@@ -442,10 +443,12 @@ pub fn keep(store: &Store, name: &str, none: bool) -> Result<Kept> {
     let mut cancel = Vec::new();
     let mut kept_run = None;
     for t in &names {
-        let run = runs::list(store, t)?.into_iter().next();
-        let going = run.as_ref().filter(|r| r.state == runs::State::Running);
+        let all = runs::list(store, t)?;
+        let run = all.first();
+        let going = run.filter(|r| r.state == runs::State::Running);
         if Some(t.as_str()) == winner {
-            kept_run = Some(winnable(store, &vm, t, run)?);
+            winnable(store, &vm, t, run)?;
+            kept_run = all.into_iter().find(on_disk);
         // A run that booted its try shuts it down once cancelled; one that
         // joined it running leaves it up, as any other try that's up.
         } else if let Some(run) = going.filter(|r| r.boots) {
@@ -573,13 +576,20 @@ fn forked(store: &Store, name: &str) -> Result<String> {
     }
 }
 
-// The try `name`'s newest run, if its disk can be kept: no run is going,
-// it's stopped, and it has a disk of its own, not still generation 0, the
-// copy of the VM's that it forked. A rollback, or a run that never got going,
-// leaves it there.
-fn winnable(store: &Store, vm: &str, name: &str, run: Option<AgentRun>) -> Result<AgentRun> {
+// Whether the run's work, and so its Claude Code session, is on its VM's
+// disk: it committed, or joined the VM running, which a clean stop commits.
+// A rolled-back run's went with the disk it ran.
+fn on_disk(run: &AgentRun) -> bool {
+    run.outcome == Some(Outcome::Committed) || !run.boots
+}
+
+// Whether the try `name`, whose newest run is `run`, can be kept: no run is
+// going, it's stopped, and it has a disk of its own, not still generation 0,
+// the copy of the VM's that it forked. A rollback, or a run that never got
+// going, leaves it there.
+fn winnable(store: &Store, vm: &str, name: &str, run: Option<&AgentRun>) -> Result<()> {
     let (vm, name) = (vm.to_string(), name.to_string());
-    if let Some(run) = run.as_ref().filter(|r| r.state == runs::State::Running) {
+    if let Some(run) = run.filter(|r| r.state == runs::State::Running) {
         let run = run.id.clone();
         return Err(Error::StillGoing { vm, run });
     }
@@ -590,12 +600,12 @@ fn winnable(store: &Store, vm: &str, name: &str, run: Option<AgentRun>) -> Resul
         Some(run) if forked => Err(Error::Unchanged {
             how: match run.outcome {
                 Some(Outcome::RolledBack) => format!("{} rolled back", run.id),
-                _ => format!("{} {}", run.id, runs::describe(&run)),
+                _ => format!("{} {}", run.id, runs::describe(run)),
             },
             vm,
             name,
         }),
-        Some(run) => Ok(run),
+        Some(_) => Ok(()),
     }
 }
 
