@@ -315,7 +315,8 @@ fn the_look_powers_off_a_host_idle_for_its_idle_time_and_says_why() {
 
 #[test]
 fn the_look_keeps_a_host_in_use_up_and_starts_its_clock_again() {
-    let in_use: [(&str, fn(&Host)); 2] = [
+    type Use = fn(&Host);
+    let in_use: [(&str, Use); 2] = [
         ("a login", |h| h.sd.set_logins(&["ubuntu"])),
         ("a running VM", |h| h.sd.set_vm_state("dev", "active")),
     ];

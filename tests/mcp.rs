@@ -453,6 +453,7 @@ fn doctor_reports_every_check() {
         "nat",
         "unit",
         "key",
+        "host-idle",
     ];
     assert_eq!(names, all, "{report}");
     // No base VM in an empty root, so at least that one fails.
