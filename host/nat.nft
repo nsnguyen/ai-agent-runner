@@ -17,11 +17,27 @@
 # by source address, which a VM can forge. What a tap brings in from outside
 # the range is dropped first, so a source forged from outside it gets
 # neither in nor through.
+# A VM with a list of names gets less (src/fence.rs). Its boot puts its tap
+# in the set `listed`, and each address its DNS answered for a listed name in
+# `reach`, paired with the tap, for the answer's TTL but at least 10 minutes.
+# A listed tap's packets go to the chain `listed`, which lets through replies
+# and connections already open, then what goes to a paired address, and
+# drops the rest: port 53 off the host too, so the VM can't ask a resolver
+# for a name its boot refused. The private ranges are dropped before that, so
+# a listed name that resolves to one stays out of reach. A reload empties
+# the sets; each boot puts its own back within 10 seconds.
 # VMs have no IPv6 address at all: no IPv6 from a VM reaches the host, its
 # link-local address on the tap included, or goes through it.
 table ip runner
 delete table ip runner
 table ip runner {
+	set listed {
+		type ifname
+	}
+	set reach {
+		type ifname . ipv4_addr
+		flags timeout
+	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		ip saddr @NET@ ip daddr != @NET@ masquerade
@@ -29,8 +45,14 @@ table ip runner {
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		iifname "fc*" ip saddr != @NET@ drop
-		iifname "fc*" ip daddr != @NET@ meta l4proto { tcp, udp } th dport 53 accept
+		iifname != @listed ip daddr != @NET@ meta l4proto { tcp, udp } th dport 53 accept
 		iifname "fc*" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+		iifname @listed jump listed
+	}
+	chain listed {
+		ct state established,related accept
+		iifname . ip daddr @reach accept
+		drop
 	}
 	chain input {
 		type filter hook input priority filter; policy accept;

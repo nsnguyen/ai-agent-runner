@@ -5,7 +5,8 @@
 mod common;
 
 use common::resolver::{Resolver, answer_to, query, read_framed, write_framed};
-use runner::dns::{Policy, Relay};
+use runner::dns::{Address, List, Policy, Relay};
+use runner::fence::{self, Fence};
 use runner::host;
 use runner::net::{DEFAULT_SUBNET, Net, Subnet, Tap, dns};
 use runner::store::Error;
@@ -281,7 +282,13 @@ fn a_real_tap_comes_up_with_the_gateway_address_and_goes() {
 #[test]
 fn the_rules_name_the_range_everywhere_install_sh_would() {
     let rules = host::nat_rules(&subnet("10.20.0.0/16"));
-    assert!(!rules.contains('@'), "{rules}");
+    // Every @ left is a set's, and the sets are the ones boot fills.
+    let sets = [fence::LISTED, fence::REACH].map(|set| format!("@{set}"));
+    let unfilled = sets.iter().fold(rules.clone(), |r, set| r.replace(set, ""));
+    assert!(!unfilled.contains('@'), "{rules}");
+    for set in [fence::LISTED, fence::REACH] {
+        assert!(rules.contains(&format!("\tset {set} {{\n")), "{rules}");
+    }
     assert!(
         rules.contains("ip saddr 10.20.0.0/16 ip daddr != 10.20.0.0/16 masquerade"),
         "{rules}"
@@ -725,6 +732,148 @@ fn a_vm_that_forges_its_source_gets_nothing_past_the_rules() {
     assert!(datagram(&vm, resolver, &lan_inbox));
     let sshd = to("192.168.77.2", 22);
     assert_dropped(ask(&vm, sshd), sshd);
+}
+
+// Echoes each connection's 4-byte pings until it closes.
+fn echo(listener: TcpListener) {
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            std::thread::spawn(move || {
+                let mut ping = [0u8; 4];
+                while conn.read_exact(&mut ping).is_ok() && conn.write_all(&ping).is_ok() {}
+            });
+        }
+    });
+}
+
+// Whether `conn` still carries a ping there and back.
+fn still_open(conn: &mut TcpStream) -> bool {
+    let mut pong = [0u8; 4];
+    conn.write_all(b"ping").is_ok() && conn.read_exact(&mut pong).is_ok() && pong == *b"ping"
+}
+
+// A VM with a list of names reaches only the addresses its boot paired with
+// its tap (src/fence.rs, here with the real nft): not another address, not a
+// resolver off the host, which it could ask for any name, and not a private
+// address even paired, as a listed name could resolve to. A pair that runs
+// out lets no new connection through, but one open already keeps going.
+// Unlisted, it reaches them all. The rules install.sh writes, in network
+// namespaces of their own, as a_vm_can_t_reach_the_host_but_hears_back_from_it.
+// Run as root: cargo test --test net -- --ignored
+#[test]
+#[ignore = "needs root, nftables and iproute2"]
+fn a_listed_vm_reaches_only_the_addresses_paired_with_its_tap() {
+    let range = subnet("10.254.0.0/16");
+    let net = range.net(16007).unwrap();
+    let mut spaces = Spaces::default();
+    let host = spaces.add("listed-host");
+    let (vm, lan) = (spaces.add("listed-vm"), spaces.add("listed-lan"));
+    plug(&host, &vm, &net, &format!("{}/30", net.address));
+    // The host's LAN, and the internet beyond: two web servers, and a
+    // resolver on each.
+    ip_in(
+        &host,
+        &format!("link add lan0 type veth peer name lan0 netns {lan}"),
+    );
+    ip_in(&host, "addr add 192.168.77.1/24 dev lan0");
+    ip_in(&host, "link set dev lan0 up");
+    ip_in(&host, "route add default via 192.168.77.2");
+    ip_in(&lan, "addr add 192.168.77.2/24 dev lan0");
+    for address in ["203.0.113.1", "203.0.113.2", "198.51.100.53"] {
+        ip_in(&lan, &format!("addr add {address}/32 dev lo"));
+    }
+    ip_in(&lan, "link set dev lan0 up");
+    ip_in(&lan, "link set dev lo up");
+    ip_in(&lan, "route add default via 192.168.77.1");
+    inside(&host, || {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+    });
+    // Each server says which address it was reached at.
+    for port in [22, 53, 80] {
+        let listener = inside(&lan, move || TcpListener::bind(("0.0.0.0", port)).unwrap());
+        serve(listener, |conn| match conn.local_addr() {
+            Ok(at) => at.ip().to_string(),
+            Err(e) => e.to_string(),
+        });
+    }
+    echo(inside(&lan, || TcpListener::bind("0.0.0.0:8080").unwrap()));
+    let lan_inbox = inside(&lan, || UdpSocket::bind("0.0.0.0:53").unwrap());
+    let to = |address: &str, port| SocketAddr::new(ip(address).into(), port);
+    let (paired, unpaired) = (to("203.0.113.1", 80), to("203.0.113.2", 80));
+    let resolver = to("198.51.100.53", 53);
+    let lan_sshd = to("192.168.77.2", 22);
+    // The host's nft, run in its namespace.
+    let dir = tempfile::tempdir().unwrap();
+    let nft = dir.path().join("nft");
+    fs::write(
+        &nft,
+        format!("#!/bin/sh\nexec ip netns exec {host} nft \"$@\"\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&nft, fs::Permissions::from_mode(0o755)).unwrap();
+    let nft_ok = |script: &str| {
+        let out = Command::new(&nft).arg(script).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "nft {script}: {err}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    load_rules(&host, &range);
+    // Unlisted, it reaches both web servers and the resolver, and the LAN's
+    // resolver but nothing else there.
+    assert_eq!(ask(&vm, paired).unwrap(), "203.0.113.1");
+    assert_eq!(ask(&vm, unpaired).unwrap(), "203.0.113.2");
+    assert_eq!(ask(&vm, resolver).unwrap(), "198.51.100.53");
+    assert!(datagram(&vm, resolver, &lan_inbox));
+    assert_dropped(ask(&vm, lan_sshd), lan_sshd);
+
+    let names = List::new(["example.com".parse().unwrap()]);
+    let fence = Fence::start(&nft, "dev", &net.tap, Some(&names)).unwrap();
+    let ttl = Duration::from_secs(60);
+    fence.hand_on(&[
+        Address {
+            ip: ip("203.0.113.1"),
+            ttl,
+        },
+        Address {
+            ip: ip("192.168.77.2"),
+            ttl,
+        },
+    ]);
+    // In for ten minutes, not the TTL's one.
+    let reach = nft_ok("list set ip runner reach");
+    assert!(reach.contains("timeout 10m"), "{reach}");
+    assert_eq!(ask(&vm, paired).unwrap(), "203.0.113.1");
+    for at in [unpaired, resolver, lan_sshd] {
+        assert_dropped(ask(&vm, at), at);
+    }
+    assert!(!datagram(&vm, resolver, &lan_inbox));
+
+    // A pair for 2 seconds: what's opened in them keeps going after.
+    let tap = &net.tap;
+    nft_ok(&format!(
+        "add element ip runner reach {{ \"{tap}\" . 203.0.113.2 timeout 2s }}"
+    ));
+    let began = std::time::Instant::now();
+    let echoed = to("203.0.113.2", 8080);
+    let mut open = inside(&vm, move || {
+        TcpStream::connect_timeout(&echoed, Duration::from_secs(2)).unwrap()
+    });
+    open.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert!(still_open(&mut open));
+    assert_eq!(ask(&vm, unpaired).unwrap(), "203.0.113.2");
+    std::thread::sleep(Duration::from_secs(3).saturating_sub(began.elapsed()));
+    assert_dropped(ask(&vm, unpaired), unpaired);
+    assert!(still_open(&mut open));
+
+    // Unlisted again, it reaches them all.
+    fence.end();
+    let left = nft_ok("list table ip runner");
+    assert!(!left.contains(tap.as_str()), "{left}");
+    assert_eq!(ask(&vm, unpaired).unwrap(), "203.0.113.2");
+    assert_eq!(ask(&vm, resolver).unwrap(), "198.51.100.53");
+    assert!(still_open(&mut open));
 }
 
 mod props {
