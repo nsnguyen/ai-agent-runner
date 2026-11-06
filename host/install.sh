@@ -5,13 +5,17 @@
 #   sudo host/install.sh [path/to/runner]
 #
 # RUNNER_NET sets the VMs' address range (default 172.16.0.0/16), kept in
-# /etc/runner/net for reruns. Safe to rerun, after an upgrade too: every step
-# overwrites or checks, never appends.
+# /etc/runner/net for reruns. RUNNER_HOST_IDLE sets how long the host goes
+# unused before it powers itself off, in `runner idle`'s syntax (90s, 60m,
+# 2h), or never, the default; it's kept in /etc/runner/host-idle for reruns
+# (src/power.rs). Safe to rerun, after an upgrade too: every step overwrites
+# or checks, never appends.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bin=${1:-$(dirname "$here")/target/release/runner}
 net=${RUNNER_NET:-$(cat /etc/runner/net 2>/dev/null || echo 172.16.0.0/16)}
+idle=${RUNNER_HOST_IDLE:-$(cat /etc/runner/host-idle 2>/dev/null || echo never)}
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -29,6 +33,12 @@ IFS=./ read -r a b c d len <<<"$net"
 addr=$(((a << 24) | (b << 16) | (c << 8) | d))
 mask=$(((0xffffffff << (32 - len)) & 0xffffffff))
 ((addr == (addr & mask))) || die "RUNNER_NET=$net has host bits set"
+# What the runner reads (src/idle.rs), short of a count too big for it.
+bad_idle="RUNNER_HOST_IDLE=$idle isn't an idle time: use minutes, like 60, or 90s, 60m or 2h, or never"
+if [[ $idle != never ]]; then
+  [[ $idle =~ ^[0-9]{1,6}[smh]?$ ]] || die "$bad_idle"
+  ((10#${idle%[smh]} > 0)) || die "$bad_idle"
+fi
 
 missing=()
 command -v nft >/dev/null || missing+=(nftables)
@@ -117,6 +127,11 @@ fi
 
 say "/var/lib/runner"
 install -d -o runner -g runner -m 0750 /var/lib/runner /var/lib/runner/kernel
+# Every runner command holds it while it works, so the host stays up. runner
+# has to own it, or a command run as root first would leave it root's.
+busy=/var/lib/runner/busy.lock
+[[ -e $busy ]] || install -o runner -g runner -m 0644 /dev/null "$busy"
+chown runner:runner "$busy"
 
 say "polkit rule"
 cat >"$tmp/50-runner.rules" <<'EOF'
@@ -131,6 +146,18 @@ polkit.addRule(function (action, subject) {
   }
 });
 EOF
+if [[ $idle != never ]]; then
+  cat >>"$tmp/50-runner.rules" <<'EOF'
+// It may power the host off once it's idle (runner-host-idle.service), and
+// only that: not with anyone else logged in, nor past an inhibitor, nor a
+// reboot. With RUNNER_HOST_IDLE=never, install.sh leaves this rule out.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.login1.power-off" && subject.user == "runner") {
+    return polkit.Result.YES;
+  }
+});
+EOF
+fi
 # mkdir, not install -d: some distros keep this directory 0700 for polkitd.
 mkdir -p /etc/polkit-1/rules.d
 install -m 0644 "$tmp/50-runner.rules" /etc/polkit-1/rules.d/50-runner.rules
@@ -157,6 +184,20 @@ install -m 0644 "$here/runner-nat.service" /etc/systemd/system/runner-nat.servic
 systemctl daemon-reload
 systemctl enable runner-nat.service
 systemctl restart runner-nat.service
+
+say "host idle: $idle"
+echo "$idle" >"$tmp/host-idle"
+install -m 0644 "$tmp/host-idle" /etc/runner/host-idle
+install -m 0644 "$here/runner-host-idle.service" /etc/systemd/system/runner-host-idle.service
+install -m 0644 "$here/runner-host-idle.timer" /etc/systemd/system/runner-host-idle.timer
+systemctl daemon-reload
+if [[ $idle == never ]]; then
+  systemctl disable --now runner-host-idle.timer
+else
+  systemctl enable runner-host-idle.timer
+  # The clock starts at the host's boot or its last use, not here.
+  systemctl restart runner-host-idle.timer
+fi
 
 say "runner doctor"
 runuser -u runner -- /usr/local/bin/runner doctor || true
