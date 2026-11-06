@@ -20,6 +20,7 @@ path = "src/bin/runner-guest.rs"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 ext4-view = { version = "1", features = ["std"] }
+hickory-proto = "0.26"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "net", "poll", "process", "signal", "socket", "term", "user"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }

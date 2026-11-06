@@ -289,6 +289,8 @@ fn dev(host: &Host) -> (Checkpoint, Checkpoint) {
     store
         .set_creds("dev", &[Cred::Github, Cred::Claude])
         .unwrap();
+    let github = "github.com".parse().unwrap();
+    store.allow("dev", &[github]).unwrap();
     let first = store.checkpoint("dev", Some("first")).unwrap();
     rewrite(&store, "dev", 2);
     let second = store.checkpoint("dev", Some("tests\npass")).unwrap();
@@ -923,8 +925,11 @@ fn an_import_gives_back_each_disk_sparse_with_my_checkpoints_and_settings() {
     assert!(!undo.status.success());
     assert!(text(&undo.stderr).contains("no earlier generation"));
 
-    // Its settings, a slot of its own, and claude only, as a fork gets.
+    // Its settings, its list of names among them, a slot of its own, and
+    // claude only, as a fork gets.
     assert_eq!(store.config("dev2").unwrap(), store.config("dev").unwrap());
+    let names = store.allowed("dev2").unwrap().expect("no list");
+    assert_eq!(Some(names), store.allowed("dev").unwrap());
     let slot = |vm| store.net(vm).unwrap().slot;
     assert_ne!(slot("dev2"), slot("dev"));
     assert_eq!(store.creds("dev2").unwrap(), [Cred::Claude]);
@@ -1072,13 +1077,45 @@ fn an_unknown_format_is_refused() {
     let host = Host::new();
     let mut entries = small(&host);
     edit_manifest(&mut entries, |j| {
-        let to = j.replacen(&format!("\"format\": {FORMAT}"), "\"format\": 99", 1);
+        let to = j.replacen("\"format\": 1", "\"format\": 99", 1);
         assert_ne!(to, j);
         to
     });
     let err = host.refused_import(&together(&entries));
     assert!(err.contains("format 99"), "{err}");
-    assert!(err.contains(&format!("reads format {FORMAT}")), "{err}");
+    assert!(
+        err.contains(&format!("reads formats 1 to {FORMAT}")),
+        "{err}"
+    );
+}
+
+// A config's list of names is a field format 1's import doesn't know, so an
+// export with one is format 2. One with none is still format 1, which an
+// older runner imports, as this one does.
+#[test]
+fn only_an_export_with_a_list_of_names_is_format_2() {
+    assert_eq!(FORMAT, 2);
+    let host = Host::new();
+    let entries = small(&host);
+    let json = text(&entries[0].1);
+    assert!(json.contains("\"format\": 1"), "{json}");
+    assert!(!json.contains("allow"), "{json}");
+    let path = host.path("old.tar");
+    fs::write(&path, together(&entries)).unwrap();
+    host.imported(&["dev2", "-"], Some(&path));
+    same(&host.current("dev2"), &host.current("dev"));
+    // With a list: format 2, and it imports with it.
+    let github = "github.com".parse().unwrap();
+    host.store().allow("dev", &[github]).unwrap();
+    let tar = host.path("listed.tar");
+    host.exported(&["dev"], &tar);
+    let json = text(&apart(&fs::read(&tar).unwrap())[0].1);
+    assert!(json.contains("\"format\": 2"), "{json}");
+    host.imported(&["dev3", &tar.display().to_string()], None);
+    assert_eq!(
+        host.store().allowed("dev3").unwrap(),
+        host.store().allowed("dev").unwrap()
+    );
 }
 
 #[test]

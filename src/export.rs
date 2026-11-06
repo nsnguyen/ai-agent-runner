@@ -36,8 +36,10 @@ use tar::{Builder, EntryType, Header};
 
 /// The manifest's format: an import reads it before the rest, and refuses
 /// one it doesn't know. A field an older import wouldn't know, in the
-/// manifest or its config (which denies unknown fields), bumps it.
-pub const FORMAT: u32 = 1;
+/// manifest or its config (which denies unknown fields), bumps it. 2: the
+/// config's list of names, so an export with no list is still format 1, for
+/// an older runner to import. An import reads every format up to its own.
+pub const FORMAT: u32 = 2;
 
 /// The stream's first entry, under the VM's name.
 pub const MANIFEST: &str = "manifest.json";
@@ -49,8 +51,8 @@ pub struct Manifest {
     pub name: String,
     /// When.
     pub exported: DateTime<Utc>,
-    /// Its sizes, kernel path, idle time and URL setting, as stored: each one
-    /// left out is the default.
+    /// Its sizes, kernel path, idle time, URL setting and list of names, as
+    /// stored: each one left out is the default.
     pub config: Config,
     /// The credentials its allowlist names. Names only; no value is kept.
     pub creds: Vec<Cred>,
@@ -192,7 +194,7 @@ pub fn write(name: &str, disks: Disks, out: impl Write) -> Result<Exported> {
         bytes: c.info.bytes,
     });
     let manifest = Manifest {
-        format: FORMAT,
+        format: if config.allow.is_some() { FORMAT } else { 1 },
         name: name.to_string(),
         exported: Utc::now().trunc_subsecs(0),
         config,

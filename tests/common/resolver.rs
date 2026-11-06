@@ -7,6 +7,16 @@ use std::thread;
 
 /// A query for `name`'s A record, as a stub resolver asks it.
 pub fn query(id: u16, name: &str) -> Vec<u8> {
+    query_for(id, name, A)
+}
+
+/// DNS's record types the tests ask for.
+pub const A: u16 = 1;
+pub const AAAA: u16 = 28;
+pub const TXT: u16 = 16;
+
+/// A query for `name`'s records of type `qtype`, class IN.
+pub fn query_for(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut q = id.to_be_bytes().to_vec();
     // Recursion desired; one question.
     q.extend([0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
@@ -14,7 +24,9 @@ pub fn query(id: u16, name: &str) -> Vec<u8> {
         q.push(label.len() as u8);
         q.extend(label.as_bytes());
     }
-    q.extend([0, 0, 1, 0, 1]);
+    q.push(0);
+    q.extend(qtype.to_be_bytes());
+    q.extend([0, 1]);
     q
 }
 

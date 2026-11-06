@@ -105,6 +105,7 @@ fn dev(store: &Store, dir: &std::path::Path) -> (Checkpoint, Checkpoint) {
         kernel: None,
         idle: Some("30m".parse().unwrap()),
         url: None,
+        allow: None,
     };
     store.fork_with("img", "dev", &config).unwrap();
     let url = Setting {
