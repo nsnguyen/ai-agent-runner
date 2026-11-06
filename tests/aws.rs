@@ -33,7 +33,8 @@ const LOG: &str = r#"log() { { printf '%s\037' "${WHO:-laptop}" "$@"; printf '\0
 // perms (the group's IpPermissions, which authorize and revoke set);
 // key-fails and signed-out make those calls fail as AWS does. stop-instances
 // and start-instances set each instance they name stopped or running, start
-// at the address in ip.<id>, else HOST_IP.
+// at the address in ip.<id>, else HOST_IP. shutdown.<id> is what an instance
+// does at a power-off, else stop; modify-instance-attribute sets it stop.
 const FAKE_AWS: &str = r#"{ for arg; do printf '%s\037' "$arg"; done; printf '\n'; } >>"$FAKE/calls"
 log aws "$@"
 fail() { echo "An error occurred ($1)" >&2; exit 254; }
@@ -77,6 +78,12 @@ case "$1 $2" in
       sed "s/^$id	.*/$id	$t/" "$f" >"$f.new" && mv "$f.new" "$f"
     done
   done ;;
+"ec2 describe-instance-attribute")
+  while [ $# -gt 0 ]; do [ "$1" != --instance-id ] || id=$2; shift; done
+  cat "$FAKE/shutdown.$id" 2>/dev/null || echo stop ;;
+"ec2 modify-instance-attribute")
+  while [ $# -gt 0 ]; do [ "$1" != --instance-id ] || id=$2; shift; done
+  echo stop >"$FAKE/shutdown.$id" ;;
 "ec2 wait") ;;
 *) echo "fake aws: unexpected $*" >&2; exit 99 ;;
 esac
@@ -379,6 +386,12 @@ impl Aws {
 
     /// The script under `shell`, with the fakes first on PATH.
     fn cmd(&self, shell: &[&str], args: &[&str]) -> Command {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("client/aws.sh");
+        self.cmd_of(shell, &script, args)
+    }
+
+    /// A copy of the script at `script`, as `cmd` runs the checkout's.
+    fn cmd_of(&self, shell: &[&str], script: &Path, args: &[&str]) -> Command {
         let path = format!(
             "{}:{}",
             self.dir.path().join("bin").display(),
@@ -386,7 +399,7 @@ impl Aws {
         );
         let mut cmd = Command::new(shell[0]);
         cmd.args(&shell[1..])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("client/aws.sh"))
+            .arg(script)
             .args(args)
             .env("PATH", path)
             .env("HOME", self.home())
@@ -593,6 +606,12 @@ fn up_launches_a_host_with_kvm_and_a_disk_for_vms() {
         assert!(
             after(&run, "--tag-specifications").contains("{Key=Name,Value=kvm-host}"),
             "{run:?}"
+        );
+        // It powers itself off when idle: stopped, not terminated, which
+        // would lose it and its VMs.
+        assert_eq!(
+            after(&run, "--instance-initiated-shutdown-behavior"),
+            "stop"
         );
 
         // The key pair's private key, kept for this user only.
@@ -1036,6 +1055,199 @@ fn start_waits_only_for_the_stopping_hosts() {
     }
 }
 
+/// The ids each `aws ec2 modify-instance-attribute` set to stop at a power-off.
+fn set_to_stop(aws: &Aws) -> Vec<String> {
+    aws.calls()
+        .into_iter()
+        .filter(|c| c.len() > 1 && c[1] == "modify-instance-attribute")
+        .map(|c| {
+            assert_eq!(
+                after(&c, "--instance-initiated-shutdown-behavior"),
+                "Value=stop"
+            );
+            after(&c, "--instance-id").to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn start_makes_a_host_that_would_terminate_stop_instead() {
+    // A host launched before up launched them to stop would be terminated
+    // when it powers itself off idle, and its VMs with it.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", "i-0old\tstopped\tNone\n");
+        aws.has("shutdown.i-0old", "terminate\n");
+        let out = ok(&aws.run(shell, &["start"]));
+        let asked = aws
+            .call("describe-instance-attribute")
+            .expect("no describe-instance-attribute");
+        assert_eq!(after(&asked, "--instance-id"), "i-0old");
+        assert_eq!(
+            after(&asked, "--attribute"),
+            "instanceInitiatedShutdownBehavior"
+        );
+        assert_eq!(set_to_stop(&aws), ["i-0old"]);
+        let ops: Vec<String> = aws.calls().into_iter().map(|c| c[1].clone()).collect();
+        let at = |op: &str| ops.iter().position(|o| o == op).unwrap();
+        assert!(
+            at("modify-instance-attribute") < at("start-instances"),
+            "{ops:?}"
+        );
+        assert!(
+            out.contains("kvm-host stops at a power-off now, rather than being terminated."),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn start_leaves_a_host_that_stops_as_it_is() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", "i-0old\tstopped\tNone\n");
+        let out = ok(&aws.run(shell, &["start"]));
+        assert!(aws.call("describe-instance-attribute").is_some());
+        assert_eq!(set_to_stop(&aws), Vec::<String>::new());
+        assert!(!out.contains("power-off"), "{out}");
+    }
+}
+
+#[test]
+fn start_makes_only_the_listed_hosts_that_would_terminate_stop() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
+        aws.has("instances.kvm-host", "i-0a\tstopped\tNone\n");
+        aws.has("instances.kvm-host-2", "i-0b\tstopped\tNone\n");
+        aws.has("shutdown.i-0b", "terminate\n");
+        let out = ok(&aws.run(shell, &["start"]));
+        assert_eq!(set_to_stop(&aws), ["i-0b"]);
+        assert!(out.contains("kvm-host-2 stops at a power-off"), "{out}");
+        assert!(!out.contains("kvm-host stops"), "{out}");
+    }
+}
+
+#[test]
+fn state_prints_what_aws_has_the_host_as() {
+    for shell in SHELLS {
+        for state in ["pending", "running", "stopping", "stopped"] {
+            let aws = Aws::new();
+            // Always the one host, whatever's listed.
+            aws.hosts("runner@kvm-host-2\nrunner@kvm-host-3\n");
+            aws.has("instances", &format!("i-0old\t{state}\t{HOST_IP}\n"));
+            assert_eq!(ok(&aws.run(shell, &["state"])), format!("{state}\n"));
+            // Only an instance up made: its name and its key pair.
+            let find = aws.call("describe-instances").unwrap();
+            assert_eq!(
+                values(&find, "--filters")[..2],
+                [
+                    "Name=tag:Name,Values=kvm-host",
+                    "Name=key-name,Values=kvm-host"
+                ]
+            );
+            assert_eq!(aws.calls().len(), 2, "{:?}", aws.calls());
+        }
+    }
+}
+
+#[test]
+fn state_of_an_instance_up_didnt_make_is_none() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has(
+            "instances.kvm-host-2",
+            &format!("i-0b\trunning\t{HOST_IP}\n"),
+        );
+        aws.has("key-of.kvm-host-2", "deploy");
+        let out = aws.run_as(shell, "kvm-host-2", &["state"], "");
+        assert_eq!(ok(&out), "none\n");
+
+        // Nor is there any instance of that name.
+        let aws = Aws::new();
+        assert_eq!(ok(&aws.run(shell, &["state"])), "none\n");
+    }
+}
+
+#[test]
+fn state_of_a_name_up_doesnt_give_is_none() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+        let out = aws.run_as(shell, "box.example.com", &["state"], "");
+        assert_eq!(ok(&out), "none\n");
+        assert_eq!(text(&out.stderr), "");
+        assert_eq!(aws.call("describe-instances"), None);
+    }
+}
+
+#[test]
+fn state_with_no_aws_cli_is_none() {
+    // A laptop with no AWS stays quiet.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        // The fakes, but no aws, and none of this machine's.
+        let bin = aws.dir.path().join("no-aws");
+        fs::create_dir(&bin).unwrap();
+        script(&bin.join("curl"), &format!("echo {LAPTOP_IP}\n"));
+        script(&bin.join("ssh"), FAKE_SSH);
+        script(&bin.join("rsync"), FAKE_RSYNC);
+        let out = aws
+            .cmd(shell, &["state"])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert_eq!(ok(&out), "none\n");
+        assert_eq!(text(&out.stderr), "");
+    }
+}
+
+#[test]
+fn state_signed_out_says_how_to_sign_in() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.has("signed-out", "");
+        aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+        let out = aws.run(shell, &["state"]);
+        let err = fails(&out);
+        assert!(err.contains("aws login"), "{err}");
+        assert_eq!(text(&out.stdout), "");
+    }
+}
+
+#[test]
+fn an_installed_copy_runs_no_up_or_setup() {
+    // setup copies the checkout around aws.sh to the host: around a copy in
+    // ~/.local/bin, that's ~/.local.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        let bin = aws.home().join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let copy = bin.join("aws.sh");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("client/aws.sh"),
+            &copy,
+        )
+        .unwrap();
+        aws.host("kvm-host").has_token();
+        aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
+        for cmd in ["up", "setup"] {
+            let err = fails(&aws.cmd_of(shell, &copy, &[cmd]).output().unwrap());
+            assert!(
+                err.contains("checkout") && err.contains("client/aws.sh up"),
+                "{cmd}: {err}"
+            );
+            assert!(aws.calls().is_empty(), "{cmd}: {:?}", aws.calls());
+            assert_eq!(aws.count(|r| ran(r, "laptop", "rsync")), 0);
+        }
+        // The rest work from it.
+        let out = aws.cmd_of(shell, &copy, &["state"]).output().unwrap();
+        assert_eq!(ok(&out), "running\n");
+        let out = aws.cmd_of(shell, &copy, &["ip"]).output().unwrap();
+        assert_eq!(ok(&out), format!("{HOST_IP}\n"));
+    }
+}
+
 #[test]
 fn close_takes_every_inbound_rule_off() {
     let perms = r#"[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "198.51.100.4/32"}, {"CidrIp": "192.0.2.9/32"}]}]"#;
@@ -1084,7 +1296,9 @@ fn a_second_host_takes_a_name_of_its_own() {
 fn no_command_prints_how_to_use_it() {
     let aws = Aws::new();
     let err = fails(&aws.run(&["sh"], &[]));
-    for cmd in ["up", "setup", "ip", "ssh", "open", "close", "stop", "start"] {
+    for cmd in [
+        "up", "setup", "ip", "ssh", "open", "close", "stop", "start", "state",
+    ] {
         assert!(err.contains(cmd), "{cmd}: {err}");
     }
     assert!(aws.calls().is_empty(), "{:?}", aws.calls());
