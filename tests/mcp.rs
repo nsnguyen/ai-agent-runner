@@ -142,6 +142,7 @@ fn lists_its_tools() {
             "start_vm",
             "stop_vm",
             "undo_vm",
+            "vm_allowlist",
             "vm_status",
             "wake_vm"
         ]
@@ -222,6 +223,70 @@ fn create_then_list() {
         why,
         format!("no host named kvm-host-2: the hosts are {}", host.trim())
     );
+}
+
+// A local Claude Code reads VMs' output, so it's what an agent would talk
+// into widening a list: MCP reads the list, and only `runner net` sets it.
+#[test]
+fn vm_allowlist_reads_the_list_and_no_tool_changes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+    store.fork("base", "dev").unwrap();
+
+    let mut s = start(dir.path());
+    let open = s.call(2, "vm_allowlist", json!({"name": "dev"}));
+    assert_eq!(open["isError"], json!(false), "{open}");
+    assert_eq!(
+        open["structuredContent"],
+        json!({"name": "dev", "open": true, "names": []})
+    );
+    let hosts = ["registry.npmjs.org", "github.com"].map(|n| n.parse().unwrap());
+    store.allow("dev", &hosts).unwrap();
+    let listed = s.call(3, "vm_allowlist", json!({"name": "dev"}));
+    assert_eq!(
+        listed["structuredContent"],
+        json!({
+            "name": "dev",
+            "open": false,
+            "names": ["api.anthropic.com", "github.com", "registry.npmjs.org"]
+        })
+    );
+    let missing = s.call(4, "vm_allowlist", json!({"name": "nope"}));
+    assert_eq!(missing["isError"], json!(true), "{missing}");
+
+    // It's marked read-only, and takes only the VM's name. No tool takes
+    // names to allow or deny, nor is named for changing a list.
+    s.send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}));
+    let tools = s.reply(5)["result"]["tools"].clone();
+    let tools = tools.as_array().unwrap();
+    let tool = tools.iter().find(|t| t["name"] == "vm_allowlist").unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], json!(true), "{tool}");
+    let takes = |t: &Value| -> Vec<String> {
+        let props = t["inputSchema"]["properties"].as_object();
+        props.map_or(Vec::new(), |p| p.keys().cloned().collect())
+    };
+    assert_eq!(takes(tool), ["name"]);
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        for word in ["allow", "deny", "open", "net"] {
+            assert!(
+                name == "vm_allowlist" || !name.contains(word),
+                "{name} looks like it changes a list"
+            );
+        }
+        for arg in takes(t) {
+            let arg = arg.as_str();
+            assert!(
+                !["allow", "deny", "names", "hosts", "hostnames", "open"].contains(&arg),
+                "{name} takes {arg}"
+            );
+        }
+    }
+    // The list is as it was.
+    assert_eq!(store.allowed("dev").unwrap().unwrap().names().len(), 3);
 }
 
 #[test]

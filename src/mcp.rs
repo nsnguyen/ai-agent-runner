@@ -273,6 +273,17 @@ pub struct RunList {
     runs: Vec<AgentRun>,
 }
 
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct Allowlist {
+    /// The VM's name.
+    name: String,
+    /// True when it has no list, and reaches every name.
+    open: bool,
+    /// With a list, the names its DNS answers, each with every name under
+    /// it, api.anthropic.com always among them. Empty when it's open.
+    names: Vec<String>,
+}
+
 // Named here, or clients see the SDK's own name.
 #[tool_handler]
 impl ServerHandler for Tools {
@@ -417,6 +428,25 @@ impl Tools {
         systemd::status(&self.store, &name)
             .map(Json)
             .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Say which names a VM can reach. With open true it has no list, and reaches the whole internet. Otherwise its DNS answers only `names`, each with every name under it (github.com covers api.github.com), api.anthropic.com always among them, and REFUSED for the rest, and the VM reaches only the addresses those answers gave. Read-only: the owner sets the list with `runner net` on the host, and no tool changes it, so for a name that's refused, ask the owner.",
+        annotations(read_only_hint = true)
+    )]
+    fn vm_allowlist(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<Allowlist>, String> {
+        let list = self.store.allowed(&name).map_err(|e| e.to_string())?;
+        let names = list.as_ref().map_or_else(Vec::new, |l| {
+            l.names().iter().map(ToString::to_string).collect()
+        });
+        Ok(Json(Allowlist {
+            open: list.is_none(),
+            name,
+            names,
+        }))
     }
 
     #[tool(

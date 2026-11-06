@@ -1107,7 +1107,7 @@ run)
   esac
   go "${at:-$first}"
   ;;
-export | start | stop | status | sleep | wake | idle | url | logs | undo | rebase | checkpoint | checkpoints | restore | creds | ip | shell | sessions | attach | kill | service | exec | runs | tries | hold)
+export | start | stop | status | sleep | wake | idle | url | net | logs | undo | rebase | checkpoint | checkpoints | restore | creds | ip | shell | sessions | attach | kill | service | exec | runs | tries | hold)
   [ -n "$vm" ] || go "$host"
   locate "$vm"
   go "${at:-$first}"
