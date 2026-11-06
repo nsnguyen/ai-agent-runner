@@ -10,6 +10,7 @@ pub mod creds;
 pub mod dns;
 pub mod doctor;
 pub mod exec;
+pub mod fence;
 pub mod export;
 pub mod firecracker;
 pub mod graft;
