@@ -51,7 +51,9 @@
 // VM's next clean shutdown commits the run's writes and the session's
 // together, as any boot does. One that joined it keeps its checkpoint. The
 // run ends taken over, with no outcome and nothing measured: the disk is
-// still in use.
+// still in use. A run that's over is taken over from the disk it ended on,
+// which claude.rs works out from its outcome and its result's generation,
+// and nothing here changes.
 use crate::changes;
 use crate::checkpoint;
 use crate::exec::{self, Streamed};
@@ -1034,6 +1036,9 @@ pub struct Placed {
     pub run: AgentRun,
     pub dir: String,
     pub user: String,
+    /// Once it's over, the disk generation it booted, as its result has it:
+    /// where a run that rolled back left its session.
+    pub generation: Option<u64>,
 }
 
 /// The run with this id, and where its Claude Code runs.
@@ -1041,8 +1046,10 @@ pub fn placed(store: &Store, id: &str) -> Result<Placed> {
     let (vm, n) = parse_id(id)?;
     let path = store.runs(&vm)?.join(n.to_string()).join(ASK);
     let ask: Ask = read_json(&path)?.ok_or_else(|| Error::NoRun(id.to_string()))?;
+    let run = load(store, &vm, n)?;
     Ok(Placed {
-        run: load(store, &vm, n)?,
+        generation: read_result(store, &vm, n)?.and_then(|r| r.generation),
+        run,
         dir: ask.dir,
         user: ask.user,
     })

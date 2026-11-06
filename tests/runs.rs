@@ -7,6 +7,7 @@ use common::{
     FakeApi, FakeSystemd, FakeVsock, Guest, debugfs, image, me, script, text, tree, wait_for,
 };
 use proptest::prelude::*;
+use runner::claude::{self, Vms};
 use runner::runs::{self, Line};
 use runner::store::Store;
 use serde_json::{Value, json};
@@ -1360,4 +1361,75 @@ fn a_run_without_a_session_yet_isn_t_taken_over() {
     assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
     t.wait_for("dev.1 has no Claude Code session yet");
     still_going(&vm, &id);
+}
+
+// A run that rolled back is taken over from its own disk: a copy goes on top
+// of dev's history, dev boots onto it, and the session's record is looked
+// for there. The fake guest's home has none, so the error names it.
+#[test]
+fn a_rolled_back_run_s_takeover_puts_its_disk_back_then_looks_for_its_session() {
+    let vm = vm(false);
+    let _boot = boot(&vm);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("break it");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+    vm.go(1, 3);
+    let row = vm.wait_until_ended(&id);
+    assert!(row.contains("  exited 3, rolled back  "), "{row}");
+    assert_eq!(runs::placed(&vm.store, &id).unwrap().generation, Some(1));
+    // What the run left on its disk, which dev's own doesn't have.
+    let gens = vm.dir.path().join("vms/dev/gens");
+    debugfs(&gens.join("1.ext4"), "rm /home/agent/work/old.rs");
+
+    let t = common::pty(24, 200);
+    let mut taking = t.spawn(vm.runner(&["claude", "--run", &id]));
+    assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
+    t.wait_for(
+        "runner: put dev.1's disk, generation 1, back on dev as generation 2: `runner undo dev` \
+         goes back",
+    );
+    t.wait_for(&format!(
+        "runner: dev.1's session isn't on dev's disk: {} has no \
+         ~/.claude/projects/*/{UUID}.jsonl there",
+        me()
+    ));
+    assert_eq!(vm.generation(), 2);
+    let disk = |g: u64| fs::read(gens.join(format!("{g}.ext4"))).unwrap();
+    assert!(disk(2) == disk(1) && disk(2) != disk(0));
+    assert_eq!(
+        stops_and_starts(&vm).last().map(String::as_str),
+        Some("start")
+    );
+    let listed = vm.ok(&["checkpoints", "dev"]);
+    let first = listed.lines().next().unwrap();
+    assert!(first.starts_with("* 2  "), "{listed}");
+    assert!(first.ends_with("  \"takeover of dev.1\""), "{listed}");
+    assert_eq!(vm.store.undo("dev").unwrap().generation, 0);
+}
+
+// The host's half: putting a rolled-back run's disk back waits for no run,
+// and once gc has dropped the disk, says so.
+#[test]
+fn a_rolled_back_run_s_disk_isn_t_put_back_under_a_run_or_once_gc_dropped_it() {
+    let vm = vm(false);
+    let _boot = boot(&vm);
+    let id = vm.start("break it");
+    wait_for("claude to start", || vm.started());
+    vm.go(0, 3);
+    vm.wait_until_ended(&id);
+    let host = claude::Host(&vm.store);
+    assert!(host.kept("dev", 1).unwrap());
+    let starting = runs::hold(&vm.store, "dev").unwrap();
+    let err = host.put_back("dev", 1, &id).unwrap_err().to_string();
+    assert_eq!(err, "dev already has a run starting: one run per VM");
+    drop(starting);
+    vm.store.clone().keeping(0).gc("dev", false).unwrap();
+    assert!(!host.kept("dev", 1).unwrap());
+    let err = host.put_back("dev", 1, &id).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "dev.1 rolled back, and its disk, dev's generation 1, is gone: gc dropped it at a \
+         later commit, and the session with it"
+    );
+    assert_eq!(vm.generation(), 0);
 }

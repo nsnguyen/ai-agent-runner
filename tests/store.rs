@@ -914,7 +914,10 @@ fn a_rolled_back_run_s_disk_goes_on_top_of_history_as_a_copy() {
     let run = store.begin_run("dev").unwrap();
     fs::write(&run.disk, b"rolled").unwrap();
     drop(run);
-    assert!(matches!(store.restore("dev", 2), Err(Error::NoCheckpoint(..))));
+    assert!(matches!(
+        store.restore("dev", 2),
+        Err(Error::NoCheckpoint(..))
+    ));
 
     let put = store.restore_generation("dev", 2, "takeover of dev.1");
     assert_eq!(put.unwrap(), vm("dev", 3, 6));
@@ -938,8 +941,14 @@ fn a_generation_gc_dropped_is_refused_by_number() {
     assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2]);
     let err = store.restore_generation("dev", 2, "takeover of dev.1");
     let err = err.unwrap_err();
-    assert!(matches!(&err, Error::NoGeneration(n, 2) if n == "dev"), "{err}");
-    assert_eq!(err.to_string(), "dev has no generation 2: gc has dropped it");
+    assert!(
+        matches!(&err, Error::NoGeneration(n, 2) if n == "dev"),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "dev has no generation 2: gc has dropped it"
+    );
     assert_eq!(store.get("dev").unwrap(), vm("dev", 1, 2));
     assert_eq!(on_disk(dir.path()), [1]);
     // Nor while something holds dev, its boot say.
