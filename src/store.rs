@@ -1167,6 +1167,12 @@ pub struct Locked {
 }
 
 impl Locked {
+    /// The VM's current disk, which nothing boots or writes while this is
+    /// held: what `keep` copies a try's work from (best.rs).
+    pub fn disk(&self) -> Result<PathBuf> {
+        Ok(disk_of(&self.dir, current(&self.dir)?))
+    }
+
     /// As Store::open_disks, under this lock, which stays held.
     pub fn open_disks(&self, checkpoints: bool) -> Result<Disks> {
         let dir = &self.dir;
