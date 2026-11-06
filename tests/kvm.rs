@@ -19,6 +19,7 @@
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
 // `a_process_lives_through_sleep_and_wake`,
 // `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
+// `a_sleeping_vm_lives_through_a_host_stop`,
 // `an_idle_vm_sleeps_and_exec_wakes_it`,
 // `an_open_proxy_keeps_its_vm_awake`,
 // `a_session_outlives_a_dropped_connection`,
@@ -1038,6 +1039,55 @@ fn a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote() {
     assert!(status.ends_with("  stopped\n"), "{status}");
     assert!(status.contains("  gen 1  "), "{status}");
     assert_eq!(sh("cat ~/before-sleep"), "kept\n");
+}
+
+// What a host stop does to a sleeping VM, without stopping the host: parked,
+// as runner-park.service parks it, its boot ends and its unit stops, and its
+// next start resumes it, every process and session where it was.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_sleeping_vm_lives_through_a_host_stop() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("park-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let unit = format!("firecracker@{name}.service");
+    let active = || {
+        let out = Command::new("systemctl")
+            .args(["is-active", &unit])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let pid = sh("setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!");
+    let pid = pid.trim().to_string();
+    sh("tmux new-session -d -s parked 'sleep 1000'");
+    ok(runner(&root, &["sleep", &name]));
+    let parked = ok(runner(&root, &["park", &name]));
+    assert_eq!(parked, format!("{name}  parked\n"));
+    eventually("its unit to stop", || active() == "inactive");
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.ends_with("  sleeping\n"), "{status}");
+
+    let began = Instant::now();
+    let started = ok(runner(&root, &["start", &name]));
+    let took = began.elapsed();
+    assert!(started.ends_with("  running\n"), "{started}");
+    assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
+    let sessions = ok(runner(&root, &["sessions", &name]));
+    assert!(
+        sessions.lines().any(|l| l.starts_with("parked  sleep  ")),
+        "{sessions}"
+    );
+    let logs = ok(runner(&root, &["logs", &name]));
+    let notes: Vec<&str> = logs.lines().filter(|l| l.contains(" resumed ")).collect();
+    assert_eq!(notes.len(), 1, "{logs}");
+    eprintln!("runner start of a parked VM took {took:?}; boot's note: {notes:?}");
 }
 
 // Sleep when idle: a minute unused and its boot puts it to sleep; an exec

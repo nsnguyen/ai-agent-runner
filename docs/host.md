@@ -52,10 +52,12 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
    sudo install release-$v-$a/firecracker-$v-$a /usr/local/bin/firecracker
    ```
 2. A guest kernel at `/var/lib/runner/kernel/vmlinux`. It needs `CONFIG_SERIO_I8042` and `CONFIG_KEYBOARD_ATKBD`, or Ctrl-Alt-Del never reaches the guest and every stop ends in a kill. Firecracker's CI kernels have both; its [getting started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) fetches one, and an Ubuntu rootfs.
-3. The unit, as the user that owns `/var/lib/runner`:
+3. The units, as the user that owns `/var/lib/runner`. The second parks each sleeping VM at a host shutdown, so it sleeps on through it:
    ```
    runner unit --user runner | sudo tee /etc/systemd/system/firecracker@.service
+   runner unit --park --user runner | sudo tee /etc/systemd/system/runner-park.service
    sudo systemctl daemon-reload
+   sudo systemctl enable --now runner-park.service
    ```
 4. That user in the `kvm` and `systemd-journal` groups, and allowed to start and stop `firecracker@*` units: a polkit rule, which #14 adds.
 5. NAT for the VMs' range, with a filter that drops what they open to the host itself (`host/nat.nft`), and `iproute2`. `host/install.sh` does both.

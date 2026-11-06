@@ -308,6 +308,7 @@ fn dev(host: &Host) -> (Checkpoint, Checkpoint) {
     let slept = Slept {
         generation: 1,
         at: Utc::now(),
+        parked: false,
     };
     snapshot.note(&slept).unwrap();
     let runs = store.runs("dev").unwrap();

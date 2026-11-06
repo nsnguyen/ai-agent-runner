@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// The systemd unit each VM runs under, as host/install.sh installs it.
 pub const UNIT: &str = include_str!("../host/firecracker@.service");
 pub const UNIT_PATH: &str = "/etc/systemd/system/firecracker@.service";
+/// The unit that parks each sleeping VM at a host shutdown (src/sleep.rs), as
+/// host/install.sh installs it.
+pub const PARK_UNIT: &str = include_str!("../host/runner-park.service");
 
 /// The unit that loads the VMs' NAT rules into the nftables table `ip runner`,
 /// and the rules that keep their IPv6 off the host into `ip6 runner`.

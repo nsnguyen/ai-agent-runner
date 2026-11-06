@@ -207,6 +207,10 @@ enum Cmd {
         /// The user VMs run as, who owns the root.
         #[arg(long, env = "USER")]
         user: String,
+        /// Print runner-park.service instead, which parks each sleeping VM
+        /// at a host shutdown, so it sleeps on through it.
+        #[arg(long)]
+        park: bool,
     },
     /// Show or set which credentials a VM gets at boot: claude, github.
     /// A VM gets claude until told otherwise.
@@ -388,6 +392,18 @@ enum Cmd {
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
     Halt { name: String },
+    /// Park sleeping VMs, as at a host shutdown: each one's boot ends,
+    /// leaving its snapshot and disk for its next start to resume.
+    /// runner-park.service's ExecStop.
+    #[command(hide = true)]
+    Park {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        names: Vec<String>,
+        /// Every VM with a boot up, at once. One awake isn't parked: its
+        /// unit's stop shuts it down cleanly.
+        #[arg(long)]
+        all: bool,
+    },
     /// Hold a VM in use, starting it unless it's running, until stdout's far
     /// end closes: what the laptop's `runner proxy` runs here beside its
     /// tunnel, so the VM doesn't idle-sleep under it.
@@ -644,10 +660,15 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             };
             return Ok(attach(|| Ok(exec::open(&store, &name)?), &req));
         }
-        Cmd::Unit { user } => {
+        Cmd::Unit { user, park } => {
             let exe = std::env::current_exe()?;
             let root = std::path::absolute(root)?;
-            print!("{}", systemd::render_unit(&exe, &root, &user)?);
+            let render = if park {
+                systemd::render_park_unit
+            } else {
+                systemd::render_unit
+            };
+            print!("{}", render(&exe, &root, &user)?);
         }
         Cmd::Creds { name, creds, none } => {
             let got = if none || !creds.is_empty() {
@@ -725,6 +746,13 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             }
         }
         Cmd::Halt { name } => runner::boot::halt(&store, &name)?,
+        Cmd::Park { names, all: false } => {
+            for name in names {
+                runner::sleep::park(&store, &name)?;
+                println!("{name}  parked");
+            }
+        }
+        Cmd::Park { all: true, .. } => park_all(&store)?,
         Cmd::Hold { name } => exec::hold(&store, &name, std::io::stdout())?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
         Cmd::Peer => return peer(root, store),
@@ -880,6 +908,31 @@ fn absolute_kernel(path: PathBuf) -> Result<PathBuf, String> {
 
 fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
+}
+
+// At a host shutdown, all at once, since each park syncs its VM's memory
+// file and the unit's stop has a deadline: each VM whose boot is up is asked,
+// and one that isn't parked is shut down cleanly by its unit's stop, as ever.
+// The VMs' units stop next whatever this says, so it fails only if it can't
+// list them.
+fn park_all(store: &Store) -> Result<(), Box<dyn Error>> {
+    let vms = store.list()?;
+    let parks: Vec<_> = std::thread::scope(|s| {
+        let parks: Vec<_> = vms
+            .iter()
+            .map(|vm| s.spawn(|| runner::sleep::park(store, &vm.name)))
+            .collect();
+        parks.into_iter().map(|p| p.join()).collect()
+    });
+    for (vm, park) in vms.iter().zip(parks) {
+        match park {
+            Ok(Ok(())) => println!("{}  parked", vm.name),
+            Ok(Err(runner::sleep::Error::NoBoot(_))) => {}
+            Ok(Err(e)) => println!("{}  not parked: {e}", vm.name),
+            Err(_) => println!("{}  not parked: its park panicked", vm.name),
+        }
+    }
+    Ok(())
 }
 
 // One VM failing, say because another command holds it, doesn't stop the

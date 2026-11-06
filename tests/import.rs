@@ -143,6 +143,7 @@ fn replace_is_refused_while_base_is_up() {
     let slept = Slept {
         generation: 0,
         at: Utc::now(),
+        parked: false,
     };
     snapshot.note(&slept).unwrap();
     let err = host.fails(&["import", "--replace", "base", &new]);

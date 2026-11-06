@@ -61,7 +61,12 @@ impl Host {
         let snap = self.store.snapshot("dev").unwrap();
         snap.make_room().unwrap();
         let at = chrono::Utc::now();
-        snap.note(&Slept { generation, at }).unwrap();
+        snap.note(&Slept {
+            generation,
+            at,
+            parked: false,
+        })
+        .unwrap();
     }
 }
 
@@ -198,4 +203,90 @@ fn restore_drops_the_snapshot_and_starts_the_vm_again() {
     );
     // The boot's disk was committed at the stop, so undo goes back to it.
     assert_eq!(h.store.undo("dev").unwrap().generation, 1);
+}
+
+// Parked at a host shutdown (tests/boot.rs): its boot has gone, its unit is
+// stopped, and it sleeps on in its snapshot until its next boot resumes it,
+// which here clears the snapshot, as a resume does.
+impl Host {
+    fn parked(&self, generation: u64) {
+        self.sd.set_state("inactive");
+        let snap = self.store.snapshot("dev").unwrap();
+        snap.make_room().unwrap();
+        let at = chrono::Utc::now();
+        snap.note(&Slept {
+            generation,
+            at,
+            parked: true,
+        })
+        .unwrap();
+        let note = snap.mem().with_file_name("slept.json");
+        script(
+            &self.sd.bin.join("on-start"),
+            &format!("rm -f '{}'\n", note.display()),
+        );
+    }
+
+    fn verbs(&self) -> Vec<String> {
+        let calls = self.sd.calls().into_iter();
+        calls.filter(|c| !c.contains(" show ")).collect()
+    }
+}
+
+#[test]
+fn a_parked_vm_is_sleeping_and_wake_starts_it() {
+    let h = host();
+    h.parked(1);
+    assert!(h.ok(&["status", "dev"]).ends_with("  sleeping\n"));
+    // Asleep already.
+    assert!(h.ok(&["sleep", "dev"]).ends_with("  sleeping\n"));
+    assert!(h.verbs().is_empty(), "{:?}", h.verbs());
+    let woke = h.ok(&["wake", "dev"]);
+    assert_eq!(woke, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(h.verbs(), ["systemctl start firecracker@dev.service"]);
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+}
+
+#[test]
+fn start_resumes_a_parked_vm() {
+    let h = host();
+    h.parked(1);
+    let started = h.ok(&["start", "dev"]);
+    assert_eq!(started, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(h.verbs(), ["systemctl start firecracker@dev.service"]);
+}
+
+// Only a host shutdown parks: a stop resumes a parked VM, to shut it down
+// cleanly, as it wakes a sleeping one.
+#[test]
+fn stop_resumes_a_parked_vm_to_shut_it_down() {
+    let h = host();
+    h.parked(1);
+    let stopped = h.ok(&["stop", "dev"]);
+    assert!(stopped.ends_with("  stopped\n"), "{stopped}");
+    assert_eq!(
+        h.verbs(),
+        [
+            "systemctl start firecracker@dev.service",
+            "systemctl stop firecracker@dev.service"
+        ]
+    );
+}
+
+// Nothing holds it, but it's busy as a sleeping VM is: undo, gc and delete
+// would take its disk from under its snapshot.
+#[test]
+fn undo_gc_and_delete_refuse_a_parked_vm() {
+    let h = host();
+    h.parked(1);
+    for args in [&["undo", "dev"][..], &["gc", "dev"], &["delete", "dev"]] {
+        let err = h.fails(args);
+        assert!(
+            err.contains("dev is busy: it's running or sleeping"),
+            "{args:?}: {err}"
+        );
+    }
+    let swept = h.ok(&["gc"]);
+    assert_eq!(swept, "dev  skipped: sleeping\n");
+    assert!(h.store.sleeping("dev").unwrap().unwrap().parked);
 }
