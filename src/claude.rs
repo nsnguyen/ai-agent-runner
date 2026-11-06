@@ -4,8 +4,15 @@
 // to run claude only if it isn't there. So a dropped connection detaches it,
 // the next `runner claude` reattaches, and a VM never runs two. Claude Code
 // gets the VM's credentials as every command does (src/creds.rs).
+//
+// `runner claude --run dev.1` takes a headless run that's going over: once
+// the run has stopped its `claude -p` (runs.rs, take_over), which leaves dev
+// up, its session goes on in that same claude session, as `claude --resume`
+// in the run's directory, as the run's user. From there it's an ordinary
+// `runner claude` session.
 use crate::exec;
 use crate::proto::{Exit, Request, WinSize};
+use crate::runs;
 use crate::sessions;
 use crate::store::{self, Store};
 use crate::systemd::{self, State};
@@ -26,6 +33,35 @@ pub enum Error {
     Sessions(#[from] sessions::Error),
     #[error(transparent)]
     Exec(#[from] exec::Error),
+    #[error(transparent)]
+    Runs(#[from] runs::Error),
+    #[error(
+        "{id} has no Claude Code session yet, so there's none to resume: `runner runs {vm}` \
+         shows it once Claude Code has named it"
+    )]
+    NoSession { id: String, vm: String },
+    #[error(
+        "{vm} already has a claude session, which the run's would replace: `runner kill {vm} \
+         claude` ends it"
+    )]
+    SessionThere { vm: String },
+    #[error("{id} has already ended: {how}")]
+    Ended { id: String, how: String },
+    #[error(
+        "{id}'s Claude Code ended on its own before the takeover stopped it, so nothing was \
+         opened: {how}"
+    )]
+    EndedFirst { id: String, how: String },
+    #[error(
+        "{id} is still stopping: once `runner runs {vm}` says it's taken over, `runner claude \
+         {vm} --dir {dir} -- --resume {session}` carries its session on"
+    )]
+    StillStopping {
+        id: String,
+        vm: String,
+        dir: String,
+        session: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -41,6 +77,51 @@ pub trait Vms {
     fn has_session(&self, vm: &str, user: &str, session: &str) -> Result<bool>;
     /// This terminal on `req` in the VM, until it exits or detaches.
     fn attach(&self, vm: &str, req: &Request) -> Result<Exit>;
+    /// The headless run with this id.
+    fn run(&self, id: &str) -> Result<Run>;
+    /// Stops the run's Claude Code, leaving its VM up, and returns the run
+    /// once it has ended, or as it stands after two minutes.
+    fn take_over(&self, id: &str) -> Result<Run>;
+}
+
+/// A headless run, as a takeover needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub id: String,
+    pub vm: String,
+    pub state: runs::State,
+    /// How it stands, in a few words: runs::describe.
+    pub how: String,
+    /// Its Claude Code session, once Claude Code has named it.
+    pub session: Option<String>,
+    /// Where its Claude Code runs, and as whom.
+    pub dir: String,
+    pub user: String,
+}
+
+impl From<runs::Placed> for Run {
+    fn from(p: runs::Placed) -> Run {
+        Run {
+            how: runs::describe(&p.run),
+            id: p.run.id,
+            vm: p.run.vm,
+            state: p.run.state,
+            session: p.run.session,
+            dir: p.dir,
+            user: p.user,
+        }
+    }
+}
+
+/// One `runner claude --run`.
+pub struct TakeOver {
+    /// The run's id, like dev.1.
+    pub run: String,
+    /// For claude, after `--resume <session>`.
+    pub args: Vec<String>,
+    /// For the guest's terminal: TERM.
+    pub env: Vec<(String, String)>,
+    pub size: WinSize,
 }
 
 /// One `runner claude`.
@@ -99,6 +180,71 @@ pub fn open(vms: &impl Vms, c: &Claude, notes: &mut impl Write) -> Result<Exit> 
     vms.attach(vm, &req)
 }
 
+/// Takes a run that's going over: checks it has a session to resume and
+/// that its VM has no claude session for it to clash with, then stops its
+/// Claude Code, leaving the VM up, and attaches this terminal to `claude
+/// --resume <session>` in the VM's claude session, in the run's directory,
+/// as its user. Nothing stops unless every check passes.
+pub fn take_over(vms: &impl Vms, t: &TakeOver, notes: &mut impl Write) -> Result<Exit> {
+    let run = vms.run(&t.run)?;
+    if run.state != runs::State::Running {
+        return Err(Error::Ended {
+            id: run.id,
+            how: run.how,
+        });
+    }
+    let Some(session) = run.session.clone() else {
+        return Err(Error::NoSession {
+            id: run.id,
+            vm: run.vm,
+        });
+    };
+    if vms.has_session(&run.vm, &run.user, SESSION)? {
+        return Err(Error::SessionThere { vm: run.vm });
+    }
+    note(notes, &format!("stopping {}'s claude -p", run.id));
+    let ended = vms.take_over(&run.id)?;
+    match ended.state {
+        runs::State::TakenOver => {}
+        runs::State::Running => {
+            return Err(Error::StillStopping {
+                id: run.id,
+                vm: run.vm,
+                dir: run.dir,
+                session,
+            });
+        }
+        _ => {
+            return Err(Error::EndedFirst {
+                id: ended.id,
+                how: ended.how,
+            });
+        }
+    }
+    let vm = &run.vm;
+    note(
+        notes,
+        &format!(
+            "{} is taken over: its session goes on in {vm}'s claude session, which `runner \
+             claude {vm}` reattaches",
+            run.id
+        ),
+    );
+    let argv: Vec<String> = ["claude", "--resume", &session]
+        .into_iter()
+        .map(String::from)
+        .chain(t.args.iter().cloned())
+        .collect();
+    let req = Request {
+        argv: sessions::attach_or_run(SESSION, &run.dir, &argv),
+        env: t.env.clone(),
+        cwd: Some(run.dir.clone()),
+        user: Some(run.user.clone()),
+        tty: Some(t.size),
+    };
+    vms.attach(vm, &req)
+}
+
 // Said before tmux takes the screen, and seen again after a detach.
 fn note(notes: &mut impl Write, what: &str) {
     let _ = writeln!(notes, "runner: {what}");
@@ -146,5 +292,14 @@ impl Vms for Host<'_> {
             in_use: _in_use,
         } = exec::open(self.0, vm)?;
         Ok(exec::attach(stream, req)?)
+    }
+
+    fn run(&self, id: &str) -> Result<Run> {
+        Ok(runs::placed(self.0, id)?.into())
+    }
+
+    fn take_over(&self, id: &str) -> Result<Run> {
+        runs::take_over(self.0, id)?;
+        self.run(id)
     }
 }

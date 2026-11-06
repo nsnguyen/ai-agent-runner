@@ -3,8 +3,9 @@
 mod common;
 
 use common::{FakeSystemd, text};
-use runner::claude::{self, Claude, DIR, SESSION, Vms};
+use runner::claude::{self, Claude, DIR, Run, SESSION, TakeOver, Vms};
 use runner::proto::{Exit, Request, WinSize};
+use runner::runs::State;
 use runner::sessions;
 use runner::store::{self, Store};
 use std::cell::RefCell;
@@ -12,11 +13,15 @@ use std::fs;
 use std::process::{Command, Stdio};
 
 // VMs by name, each running or not, and whether a running one has a claude
-// session. Each call is logged; a call named in `fail` fails.
+// session. Each call is logged; a call named in `fail` fails. `run` is the
+// headless run there is, and `ends` how a takeover leaves it: taken over
+// unless set.
 #[derive(Default)]
 struct Fake {
     vms: RefCell<Vec<(String, bool)>>,
     session: bool,
+    run: Option<Run>,
+    ends: Option<Run>,
     fail: Option<&'static str>,
     calls: RefCell<Vec<String>>,
     attached: RefCell<Option<Request>>,
@@ -87,6 +92,21 @@ impl Vms for Fake {
         assert!(self.running(vm).unwrap(), "attached to stopped {vm}");
         *self.attached.borrow_mut() = Some(req.clone());
         Ok(Exit::Code(0))
+    }
+
+    fn run(&self, id: &str) -> claude::Result<Run> {
+        self.call("run", format!("run {id}"))?;
+        Ok(self.run.clone().expect("no run"))
+    }
+
+    fn take_over(&self, id: &str) -> claude::Result<Run> {
+        self.call("take_over", format!("take_over {id}"))?;
+        let taken = Run {
+            state: State::TakenOver,
+            how: "taken over".to_string(),
+            ..self.run.clone().expect("no run")
+        };
+        Ok(self.ends.clone().unwrap_or(taken))
     }
 }
 
@@ -316,4 +336,174 @@ fn the_host_s_vms_are_the_store_s() {
     host.create("dev", "base").unwrap();
     let missing = host.create("dev-2", "nope").unwrap_err().to_string();
     assert_eq!(missing, "no VM named nope");
+}
+
+const UUID: &str = "0f8b2c4e-1a2b-4c3d-9e8f-123456789abc";
+
+// dev.1, going, with its session named, in a directory of its own.
+fn going() -> Run {
+    Run {
+        id: "dev.1".to_string(),
+        vm: "dev".to_string(),
+        state: State::Running,
+        how: "running".to_string(),
+        session: Some(UUID.to_string()),
+        dir: "/home/agent/src".to_string(),
+        user: "me".to_string(),
+    }
+}
+
+fn take(args: &[&str]) -> TakeOver {
+    TakeOver {
+        run: "dev.1".to_string(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        env: vec![("TERM".to_string(), "xterm-kitty".to_string())],
+        size: SIZE,
+    }
+}
+
+fn take_over(fake: &Fake, t: &TakeOver) -> (String, claude::Result<Exit>) {
+    let mut notes = Vec::new();
+    let got = claude::take_over(fake, t, &mut notes);
+    (text(&notes), got)
+}
+
+// `runner claude --run dev.1`: once the run's claude -p has stopped, its
+// session goes on in dev's claude session, in the run's directory, as its
+// user, with the arguments after `--`.
+#[test]
+fn a_run_taken_over_resumes_its_session_where_it_ran() {
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(going());
+    let t = take(&["--model", "opus"]);
+    let (notes, got) = take_over(&fake, &t);
+    assert_eq!(got.unwrap(), Exit::Code(0));
+    assert_eq!(
+        fake.calls(),
+        [
+            "run dev.1",
+            "has_session dev me claude",
+            "take_over dev.1",
+            "attach dev"
+        ]
+    );
+    let argv = ["claude", "--resume", UUID, "--model", "opus"].map(String::from);
+    let want = Request {
+        argv: sessions::attach_or_run(SESSION, "/home/agent/src", &argv),
+        env: t.env.clone(),
+        cwd: Some("/home/agent/src".to_string()),
+        user: Some("me".to_string()),
+        tty: Some(SIZE),
+    };
+    assert_eq!(fake.attached(), want);
+    assert_eq!(
+        notes,
+        "runner: stopping dev.1's claude -p\n\
+         runner: dev.1 is taken over: its session goes on in dev's claude session, \
+         which `runner claude dev` reattaches\n"
+    );
+}
+
+// Each is checked before anything stops, so a refused takeover leaves the
+// run going.
+#[test]
+fn a_takeover_is_refused_before_the_run_is_stopped() {
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(Run {
+        session: None,
+        ..going()
+    });
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        "dev.1 has no Claude Code session yet, so there's none to resume: \
+         `runner runs dev` shows it once Claude Code has named it"
+    );
+    assert_eq!(fake.calls(), ["run dev.1"]);
+
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(going());
+    fake.session = true;
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        "dev already has a claude session, which the run's would replace: \
+         `runner kill dev claude` ends it"
+    );
+    assert_eq!(fake.calls(), ["run dev.1", "has_session dev me claude"]);
+
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(Run {
+        state: State::Exited,
+        how: "exited 0, committed".to_string(),
+        ..going()
+    });
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        "dev.1 has already ended: exited 0, committed"
+    );
+    assert_eq!(fake.calls(), ["run dev.1"]);
+}
+
+// Claude Code can exit on its own while the takeover waits on it: then the
+// run ends as it would have, and nothing is opened.
+#[test]
+fn a_run_whose_claude_code_ends_first_isn_t_resumed() {
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(going());
+    fake.ends = Some(Run {
+        state: State::Exited,
+        how: "exited 0, committed".to_string(),
+        ..going()
+    });
+    let (notes, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        "dev.1's Claude Code ended on its own before the takeover stopped it, \
+         so nothing was opened: exited 0, committed"
+    );
+    assert_eq!(
+        fake.calls(),
+        ["run dev.1", "has_session dev me claude", "take_over dev.1"]
+    );
+    assert_eq!(notes, "runner: stopping dev.1's claude -p\n");
+
+    // Or it's still stopping when the takeover gives up waiting.
+    fake.ends = Some(going());
+    fake.calls.borrow_mut().clear();
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        format!(
+            "dev.1 is still stopping: once `runner runs dev` says it's taken over, \
+             `runner claude dev --dir /home/agent/src -- --resume {UUID}` carries its session on"
+        )
+    );
+    assert!(!fake.calls().contains(&"attach dev".to_string()));
+}
+
+// A takeover names no VM, nor where or what a new one forks: the run says.
+#[test]
+fn run_takes_no_vm_from_or_dir() {
+    for args in [
+        &["claude", "dev", "--run", "dev.1"][..],
+        &["claude", "--run", "dev.1", "--from", "base"],
+        &["claude", "--run", "dev.1", "--dir", "/tmp"],
+        &["claude"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_runner"))
+            .env("RUNNER_ROOT", dir.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
 }

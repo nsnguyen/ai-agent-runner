@@ -17,6 +17,8 @@
 //   <vm>/runs/<n>/log       what the driving process itself printed
 //   <vm>/runs/<n>/cancel    there once someone has asked to cancel the run,
 //                           until Claude Code is done
+//   <vm>/runs/<n>/takeover  there once `runner claude --run` has asked to
+//                           take the run over, until Claude Code is done
 //   <vm>/runs/<n>/result.json  what the runner measured once it was over
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
@@ -41,6 +43,15 @@
 // to be running a while after Claude Code exits, until it's measured or a
 // cancel stops the measuring. A cancel that stopped Claude Code doesn't: a
 // cancelled run is measured too.
+//
+// A takeover (`runner claude --run`, claude.rs) stops Claude Code as a
+// cancel does, then leaves the VM up, on the run's disk, for the session to
+// carry on in interactively. So it shuts nothing down and rolls nothing
+// back. A run that booted the VM takes back its ask to roll back, so the
+// VM's next clean shutdown commits the run's writes and the session's
+// together, as any boot does. One that joined it keeps its checkpoint. The
+// run ends taken over, with no outcome and nothing measured: the disk is
+// still in use.
 use crate::changes;
 use crate::checkpoint;
 use crate::exec::{self, Streamed};
@@ -98,6 +109,7 @@ const STREAM: &str = "stream";
 const STDERR: &str = "stderr";
 const LOG: &str = "log";
 const CANCEL: &str = "cancel";
+const TAKEOVER: &str = "takeover";
 const RESULT: &str = "result.json";
 const END: &str = "end.json";
 
@@ -154,6 +166,11 @@ pub enum State {
     Exited,
     /// Cancelled before Claude Code exited on its own.
     Cancelled,
+    /// Taken over by `runner claude --run` before Claude Code exited on its
+    /// own: its session goes on in the VM's claude tmux session, and the VM
+    /// runs on, on the run's disk, so nothing was committed or rolled back.
+    #[serde(rename = "taken_over")]
+    TakenOver,
     /// It couldn't run, or lost its VM partway: error says why.
     Failed,
     /// The process driving it died before it could say how it ended.
@@ -166,6 +183,7 @@ impl fmt::Display for State {
             State::Running => "running",
             State::Exited => "exited",
             State::Cancelled => "cancelled",
+            State::TakenOver => "taken over",
             State::Failed => "failed",
             State::Lost => "lost",
         })
@@ -194,11 +212,12 @@ pub struct AgentRun {
     /// For a run that booted its VM, once the VM is down: whether the disk
     /// generation it ran was committed or rolled back. For one that joined
     /// it running: not rolled back if it failed or was cancelled once Claude
-    /// Code had started, which left the VM as it was.
+    /// Code had started, which left the VM as it was. None for a run taken
+    /// over, whose VM runs on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
-    /// For a run that joined its VM running, once it's over: the checkpoint
-    /// it took first, which `restore` brings back.
+    /// For a run that joined its VM running, once it's over, taken over
+    /// too: the checkpoint it took first, which `restore` brings back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<u64>,
     /// What went wrong, if anything did.
@@ -238,6 +257,9 @@ struct End {
     exit_code: Option<i32>,
     signal: Option<i32>,
     cancelled: bool,
+    // Missing from the end of a run from before takeovers.
+    #[serde(default)]
+    taken_over: bool,
     outcome: Option<Outcome>,
     // Missing from the end of a run from before it was noted here.
     #[serde(default)]
@@ -248,6 +270,9 @@ struct End {
 impl End {
     fn state(&self) -> State {
         match self {
+            End {
+                taken_over: true, ..
+            } => State::TakenOver,
             End {
                 cancelled: true, ..
             } => State::Cancelled,
@@ -435,10 +460,14 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
     let ask: Ask = read_json(&dir.join(ASK))?.ok_or_else(|| Error::NoRun(run_id.clone()))?;
     let mut gens = Gens::default();
     let ran = run_claude(store, vm, &run_id, &dir, &ask, program, &mut gens);
+    let (cancel, takeover) = (dir.join(CANCEL), dir.join(TAKEOVER));
     let mut end = End::default();
     match ran {
         Ok(Streamed { exit, stopped }) => {
-            end.cancelled = stopped;
+            // Stopped for a takeover only if nobody asked to cancel: a
+            // cancel asked for too rolls back as it says.
+            end.taken_over = stopped && !cancel.exists() && takeover.exists();
+            end.cancelled = stopped && !end.taken_over;
             match exit {
                 Some(Exit::Code(code)) => end.exit_code = Some(code),
                 Some(Exit::Signal(sig)) => end.signal = Some(sig),
@@ -449,17 +478,32 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
     }
     // Claude Code is done, so a cancel asked for by now was for it, even one
     // whose run then failed: only a cancel asked for after that stops the
-    // measuring.
-    let cancel = dir.join(CANCEL);
-    match fs::remove_file(&cancel) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            eprintln!("runner: removing {}: {e}", cancel.display());
+    // measuring. A takeover asked for since finds the run ending as it would.
+    for mark in [&cancel, &takeover] {
+        match fs::remove_file(mark) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                eprintln!("runner: removing {}: {e}", mark.display());
+            }
+            _ => {}
         }
-        _ => {}
     }
     // A disk the VM may still be writing isn't measured.
     let mut down = true;
-    if ask.boots {
+    if end.taken_over {
+        // The VM runs on for the session, and commits at its next clean
+        // shutdown, as any boot does, unless the run's ask to roll back
+        // stays.
+        down = false;
+        if ask.boots
+            && let Err(e) = store.withdraw_rollback(vm)
+        {
+            eprintln!("runner: {e}");
+            end.error.get_or_insert(format!(
+                "taking back the run's ask to roll back, so {vm}'s next shutdown rolls \
+                 back: {e}"
+            ));
+        }
+    } else if ask.boots {
         let clean = end.exit_code == Some(0) && !end.cancelled && end.error.is_none();
         if let Err(e) = shut_down(store, vm, &run_id, clean) {
             eprintln!("runner: {e}");
@@ -506,7 +550,16 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         from_generation: gens.booted.map(|b| b.from).or(gens.from),
         generation: gens.booted.map(|b| b.generation),
         checkpoint: gens.checkpoint,
-        changed: changed(store, vm, &ask, &gens, down, &|| cancel.exists()),
+        changed: if end.taken_over {
+            Changed::Unmeasured {
+                error: format!(
+                    "taken over: {vm} runs on, on the run's disk, so what the run changed \
+                     isn't measured"
+                ),
+            }
+        } else {
+            changed(store, vm, &ask, &gens, down, &|| cancel.exists())
+        },
         agent_says: agent_says(&dir.join(STREAM)),
     };
     // Without its end, a run would look lost, how it ended and all.
@@ -597,7 +650,7 @@ fn run_claude(
     program: &str,
     gens: &mut Gens,
 ) -> Result<Streamed> {
-    let cancel = dir.join(CANCEL);
+    let (cancel, takeover) = (dir.join(CANCEL), dir.join(TAKEOVER));
     let cancelled = || cancel.exists();
     let stopped = Streamed {
         exit: None,
@@ -659,7 +712,10 @@ fn run_claude(
     let (mut out, mut err) = (append(STREAM)?, append(STDERR)?);
     let prompt = ask.prompt.as_bytes();
     gens.ran = true;
-    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, cancelled, GRACE);
+    // A takeover needs Claude Code's session, so it comes only once Claude
+    // Code is running.
+    let stop = || cancelled() || takeover.exists();
+    let streamed = exec::stream(conn, &req, prompt, &mut out, &mut err, stop, GRACE);
     // The guest couldn't start claude, so nothing ran.
     if let Err(exec::Error::Guest(_)) = &streamed {
         gens.ran = false;
@@ -960,13 +1016,49 @@ fn event(line: &Line) -> Option<Value> {
 /// Asks the run to stop, and returns it once it has ended, or as it stands
 /// if it's still going after two minutes.
 pub fn cancel(store: &Store, id: &str) -> Result<AgentRun> {
+    ask_to_stop(store, id, CANCEL)
+}
+
+/// Takes the run over, for `runner claude --run`: stops its Claude Code as
+/// a cancel does, but leaves its VM up and its disk as it is, for the
+/// session to carry on in. Returns the run once it has ended, or as it
+/// stands if it's still going after two minutes. A run whose Claude Code
+/// exits on its own first ends as it would have, not taken over.
+pub fn take_over(store: &Store, id: &str) -> Result<AgentRun> {
+    ask_to_stop(store, id, TAKEOVER)
+}
+
+/// A run, with where its Claude Code runs and as whom: what a takeover
+/// carries its session on with.
+#[derive(Debug, Clone)]
+pub struct Placed {
+    pub run: AgentRun,
+    pub dir: String,
+    pub user: String,
+}
+
+/// The run with this id, and where its Claude Code runs.
+pub fn placed(store: &Store, id: &str) -> Result<Placed> {
+    let (vm, n) = parse_id(id)?;
+    let path = store.runs(&vm)?.join(n.to_string()).join(ASK);
+    let ask: Ask = read_json(&path)?.ok_or_else(|| Error::NoRun(id.to_string()))?;
+    Ok(Placed {
+        run: load(store, &vm, n)?,
+        dir: ask.dir,
+        user: ask.user,
+    })
+}
+
+// Leaves `mark` for the process driving the run, which stops Claude Code on
+// it, and waits for the run to end.
+fn ask_to_stop(store: &Store, id: &str, mark: &str) -> Result<AgentRun> {
     let (vm, n) = parse_id(id)?;
     let run = load(store, &vm, n)?;
     if run.state != State::Running {
         let how = describe(&run);
         return Err(Error::Ended { id: run.id, how });
     }
-    let path = store.runs(&vm)?.join(n.to_string()).join(CANCEL);
+    let path = store.runs(&vm)?.join(n.to_string()).join(mark);
     fs::write(&path, "").map_err(io_err(format!("writing {}", path.display())))?;
     let deadline = Instant::now() + CANCEL_WAIT;
     loop {
@@ -996,6 +1088,11 @@ pub fn describe(run: &AgentRun) -> String {
         (Some(Outcome::NotRolledBack), ..) => match run.checkpoint {
             Some(id) => format!(", not rolled back, checkpoint {id} undoes it"),
             None => ", not rolled back".to_string(),
+        },
+        // It ran on the VM as it was, and the VM runs on.
+        (None, false, State::TakenOver) => match run.checkpoint {
+            Some(id) => format!(", checkpoint {id} undoes it"),
+            None => ", joined".to_string(),
         },
         (None, false, _) => ", joined".to_string(),
         (None, true, _) => String::new(),
