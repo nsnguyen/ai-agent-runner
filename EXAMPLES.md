@@ -142,16 +142,20 @@ demo carries on while it's exported: the disk is a copy made with demo paused fo
 ## 9. More than one server
 
 ```sh
-runner hosts add runner@kvm-host-2   # once the second server is set up
+RUNNER_AWS_NAME=kvm-host-2 client/aws.sh up   # make a second server, set up like the first
+runner hosts add runner@kvm-host-2   # then add it: the servers learn each other's keys
 runner hosts                         # each server: its VMs, how many are up, its free memory
 runner create demo3                  # goes to the server with the most free memory
 runner list                          # every server's VMs, each line led by its server
 runner shell demo3                   # finds demo3's server for you
 runner create demo4 --host kvm-host  # or pick the server yourself
 runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
+RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop  # it costs too: stop it when you're done
 ```
 
-A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed.
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed. Every `client/aws.sh` command takes `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, it means `kvm-host`.
+
+Each server runs the build it was last given, and only `kvm-host` gets a new one from `client/check.sh`. After an update, give the second one the same build (README.md, After merging a change), so a move or Claude reaching across servers finds the same `runner` on both.
 
 `move` keeps the name, your checkpoints, its settings, services and credentials. A running demo3 is shut down first, which ends what runs in it, and started again on the new server; its address and URL change, so it prints the new URL. The copy goes straight from server to server, and demo3 leaves the old one only once the new one has it all, so a move cut off halfway leaves it where it was.
 
@@ -172,6 +176,7 @@ client/aws.sh stop     # turn the server off
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |
+| `kvm-host-2 didn't answer: … Permission denied (publickey)`, from a move or Claude | The servers don't trust each other yet, say because one had an older build when you added the other: `runner hosts add runner@kvm-host-2` again. It says if a server needs a new build first |
 | `administratively prohibited` from `runner proxy` | Add `port-forwarding` to the laptop's key line on the server (README.md, Add the laptop's key) |
 
 More detail: README.md.
