@@ -117,9 +117,10 @@ fn without_ip6(rules: &str) -> String {
     format!("{}{}", &rules[..start], &rules[end..])
 }
 
-const NAMES: [&str; 9] = [
+const NAMES: [&str; 10] = [
     "kvm",
     "firecracker",
+    "e2fsprogs",
     "reflink",
     "kernel",
     "base",
@@ -146,6 +147,15 @@ fn version() -> String {
 
 fn key() -> String {
     format!("{HOME}/.ssh/id_ed25519")
+}
+
+// What `runner resize` grows a disk with, by full path as debugfs is.
+fn e2fsck() -> String {
+    format!("{} -V", host::E2FSCK)
+}
+
+fn resize2fs() -> String {
+    host::RESIZE2FS.to_string()
 }
 
 // An ed25519 public key's base64: its type's name first.
@@ -204,6 +214,8 @@ impl Fake {
         ];
         let runs = [
             (version(), ran(true, &pinned, "")),
+            (e2fsck(), ran(true, "", "e2fsck 1.47.0 (5-Feb-2023)\n")),
+            (resize2fs(), ran(false, "", "resize2fs 1.47.0 (5-Feb-2023)\nUsage: ...\n")),
             (
                 "systemctl is-active runner-nat.service".to_string(),
                 ran(true, "active\n", ""),
@@ -348,6 +360,23 @@ fn firecracker_fails_when_missing_or_not_the_pinned_version() {
     assert!(verdict(&report, "firecracker").1.contains(pinned));
     let broken = fake().cmd(line, ran(false, "", "Illegal instruction"));
     assert_verdict(broken, &store, "firecracker", Status::Fail, "Illegal");
+}
+
+// VMs run without them; only resize and create --disk need them.
+#[test]
+fn e2fsprogs_warns_when_a_disk_can_t_grow() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let report = doctor::check(&fake(), &store);
+    let detail = verdict(&report, "e2fsprogs").1;
+    assert!(detail.contains("e2fsck 1.47.0"), "{detail}");
+    let missing = fake().cmd(&e2fsck(), Err(ErrorKind::NotFound));
+    assert_verdict(missing, &store, "e2fsprogs", Status::Warn, host::E2FSCK);
+    let missing = fake().cmd(&resize2fs(), Err(ErrorKind::NotFound));
+    let report = assert_verdict(missing, &store, "e2fsprogs", Status::Warn, host::RESIZE2FS);
+    assert!(verdict(&report, "e2fsprogs").1.contains("install.sh"));
+    let denied = fake().cmd(&e2fsck(), Err(ErrorKind::PermissionDenied));
+    assert_verdict(denied, &store, "e2fsprogs", Status::Warn, host::E2FSCK);
 }
 
 #[test]

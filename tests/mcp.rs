@@ -135,6 +135,7 @@ fn lists_its_tools() {
             "read_session",
             "rebase_vm",
             "remove_service",
+            "resize_vm",
             "restore_vm",
             "run_agent",
             "run_best_of",
@@ -192,7 +193,7 @@ fn create_then_list() {
     let mut s = start(dir.path());
     let made = s.call(2, "create_vm", json!({"name": "dev"}));
     assert_eq!(made["isError"], json!(false), "{made}");
-    let dev = json!({"name": "dev", "generation": 0, "bytes": 6, "used": used(dir.path(), "dev")});
+    let dev = json!({"name": "dev", "generation": 0, "bytes": 6, "used": used(dir.path(), "dev"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(made["structuredContent"], dev);
 
     // Each VM with its host, this one, by the kernel's name for it.
@@ -204,7 +205,7 @@ fn create_then_list() {
     };
     let listed = s.call(3, "list_vms", json!({}));
     let base =
-        json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base")});
+        json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(
         listed["structuredContent"],
         json!({"vms": [here(&base), here(&dev)]})
@@ -309,7 +310,7 @@ fn rebase_vm_says_what_it_kept() {
     let done = s.call(2, "rebase_vm", json!({"name": "dev"}));
     assert_eq!(done["isError"], json!(false), "{done}");
     let vm =
-        json!({"name": "dev", "generation": 1, "bytes": 16 << 20, "used": used(dir.path(), "dev")});
+        json!({"name": "dev", "generation": 1, "bytes": 16 << 20, "used": used(dir.path(), "dev"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(
         done["structuredContent"],
         json!({
@@ -361,7 +362,7 @@ fn start_status_and_stop_through_systemd() {
     let mut s = start_with_path(dir.path(), &sd.path());
     let address = Store::new(dir.path()).net("base").unwrap().address;
     let used = used(dir.path(), "base");
-    let base = |state: &str| json!({"name": "base", "generation": 0, "bytes": 6, "used": used, "address": address, "state": state});
+    let base = |state: &str| json!({"name": "base", "generation": 0, "bytes": 6, "used": used, "cpus": 2, "mem_mib": 2048, "address": address, "state": state});
     let got = s.call(2, "vm_status", json!({"name": "base"}));
     assert_eq!(got["structuredContent"], base("stopped"), "{got}");
     let got = s.call(3, "start_vm", json!({"name": "base"}));
@@ -524,6 +525,53 @@ fn create_vm_takes_sizes() {
     assert_eq!(bad["isError"], json!(true), "{bad}");
 }
 
+// A 16 MiB ext4 disk grown to 32 MiB, sizes set, refused while up, and a
+// fork grown as it's made.
+#[test]
+fn resize_vm_grows_a_disk_and_sets_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let tree = common::tree(&dir.path().join("dev"), &[("home/agent/a", "kept\n")]);
+    store.import("dev", &common::image(&tree)).unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    let mut s = start_with_path(dir.path(), &sd.path());
+
+    let args = json!({"name": "dev", "disk": "32M", "mem": "4G", "cpus": 4});
+    let done = s.call(2, "resize_vm", args);
+    assert_eq!(done["isError"], json!(false), "{done}");
+    let used = used(dir.path(), "dev");
+    let vm = json!({"name": "dev", "generation": 1, "bytes": 32 << 20, "used": used, "cpus": 4, "mem_mib": 4096});
+    assert_eq!(done["structuredContent"], vm);
+    let machine = store.machine("dev").unwrap();
+    assert_eq!((machine.cpus, machine.mem_mib), (4, 4096));
+    let undone = s.call(3, "undo_vm", json!({"name": "dev"}));
+    assert_eq!(undone["structuredContent"]["bytes"], json!(16 << 20), "{undone}");
+
+    let bad = s.call(4, "resize_vm", json!({"name": "dev", "disk": "big"}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+    let why = bad["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("isn't a disk size"), "{why}");
+    let none = s.call(5, "resize_vm", json!({"name": "dev"}));
+    assert_eq!(none["isError"], json!(true), "{none}");
+    sd.set_state("active");
+    let up = s.call(6, "resize_vm", json!({"name": "dev", "cpus": 2}));
+    assert_eq!(up["isError"], json!(true), "{up}");
+    let why = up["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("dev is running"), "{why}");
+    assert_eq!(store.machine("dev").unwrap().cpus, 4);
+
+    // A fork grown as it's made, its source as it was.
+    let history = fs::read_to_string(dir.path().join("vms/dev/history")).unwrap();
+    let args = json!({"name": "app", "from": "dev", "disk": "64M"});
+    let made = s.call(7, "create_vm", args);
+    assert_eq!(made["isError"], json!(false), "{made}");
+    assert_eq!(made["structuredContent"]["bytes"], json!(64 << 20), "{made}");
+    let after = fs::read_to_string(dir.path().join("vms/dev/history")).unwrap();
+    assert_eq!(after, history);
+    let small = s.call(8, "create_vm", json!({"name": "x", "from": "dev", "disk": "8M"}));
+    assert_eq!(small["isError"], json!(true), "{small}");
+}
+
 #[test]
 fn create_vm_takes_an_idle_time() {
     let dir = tempfile::tempdir().unwrap();
@@ -558,6 +606,7 @@ fn doctor_reports_every_check() {
     let all = [
         "kvm",
         "firecracker",
+        "e2fsprogs",
         "reflink",
         "kernel",
         "base",
@@ -568,7 +617,7 @@ fn doctor_reports_every_check() {
     ];
     assert_eq!(names, all, "{report}");
     // No base VM in an empty root, so at least that one fails.
-    assert_eq!(report["checks"][4]["status"], json!("fail"), "{report}");
+    assert_eq!(report["checks"][5]["status"], json!("fail"), "{report}");
     assert_eq!(report["ok"], json!(false), "{report}");
 }
 
@@ -609,7 +658,7 @@ fn checkpoint_list_and_restore() {
 
     let back = s.call(4, "restore_vm", json!({"name": "dev", "id": 1}));
     assert_eq!(back["isError"], json!(false), "{back}");
-    let dev = json!({"name": "dev", "generation": 2, "bytes": 6, "used": used(dir.path(), "dev")});
+    let dev = json!({"name": "dev", "generation": 2, "bytes": 6, "used": used(dir.path(), "dev"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(back["structuredContent"], dev);
 
     let bad = s.call(5, "restore_vm", json!({"name": "dev", "id": 9}));

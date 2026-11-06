@@ -18,10 +18,11 @@ use crate::moves::{self, Moved};
 use crate::peers::{Remote, structured};
 use crate::proto::Request;
 use crate::rebase::{self, Rebased};
+use crate::resize;
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
-use crate::store::{BASE, Checkpoint, Config, Store, Vm, parse_mem};
+use crate::store::{BASE, Checkpoint, Config, Sizes, Store, Vm, parse_disk, parse_mem};
 use crate::systemd::{self, VmStatus};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -64,6 +65,9 @@ pub struct CreateArgs {
     cpus: Option<u32>,
     /// Memory, like "4G" or "4096" (MiB). Defaults to the source VM's, else 2G.
     mem: Option<String>,
+    /// Its disk's size, like "40G", if bigger than the source VM's: grown as
+    /// resize_vm grows one. Defaults to the source VM's.
+    disk: Option<String>,
     /// An absolute path to a kernel for this VM, in place of the host's.
     kernel: Option<std::path::PathBuf>,
     /// How long it goes unused before it sleeps: minutes, like "10", or
@@ -73,6 +77,19 @@ pub struct CreateArgs {
     /// The host to make it on, as list_hosts names it. Left out, it goes
     /// where the VM it forks is, else to the host with the most free memory.
     host: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResizeArgs {
+    /// The VM's name.
+    name: String,
+    /// The disk's new size, bigger than it is now, like "40G" or "40960"
+    /// (MiB). A disk only grows.
+    disk: Option<String>,
+    /// Memory from its next boot, like "4G" or "4096" (MiB).
+    mem: Option<String>,
+    /// vCPUs from its next boot: 1 or an even number up to 32.
+    cpus: Option<u32>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -351,7 +368,7 @@ impl ServerHandler for Tools {
 #[tool_router]
 impl Tools {
     #[tool(
-        description = "List the VMs on every host this runner reaches, each with its host, its current disk generation, and the space its disks use (allocated blocks, not apparent size). A host that doesn't answer is named in `unreachable`, with why."
+        description = "List the VMs on every host this runner reaches, each with its host, its current disk generation and that disk's size in bytes, the vCPUs and memory (MiB) its next boot gets, and the space its disks use (allocated blocks, not apparent size). A host that doesn't answer is named in `unreachable`, with why."
     )]
     async fn list_vms(&self) -> Result<Json<VmList>, String> {
         let here = self.store.list().map_err(|e| e.to_string())?;
@@ -379,7 +396,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist). It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
+        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist); `disk` grows its disk as it's made. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
     )]
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
         // Another host's name took the call there (route).
@@ -390,6 +407,8 @@ impl Tools {
         }
         let from = args.from.as_deref().unwrap_or(BASE);
         let mem_mib = args.mem.as_deref().map(parse_mem).transpose();
+        let disk = args.disk.as_deref().map(parse_disk).transpose();
+        let disk = disk.map_err(|e| e.to_string())?;
         let config = Config {
             cpus: args.cpus,
             mem_mib: mem_mib.map_err(|e| e.to_string())?,
@@ -399,7 +418,7 @@ impl Tools {
             allow: None,
         };
         self.store
-            .fork_with(from, &args.name, &config)
+            .fork_sized(from, &args.name, &config, disk)
             .map(Json)
             .map_err(|e| e.to_string())
     }
@@ -558,6 +577,23 @@ impl Tools {
             self.note(&name, i, true);
         }
         Ok(moved)
+    }
+
+    #[tool(
+        description = "Change a stopped VM's sizes: grow its disk to `disk`, and set its `mem` and `cpus`, which count from its next boot. Give any of the three. The bigger disk is a new generation, which undo_vm takes back, with its files as they were, and the guest's / is that big at its next boot; a disk only grows. Refused while the VM is up or sleeping: stop_vm first. Returns the VM with its sizes."
+    )]
+    async fn resize_vm(
+        &self,
+        Parameters(args): Parameters<ResizeArgs>,
+    ) -> Result<Json<Vm>, String> {
+        let text = |e: crate::store::Error| e.to_string();
+        let sizes = Sizes {
+            disk: args.disk.as_deref().map(parse_disk).transpose().map_err(text)?,
+            mem_mib: args.mem.as_deref().map(parse_mem).transpose().map_err(text)?,
+            cpus: args.cpus,
+        };
+        let store = self.store.clone();
+        blocking(move || resize::resize(&store, &args.name, &sizes)).await
     }
 
     #[tool(description = "Roll a VM back to its previous committed disk generation.")]
