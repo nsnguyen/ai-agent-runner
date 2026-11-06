@@ -81,6 +81,13 @@ runner result demo.1                                  # the summary once it's do
 
 If `demo` was stopped, the run boots it and keeps the changes only if the agent finishes without an error. If it was running, the run leaves it running, changes and all, even when the agent fails, so your own sessions in it carry on. The run saves a checkpoint first, and `runner result demo.1` gives its id: `runner restore demo <id>` undoes the run.
 
+To carry on where a run left off, give `--resume` the session `runner runs demo` shows for it, a long id like `0f8b2c4e-…`. It works for a run whose changes were kept, since the session is saved on demo's disk:
+
+```sh
+runner runs demo                                          # each run, with its session once the agent has started
+runner run demo --resume <session> "Now add a LICENSE too"
+```
+
 To have several agents try the same thing at once and keep the best, give `--n`:
 
 ```sh

@@ -987,7 +987,10 @@ fn a_run_names_its_session_once_claude_code_has_started() {
     fs::remove_file(vm.ctl.join("hold")).unwrap();
     wait_for("the session to show", || vm.row(&id).contains(UUID));
     let row = vm.row(&id);
-    assert!(row.ends_with(&format!(r#"Z  running  {UUID}  "hi""#)), "{row}");
+    assert!(
+        row.ends_with(&format!(r#"Z  running  {UUID}  "hi""#)),
+        "{row}"
+    );
     assert_eq!(listed(&mut s, 3)[0]["session"], json!(UUID));
 
     vm.go(1, 0);
@@ -1018,7 +1021,10 @@ fn a_run_names_no_session_without_a_uuid_in_its_init_event() {
         let id = vm.start("hi");
         vm.go(1, 0);
         let row = vm.wait_until_ended(&id);
-        assert!(row.ends_with(r#"  exited 0, joined  -  "hi""#), "{what}: {row}");
+        assert!(
+            row.ends_with(r#"  exited 0, joined  -  "hi""#),
+            "{what}: {row}"
+        );
         let mut s = mcp(&vm);
         assert_eq!(listed(&mut s, 2)[0].get("session"), None, "{what}");
     }
@@ -1089,7 +1095,10 @@ fn an_init_event_past_the_first_64_kib_isn_t_found() {
         Some(UUID.to_string())
     );
     // Cut short by the end of the 64 KiB, it isn't, nor past it.
-    assert_eq!(found(&format!("{}{init}", pad(within - init.len() + 2))), None);
+    assert_eq!(
+        found(&format!("{}{init}", pad(within - init.len() + 2))),
+        None
+    );
     assert_eq!(found(&format!("{}{init}", pad(within))), None);
 }
 
