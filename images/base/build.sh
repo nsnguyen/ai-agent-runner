@@ -112,7 +112,8 @@ trap cleanup EXIT
 echo "== image ($engine)"
 mkdir "$work/context"
 cp "$here/Dockerfile" "$here/runner-guest.service" "$here/llm.txt" \
-  "$here/managed-settings.json" "$work/context/"
+  "$here/managed-settings.json" "$here/docker-daemon.json" \
+  "$here/docker-no-raw-table.conf" "$work/context/"
 cp "$guest" "$work/context/runner-guest"
 "$engine" build -t "$tag" "$work/context"
 
@@ -146,9 +147,11 @@ mkfs.ext4 -q -F -L runner-base -d "$work/root" "$work/base.ext4"
 echo "== check"
 "$here/check.sh" "$work/base.ext4"
 # The tools run on the image's userland, checked in a container with no
-# network. The boot test checks the guest kernel and runner-guest.
+# network: docker's clients only, as dockerd isn't running there. The boot
+# test checks the guest kernel and runner-guest.
 "$engine" run --rm --network none -u agent "$tag" bash -c \
-  'claude --version && node --version && python3 --version && rustc --version && cargo --version' |
+  'claude --version && node --version && python3 --version && rustc --version && cargo --version &&
+   docker --version && docker compose version && docker buildx version' |
   sed 's/^/ok    /'
 mv -f "$work/base.ext4" "$disk"
 
