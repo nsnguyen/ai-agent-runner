@@ -422,7 +422,7 @@ fn llm_txt_says_what_docker_here_can_and_can_t_do() {
         "aren't in another VM",
         "registry-1.docker.io",
         "auth.docker.io",
-        "production.cloudflare.docker.com",
+        "production.cloudfront.docker.com",
         "/var/lib/docker",
     ] {
         assert!(llm.contains(said), "llm.txt doesn't say {said:?}");

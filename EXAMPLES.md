@@ -269,7 +269,7 @@ Or ask Claude in `runner claude demo` to bring it up. `restart: unless-stopped` 
 On a VM kept to a few sites (section 10), let Docker Hub in first:
 
 ```sh
-runner net demo allow registry-1.docker.io auth.docker.io production.cloudflare.docker.com
+runner net demo allow registry-1.docker.io auth.docker.io production.cloudfront.docker.com
 ```
 
 ## 12. When you're done

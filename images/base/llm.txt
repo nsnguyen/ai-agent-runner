@@ -76,7 +76,7 @@ you can go back.
 - The kernel has no nf_tables, so iptables here is iptables-legacy: leave
   it, or Docker's networking stops.
 - On a VM kept to a list of names (The network), Docker Hub needs
-  registry-1.docker.io, auth.docker.io and production.cloudflare.docker.com
+  registry-1.docker.io, auth.docker.io and production.cloudfront.docker.com
   on it. A pull refused for one of those is the list: ask the owner.
 
 ## The network
