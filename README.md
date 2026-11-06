@@ -313,6 +313,17 @@ N is 2 to 4, and all N start at once, with no queue. Nothing is made, and the er
 
 The tries are made on dev's host. A try whose run can't start is deleted, with the ones after it, and the runs that started go on. dev records its batch in its directory, in `tries.json`: the prompt, when, the generation the tries forked, and their names and runs. On ext4 each try is a full copy of dev's disk, so put `/var/lib/runner` on XFS or btrfs. Over MCP, `run_best_of` takes `name`, `prompt`, `n`, `dir` and `resume`, and returns the N runs.
 
+`runner tries dev` shows the tries side by side, a row each, so you can pick one without reading three streams:
+
+```
+RUN      STATE                  EXIT  TOOK   CHANGED  AGENT SAYS (UNTRUSTED)
+dev-1.1  exited 0, committed    0     2m14s  2        "Fixed the flaky test."
+dev-2.1  exited 1, rolled back  1     1m03s  1        "I couldn't make it pass: the fixture is missing."
+dev-3.1  running                -     2h00m  -        -
+```
+
+STATE is how the run stands, as `runs` says it. TOOK is the result's duration, or how long so far for a run still going. CHANGED counts the paths the result lists and counts past those, less the ones only the VM's boot writes: `runner result dev-1.1` lists them. AGENT SAYS is the first line of the agent's last message, quoted, so control characters show escaped, and cut at 60 characters. It's the agent's own word, so check it against CHANGED. `--json` prints the batch and each try's run with its whole result instead, the `changed` paths and all of `agent_says` included. `--wait` waits until every try's run has ended, then prints. A try deleted since shows as `gone`, and the rest still show; with no batch, `tries` says `no tries yet`. Over MCP, `list_tries` takes `name` and returns each try's run, and its result once that's over, at once: wait on a run with `run_output`, as for any.
+
 ### Checkpoints
 
 ```sh
@@ -407,6 +418,6 @@ Restart the app after editing its config.
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
-`run_agent`, `run_best_of`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `run --n`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once, and `run_best_of` the N runs. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
+`run_agent`, `run_best_of`, `run_output`, `cancel_run`, `list_runs` and `list_tries` do for an agent what `runner run`, `run --n`, `output`, `cancel`, `runs` and `tries` do for you. `run_agent` returns the run at once, and `run_best_of` the N runs. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
 
 `list_sessions`, `read_session` and `kill_session` do for an agent what `runner sessions`, `attach` and `kill` do for you. `read_session` returns the last `lines` (100 unless given, at most 2000) of a session's active pane as plain text, history included, cut at 32 KiB from the end.
