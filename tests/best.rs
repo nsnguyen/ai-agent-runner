@@ -452,6 +452,7 @@ fn one_batch_at_a_time() {
     let (before, batch) = (h.history(), best::tries(&h.store, "dev").unwrap());
     let err = h.refused(&["run", "dev", "--n", "2", "p"]);
     assert!(err.contains("dev-1 and dev-2"), "{err}");
+    assert!(err.contains("`runner keep dev --none` drops them"), "{err}");
     assert_eq!(h.vms(), ["dev", "dev-1", "dev-2"]);
     assert_eq!(h.history(), before);
     assert_eq!(best::tries(&h.store, "dev").unwrap(), batch);
@@ -886,6 +887,13 @@ fn keep_puts_the_winner_s_disk_on_dev_and_deletes_every_try() {
     let listed = h.history();
     let top = listed.iter().find(|c| c.current).unwrap();
     assert_eq!(top.comment.as_deref(), Some("keep of dev-2"));
+    // The batch is done with: a VM made since under a try's name isn't one.
+    assert_eq!(best::tries(&h.store, "dev").unwrap(), None);
+    assert_eq!(h.ok(&["tries", "dev"]), "no tries yet\n");
+    h.store.fork("dev", "dev-1").unwrap();
+    let err = h.refused(&["keep", "dev", "--none"]);
+    assert!(err.contains("dev has no tries on hand"), "{err}");
+    h.ok(&["delete", "dev-1"]);
     // On top of dev's history: undo goes back.
     h.ok(&["undo", "dev"]);
     assert_eq!(h.store.get("dev").unwrap().generation, was);
@@ -930,6 +938,56 @@ fn a_try_still_going_rolled_back_or_up_isn_t_kept() {
     assert_eq!(h.history(), before);
 }
 
+// A try a run joined running is up, and a cancel would leave it so: refused
+// before anything's cancelled.
+#[test]
+fn a_try_up_for_a_run_that_joined_it_is_refused() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    commit_try(&h, "dev-1");
+    let ask = h.store.runs("dev-3").unwrap().join("1/ask.json");
+    let mut joined: Value = serde_json::from_slice(&fs::read(&ask).unwrap()).unwrap();
+    joined["boots"] = json!(false);
+    fs::write(&ask, joined.to_string()).unwrap();
+    h.sd.set_vm_state("dev-3", "active");
+    let err = h.refused(&["keep", "dev-1"]);
+    assert!(err.contains("dev-3 is running: stop it first"), "{err}");
+    assert!(!h.store.runs("dev-3").unwrap().join("1/cancel").exists());
+    assert_eq!(h.vms(), ["dev", "dev-1", "dev-2", "dev-3"]);
+    drop(lock);
+}
+
+// What decides is the try's disk: one whose batch run committed keeps its
+// work through a later run of its own that rolled back.
+#[test]
+fn a_try_whose_later_run_rolled_back_is_kept_with_its_work() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    finish_third(&h, lock);
+    commit_try(&h, "dev-1");
+    let won = current(&h, "dev-1");
+    let runs = h.store.runs("dev-1").unwrap();
+    fs::create_dir_all(runs.join("2")).unwrap();
+    fs::copy(runs.join("1/ask.json"), runs.join("2/ask.json")).unwrap();
+    fs::write(runs.join("2/stream"), "").unwrap();
+    let rolled_back = end("2026-11-06T10:00:00Z", 1, "rolled_back");
+    fs::write(runs.join("2/end.json"), rolled_back.to_string()).unwrap();
+    // dev-2's run rolled back, so it's still at the disk it forked.
+    let err = h.refused(&["keep", "dev-2"]);
+    assert!(
+        err.contains("dev-2.1 rolled back, so dev-2 still has dev's disk"),
+        "{err}"
+    );
+
+    let out = h.ok(&["keep", "dev-1"]);
+    assert!(
+        out.contains("dev-1.2 named no Claude Code session"),
+        "{out}"
+    );
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-1's");
+    assert_eq!(h.vms(), ["dev"]);
+}
+
 #[test]
 fn keep_none_deletes_the_tries_and_leaves_dev_as_it_was() {
     let h = host(false);
@@ -961,6 +1019,7 @@ fn keep_none_deletes_the_tries_and_leaves_dev_as_it_was() {
     assert!(current(&h, "dev") == was);
     let err = h.refused(&["keep", "dev", "--none"]);
     assert!(err.contains("dev has no tries on hand"), "{err}");
+    assert_eq!(best::tries(&h.store, "dev").unwrap(), None);
 }
 
 #[test]

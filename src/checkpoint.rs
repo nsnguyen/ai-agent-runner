@@ -248,26 +248,21 @@ fn restore_held(store: &Store, name: &str, id: u64) -> Result<Vm> {
     if systemd::status(store, name)?.state == State::Stopped {
         return Ok(store.restore(name, id)?);
     }
-    put_disk(
-        store,
-        name,
-        || store.hold_checkpoints(name)?.stage_restore(id),
-        |_| {},
-    )
+    put_disk(store, name, || {
+        store.hold_checkpoints(name)?.stage_restore(id)
+    })
 }
 
 /// Puts the disk `stage` copies aside (Store::stage_disk, or a checkpoint's
 /// copy) on top of the VM's history, as `restore` does, so `undo` goes back
-/// to the disk from before it, and calls `then` once it's there and the VM
-/// is down. A running or sleeping VM is stopped first, after the copy, which
-/// commits its disk, and started again after `then`; a stopping one is
-/// waited out and stays stopped. The caller holds the VM's run lock
-/// (runs::hold), so no run is going.
+/// to the disk from before it. A running or sleeping VM is stopped first,
+/// after the copy, which commits its disk, and started again after; a
+/// stopping one is waited out and stays stopped. The caller holds the VM's
+/// run lock (runs::hold), so no run is going.
 pub fn put_disk(
     store: &Store,
     name: &str,
     stage: impl FnOnce() -> store::Result<Staged>,
-    then: impl FnOnce(&Vm),
 ) -> Result<Vm> {
     let state = systemd::status(store, name)?.state;
     match state {
@@ -287,9 +282,6 @@ pub fn put_disk(
     let restored = store.finish_restore(name, &staged);
     if restored.is_err() {
         drop_staged(store, name, staged);
-    }
-    if let Ok(vm) = &restored {
-        then(vm);
     }
     // One that was stopped or stopping was asked to stop, so it stays down.
     if matches!(state, State::Stopped | State::Stopping) {

@@ -26,13 +26,15 @@
 // a restore puts a checkpoint's copy (checkpoint::put_disk), so `undo` goes
 // back to dev from before, and deletes every try of the batch; `keep dev
 // --none` only deletes them. dev keeps its name and settings. Everything is
-// checked before anything changes: a try whose newest run is still going, or
-// rolled back, or that never ran, still has dev's disk, so it can't be the
-// one kept, and the one kept, held by its lock, can't be up. Tries whose runs
-// are still going are cancelled first, then the disk goes on dev, which is
-// stopped for it if it's up and started again after, and then the tries go.
-// It holds dev's run lock throughout, as a batch's start does, so it's
-// refused while dev has a run going.
+// checked before anything changes: a try still at the generation it forked,
+// whose run rolled back or never got going, still has dev's disk, so it
+// can't be the one kept, nor can one whose run is going; and no try can be
+// up, but for one a run booted, which a cancel shuts down. The one kept is
+// held by its lock from then on. Tries whose runs are going are cancelled
+// first, then the disk goes on dev, which is stopped for it if it's up and
+// started again after, then the tries go, and with them dev's record of the
+// batch. It holds dev's run lock throughout, as a batch's start does, so
+// it's refused while dev has a run going.
 use crate::checkpoint;
 use crate::host;
 use crate::idle::InUse;
@@ -78,7 +80,8 @@ pub enum Error {
     )]
     Taken { vm: String, n: u32, name: String },
     #[error(
-        "{vm} has tries on hand from best of {n} at {when}: {left}. One batch at a time: delete them first"
+        "{vm} has tries on hand from best of {n} at {when}: {left}. One batch at a time: \
+         `runner keep {vm} --none` drops them, or `runner keep` the best"
     )]
     OnHand {
         vm: String,
@@ -115,11 +118,11 @@ pub enum Error {
     NoTries(String),
     #[error("{run} is still going: wait for it (`runner tries {vm} --wait`), or keep another")]
     StillGoing { vm: String, run: String },
-    #[error("{run} rolled back, so {name} still has {vm}'s disk: keep a try whose run committed")]
-    RolledBack {
+    #[error("{how}, so {name} still has {vm}'s disk: keep a try whose run committed")]
+    Unchanged {
         vm: String,
         name: String,
-        run: String,
+        how: String,
     },
     #[error("{name} never ran, so it still has {vm}'s disk: keep a try whose run committed")]
     NeverRan { vm: String, name: String },
@@ -133,8 +136,8 @@ pub enum Error {
         vm: String,
         source: systemd::Error,
     },
-    #[error("{said}but couldn't delete {left}: `runner delete` each by hand")]
-    NotDeleted { said: String, left: String },
+    #[error("{}", said.trim_end())]
+    NotDeleted { said: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -443,7 +446,9 @@ pub fn keep(store: &Store, name: &str, none: bool) -> Result<Kept> {
         let going = run.as_ref().filter(|r| r.state == runs::State::Running);
         if Some(t.as_str()) == winner {
             kept_run = Some(winnable(store, &vm, t, run)?);
-        } else if let Some(run) = going {
+        // A run that booted its try shuts it down once cancelled; one that
+        // joined it running leaves it up, as any other try that's up.
+        } else if let Some(run) = going.filter(|r| r.boots) {
             cancel.push(run.id.clone());
         } else {
             stopped(store, t)?;
@@ -492,58 +497,64 @@ pub fn keep(store: &Store, name: &str, none: bool) -> Result<Kept> {
             Err(e) => return Err(e.into()),
         }
     }
-    let mut left = Vec::new();
-    // The kept try goes last, under the lock that has held it.
-    let delete = |kept: &mut Kept, left: &mut Vec<String>, held: Option<(&str, store::Locked)>| {
-        for t in names.iter().filter(|t| Some(t.as_str()) != winner) {
-            match store.delete(t) {
-                Ok(_) => kept.deleted.push(t.clone()),
-                Err(e) => left.push(format!("{t} ({e})")),
-            }
-        }
-        if let Some((w, held)) = held {
-            match held.delete() {
-                Ok(_) => kept.deleted.push(w.to_string()),
-                Err(e) => left.push(format!("{w} ({e})")),
-            }
-        }
-        kept.deleted
-            .sort_by_key(|t| names.iter().position(|n| n == t));
-    };
-    match held {
+    // dev is back up first, if it was up: the kept disk is copied already,
+    // and the kept try is held until it goes.
+    let restarted = match held {
         None => {
-            delete(&mut kept, &mut left, None);
             kept.generation = store.get(&vm)?.generation;
+            Ok(())
         }
-        Some((w, held)) => {
+        Some((w, ref held)) => {
             let from = held.disk()?;
             let note = format!("keep of {w}");
             let stage = || store.stage_disk(&vm, Source::File(&from), &note);
-            let put = checkpoint::put_disk(store, &vm, stage, |on| {
-                kept.generation = on.generation;
-                delete(&mut kept, &mut left, Some((w, held)));
-            });
-            match put {
-                Ok(_) => {}
-                Err(checkpoint::Error::NotStarted { source, .. }) => {
-                    return Err(Error::KeptNotStarted {
-                        said: kept.said(),
-                        vm,
-                        source,
-                    });
+            match checkpoint::put_disk(store, &vm, stage) {
+                Ok(on) => {
+                    kept.generation = on.generation;
+                    Ok(())
+                }
+                Err(checkpoint::Error::NotStarted {
+                    generation, source, ..
+                }) => {
+                    kept.generation = generation;
+                    Err(source)
                 }
                 Err(e) => return Err(e.into()),
             }
         }
+    };
+    let mut left = Vec::new();
+    for t in names.iter().filter(|t| Some(t.as_str()) != winner) {
+        match store.delete(t) {
+            Ok(_) => kept.deleted.push(t.clone()),
+            Err(e) => left.push(format!("{t} ({e})")),
+        }
     }
-    if !left.is_empty() {
+    if let Some((w, held)) = held {
+        match held.delete() {
+            Ok(_) => kept.deleted.push(w.to_string()),
+            Err(e) => left.push(format!("{w} ({e})")),
+        }
+    }
+    kept.deleted
+        .sort_by_key(|t| names.iter().position(|n| n == t));
+    let mut said = kept.said();
+    if left.is_empty() {
+        // Done with: a VM made later under a try's name isn't one.
+        drop_record(store, &vm)?;
+    } else {
         let left: Vec<&str> = left.iter().map(String::as_str).collect();
-        return Err(Error::NotDeleted {
-            said: kept.said(),
-            left: and(&left),
-        });
+        let _ = writeln!(
+            said,
+            "couldn't delete {}: `runner delete` each by hand",
+            and(&left)
+        );
     }
-    Ok(kept)
+    match restarted {
+        Err(source) => Err(Error::KeptNotStarted { said, vm, source }),
+        Ok(()) if !left.is_empty() => Err(Error::NotDeleted { said }),
+        Ok(()) => Ok(kept),
+    }
 }
 
 // The VM whose latest batch has the try `name`: the name less its dash and
@@ -562,25 +573,30 @@ fn forked(store: &Store, name: &str) -> Result<String> {
     }
 }
 
-// The try `name`'s newest run, if its disk can be kept: the run is over and
-// didn't roll back, and the try is stopped.
+// The try `name`'s newest run, if its disk can be kept: no run is going,
+// it's stopped, and it has a disk of its own, not still generation 0, the
+// copy of the VM's that it forked. A rollback, or a run that never got going,
+// leaves it there.
 fn winnable(store: &Store, vm: &str, name: &str, run: Option<AgentRun>) -> Result<AgentRun> {
     let (vm, name) = (vm.to_string(), name.to_string());
-    let Some(run) = run else {
-        return Err(Error::NeverRan { vm, name });
-    };
-    if run.state == runs::State::Running {
-        return Err(Error::StillGoing { vm, run: run.id });
-    }
-    if run.outcome == Some(Outcome::RolledBack) {
-        return Err(Error::RolledBack {
-            vm,
-            name,
-            run: run.id,
-        });
+    if let Some(run) = run.as_ref().filter(|r| r.state == runs::State::Running) {
+        let run = run.id.clone();
+        return Err(Error::StillGoing { vm, run });
     }
     stopped(store, &name)?;
-    Ok(run)
+    let forked = store.get(&name)?.generation == 0;
+    match run {
+        None => Err(Error::NeverRan { vm, name }),
+        Some(run) if forked => Err(Error::Unchanged {
+            how: match run.outcome {
+                Some(Outcome::RolledBack) => format!("{} rolled back", run.id),
+                _ => format!("{} {}", run.id, runs::describe(&run)),
+            },
+            vm,
+            name,
+        }),
+        Some(run) => Ok(run),
+    }
 }
 
 // Refused unless `name` is stopped.
@@ -784,6 +800,15 @@ fn record(store: &Store, vm: &str, batch: &Batch) -> Result<()> {
         return Err(store::at(&path)(io::ErrorKind::InvalidInput.into()).into());
     };
     Ok(store::write_aside(dir, name, &text)?)
+}
+
+// Clears the VM's batch once keep has deleted its tries.
+fn drop_record(store: &Store, vm: &str) -> Result<()> {
+    let path = store.tries(vm)?;
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(store::at(&path)(e).into()),
+        _ => Ok(()),
+    }
 }
 
 // "a", "a and b", "a, b and c".

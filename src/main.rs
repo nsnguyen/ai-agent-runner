@@ -377,8 +377,9 @@ enum Cmd {
     /// Tries whose runs are going are cancelled first. A running dev is
     /// stopped, which commits its disk, and started again after. Prints the
     /// kept run's Claude Code session, for `runner run dev --resume`.
-    /// Refused, with nothing changed, for a try whose run is going, rolled
-    /// back or never ran, for one that's up, and while dev has a run going.
+    /// Refused, with nothing changed, for a try still at the disk it forked,
+    /// its run rolled back, for one whose run is going, for one that's up
+    /// other than for its run, and while dev has a run going.
     Keep {
         /// A try, like dev-2; with --none, the VM the tries forked.
         name: String,
