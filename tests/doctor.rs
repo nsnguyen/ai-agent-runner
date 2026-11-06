@@ -31,15 +31,18 @@ const NAT: &str = "table ip runner {
 \t\ttype filter hook input priority filter; policy accept;
 \t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
 \t\tiifname \"fc*\" ct state established,related accept
+\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 accept
 \t\tiifname \"fc*\" drop
 \t}
 }
 ";
 
-// The ip input chain's rules as install.sh writes them, and as it wrote them
-// before, by source address, which let in a VM that forged its source.
+// The ip input chain's rules as install.sh writes them, port 53 to a tap's
+// own address for the VM's DNS included, and as it wrote them before, by
+// source address, which let in a VM that forged its source.
 const INPUT: &str = "\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
 \t\tiifname \"fc*\" ct state established,related accept
+\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 accept
 \t\tiifname \"fc*\" drop
 ";
 const INPUT_BY_SOURCE: &str = "\t\tip saddr 172.16.0.0/16 ct state established,related accept

@@ -3,11 +3,15 @@
 # then deleting it makes reapplying replace it instead of adding to it.
 # VMs get the internet, but not the tailnet, the LAN, cloud metadata or each
 # other: an agent that's been talked into something can't reach my machines.
-# DNS is the exception: a guest uses the host's resolvers, which usually sit
-# on the LAN, the tailnet or the cloud's private network.
 # Nor the host itself, on any of its addresses: a VM can't open a connection
 # to its sshd or anything else listening there. Replies to what the host
 # opens, like the URL proxy's connection to a VM, still come back.
+# DNS is the exception. A VM's boot serves its DNS on the host's end of its
+# tap (src/dns.rs), so port 53 comes in from a tap to that tap's own address
+# only: no VM uses another's boot, or a resolver on another of the host's
+# addresses. And port 53 goes through to resolvers off the host, for a boot
+# that can't serve it and gives its guest the host's resolvers instead,
+# which usually sit on the LAN, the tailnet or the cloud's private network.
 # The filters go by the VMs' taps (net.rs names each fc<8 hex digits>), not
 # by source address, which a VM can forge. What a tap brings in from outside
 # the range is dropped first, so a source forged from outside it gets
@@ -31,6 +35,7 @@ table ip runner {
 		type filter hook input priority filter; policy accept;
 		iifname "fc*" ip saddr != @NET@ drop
 		iifname "fc*" ct state established,related accept
+		iifname "fc*" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 accept
 		iifname "fc*" drop
 	}
 }

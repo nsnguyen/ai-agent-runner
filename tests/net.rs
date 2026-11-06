@@ -1,7 +1,11 @@
 // A VM's network: the /30 its slot picks, its boot argument, its tap, and the
-// host's rules for it. The tap tests drive a fake `ip`; the one that makes a
+// host's rules for it, its DNS included. The tap tests drive a fake `ip`; the one that makes a
 // real tap needs CAP_NET_ADMIN and iproute2, and the one that loads the rules
 // needs root and nftables too, so those are ignored by default.
+mod common;
+
+use common::resolver::{Resolver, answer_to, query, read_framed, write_framed};
+use runner::dns::Relay;
 use runner::host;
 use runner::net::{DEFAULT_SUBNET, Net, Subnet, Tap, dns};
 use runner::store::Error;
@@ -440,6 +444,30 @@ fn load_rules(ns: &str, range: &Subnet) {
     assert!(out.status.success(), "nft -f: {err}\n{rules}");
 }
 
+// Asks `to` for example.com over UDP from inside `ns`, and returns the
+// answer that came within two seconds, if any.
+fn ask_dns_udp(ns: &str, to: SocketAddr) -> Option<Vec<u8>> {
+    inside(ns, move || {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket.send_to(&query(1, "example.com"), to).unwrap();
+        let mut buf = [0u8; 512];
+        socket.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+    })
+}
+
+// The same over TCP.
+fn ask_dns_tcp(ns: &str, to: SocketAddr) -> std::io::Result<Vec<u8>> {
+    inside(ns, move || {
+        let mut conn = TcpStream::connect_timeout(&to, Duration::from_secs(2))?;
+        conn.set_read_timeout(Some(Duration::from_secs(2)))?;
+        write_framed(&mut conn, &query(2, "example.com"))?;
+        read_framed(&mut conn)
+    })
+}
+
 #[track_caller]
 fn assert_dropped(got: std::io::Result<String>, to: SocketAddr) {
     let got = got.map_err(|e| e.kind());
@@ -475,6 +503,76 @@ fn a_vm_can_t_reach_the_host_but_hears_back_from_it() {
     assert_dropped(ask(&vm_ns, host_22), host_22);
     // The host opened this one, so the VM's replies come back.
     assert_eq!(ask(&host_ns, at).unwrap(), "vm");
+}
+
+// A VM's DNS is its own boot's, on its gateway: the rules let port 53 in from
+// a tap only to the host's end of that same tap. So no VM can use another's
+// boot, nor a resolver on another of the host's addresses (#122). A second
+// boot's sockets are bound to its own tap, so it refuses the VM even without
+// the rules; with them, nothing comes back at all.
+// Run as root: cargo test --test net -- --ignored
+#[test]
+#[ignore = "needs root, nftables and iproute2"]
+fn a_vm_s_dns_is_its_own_boot_and_no_other() {
+    let range = subnet("10.254.0.0/16");
+    let (own, other) = (range.net(16004).unwrap(), range.net(16005).unwrap());
+    let mut spaces = Spaces::default();
+    let host = spaces.add("dns-host");
+    let (vm, neighbor) = (spaces.add("dns-vm"), spaces.add("dns-neighbor"));
+    plug(&host, &vm, &own, &format!("{}/30", own.address));
+    plug(&host, &neighbor, &other, &format!("{}/30", other.address));
+    // The host's resolver, on loopback, and another address of the host's
+    // with a resolver of its own on it, like a dnsmasq on its LAN address.
+    ip_in(&host, "link set dev lo up");
+    ip_in(&host, "addr add 192.168.77.1/32 dev lo");
+    let resolver = |at: &'static str| {
+        inside(&host, move || {
+            let udp = UdpSocket::bind(at).unwrap();
+            Resolver::on(udp, TcpListener::bind(at).unwrap(), true)
+        })
+    };
+    let upstream = resolver("127.0.0.1:53");
+    let _lan = resolver("192.168.77.1:53");
+    // Each VM's boot, passing queries on to the host's resolver.
+    let (own_net, other_net) = (own.clone(), other.clone());
+    let _boots = inside(&host, move || {
+        let resolvers = [Ipv4Addr::LOCALHOST];
+        let own = Relay::bind(&own_net, &resolvers).unwrap();
+        (own, Relay::bind(&other_net, &resolvers).unwrap())
+    });
+    let at = |address: Ipv4Addr| SocketAddr::new(address.into(), 53);
+    let (own_boot, other_boot) = (at(own.gateway), at(other.gateway));
+    let lan = at(ip("192.168.77.1"));
+    let (udp_answer, tcp_answer) = (
+        answer_to(&query(1, "example.com")),
+        answer_to(&query(2, "example.com")),
+    );
+
+    // Without the rules, the VM's own boot answers it, the LAN's resolver
+    // too, and the second boot refuses it.
+    assert_eq!(ask_dns_udp(&vm, own_boot), Some(udp_answer.clone()));
+    assert_eq!(ask_dns_tcp(&vm, own_boot).unwrap(), tcp_answer);
+    assert_eq!(ask_dns_udp(&vm, lan), Some(udp_answer.clone()));
+    assert_eq!(ask_dns_tcp(&vm, lan).unwrap(), tcp_answer);
+    assert_eq!(ask_dns_udp(&vm, other_boot), None);
+    let refused = ask_dns_tcp(&vm, other_boot).map_err(|e| e.kind());
+    assert_eq!(refused, Err(ErrorKind::ConnectionRefused));
+    // The second VM's own boot answers it, though.
+    assert_eq!(ask_dns_udp(&neighbor, other_boot), Some(udp_answer.clone()));
+
+    load_rules(&host, &range);
+    assert_eq!(ask_dns_udp(&vm, own_boot), Some(udp_answer.clone()));
+    assert_eq!(ask_dns_tcp(&vm, own_boot).unwrap(), tcp_answer);
+    assert_eq!(ask_dns_udp(&neighbor, other_boot), Some(udp_answer));
+    // Dropped: nothing even refuses.
+    for to in [other_boot, lan] {
+        assert_eq!(ask_dns_udp(&vm, to), None, "{to}");
+        let got = ask_dns_tcp(&vm, to).map_err(|e| e.kind());
+        assert_eq!(got, Err(ErrorKind::TimedOut), "{to}");
+    }
+    // The answers were the host's resolver's, passed on.
+    assert!(upstream.heard().contains(&query(1, "example.com")));
+    assert!(upstream.heard().contains(&query(2, "example.com")));
 }
 
 // A VM that gives itself an address outside the VMs' range gets nothing past
