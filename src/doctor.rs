@@ -2,6 +2,8 @@
 // Checks read the host only through `Host`, so tests can fake it; `System` is
 // the real machine.
 use crate::host;
+use crate::idle::Idle;
+use crate::power;
 use crate::store::{BASE, Error, Store};
 use rmcp::schemars;
 use serde::Serialize;
@@ -154,6 +156,7 @@ pub fn check(host: &impl Host, store: &Store) -> Report {
         named("nat", nat(host)),
         named("unit", unit(host)),
         named("key", key(host)),
+        named("host-idle", host_idle(host, store.root())),
     ];
     let ok = checks.iter().all(|c| c.status != Status::Fail);
     Report { ok, checks }
@@ -453,6 +456,70 @@ fn key(host: &impl Host) -> Verdict {
     ok(format!(
         "{}, which `runner hosts add` shares with the other hosts",
         key.display()
+    ))
+}
+
+// The host's idle time (power.rs), and whether it can power itself off once
+// idle: its timer looking, polkit letting this user power it off, and the
+// busy lock open to the commands that keep it up. A host that stays up
+// still runs VMs, so none of it fails.
+fn host_idle(host: &impl Host, root: &Path) -> Verdict {
+    let path = host::HOST_IDLE;
+    let idle = match host.read(Path::new(path)) {
+        Ok(text) => match text.trim().parse::<Idle>() {
+            Ok(idle) => idle,
+            Err(e) => {
+                return warn(format!(
+                    "{path}: {e}. RUNNER_HOST_IDLE=1h {INSTALL} sets it, or never"
+                ));
+            }
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return warn(format!("no {path}, so the host stays up: rerun {INSTALL}"));
+        }
+        Err(e) => return warn(format!("{path}: {e}")),
+    };
+    if idle == Idle::Never {
+        return ok(format!(
+            "never: the host stays up until it's stopped (RUNNER_HOST_IDLE=1h {INSTALL} sets an idle time)"
+        ));
+    }
+    let timer = host::IDLE_TIMER;
+    match host.run("systemctl", &["is-active", timer]) {
+        Ok(r) if r.ok => {}
+        Ok(r) => {
+            let state = r.stdout.trim();
+            return warn(format!(
+                "{idle}, but {timer} is {state}, so nothing looks whether the host is idle: rerun {INSTALL}"
+            ));
+        }
+        Err(e) => return warn(format!("systemctl: {e}")),
+    }
+    let pid = std::process::id().to_string();
+    let args = ["--action-id", power::POWER_OFF, "--process", &pid];
+    match host.run("pkcheck", &args) {
+        Ok(r) if r.ok => {}
+        Ok(_) => {
+            return warn(format!(
+                "{idle}, but polkit doesn't let this user power the host off, so it stays up: rerun {INSTALL}, and run doctor as runner"
+            ));
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return warn(format!(
+                "{idle}, but there's no pkcheck to ask polkit whether this user can power the host off: rerun {INSTALL}"
+            ));
+        }
+        Err(e) => return warn(format!("pkcheck: {e}")),
+    }
+    let lock = power::busy_lock(root);
+    if let Err(e) = host.open_rw(&lock) {
+        return warn(format!(
+            "{idle}, but {}: {e}, so a runner command at work can't keep the host up: rerun {INSTALL}",
+            lock.display()
+        ));
+    }
+    ok(format!(
+        "{idle}: the host powers itself off once every VM has been stopped or asleep, with no one but runner logged in, for {idle}"
     ))
 }
 
