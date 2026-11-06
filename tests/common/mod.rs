@@ -672,11 +672,16 @@ fn ok(cmd: &mut Command) {
 
 // An ext4 disk holding a copy of `tree`, the way images/base builds one.
 pub fn image(tree: &Path) -> PathBuf {
+    image_of(tree, "16M")
+}
+
+// As `image`, `size` big, as mkfs.ext4 reads a size.
+pub fn image_of(tree: &Path, size: &str) -> PathBuf {
     let disk = tree.with_extension("ext4");
     ok(Command::new("mkfs.ext4")
         .args(["-q", "-F", "-d"])
         .args([tree, &disk])
-        .arg("16M"));
+        .arg(size));
     disk
 }
 
