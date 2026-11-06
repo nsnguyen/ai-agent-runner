@@ -7,6 +7,7 @@
 // ask every host, create_vm places a VM as the laptop's `runner create`
 // does, and a call naming a VM or a run goes, as it came, to the VM's host,
 // through one `ssh <peer> runner mcp` each (peers::Remote).
+use crate::best;
 use crate::checkpoint;
 use crate::claude;
 use crate::creds;
@@ -227,6 +228,21 @@ pub struct RunAgentArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct BestOfArgs {
+    /// The VM to fork. It isn't touched: a running or sleeping one is
+    /// checkpointed, and the forks copy that.
+    name: String,
+    /// What to ask Claude Code in each fork.
+    prompt: String,
+    /// How many forks: 2 to 4. Each run costs its own tokens.
+    n: u32,
+    /// Where in each fork Claude Code runs; it has to exist. Defaults to /home/agent/work.
+    dir: Option<String>,
+    /// A Claude Code session each fork carries on: the session_id in an earlier run's init event.
+    resume: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct RunArg {
     /// The run's id, from run_agent or list_runs, like dev.1.
     run: String,
@@ -280,7 +296,13 @@ impl ServerHandler for Tools {
                 Ok(Some((i, request))) => {
                     let changes = self.changes(&request);
                     let moves_to = self.moves_to(&request);
+                    let tries = tries_of(&request);
                     let answer = self.peers[i].call(request).await;
+                    if let Ok(result) = &answer
+                        && result.is_error != Some(true)
+                    {
+                        tries.iter().for_each(|vm| self.note(vm, i, true));
+                    }
                     if let (Ok(result), Some((vm, made))) = (&answer, changes)
                         && result.is_error != Some(true)
                     {
@@ -693,6 +715,29 @@ impl Tools {
     }
 
     #[tool(
+        description = "Best of N: fork a VM into <name>-1 to <name>-<n>, n from 2 to 4, start the prompt in each at once as an ordinary run, and return the n runs; read each with run_output, as any run. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its result measures what that try changed against the VM's disk. The VM itself isn't touched: a stopped one's current disk is forked, and a running or sleeping one is checkpointed first (kind run), and that's forked. The forks get the default credentials, claude only, and the VM's sizes. Refused, with nothing made, if a fork's name is taken, if the host's free memory less 1 GiB can't hold n of the VM, while the VM has a run going, and while an earlier batch's forks are still VMs. Tokens cost n times one run's."
+    )]
+    async fn run_best_of(
+        &self,
+        Parameters(args): Parameters<BestOfArgs>,
+    ) -> Result<Json<RunList>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        blocking(move || {
+            let exe = std::env::current_exe().map_err(|e| format!("finding runner: {e}"))?;
+            let start = runs::Start {
+                vm: &args.name,
+                prompt: &args.prompt,
+                dir: args.dir.as_deref().unwrap_or(claude::DIR),
+                resume: args.resume.as_deref(),
+                user: &user,
+            };
+            let runs = best::start(&store, &exe, &start, args.n).map_err(|e| e.to_string())?;
+            Ok::<_, String>(RunList { runs })
+        })
+        .await
+    }
+
+    #[tool(
         description = "Read a run's stream-json events from `cursor`: 0 at first, then the cursor each reply gives. The reply has the run too. While it goes on with nothing new to read, this waits up to 45 seconds for an event. A reply holds up to 64 KiB of events and says if there's `more`; an event bigger than that comes as {\"runner_cut\": true, \"bytes\": n}. The run is over once its state isn't running: read on until `more` is false. That last reply has the run's `result`, unless the run was lost or never started: what the runner measured itself, the exit code, duration, whether the disk generation the run booted was committed or rolled back, and the paths that changed on that disk, less those only the VM's boot writes, counted in `boot_only`, with `agent_says`, the agent's own last message, kept apart: it's untrusted, so check it against `changed`."
     )]
     async fn run_output(
@@ -801,13 +846,52 @@ impl Tools {
             _ => arg("name"),
         };
         let Some(vm) = vm else { return Ok(None) };
-        let Some(i) = self.locate(vm).await? else {
+        let at = self.locate(vm).await?;
+        self.check_tries(request, at).await?;
+        let Some(i) = at else {
             return Ok(None);
         };
         if request.name == "move_vm" {
             return self.move_from(i, vm, request).map(Some);
         }
         Ok(Some((i, request.clone())))
+    }
+
+    /// Refuses run_best_of when a host but the VM's, at `at` (None for this
+    /// one), has a name its tries take, as create_vm refuses one, so nothing
+    /// is made: the VM's host refuses one it has itself.
+    async fn check_tries(
+        &self,
+        request: &CallToolRequestParams,
+        at: Option<usize>,
+    ) -> Result<(), String> {
+        let names = tries_of(request);
+        if names.is_empty() {
+            return Ok(());
+        }
+        let here = self.store.list().map_err(|e| e.to_string())?;
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        let lists = self.survey(&all).await;
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for name in &names {
+            let has = |l: &Result<Vec<Vm>, String>, i: usize| match l {
+                Ok(l) => l.iter().any(|v| v.name == *name),
+                Err(_) => seen.get(name) == Some(&i),
+            };
+            let on = if at.is_some() && here.iter().any(|v| v.name == *name) {
+                Some(self.name.as_str())
+            } else {
+                (lists.iter().enumerate())
+                    .find(|&(i, l)| Some(i) != at && has(l, i))
+                    .map(|(i, _)| self.peers[i].name.as_str())
+            };
+            if let Some(on) = on {
+                return Err(format!(
+                    "{on} has a VM named {name} already: VM names are one per name across hosts"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// move_vm for a VM on peer `i`, with its host as ssh takes it, which
@@ -1098,6 +1182,22 @@ const ASK_WAIT: Duration = Duration::from_secs(20);
 
 /// Each peer's VMs, in order, or why there are none.
 type Lists = Vec<Result<Vec<Vm>, String>>;
+
+// The VMs a run_best_of call makes, as best::start names them; none for any
+// other call, or an n the tool refuses.
+fn tries_of(request: &CallToolRequestParams) -> Vec<String> {
+    if request.name != "run_best_of" {
+        return Vec::new();
+    }
+    let args = request.arguments.as_ref();
+    let vm = args.and_then(|a| a.get("name")).and_then(Value::as_str);
+    let n = args.and_then(|a| a.get("n")).and_then(Value::as_u64);
+    let n = n.and_then(|n| u32::try_from(n).ok());
+    match (vm, n) {
+        (Some(vm), Some(n)) if (best::MIN..=best::MAX).contains(&n) => best::names(vm, n),
+        _ => Vec::new(),
+    }
+}
 
 // A peer's own row from its list_hosts, under the name this host calls it.
 fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {

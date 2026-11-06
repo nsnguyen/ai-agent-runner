@@ -517,6 +517,33 @@ fn a_vm_deleted_on_a_peer_frees_its_name_while_that_peer_is_down() {
     assert!(fleet.two.has("old"), "4 GiB free beats this host's 2");
 }
 
+// run_best_of makes its tries where the VM is, so a try's name that another
+// host has, this one included, is refused with nothing made: names are one
+// per name across hosts.
+#[test]
+fn run_best_of_refuses_a_try_s_name_another_host_has() {
+    let fleet = Fleet::new();
+    let mut s = fleet.serve();
+    fleet.three.store().fork("base", "web-2").unwrap();
+    let args = json!({"name": "web", "prompt": "p", "n": 3});
+    let why = s.fails(2, "run_best_of", args.clone());
+    assert_eq!(
+        why,
+        "kvm-host-3 has a VM named web-2 already: VM names are one per name across hosts"
+    );
+    fleet.three.store().delete("web-2").unwrap();
+    fleet.here.store().fork("base", "web-3").unwrap();
+    let why = s.fails(3, "run_best_of", args);
+    assert!(
+        why.ends_with(" has a VM named web-3 already: VM names are one per name across hosts"),
+        "{why}"
+    );
+    assert!(!why.starts_with("kvm-host-2 "), "{why}");
+    for vm in ["web-1", "web-2", "web-3"] {
+        assert!(!fleet.two.has(vm), "{vm}");
+    }
+}
+
 // move_vm through the first host: web goes from kvm-host-2 to kvm-host-3,
 // host to host, and every call after finds it there; dev from here to
 // kvm-host-2. Its own host, or one that isn't listed, is refused first.

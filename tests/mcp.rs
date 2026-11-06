@@ -134,6 +134,7 @@ fn lists_its_tools() {
             "remove_service",
             "restore_vm",
             "run_agent",
+            "run_best_of",
             "run_output",
             "sleep_vm",
             "start_vm",

@@ -23,8 +23,7 @@ ask="-n -o BatchMode=yes -o ConnectTimeout=$wait -o ServerAliveInterval=$wait -o
 
 # Options of the host's runner that take a value, so the scan below knows the
 # next argument is that value and not the VM. tests/hosts.rs checks that
-# every one clap has is here. --n and --run are for #147 and #160; --host is
-# the laptop's own.
+# every one clap has is here. --run is for #160; --host is the laptop's own.
 valued=" --root --keep --creds --from --cpus --mem --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --peer --name --host "
 
 hosts_usage="usage: runner hosts [add <host> | rm <host>]
@@ -646,7 +645,7 @@ fi
 # command's own. --host comes out: the host's runner hasn't got it. move's
 # target is $to, and $spot its place among the arguments kept, so only it
 # becomes its listed form, not an option's value that reads the same.
-cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra='' to='' spot=''
+cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra='' to='' spot='' tries=''
 n=$#
 while [ "$n" -gt 0 ]; do
   a=$1
@@ -683,6 +682,7 @@ while [ "$n" -gt 0 ]; do
       ;;
     --from) from=$a ;;
     --run) run=$a ;;
+    --n) tries=$a ;;
     esac
     takes=
     set -- "$@" "$a"
@@ -704,6 +704,7 @@ while [ "$n" -gt 0 ]; do
     ;;
   --from=*) from=${a#*=} ;;
   --run=*) run=${a#*=} ;;
+  --n=*) tries=${a#*=} ;;
   --replace) replace=1 ;;
   --*=*) ;;
   --*) case $valued in *" $a "*) takes=$a ;; esac ;;
@@ -982,7 +983,33 @@ output | result | cancel)
   locate "${vm%.*}"
   go "${at:-$first}"
   ;;
-export | start | stop | status | sleep | wake | idle | url | logs | undo | checkpoint | checkpoints | restore | creds | ip | shell | sessions | attach | kill | service | exec | run | runs | hold)
+run)
+  [ -n "$vm" ] || go "$host"
+  locate "$vm"
+  # Best of N makes VM-1 to VM-N on VM's host, which refuses a name it has;
+  # one another host has is refused here. Any other N is the host's to refuse.
+  case $tries in 2 | 3 | 4)
+    if [ -n "$at" ]; then
+      home=$at
+      survey "runner list"
+      answered "runner list"
+      recache 0
+      i=1
+      while [ "$i" -le "$tries" ]; do
+        cached "$vm-$i"
+        if [ -n "$at" ] && [ "$at" != "$home" ]; then
+          echo "runner: $(name_of "$at") has a VM named $vm-$i already: VM names are one per name across hosts" >&2
+          exit 1
+        fi
+        i=$((i + 1))
+      done
+      at=$home
+    fi
+    ;;
+  esac
+  go "${at:-$first}"
+  ;;
+export | start | stop | status | sleep | wake | idle | url | logs | undo | checkpoint | checkpoints | restore | creds | ip | shell | sessions | attach | kill | service | exec | runs | hold)
   [ -n "$vm" ] || go "$host"
   locate "$vm"
   go "${at:-$first}"
