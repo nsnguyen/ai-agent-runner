@@ -201,8 +201,8 @@ impl List {
         self.0.iter().find(|name| name.covers(host.labels()))
     }
 
-    // Whether a query's name is on the list, or under a name on it.
-    fn answers(&self, name: &Name) -> bool {
+    /// Whether a query's name is on the list, or under a name on it.
+    pub fn answers(&self, name: &Name) -> bool {
         let labels: Vec<&[u8]> = name.iter().collect();
         self.0
             .iter()
@@ -219,8 +219,9 @@ pub struct Address {
 
 /// Reads the VM's list: None if it has none and every name is answered.
 pub type ReadList = Box<dyn Fn() -> Result<Option<List>, String> + Send>;
-/// Takes each allowed answer's addresses before the guest gets the answer.
-pub type HandOn = Arc<dyn Fn(&[Address]) + Send + Sync>;
+/// Takes each allowed answer's addresses before the guest gets the answer,
+/// with the name it was asked for.
+pub type HandOn = Arc<dyn Fn(&Name, &[Address]) + Send + Sync>;
 
 /// What a relay answers.
 pub struct Policy {
@@ -236,7 +237,7 @@ impl Default for Policy {
     fn default() -> Policy {
         Policy {
             list: Box::new(|| Ok(None)),
-            hand_on: Arc::new(|_| {}),
+            hand_on: Arc::new(|_, _| {}),
         }
     }
 }
@@ -598,12 +599,20 @@ fn answer(
         Verdict::Ask(asked) => {
             let answer = ask(&asked, shared)?;
             let got = addresses(&answer);
-            if !got.is_empty() {
-                (shared.hand_on)(&got);
+            if !got.is_empty()
+                && let Some(name) = asked_name(&asked)
+            {
+                (shared.hand_on)(&name, &got);
             }
             Some(answer)
         }
     }
+}
+
+// The name a query asks for: the one question of a query judge rebuilt.
+fn asked_name(query: &[u8]) -> Option<Name> {
+    let msg = Message::from_vec(query).ok()?;
+    msg.queries.first().map(|q| q.name.clone())
 }
 
 // As boot's notes: under the unit, stderr is the journal stream Firecracker

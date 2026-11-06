@@ -425,6 +425,8 @@ enum Cmd {
         firecracker: PathBuf,
         #[arg(long, env = "RUNNER_IP", default_value = runner::host::IP)]
         ip: PathBuf,
+        #[arg(long, env = "RUNNER_NFT", default_value = runner::host::NFT)]
+        nft: PathBuf,
     },
     /// Shut a VM down and wait for it: the unit's ExecStop.
     #[command(hide = true)]
@@ -824,8 +826,9 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             name,
             firecracker,
             ip,
+            nft,
         } => {
-            let ended = runner::boot::boot(&store, &name, &firecracker, &ip)?;
+            let ended = runner::boot::boot(&store, &name, &firecracker, &ip, &nft)?;
             if ended == runner::boot::Ended::Restart {
                 return Ok(ExitCode::from(runner::boot::RESTART));
             }

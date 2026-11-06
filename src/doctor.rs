@@ -1,6 +1,7 @@
 // `runner doctor`: what this host still lacks to run VMs, one check per line.
 // Checks read the host only through `Host`, so tests can fake it; `System` is
 // the real machine.
+use crate::fence;
 use crate::host;
 use crate::idle::Idle;
 use crate::power;
@@ -278,8 +279,9 @@ fn base(store: &Store) -> Verdict {
 
 // Three things have to hold: forwarding on, the unit active, and its rules
 // still loaded, since a firewall reload can flush them under an active unit.
-// A fourth only warns, since VMs still run without it: the rules keep VMs off
-// the host's own services.
+// Two more only warn, since VMs still run without them: the rules keep VMs
+// off the host's own services, and can hold a VM to its list of names,
+// without which a VM with a list doesn't boot.
 fn nat(host: &impl Host) -> Verdict {
     let unit = host::NAT_UNIT;
     match host.read(Path::new(host::IP_FORWARD)) {
@@ -297,7 +299,7 @@ fn nat(host: &impl Host) -> Verdict {
     }
     let [family, table] = host::NAT_TABLE;
     let restart = format!("systemctl restart {unit}");
-    let (range, guarded) = match host.run(host::NFT, &["list", "table", family, table]) {
+    let (range, rules) = match host.run(host::NFT, &["list", "table", family, table]) {
         Ok(r) if r.ok && r.stdout.contains("masquerade") => {
             let masquerade = r.stdout.lines().find(|l| l.contains("masquerade"));
             let mut words = masquerade.unwrap_or_default().split_whitespace();
@@ -307,7 +309,7 @@ fn nat(host: &impl Host) -> Verdict {
             let ip6 = host.run(host::NFT, &["list", "table", family6, table6]);
             let ip6 = ip6.ok().filter(|r| r.ok).map(|r| r.stdout);
             let rules = format!("{}{}", r.stdout, ip6.unwrap_or_default());
-            (range.map(str::to_string), Some(guards_host(&rules)))
+            (range.map(str::to_string), Some(rules))
         }
         Ok(r) if r.ok => {
             return fail(format!(
@@ -317,8 +319,7 @@ fn nat(host: &impl Host) -> Verdict {
         // As the runner user, nft can't list rules, so the active unit, and
         // the file it loaded, have to do.
         Ok(r) if r.stderr.contains("Operation not permitted") => {
-            let file = host.read(Path::new(host::NAT_RULES));
-            (None, file.ok().map(|rules| guards_host(&rules)))
+            (None, host.read(Path::new(host::NAT_RULES)).ok())
         }
         Ok(_) => {
             return fail(format!(
@@ -327,6 +328,8 @@ fn nat(host: &impl Host) -> Verdict {
         }
         Err(e) => return fail(format!("nft: {e}")),
     };
+    let guarded = rules.as_deref().map(guards_host);
+    let holds = rules.as_deref().map(holds_lists);
     let kept_off = if guarded == Some(true) {
         ", VMs kept off the host"
     } else {
@@ -339,14 +342,20 @@ fn nat(host: &impl Host) -> Verdict {
         }
     };
     let mut warnings = Vec::new();
+    let rules = if range.is_some() {
+        "the loaded rules".to_string()
+    } else {
+        format!("the rules in {}", host::NAT_RULES)
+    };
     if guarded == Some(false) {
-        let rules = if range.is_some() {
-            "the loaded rules".to_string()
-        } else {
-            format!("the rules in {}", host::NAT_RULES)
-        };
         warnings.push(format!(
             "{rules} don't keep the VMs off the host's own services: rerun {INSTALL}"
+        ));
+    }
+    if holds == Some(false) {
+        warnings.push(format!(
+            "{rules} can't hold a VM to its list of names, so one with a list won't boot: \
+             rerun {INSTALL}"
         ));
     }
     // Both drop forwarded traffic by default, so the VMs would lose the
@@ -404,6 +413,19 @@ fn guards_host(rules: &str) -> bool {
         }
     }
     v4 && v6
+}
+
+/// Whether nftables rules, as `nft list` prints them or as host/nat.nft has
+/// them, can hold a VM to its list of names: the sets boot puts a listed
+/// VM's tap and addresses in (src/fence.rs), and a forward rule that sends a
+/// listed tap's packets to the chain that holds them to those addresses.
+fn holds_lists(rules: &str) -> bool {
+    let lines: Vec<&str> = rules.lines().map(str::trim).collect();
+    let has = |line: String| lines.contains(&line.as_str());
+    let (listed, reach) = (fence::LISTED, fence::REACH);
+    has(format!("set {listed} {{"))
+        && has(format!("set {reach} {{"))
+        && has(format!("iifname @{listed} jump {listed}"))
 }
 
 fn unit(host: &impl Host) -> Verdict {

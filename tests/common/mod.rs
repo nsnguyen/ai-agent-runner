@@ -245,6 +245,106 @@ exit "$code"
     }
 }
 
+/// An `nft` that logs each call's arguments, a line each, and runs `hook`
+/// with them if a test put one there. It answers a listing of the set
+/// `reach` with the pairs `pairs` gave, and a `get` of a tap in `listed`
+/// with whether a tap went in and didn't come out since: one test's VM's.
+/// Any call holding the text `fail` gave fails, as nft does when a set
+/// isn't there.
+pub struct FakeNft {
+    pub dir: PathBuf,
+    pub bin: PathBuf,
+}
+
+impl FakeNft {
+    pub fn new(dir: &Path) -> FakeNft {
+        fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("nft");
+        script(
+            &bin,
+            &format!(
+                r#"d='{}'
+printf '%s\n' "$*" >> "$d/log"
+[ -x "$d/hook" ] && "$d/hook" "$*"
+if [ -f "$d/fail" ]; then
+  case "$*" in *"$(cat "$d/fail")"*)
+    echo 'Error: Could not process rule: No such file or directory' >&2; exit 1;;
+  esac
+fi
+case "$*" in
+  '-j list set ip runner reach')
+    if [ -f "$d/pairs" ]; then cat "$d/pairs"; else echo '{{"nftables": []}}'; fi;;
+  'get element ip runner listed '*)
+    if [ ! -f "$d/listed" ]; then
+      echo 'Error: Could not process rule: No such file or directory' >&2; exit 1
+    fi;;
+  *'delete element ip runner listed '*) rm -f "$d/listed";;
+  *'add element ip runner listed '*) touch "$d/listed";;
+esac
+exit 0
+"#,
+                dir.display()
+            ),
+        );
+        FakeNft {
+            dir: dir.to_path_buf(),
+            bin,
+        }
+    }
+
+    /// What it was asked, a call a line.
+    pub fn calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.dir.join("log")).unwrap_or_default();
+        log.lines().map(String::from).collect()
+    }
+
+    /// Forgets what it was asked so far.
+    pub fn forget(&self) {
+        let _ = fs::remove_file(self.dir.join("log"));
+    }
+
+    /// Fails every call from now on that holds `what`.
+    pub fn fail(&self, what: &str) {
+        fs::write(self.dir.join("fail"), what).unwrap();
+    }
+
+    pub fn heal(&self) {
+        let _ = fs::remove_file(self.dir.join("fail"));
+    }
+
+    /// The set `reach` holds these tap . address pairs, as `nft -j` lists them.
+    pub fn pairs(&self, pairs: &[(&str, &str)]) {
+        let elem: Vec<Value> = pairs
+            .iter()
+            .map(|(tap, ip)| {
+                serde_json::json!({"elem": {"val": {"concat": [tap, ip]},
+                                            "timeout": 600, "expires": 599}})
+            })
+            .collect();
+        let set = serde_json::json!({"nftables": [
+            {"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
+            {"set": {"family": "ip", "name": "reach", "table": "runner",
+                     "type": ["ifname", "ipv4_addr"], "flags": ["timeout"], "elem": elem}}
+        ]});
+        fs::write(self.dir.join("pairs"), set.to_string()).unwrap();
+    }
+
+    /// The set `listed` has lost its taps, as after a firewall reload.
+    pub fn lose_taps(&self) {
+        let _ = fs::remove_file(self.dir.join("listed"));
+    }
+
+    /// A tap is in `listed`, as a boot that was killed leaves its own.
+    pub fn leave_tap(&self) {
+        fs::write(self.dir.join("listed"), "").unwrap();
+    }
+
+    /// Whether a tap is in `listed`.
+    pub fn has_tap(&self) -> bool {
+        self.dir.join("listed").exists()
+    }
+}
+
 /// systemctl, journalctl and loginctl on PATH. systemctl logs its argv to `calls`,
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
 /// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that

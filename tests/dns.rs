@@ -9,6 +9,7 @@ use common::resolver::{
     AAAA, Resolver, TXT, answer_to, query, query_for, read_framed, same_port, write_framed,
 };
 use common::wait_for;
+use hickory_proto::rr::Name;
 use proptest::prelude::*;
 use runner::dns::{self, Address, Hostname, List, Policy, Relay, Verdict};
 use std::io::{ErrorKind, Read, Write};
@@ -247,12 +248,13 @@ fn list(names: &[&str]) -> List {
 }
 
 // A relay whose list is whatever `list` holds each time it looks, and the
-// addresses it has handed on.
+// addresses it has handed on, with the names they were asked for.
 struct Listed {
     relay: Relay,
     at: SocketAddr,
     list: Arc<Mutex<Result<Option<List>, String>>>,
     handed: Arc<Mutex<Vec<Address>>>,
+    asked: Arc<Mutex<Vec<Name>>>,
 }
 
 fn listed(resolvers: &[SocketAddr], first: Option<List>) -> Listed {
@@ -260,14 +262,18 @@ fn listed(resolvers: &[SocketAddr], first: Option<List>) -> Listed {
     let at = udp.local_addr().unwrap();
     let list = Arc::new(Mutex::new(Ok(first)));
     let handed = Arc::new(Mutex::new(Vec::new()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
     let policy = Policy {
         list: Box::new({
             let list = list.clone();
             move || list.lock().unwrap().clone()
         }),
         hand_on: Arc::new({
-            let handed = handed.clone();
-            move |got: &[Address]| handed.lock().unwrap().extend_from_slice(got)
+            let (handed, asked) = (handed.clone(), asked.clone());
+            move |name: &Name, got: &[Address]| {
+                asked.lock().unwrap().push(name.clone());
+                handed.lock().unwrap().extend_from_slice(got);
+            }
         }),
     };
     let relay = Relay::serve(udp, tcp, GUEST, resolvers.to_vec(), WAIT, policy).unwrap();
@@ -276,6 +282,7 @@ fn listed(resolvers: &[SocketAddr], first: Option<List>) -> Listed {
         at,
         list,
         handed,
+        asked,
     }
 }
 
@@ -379,6 +386,9 @@ fn an_allowed_answer_s_addresses_are_handed_on_before_the_guest_gets_it() {
         ttl: Duration::from_secs(60),
     };
     assert_eq!(vm.handed(), [one]);
+    // With the name asked, for the rules to check against the list then.
+    let asked = vm.asked.lock().unwrap().clone();
+    assert_eq!(asked, [Name::from_ascii("github.com.").unwrap()]);
     let mut conn = connect("127.0.0.1", vm.at, ANSWERED);
     write_framed(&mut conn, &q).unwrap();
     assert_eq!(read_framed(&mut conn).unwrap(), answer_to(&q));

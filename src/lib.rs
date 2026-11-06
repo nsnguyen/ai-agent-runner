@@ -11,6 +11,7 @@ pub mod dns;
 pub mod doctor;
 pub mod exec;
 pub mod export;
+pub mod fence;
 pub mod firecracker;
 pub mod graft;
 pub mod guest;
