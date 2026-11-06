@@ -1083,7 +1083,10 @@ fn an_unknown_format_is_refused() {
     });
     let err = host.refused_import(&together(&entries));
     assert!(err.contains("format 99"), "{err}");
-    assert!(err.contains(&format!("reads formats 1 to {FORMAT}")), "{err}");
+    assert!(
+        err.contains(&format!("reads formats 1 to {FORMAT}")),
+        "{err}"
+    );
 }
 
 // A config's list of names is a field format 1's import doesn't know, so

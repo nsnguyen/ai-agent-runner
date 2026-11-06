@@ -538,7 +538,10 @@ fn a_vm_s_dns_is_its_own_boot_and_no_other() {
     let _boots = inside(&host, move || {
         let resolvers = [Ipv4Addr::LOCALHOST];
         let own = Relay::bind(&own_net, &resolvers, Policy::default()).unwrap();
-        (own, Relay::bind(&other_net, &resolvers, Policy::default()).unwrap())
+        (
+            own,
+            Relay::bind(&other_net, &resolvers, Policy::default()).unwrap(),
+        )
     });
     let at = |address: Ipv4Addr| SocketAddr::new(address.into(), 53);
     let (own_boot, other_boot) = (at(own.gateway), at(other.gateway));

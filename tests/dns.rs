@@ -330,7 +330,12 @@ fn with_no_list_every_name_is_answered_and_nothing_is_handed_on() {
 fn a_listed_name_and_those_under_it_are_answered_and_the_rest_refused_unasked() {
     let resolver = Resolver::start(true);
     let vm = listed(&[resolver.at], Some(list(&["github.com"])));
-    let allowed = ["github.com", "api.github.com", "GitHub.COM", "api.anthropic.com"];
+    let allowed = [
+        "github.com",
+        "api.github.com",
+        "GitHub.COM",
+        "api.anthropic.com",
+    ];
     for (id, name) in (10..).zip(allowed) {
         let q = query(id, name);
         assert_eq!(both(vm.at, &q), [answer_to(&q), answer_to(&q)], "{name}");
@@ -430,12 +435,22 @@ fn a_listed_vm_s_query_that_is_not_one_plain_question_is_not_passed_on() {
             "an answer record",
             edit(&|q| {
                 q[7] = 1;
-                q.extend([0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60, 0, 4, 3, b'h', b'i', b'!']);
+                q.extend([
+                    0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60, 0, 4, 3, b'h', b'i', b'!',
+                ]);
             }),
             REFUSED,
         ),
-        ("bytes past the question", edit(&|q| q.extend(b"leak")), FORMERR),
-        ("a cut-off question", plain[..plain.len() - 3].to_vec(), FORMERR),
+        (
+            "bytes past the question",
+            edit(&|q| q.extend(b"leak")),
+            FORMERR,
+        ),
+        (
+            "a cut-off question",
+            plain[..plain.len() - 3].to_vec(),
+            FORMERR,
+        ),
     ];
     for (what, q, want) in cases {
         let answer = ask_udp("127.0.0.1", vm.at, &q, ANSWERED);

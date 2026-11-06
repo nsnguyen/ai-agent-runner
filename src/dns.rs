@@ -126,7 +126,10 @@ impl FromStr for Hostname {
             return bad("it has an empty label, between two dots or at an end".into());
         }
         for label in &labels {
-            if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            if !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
                 return bad(
                     "use only letters, digits and hyphens between the dots, and a name's \
                      xn-- form for other scripts"
@@ -143,7 +146,10 @@ impl FromStr for Hostname {
         if labels.len() < 2 {
             return bad("a name of one label, like com, would cover every name under it".into());
         }
-        if labels.last().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit())) {
+        if labels
+            .last()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
+        {
             return bad("it ends in a number, like an address".into());
         }
         Ok(Hostname(host.to_string()))
@@ -307,11 +313,7 @@ fn reply(query: &[u8], msg: &Message, code: ResponseCode) -> Verdict {
         edns.set_max_payload(PAYLOAD);
         answer.edns = Some(edns);
     }
-    Verdict::Answer(
-        answer
-            .to_vec()
-            .unwrap_or_else(|_| header_only(query, code)),
-    )
+    Verdict::Answer(answer.to_vec().unwrap_or_else(|_| header_only(query, code)))
 }
 
 // An answer that's only a header: the query's ID, and `code`.
@@ -378,7 +380,10 @@ impl Relay {
         wait: Duration,
         policy: Policy,
     ) -> io::Result<Relay> {
-        let Policy { list: read, hand_on } = policy;
+        let Policy {
+            list: read,
+            hand_on,
+        } = policy;
         let first = read().map_err(io::Error::other)?;
         udp.set_read_timeout(Some(LOOK))?;
         tcp.set_nonblocking(true)?;
