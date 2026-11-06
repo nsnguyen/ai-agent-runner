@@ -30,13 +30,14 @@
 //
 // It serves the VM's URL on the tailnet, too (src/url.rs), for as long as it's
 // up: a connection to a sleeping VM has the loop wake it, as a `runner wake`
-// does.
+// does. And the VM's DNS, on its gateway (src/dns.rs), for as long too.
 use crate::calls::{Calls, Restore};
 use crate::creds::{Cred, Keyring, Source};
+use crate::dns;
 use crate::exec;
 use crate::firecracker::{self, Api, Guest};
 use crate::idle::{self, Idle, Look, Quiet, Timer, Uses};
-use crate::net::{self, HOST_RESOLV_CONFS, Tap};
+use crate::net::{self, HOST_RESOLV_CONFS, Net, Tap};
 use crate::proto::{self, Request};
 use crate::runs;
 use crate::sessions;
@@ -165,14 +166,8 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             return Err(e.into());
         }
     };
-    let dns = net::dns(&HOST_RESOLV_CONFS.map(Path::new));
-    if dns.is_empty() {
-        note(format_args!(
-            "{name} boots without DNS: no IPv4 nameserver in {}",
-            HOST_RESOLV_CONFS.join(" or ")
-        ));
-    }
-    let ip_arg = net.boot_arg(name, &dns);
+    // On the tap's address, so after it, and dropped just before it.
+    let (relay, ip_arg) = serve_dns(name, &net, run.parked().is_some());
     let api_sock = run.api_socket();
     let vsock = run.vsock();
     let creds_sock = run.creds_socket();
@@ -193,6 +188,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     let uses = match Uses::open(store, name) {
         Ok(uses) => uses,
         Err(e) => {
+            drop(relay);
             drop(tap);
             run.discard();
             return Err(e.into());
@@ -211,6 +207,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         Ok(served) => served,
         Err(e) => {
             let _ = remove_sockets(&sockets);
+            drop(relay);
             drop(tap);
             run.discard();
             return Err(e);
@@ -240,6 +237,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
                     drop(calls);
                     drop(offer);
                     let _ = remove_sockets(&sockets);
+                    drop(relay);
                     drop(tap);
                     run.discard();
                     return Err(e);
@@ -305,6 +303,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         drop(calls);
         drop(offer);
         let _ = remove_sockets(&sockets);
+        drop(relay);
         drop(tap);
         run.discard();
         return Err(e);
@@ -355,6 +354,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     {
         note(format_args!("{e}"));
     }
+    drop(relay);
     drop(tap);
     let status = match over {
         Over::Exited(Ok(status)) => status,
@@ -426,6 +426,38 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     })
 }
 
+// The VM's DNS, served on its gateway, and the boot argument that points
+// the guest there. A boot that can't serve it, with a resolver already on
+// port 53 of every address, say, gives the guest the host's resolvers, which
+// the host's rules let it reach if they're off the host. A parked VM that
+// resumes keeps the server it booted with, likely its gateway.
+fn serve_dns(name: &str, net: &Net, parked: bool) -> (Option<dns::Relay>, String) {
+    let resolvers = net::dns(&HOST_RESOLV_CONFS.map(Path::new));
+    if resolvers.is_empty() {
+        note(format_args!(
+            "{name} boots without DNS: no IPv4 nameserver in {}",
+            HOST_RESOLV_CONFS.join(" or ")
+        ));
+        return (None, net.boot_arg_with(name, &[]));
+    }
+    match dns::Relay::bind(net, &resolvers) {
+        Ok(relay) => (Some(relay), net.boot_arg(name)),
+        Err(e) if parked => {
+            note(format_args!(
+                "boot can't serve {name}'s DNS on {e}: resumed, its guest gets no answer \
+                 at its gateway until it boots again"
+            ));
+            (None, net.boot_arg_with(name, &resolvers))
+        }
+        Err(e) => {
+            note(format_args!(
+                "{name}'s DNS goes straight to the host's resolvers: boot can't serve it on {e}"
+            ));
+            (None, net.boot_arg_with(name, &resolvers))
+        }
+    }
+}
+
 // Firecracker for this boot's VM, on its API socket. Its stdin is the lock,
 // so the VM stays held while the guest runs even if boot dies. It reads stdin
 // only from a tty or a fifo, so it never touches the file.
@@ -442,9 +474,10 @@ fn firecracker(bin: &Path, api_sock: &Path, name: &str, lock: File) -> Result<Ch
     for var in Cred::ALL.iter().flat_map(|c| c.vars()) {
         fc.env_remove(var);
     }
-    // The unit gives this process CAP_NET_ADMIN for the tap. Firecracker
-    // opens the tap without it, and a guest that broke into Firecracker
-    // could use it to undo the host's NAT rules, so it doesn't inherit it.
+    // The unit gives this process CAP_NET_ADMIN for the tap, and
+    // CAP_NET_BIND_SERVICE for the VM's DNS. Firecracker opens the tap
+    // without either, and a guest that broke into Firecracker could use the
+    // first to undo the host's NAT rules, so it inherits neither.
     // SAFETY: prctl is async-signal-safe, so fine between fork and exec.
     unsafe {
         fc.pre_exec(|| {

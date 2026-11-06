@@ -3,6 +3,8 @@
 // built with e2fsprogs. Each test file uses its own share of them.
 #![allow(dead_code)]
 
+pub mod resolver;
+
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

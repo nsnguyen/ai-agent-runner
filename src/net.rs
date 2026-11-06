@@ -104,9 +104,16 @@ pub struct Net {
 
 impl Net {
     /// The kernel's `ip=` boot argument: the guest's address, gateway, netmask
-    /// and hostname on eth0, no autoconfiguration, and up to two DNS servers,
-    /// which the kernel shows the guest in /proc/net/pnp.
-    pub fn boot_arg(&self, hostname: &str, dns: &[Ipv4Addr]) -> String {
+    /// and hostname on eth0, no autoconfiguration, and the gateway as its one
+    /// DNS server, which the kernel shows the guest in /proc/net/pnp. There
+    /// the VM's boot answers it (src/dns.rs).
+    pub fn boot_arg(&self, hostname: &str) -> String {
+        self.boot_arg_with(hostname, &[self.gateway])
+    }
+
+    /// `boot_arg`, with up to two other DNS servers in place of the gateway,
+    /// or none: for a boot that can't serve the VM's DNS.
+    pub fn boot_arg_with(&self, hostname: &str, dns: &[Ipv4Addr]) -> String {
         let mut arg = format!(
             "ip={}::{}:255.255.255.252:{hostname}:eth0:off",
             self.address, self.gateway
