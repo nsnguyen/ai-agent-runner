@@ -132,6 +132,7 @@ fn lists_its_tools() {
             "list_vms",
             "move_vm",
             "read_session",
+            "rebase_vm",
             "remove_service",
             "restore_vm",
             "run_agent",
@@ -221,6 +222,48 @@ fn create_then_list() {
         why,
         format!("no host named kvm-host-2: the hosts are {}", host.trim())
     );
+}
+
+#[test]
+fn rebase_vm_says_what_it_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let base = common::tree(&dir.path().join("base"), &[("etc/os-release", "2\n")]);
+    store.import("base", &common::image(&base)).unwrap();
+    let dev = common::tree(
+        &dir.path().join("dev"),
+        &[
+            ("etc/systemd/system/runner-svc-web.service", "[Service]\n"),
+            ("home/agent/work/a\nb", "skipped"),
+        ],
+    );
+    store.import("dev", &common::image(&dev)).unwrap();
+
+    let mut s = start(dir.path());
+    let done = s.call(2, "rebase_vm", json!({"name": "dev"}));
+    assert_eq!(done["isError"], json!(false), "{done}");
+    let vm =
+        json!({"name": "dev", "generation": 1, "bytes": 16 << 20, "used": used(dir.path(), "dev")});
+    assert_eq!(
+        done["structuredContent"],
+        json!({
+            "vm": vm,
+            "base_generation": 0,
+            "kept": ["/home", "/root", "/etc/machine-id"],
+            "services": ["web"],
+            "skipped": [{"path": "/home/agent/work/a\nb", "why": "name"}],
+            "more": 0,
+            "own_claude": null,
+        })
+    );
+
+    let held = store.lock("dev").unwrap();
+    let busy = s.call(3, "rebase_vm", json!({"name": "dev"}));
+    assert_eq!(busy["isError"], json!(true), "{busy}");
+    let why = busy["content"][0]["text"].as_str().unwrap();
+    assert!(why.contains("stop it first: runner stop dev"), "{why}");
+    drop(held);
+    assert_eq!(store.get("dev").unwrap().generation, 1);
 }
 
 #[test]

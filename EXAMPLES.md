@@ -34,6 +34,24 @@ runner stop demo       # shut it down cleanly, which saves its disk
 runner delete demo     # remove it, checkpoints and all (stop it first)
 ```
 
+A VM keeps the base it was made from. Once base is rebuilt, say with a newer Claude Code, `rebase` moves an older VM onto it, keeping its files:
+
+```sh
+runner stop demo
+runner rebase demo     # base's system, demo's /home, /root and services
+runner undo demo       # changed your mind: demo's old disk is back
+```
+
+It prints what it kept and warns about the rest:
+
+```
+demo is on base's generation 4 now: generation 13 is current.
+Kept /home, /root, /etc/machine-id and 2 services (api, web).
+Anything installed outside those, like apt packages, is gone, and so are users added with useradd, crontabs and /var: runner undo demo brings it back.
+```
+
+So reinstall your apt packages after it. Claude Code comes from base, at base's version.
+
 ## 3. Work in a VM
 
 ```sh
@@ -200,6 +218,8 @@ client/aws.sh stop     # turn the servers off now, or leave them to turn themsel
 | A server that's off stays off | Rerun `client/install.sh`, which puts `aws.sh` beside `runner`, and `export AWS_PROFILE=runner` |
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
+| `demo is up, or a run or another runner command holds it` from `rebase` | `runner stop demo` first, or wait for its run to end |
+| `base's current generation, … came from "run", not an import` from `rebase` | base booted since its import: import it again (README.md, Build the base image) |
 | A VM won't start | `runner logs demo` shows why |
 | `kvm-host-2 didn't answer: … Permission denied (publickey)`, from a move or Claude | The servers don't trust each other yet, say because one had an older build when you added the other: `runner hosts add runner@kvm-host-2` again. It names any server without a key: update that one first (README.md, After merging a change) |
 | `administratively prohibited` from `runner proxy` | Add `port-forwarding` to the laptop's key line on the server (README.md, Add the laptop's key) |

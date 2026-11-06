@@ -12,6 +12,7 @@ use runner::import;
 use runner::peers;
 use runner::power;
 use runner::proto::{Exit, Request};
+use runner::rebase;
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
@@ -176,6 +177,13 @@ enum Cmd {
     },
     /// Roll a VM back to its previous committed disk generation.
     Undo { name: String },
+    /// Give a stopped VM the current base's system, runner-guest and Claude
+    /// Code included, as a new disk generation that keeps its /home, /root,
+    /// /etc/machine-id and services. Anything else it installed, like apt
+    /// packages, is gone: `runner undo <name>` brings the old disk back.
+    /// Refused while it's up, and when base's current disk didn't come from
+    /// an import.
+    Rebase { name: String },
     /// Remove a VM and all its disk generations.
     Delete { name: String },
     /// Delete old disk generations: all but the current one, your checkpoints,
@@ -630,6 +638,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             });
         }
         Cmd::Undo { name } => show(&store.undo(&name)?),
+        Cmd::Rebase { name } => print!("{}", rebase::said(&rebase::rebase(&store, &name)?)),
         Cmd::Delete { name } => println!("deleted {}", line(&store.delete(&name)?)),
         Cmd::Ip { name } => println!("{}", store.net(&name)?.address),
         Cmd::Shell {
