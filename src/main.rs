@@ -348,6 +348,20 @@ enum Cmd {
     /// List a VM's runs, newest first: id, when it started, how it stands,
     /// and its prompt.
     Runs { name: String },
+    /// Show the tries of a VM's latest best of N side by side, a row per
+    /// try: its run, how it stands, its exit code, how long it took, how many
+    /// paths it changed, and the first line of what its agent says, which is
+    /// untrusted. A try deleted since shows as gone.
+    Tries {
+        name: String,
+        /// Print each try's run and its whole result as JSON instead, the
+        /// paths it changed and all of what its agent says included.
+        #[arg(long)]
+        json: bool,
+        /// Wait until every try's run has ended, then print.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Print a run's stream-json, an event per line: what's there now, or
     /// with --follow, all of it as it comes.
     Output {
@@ -749,6 +763,19 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 println!("no runs yet");
             }
             all.iter().for_each(|r| println!("{}", run_row(r)));
+        }
+        Cmd::Tries { name, json, wait } => {
+            let now = match wait {
+                true => best::wait(&store, &name)?,
+                false => best::standing(&store, &name)?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&now)?);
+            } else if now.tries.is_empty() {
+                println!("no tries yet");
+            } else {
+                print!("{}", now.table(chrono::Utc::now()));
+            }
         }
         Cmd::Output { run, from, follow } => {
             let run = runs::output(&store, &run, from, follow, &mut std::io::stdout().lock())?;
