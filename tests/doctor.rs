@@ -31,7 +31,7 @@ const NAT: &str = "table ip runner {
 \t\ttype filter hook input priority filter; policy accept;
 \t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
 \t\tiifname \"fc*\" ct state established,related accept
-\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 accept
+\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 socket wildcard 0 accept
 \t\tiifname \"fc*\" drop
 \t}
 }
@@ -42,7 +42,7 @@ const NAT: &str = "table ip runner {
 // source address, which let in a VM that forged its source.
 const INPUT: &str = "\t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
 \t\tiifname \"fc*\" ct state established,related accept
-\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 accept
+\t\tiifname \"fc*\" fib daddr . iif type local meta l4proto { tcp, udp } th dport 53 socket wildcard 0 accept
 \t\tiifname \"fc*\" drop
 ";
 const INPUT_BY_SOURCE: &str = "\t\tip saddr 172.16.0.0/16 ct state established,related accept

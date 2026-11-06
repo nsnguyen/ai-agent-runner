@@ -575,6 +575,41 @@ fn a_vm_s_dns_is_its_own_boot_and_no_other() {
     assert!(upstream.heard().contains(&query(2, "example.com")));
 }
 
+// A VM whose boot can't serve its DNS, under a resolver the host runs on
+// every address, say, doesn't reach that resolver at its gateway either: the
+// rules let port 53 in only to a socket bound to the tap's own address, as
+// the boot's are (#122).
+// Run as root: cargo test --test net -- --ignored
+#[test]
+#[ignore = "needs root, nftables and iproute2"]
+fn a_vm_whose_boot_can_t_serve_its_dns_doesn_t_reach_the_host_s() {
+    let range = subnet("10.254.0.0/16");
+    let net = range.net(16006).unwrap();
+    let mut spaces = Spaces::default();
+    let (host, vm) = (spaces.add("dnsless-host"), spaces.add("dnsless-vm"));
+    plug(&host, &vm, &net, &format!("{}/30", net.address));
+    let _dnsmasq = inside(&host, || {
+        let udp = UdpSocket::bind("0.0.0.0:53").unwrap();
+        Resolver::on(udp, TcpListener::bind("0.0.0.0:53").unwrap(), true)
+    });
+    // So the boot can't bind port 53 on the gateway.
+    let own = net.clone();
+    let bound = inside(&host, move || {
+        Relay::bind(&own, &[Ipv4Addr::LOCALHOST])
+            .map(drop)
+            .map_err(|e| e.kind())
+    });
+    assert_eq!(bound, Err(ErrorKind::AddrInUse));
+    let gateway = SocketAddr::new(net.gateway.into(), 53);
+    let answer = answer_to(&query(1, "example.com"));
+    assert_eq!(ask_dns_udp(&vm, gateway), Some(answer));
+
+    load_rules(&host, &range);
+    assert_eq!(ask_dns_udp(&vm, gateway), None);
+    let got = ask_dns_tcp(&vm, gateway).map_err(|e| e.kind());
+    assert_eq!(got, Err(ErrorKind::TimedOut));
+}
+
 // A VM that gives itself an address outside the VMs' range gets nothing past
 // the rules, over TCP or UDP: not to the host, at its tap's address or its
 // LAN one, not through it to the LAN or the internet, and not as a forged
