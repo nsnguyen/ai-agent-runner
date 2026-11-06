@@ -77,10 +77,10 @@ fn sleep_and_wake_go_through_the_vm_s_boot() {
     assert!(h.ok(&["status", "dev"]).ends_with("  running\n"));
 
     let slept = h.ok(&["sleep", "dev"]);
-    assert_eq!(slept, "dev  gen 0  6 bytes  sleeping\n");
+    assert_eq!(slept, "dev  gen 0  6 bytes  cpus 2  mem 2G  sleeping\n");
     assert!(h.ok(&["status", "dev"]).ends_with("  sleeping\n"));
     let woke = h.ok(&["wake", "dev"]);
-    assert_eq!(woke, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(woke, "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
     assert_eq!(boot.asked(), [Ask::Sleep, Ask::Wake]);
     // Neither touches systemd's state.
     let verbs: Vec<String> =
@@ -154,7 +154,7 @@ fn start_wakes_a_sleeping_vm() {
     let boot = StandIn::serve(&h.store, "dev");
     h.asleep(1);
     let started = h.ok(&["start", "dev"]);
-    assert_eq!(started, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(started, "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
     assert_eq!(boot.asked(), [Ask::Wake]);
 }
 
@@ -242,7 +242,7 @@ fn a_parked_vm_is_sleeping_and_wake_starts_it() {
     assert!(h.ok(&["sleep", "dev"]).ends_with("  sleeping\n"));
     assert!(h.verbs().is_empty(), "{:?}", h.verbs());
     let woke = h.ok(&["wake", "dev"]);
-    assert_eq!(woke, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(woke, "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
     assert_eq!(h.verbs(), ["systemctl start firecracker@dev.service"]);
     assert_eq!(h.store.sleeping("dev").unwrap(), None);
 }
@@ -252,7 +252,7 @@ fn start_resumes_a_parked_vm() {
     let h = host();
     h.parked(1);
     let started = h.ok(&["start", "dev"]);
-    assert_eq!(started, "dev  gen 0  6 bytes  running\n");
+    assert_eq!(started, "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
     assert_eq!(h.verbs(), ["systemctl start firecracker@dev.service"]);
 }
 
