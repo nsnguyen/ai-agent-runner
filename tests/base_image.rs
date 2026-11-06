@@ -232,6 +232,25 @@ fn the_image_turns_claude_code_s_updater_off() {
     );
 }
 
+// A VM with a list of names gets REFUSED for the rest, which an agent could
+// take for a broken network and work around: llm.txt says it's the owner's
+// list, and to ask.
+#[test]
+fn llm_txt_says_a_refused_name_is_off_the_owner_s_list() {
+    let llm = fs::read_to_string(script("llm.txt")).unwrap();
+    for said in [
+        "## The network",
+        "REFUSED",
+        "off the owner's list for this VM",
+        "ask the owner",
+        "don't work around it",
+        "runner net",
+        runner::dns::ALWAYS[0],
+    ] {
+        assert!(llm.contains(said), "llm.txt doesn't say {said:?}");
+    }
+}
+
 // What the agent reads to know where it is: the commands it names are the
 // ones runner-guest has, and the numbers are the runner's own.
 #[test]

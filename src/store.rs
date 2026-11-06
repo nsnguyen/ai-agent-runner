@@ -9,6 +9,7 @@
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
 //   <root>/vms/<name>/use.lock       flock'd shared by each command using the VM, and touched; exclusive by its boot as it sleeps it (idle.rs)
 //   <root>/vms/<name>/config.json    sizes, kernel, idle time, URL and list of names (dns.rs), only where they differ from the defaults
+//   <root>/vms/<name>/config.lock    flock'd while a command changes config.json, one at a time
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
@@ -629,11 +630,13 @@ impl Store {
     /// VM's boot reads it every second, so it counts from then on, unless
     /// that boot couldn't serve its DNS and gave it the host's resolvers:
     /// then from its next boot, which doesn't start without serving it.
+    /// api.anthropic.com, on every list, isn't kept among the owner's.
     pub fn allow(&self, name: &str, hosts: &[Hostname]) -> Result<List> {
         let mut now = Vec::new();
         self.set_config(name, |config| {
             let names = config.allow.get_or_insert_with(Vec::new);
-            names.extend_from_slice(hosts);
+            let own = hosts.iter().filter(|h| !dns::ALWAYS.contains(&h.as_str()));
+            names.extend(own.cloned());
             names.sort();
             names.dedup();
             now.clone_from(names);
@@ -650,7 +653,8 @@ impl Store {
         self.set_config(name, |config| {
             let Some(names) = config.allow.as_mut() else {
                 return Err(Error::BadConfig(format!(
-                    "{name} has no list of names to take one off: it reaches every name"
+                    "{name} is open: it reaches every name. A list allows names, it doesn't \
+                     block them: `runner net {name} allow <names>` makes one"
                 )));
             };
             let list = List::new(names.clone());
@@ -685,11 +689,14 @@ impl Store {
     }
 
     // Changes the VM's config, keeping the rest, and writes it whole, so a
-    // boot reading it sees the old one or the new. An imported VM's kernel
-    // needn't be on this host: only its boot needs it. A change that fails
-    // writes nothing.
+    // boot reading it sees the old one or the new. One change at a time, so
+    // two at once each keep theirs. An imported VM's kernel needn't be on
+    // this host: only its boot needs it. A change that fails writes nothing.
     fn set_config(&self, name: &str, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
         let dir = self.existing(name)?;
+        let path = dir.join(CONFIG_LOCK);
+        let lock = open_lock(&path, name)?;
+        lock.lock().map_err(at(&path))?;
         let mut config = read_config(&dir)?;
         change(&mut config)?;
         config.check_values()?;
@@ -1686,6 +1693,7 @@ const HANDED: &str = "handed";
 const ROLLBACK: &str = "rollback";
 const BOOTED: &str = "booted";
 const FREEZE_LOCK: &str = "freeze.lock";
+const CONFIG_LOCK: &str = "config.lock";
 const PART: &str = ".part";
 
 /// A boot's generations (Store::booted).

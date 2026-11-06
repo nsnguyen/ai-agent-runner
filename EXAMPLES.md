@@ -208,7 +208,18 @@ Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this 
 
 `move` keeps the name, your checkpoints, its settings, services and credentials. A running demo3 is shut down first, which ends what runs in it, and started again on the new server; its address and URL change, so it prints the new URL. The copy goes straight from server to server, and demo3 leaves the old one only once the new one has it all, so a move cut off halfway leaves it where it was.
 
-## 10. When you're done
+## 10. Keep a VM to a few sites
+
+```sh
+runner net demo allow github.com registry.npmjs.org   # demo reaches only these, and Claude's API
+runner net demo list                                   # what it can reach
+runner net demo deny registry.npmjs.org                # take one off
+runner net demo open                                   # the whole internet again
+```
+
+It works at once, on a running VM too, with no restart. A name covers the names under it: github.com lets in api.github.com. Any other site doesn't resolve inside demo, and Claude there knows to ask you rather than work around it. Claude on your laptop can read the list (`vm_allowlist`) but not change it.
+
+## 11. When you're done
 
 ```sh
 runner stop demo       # saves its disk

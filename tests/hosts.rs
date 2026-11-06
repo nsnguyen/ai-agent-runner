@@ -463,6 +463,10 @@ fn a_command_naming_a_vm_reaches_only_its_host() {
         (&["cancel", "web.3"], "cancel web.3"),
         (&["tries", "web", "--wait"], "tries web --wait"),
         (
+            &["net", "web", "allow", "github.com"],
+            "net web allow github.com",
+        ),
+        (
             &["service", "logs", "-n", "50", "web", "srv"],
             "service logs -n 50 web srv",
         ),
