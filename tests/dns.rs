@@ -121,9 +121,10 @@ fn a_resolver_that_never_answers_is_passed_over() {
 fn a_resolver_that_never_answers_doesn_t_hang_the_relay() {
     let (silent, live) = (Resolver::start(false), Resolver::start(true));
     let (relay, at) = relay(&[silent.at, live.at]);
-    // Each waits out the silent one, at the same time, not in turn.
+    // Each waits out the silent one, at the same time, not in turn: in turn,
+    // 16 would take 16 waits.
     let began = Instant::now();
-    let asks: Vec<_> = (0..8)
+    let asks: Vec<_> = (0..16)
         .map(|id| {
             thread::spawn(move || {
                 (
@@ -137,7 +138,7 @@ fn a_resolver_that_never_answers_doesn_t_hang_the_relay() {
         let (id, got) = ask.join().unwrap();
         assert_eq!(got, Some(answer_to(&query(id, "a.example"))));
     }
-    assert!(began.elapsed() < WAIT * 4, "{:?}", began.elapsed());
+    assert!(began.elapsed() < WAIT * 8, "{:?}", began.elapsed());
     drop(relay);
 
     // With only the silent one, nothing comes back, over either.
