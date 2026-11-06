@@ -231,8 +231,12 @@ esac
 // Host tools that only log.
 const LOGGERS: &[&str] = &["podman", "stty"];
 
+// It notes each run's RUNNER_HOST_IDLE in install-idle, and keeps it as
+// install.sh does.
 const STUB_INSTALL: &str = r#"log install.sh "$@"
-mkdir -p "$HOST/home/runner/.ssh"
+mkdir -p "$HOST/home/runner/.ssh" "$HOST/etc/runner"
+echo "${RUNNER_HOST_IDLE-unset}" >>"$HOST/install-idle"
+[ -z "${RUNNER_HOST_IDLE-}" ] || echo "$RUNNER_HOST_IDLE" >"$HOST/etc/runner/host-idle"
 "#;
 
 const STUB_BUILD: &str = r#"log build.sh "$@"
@@ -1037,6 +1041,25 @@ fn a_rerun_redoes_nothing() {
             out.contains(&format!("runner hosts add runner@{NEW}")),
             "{out}"
         );
+    }
+}
+
+// A host aws.sh made powers itself off after an hour idle (src/power.rs),
+// unless it has an idle time already, which reruns keep.
+#[test]
+fn the_setup_sets_an_hour_idle_on_a_host_with_no_setting() {
+    for shell in SHELLS {
+        let (aws, host, _) = second_host();
+        ok(&aws.run_as(shell, NEW, &["up"], ""));
+        assert_eq!(host.read("etc/runner/host-idle").unwrap(), "1h\n");
+        ok(&aws.run_as(shell, NEW, &["setup"], ""));
+        assert_eq!(host.read("install-idle").unwrap(), "1h\nunset\n");
+
+        let (aws, host, _) = second_host();
+        host.has("etc/runner/host-idle", "2h\n");
+        ok(&aws.run_as(shell, NEW, &["up"], ""));
+        assert_eq!(host.read("install-idle").unwrap(), "unset\n");
+        assert_eq!(host.read("etc/runner/host-idle").unwrap(), "2h\n");
     }
 }
 
