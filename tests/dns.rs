@@ -5,6 +5,7 @@
 mod common;
 
 use common::resolver::{Resolver, answer_to, query, read_framed, same_port, write_framed};
+use common::wait_for;
 use proptest::prelude::*;
 use runner::dns::Relay;
 use std::io::{ErrorKind, Read, Write};
@@ -111,7 +112,10 @@ fn a_resolver_that_never_answers_is_passed_over() {
     let mut conn = connect("127.0.0.1", at, ANSWERED);
     write_framed(&mut conn, &q).unwrap();
     assert_eq!(read_framed(&mut conn).unwrap(), answer_to(&q));
-    assert_eq!(silent.heard(), [q.clone(), q.clone()]);
+    // It heard both, though maybe only just.
+    wait_for("the silent resolver to hear both", || {
+        silent.heard() == [q.clone(), q.clone()]
+    });
     assert_eq!(live.heard(), [q.clone(), q]);
 }
 
@@ -145,7 +149,7 @@ fn a_resolver_that_never_answers_doesn_t_hang_the_relay() {
     let (relay, at) = self::relay(&[silent.at]);
     let q = query(9, "example.com");
     assert_eq!(ask_udp("127.0.0.1", at, &q, WAIT * 3), None);
-    let mut conn = connect("127.0.0.1", at, WAIT * 3);
+    let mut conn = connect("127.0.0.1", at, ANSWERED);
     write_framed(&mut conn, &q).unwrap();
     let mut rest = Vec::new();
     // Closed with nothing said, so the guest tries again.

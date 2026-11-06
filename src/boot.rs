@@ -167,7 +167,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         }
     };
     // On the tap's address, so after it, and dropped just before it.
-    let (relay, ip_arg) = serve_dns(name, &net);
+    let (relay, ip_arg) = serve_dns(name, &net, run.parked().is_some());
     let api_sock = run.api_socket();
     let vsock = run.vsock();
     let creds_sock = run.creds_socket();
@@ -429,8 +429,9 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
 // The VM's DNS, served on its gateway, and the boot argument that points
 // the guest there. A boot that can't serve it, with a resolver already on
 // port 53 of every address, say, gives the guest the host's resolvers, which
-// the host's rules let it reach.
-fn serve_dns(name: &str, net: &Net) -> (Option<dns::Relay>, String) {
+// the host's rules let it reach if they're off the host. A parked VM that
+// resumes keeps the server it booted with, likely its gateway.
+fn serve_dns(name: &str, net: &Net, parked: bool) -> (Option<dns::Relay>, String) {
     let resolvers = net::dns(&HOST_RESOLV_CONFS.map(Path::new));
     if resolvers.is_empty() {
         note(format_args!(
@@ -441,6 +442,13 @@ fn serve_dns(name: &str, net: &Net) -> (Option<dns::Relay>, String) {
     }
     match dns::Relay::bind(net, &resolvers) {
         Ok(relay) => (Some(relay), net.boot_arg(name)),
+        Err(e) if parked => {
+            note(format_args!(
+                "boot can't serve {name}'s DNS on {e}: resumed, its guest gets no answer \
+                 at its gateway until it boots again"
+            ));
+            (None, net.boot_arg_with(name, &resolvers))
+        }
         Err(e) => {
             note(format_args!(
                 "{name}'s DNS goes straight to the host's resolvers: boot can't serve it on {e}"
