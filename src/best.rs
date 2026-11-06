@@ -370,8 +370,9 @@ pub struct Kept {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
     /// The kept try's newest run whose work is on the disk kept: one that
-    /// committed, or joined it running. The one best of N started, unless
-    /// another committed in it or joined it since. Left out if none is.
+    /// committed, joined it running, or was taken over. The one best of N
+    /// started, unless another did one of those in it since. Left out if
+    /// none is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     /// That run's Claude Code session, which run_agent's resume takes to
@@ -577,10 +578,11 @@ fn forked(store: &Store, name: &str) -> Result<String> {
 }
 
 // Whether the run's work, and so its Claude Code session, is on its VM's
-// disk: it committed, or joined the VM running, which a clean stop commits.
-// A rolled-back run's went with the disk it ran.
+// disk: it committed, joined the VM running, or was taken over, which
+// leaves the VM up on the run's disk; a clean stop commits those two. A
+// rolled-back run's went with the disk it ran.
 fn on_disk(run: &AgentRun) -> bool {
-    run.outcome == Some(Outcome::Committed) || !run.boots
+    run.outcome == Some(Outcome::Committed) || !run.boots || run.state == runs::State::TakenOver
 }
 
 // Whether the try `name`, whose newest run is `run`, can be kept: no run is

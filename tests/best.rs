@@ -994,6 +994,32 @@ fn a_try_whose_later_run_rolled_back_is_kept_with_its_work() {
     assert_eq!(h.vms(), ["dev"]);
 }
 
+// A try whose batch run `runner claude --run` took over: the run ended with
+// no outcome and left the try up, and the clean stop since committed what
+// the run and its session wrote. So its session is on the disk kept.
+#[test]
+fn a_try_whose_run_was_taken_over_is_kept_with_its_session() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    finish_third(&h, lock);
+    commit_try(&h, "dev-1");
+    let won = current(&h, "dev-1");
+    let runs = h.store.runs("dev-1").unwrap();
+    let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#);
+    fs::write(runs.join("1/stream"), init + "\n").unwrap();
+    let taken = json!({"ended": "2026-11-06T09:02:14Z", "exit_code": null, "signal": 15, "cancelled": false, "taken_over": true, "outcome": null, "error": null});
+    fs::write(runs.join("1/end.json"), taken.to_string()).unwrap();
+    assert!(h.ok(&["tries", "dev"]).contains("dev-1.1  taken over"));
+
+    let out = h.ok(&["keep", "dev-1"]);
+    let want = format!(
+        "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-1.1's conversation"
+    );
+    assert!(out.contains(&want), "{out}");
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-1's");
+    assert_eq!(h.vms(), ["dev"]);
+}
+
 #[test]
 fn keep_none_deletes_the_tries_and_leaves_dev_as_it_was() {
     let h = host(false);
