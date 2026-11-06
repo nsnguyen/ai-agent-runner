@@ -15,7 +15,7 @@ client/aws.sh start             # a few minutes: it waits until the host has boo
 runner list                     # over the tailnet; base and your VMs
 ```
 
-The host comes back at a new public address, which doesn't matter: Tailscale reaches it as `kvm-host`.
+The host comes back at a new public address, which doesn't matter: Tailscale reaches it as `kvm-host`. It powers itself off once it's been idle for an hour: every VM stopped or asleep, no one logged in to the host itself, and no `runner` command at work. The laptop's own `runner` connections count only while a command runs, so a `runner mcp` left open doesn't keep it up. After that, start it here again.
 
 ### 2. Claude Code in a VM
 
@@ -56,7 +56,7 @@ client/aws.sh close       # SSH from the internet off again, if `open` let you i
 client/aws.sh stop        # the host: about $0.10 an hour while it runs, only its disks while stopped
 ```
 
-`client/aws.sh stop` waits until the host has stopped. Next time, start again at step 1.
+`client/aws.sh stop` waits until the host has stopped. Leave it out and the host stops itself an hour after the last use (step 1): a sleeping VM wakes to shut down cleanly with the rest, its disk kept. `client/aws.sh ip` says whether it's stopped. For another idle time, `sudo RUNNER_HOST_IDLE=2h host/install.sh` on the host, or `never`; reruns keep it (`/etc/runner/host-idle`). Next time, start again at step 1.
 
 ### After merging a change
 
@@ -98,7 +98,7 @@ cargo build --release
 sudo host/install.sh
 ```
 
-VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/install.sh`, which reruns remember (`/etc/runner/net`). VMs reach the internet but not the tailnet, the LAN, cloud metadata (169.254.0.0/16) or each other, except for DNS (port 53), since they use the host's resolvers. Nor the host itself: it drops any connection a VM opens to it, to its sshd or anything else, on any of its addresses, IPv6 included, while replies to what the host opens, like a URL's connection to the VM, come back. So a resolver on one of the host's own addresses (a local dnsmasq, say) won't answer VMs; one on loopback isn't offered to them anyway. The rules, `host/nat.nft`, go by each VM's tap, not its source address, and drop what a tap brings in from outside the range, so a VM that forges a source outside the range gets no further. Docker and firewalld drop forwarded traffic by default, so on a host running either, allow the VM range there; `runner doctor` warns when one is active, or when the host's rules don't keep VMs off it. It installs the pinned Firecracker (hash-checked, `host/firecracker.pin`) and `runner` into `/usr/local/bin`, makes the `runner` user and its SSH key (Keys between hosts), lets it start and stop `firecracker@<vm>` units through polkit, and sets up NAT for the VMs. It's safe to rerun, and rerunning it after a `git pull` and a build is how to upgrade. It ends with `runner doctor`, run as the runner user, which says what's still missing: usually a guest kernel at `/var/lib/runner/kernel/vmlinux`, the base disk (`sudo -u runner runner import --replace base - <path/to/base.ext4`), and the laptop's key. Run it again any time with `ssh runner@kvm-host runner doctor`.
+VMs get 172.16.0.0/16; for another range, `sudo RUNNER_NET=10.20.0.0/16 host/install.sh`, which reruns remember (`/etc/runner/net`). The host stays up until it's stopped; `sudo RUNNER_HOST_IDLE=1h host/install.sh` has it power itself off once nothing has used it for an hour, which reruns remember too (`/etc/runner/host-idle`; `never` turns it off again). It's for a host that a power-off only stops, as on EC2, and `runner doctor` shows it (docs/host.md, Idle power-off). VMs reach the internet but not the tailnet, the LAN, cloud metadata (169.254.0.0/16) or each other, except for DNS (port 53), since they use the host's resolvers. Nor the host itself: it drops any connection a VM opens to it, to its sshd or anything else, on any of its addresses, IPv6 included, while replies to what the host opens, like a URL's connection to the VM, come back. So a resolver on one of the host's own addresses (a local dnsmasq, say) won't answer VMs; one on loopback isn't offered to them anyway. The rules, `host/nat.nft`, go by each VM's tap, not its source address, and drop what a tap brings in from outside the range, so a VM that forges a source outside the range gets no further. Docker and firewalld drop forwarded traffic by default, so on a host running either, allow the VM range there; `runner doctor` warns when one is active, or when the host's rules don't keep VMs off it. It installs the pinned Firecracker (hash-checked, `host/firecracker.pin`) and `runner` into `/usr/local/bin`, makes the `runner` user and its SSH key (Keys between hosts), lets it start and stop `firecracker@<vm>` units through polkit, and sets up NAT for the VMs. It's safe to rerun, and rerunning it after a `git pull` and a build is how to upgrade. It ends with `runner doctor`, run as the runner user, which says what's still missing: usually a guest kernel at `/var/lib/runner/kernel/vmlinux`, the base disk (`sudo -u runner runner import --replace base - <path/to/base.ext4`), and the laptop's key. Run it again any time with `ssh runner@kvm-host runner doctor`.
 
 ### Add the laptop's key
 
@@ -146,7 +146,7 @@ If `aws login` refuses because the default profile already holds access keys, `a
 `up` launches the host if it isn't there, waits until it has booted, and lets in only this laptop's address over SSH, as `ubuntu` with the key it saves in `~/.ssh/<name>.pem`. Then it sets the host up over SSH, a `==>` line for each step:
 
 1. XFS on the 50 GiB disk, mounted at `/var/lib/runner`. It finds the disk by its size, since EC2 doesn't name NVMe disks in a fixed order, and never formats one that holds anything but XFS.
-2. This checkout, by rsync; Rust, the build tools and podman; `cargo build --release && sudo host/install.sh`.
+2. This checkout, by rsync; Rust, the build tools and podman; `cargo build --release && sudo host/install.sh`, with `RUNNER_HOST_IDLE=1h` on a host with no idle time yet, so it powers itself off once idle for an hour (Day to day, step 1). A rerun keeps the one it has.
 3. The base image and kernel, built there with podman (docker drops the VMs' forwarded traffic), imported as `base` and installed.
 4. Tailscale, as the host's name. **It stops for the login link it prints: open it and add the host.** A tailnet that already has a machine of that name calls this one `kvm-host-2-1`, say, and the setup stops there: remove the old one in the admin console, rename this one, and rerun.
 5. The laptop's key line in `~runner/.ssh/authorized_keys`, as Add the laptop's key writes it.
