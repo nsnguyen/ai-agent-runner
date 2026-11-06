@@ -128,6 +128,7 @@ fn lists_its_tools() {
             "list_runs",
             "list_services",
             "list_sessions",
+            "list_tries",
             "list_vms",
             "move_vm",
             "read_session",

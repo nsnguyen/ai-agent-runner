@@ -773,6 +773,17 @@ impl Tools {
     }
 
     #[tool(
+        description = "List the tries of a VM's latest best of N (run_best_of), in order, side by side: each with its run's id, the run as list_runs gives it, and once the run is over, its result, as run_output's last reply has it: exit code, duration, outcome, the paths that changed, and agent_says, which is untrusted. A try whose fork or run has been deleted or moved since is gone: true, with no run. Returns at once: wait on a run with run_output. `tries` is empty if the VM never had a batch."
+    )]
+    fn list_tries(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<best::Standing>, String> {
+        let now = best::standing(&self.store, &name).map_err(|e| e.to_string())?;
+        Ok(Json(now))
+    }
+
+    #[tool(
         description = "Make a copy of checkpoint `id` the VM's current disk. undo_vm reverses it, and the checkpoint stays to restore again. A running or sleeping VM is stopped first, ending what runs in it, and started again after, awake; one stopping is waited out and stays stopped. Fails while a run is going."
     )]
     async fn restore_vm(

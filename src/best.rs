@@ -17,17 +17,25 @@
 // is still a VM. dev records the batch in its directory, in tries.json: what
 // was asked, when, the generation the tries forked, and their names and runs,
 // for `runner tries` and `keep` to read.
+//
+// `runner tries dev` reads that record, and each try's run and result as
+// runs.rs keeps them, into one table to pick from; a try deleted by hand is
+// gone, and the rest still show.
 use crate::checkpoint;
 use crate::host;
 use crate::idle::InUse;
+use crate::result::{Changed, RunResult};
 use crate::runs::{self, AgentRun, Start};
 use crate::store::{self, Config, DEFAULT_MEM_MIB, Store};
 use crate::systemd::{self, State};
 use chrono::{DateTime, SubsecRound, Utc};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 /// The fewest tries a batch has.
 pub const MIN: u32 = 2;
@@ -35,6 +43,10 @@ pub const MIN: u32 = 2;
 pub const MAX: u32 = 4;
 /// What the host keeps free past what a batch's tries take, in MiB.
 pub const SPARE_MIB: u64 = 1024;
+/// How many characters of what an agent says a row of `table` shows.
+pub const SAYS_WIDTH: usize = 60;
+// How often `wait` looks again: each look reads every try's result.
+const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -219,6 +231,207 @@ pub fn tries(store: &Store, vm: &str) -> Result<Option<Batch>> {
     let bad =
         |e: serde_json::Error| store::at(&path)(io::Error::new(io::ErrorKind::InvalidData, e));
     Ok(Some(serde_json::from_slice(&bytes).map_err(bad)?))
+}
+
+/// A VM's latest batch as it stands, for `runner tries` and list_tries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct Standing {
+    /// The VM the tries forked.
+    pub vm: String,
+    /// What each try was asked. Left out, with the rest of the batch's
+    /// fields, if the VM never had a batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// When the batch started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
+    /// The VM's generation that every try forked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// That generation, if it's the checkpoint taken of the VM running or
+    /// sleeping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<u64>,
+    /// The tries in order, none if the VM never had a batch.
+    pub tries: Vec<Tried>,
+}
+
+/// One try as it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct Tried {
+    /// The fork: the VM's name, a dash, and the try's number.
+    pub vm: String,
+    /// Its run's id, like dev-1.1; null if its run never started.
+    pub id: Option<String>,
+    /// The fork, or its run, isn't on this host any more: deleted, or moved
+    /// to another host, since. Then there's no run or result to show.
+    pub gone: bool,
+    /// Its run, as list_runs gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRun>,
+    /// Once its run is over, what the runner measured, as `runner result`
+    /// prints it, with agent_says kept apart: untrusted. Left out while the
+    /// run goes on, and for one lost or that never got as far as running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
+}
+
+/// The VM's latest batch as it stands: each try's run, and once that's over,
+/// its result. A try whose fork or run has been deleted is gone.
+pub fn standing(store: &Store, vm: &str) -> Result<Standing> {
+    let Some(batch) = tries(store, vm)? else {
+        return Ok(Standing {
+            vm: vm.to_string(),
+            prompt: None,
+            started: None,
+            generation: None,
+            checkpoint: None,
+            tries: Vec::new(),
+        });
+    };
+    let tries = (batch.tries.iter())
+        .map(|t| tried(store, t))
+        .collect::<Result<_>>()?;
+    Ok(Standing {
+        vm: vm.to_string(),
+        prompt: Some(batch.prompt),
+        started: Some(batch.started),
+        generation: Some(batch.generation),
+        checkpoint: batch.checkpoint,
+        tries,
+    })
+}
+
+/// As `standing`, once no try's run is going.
+pub fn wait(store: &Store, vm: &str) -> Result<Standing> {
+    loop {
+        let now = standing(store, vm)?;
+        let going = (now.tries.iter())
+            .filter_map(|t| t.run.as_ref())
+            .any(|r| r.state == runs::State::Running);
+        if !going {
+            return Ok(now);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+impl Standing {
+    /// One table, a header and then a row per try: its run, how it stands,
+    /// its exit code, how long it took, how many paths it changed, and the
+    /// first line of what its agent says, quoted and cut at SAYS_WIDTH
+    /// characters. A running try's time is so far, at `now`.
+    pub fn table(&self, now: DateTime<Utc>) -> String {
+        let head = ["RUN", "STATE", "EXIT", "TOOK", "CHANGED"];
+        let mut rows = vec![(head.map(String::from), "AGENT SAYS (UNTRUSTED)".to_string())];
+        rows.extend(self.tries.iter().map(|t| t.row(now)));
+        let width = |i: usize| rows.iter().map(|(r, _)| r[i].chars().count()).max();
+        let widths = [0, 1, 2, 3, 4].map(|i| width(i).unwrap_or(0));
+        let mut out = String::new();
+        for (cells, says) in &rows {
+            for (cell, w) in cells.iter().zip(widths) {
+                let _ = write!(out, "{cell:<w$}  ");
+            }
+            out.push_str(says);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+impl Tried {
+    // Its cells, and what its agent says.
+    fn row(&self, now: DateTime<Utc>) -> ([String; 5], String) {
+        let id = self.id.clone().unwrap_or_else(|| self.vm.clone());
+        let dash = || "-".to_string();
+        let Some(run) = &self.run else {
+            let state = if self.gone { "gone" } else { "no run" };
+            return ([id, state.to_string(), dash(), dash(), dash()], dash());
+        };
+        let exit = run.exit_code.map_or_else(dash, |code| code.to_string());
+        let since = |to: DateTime<Utc>| {
+            let ms = (to - run.started).num_milliseconds();
+            took(u64::try_from(ms).unwrap_or(0))
+        };
+        let took = match (&self.result, run.ended, run.state) {
+            (Some(result), ..) => took(result.duration_ms),
+            (None, Some(ended), _) => since(ended),
+            (None, None, runs::State::Running) => since(now),
+            // Lost: when it ended isn't known.
+            (None, None, _) => dash(),
+        };
+        let changed = match self.result.as_ref().map(|r| &r.changed) {
+            Some(Changed::Measured(c)) => (c.paths.len() as u64 + c.more).to_string(),
+            _ => dash(),
+        };
+        let says = (self.result.as_ref())
+            .and_then(|r| r.agent_says.text())
+            .and_then(first_line)
+            .unwrap_or_else(dash);
+        let cells = [id, runs::describe(run), exit, took, changed];
+        (cells, says)
+    }
+}
+
+// "42s", "2m14s", "1h03m".
+fn took(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
+    }
+}
+
+// The first line with something on it, cut at SAYS_WIDTH characters and
+// quoted, so control characters show escaped rather than reach the terminal.
+fn first_line(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= SAYS_WIDTH {
+        return Some(format!("{line:?}"));
+    }
+    let mut cut: String = line.chars().take(SAYS_WIDTH - 1).collect();
+    cut.push('…');
+    Some(format!("{cut:?}"))
+}
+
+// A try as it stands: gone if its fork or run has been deleted, even while
+// it's read. One the record has no run for may have one all the same, if
+// `run --n` died before it noted it: a fork's first run is <vm>.1.
+fn tried(store: &Store, t: &Try) -> Result<Tried> {
+    let mut tried = Tried {
+        vm: t.vm.clone(),
+        id: t.run.clone(),
+        gone: false,
+        run: None,
+        result: None,
+    };
+    let id = t.run.clone().unwrap_or_else(|| runs::id(&t.vm, 1));
+    let run = match runs::get(store, &id) {
+        Err(runs::Error::Store(store::Error::NoVm(_))) => {
+            tried.gone = true;
+            return Ok(tried);
+        }
+        // Its run was deleted, or it never had one.
+        Err(runs::Error::NoRun(_)) => {
+            tried.gone = t.run.is_some();
+            return Ok(tried);
+        }
+        r => r?,
+    };
+    tried.id = Some(id.clone());
+    if run.state != runs::State::Running {
+        tried.result = match runs::result(store, &id) {
+            Err(runs::Error::NoResult { .. } | runs::Error::StillRunning(_)) => None,
+            Err(runs::Error::Store(store::Error::NoVm(_)) | runs::Error::NoRun(_)) => {
+                tried.gone = true;
+                return Ok(tried);
+            }
+            r => Some(r?),
+        };
+    }
+    tried.run = Some(run);
+    Ok(tried)
 }
 
 // Why a new batch can't start while one of the VM's is on hand: some of its
