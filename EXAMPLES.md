@@ -88,6 +88,14 @@ runner runs demo                                          # each run, with its s
 runner run demo --resume <session> "Now add a LICENSE too"
 ```
 
+To step into a run that's still going and steer it yourself, take it over:
+
+```sh
+runner claude --run demo.1   # stops the run's agent, then opens its conversation in Claude Code in demo
+```
+
+The run's changes stay, and demo stays on: from there it's the same as `runner claude demo`, and **Ctrl-b**, then **d**, leaves it running. It works once `runner runs demo` shows the run's session, and not while `runner claude demo` is already open (Ctrl-b, then d, doesn't close it: `runner kill demo claude` does).
+
 To have several agents try the same thing at once and keep the best, give `--n`:
 
 ```sh

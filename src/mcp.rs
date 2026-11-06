@@ -813,7 +813,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, not_rolled_back for one that joined it running and failed or was cancelled, with the checkpoint it took first to restore by hand; and its session: Claude Code's session id once Claude Code has started, which run_agent's resume takes to carry it on."
+        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, taken_over (by `runner claude --run` on a terminal, which leaves the VM up and carries the session on there, so no outcome), failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, not_rolled_back for one that joined it running and failed or was cancelled, with the checkpoint it took first to restore by hand; and its session: Claude Code's session id once Claude Code has started, which run_agent's resume takes to carry it on."
     )]
     fn list_runs(
         &self,
