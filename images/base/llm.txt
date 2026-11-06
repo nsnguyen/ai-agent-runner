@@ -66,8 +66,11 @@ you can go back.
   limit Docker here, and images fill a disk fast: `docker system df` shows
   what they take. If you need more, ask: the owner can give the VM more
   disk and memory.
-- Images you pull here aren't in another VM, unless the owner forks this
-  one: each VM pulls its own.
+- Images you pull here aren't in another VM: each VM pulls its own.
+- A shutdown stops your containers first, and the VM gets 30 seconds to
+  shut down before it's killed, which throws away what this boot wrote
+  (What persists). Keep a container's stop timeout, Compose's
+  `stop_grace_period`, at its default 10 seconds or near it.
 - A published port, like `ports: ["5432:5432"]`, listens on this VM's
   address, where the owner reaches it with `runner proxy`.
 - The kernel has no nf_tables, so iptables here is iptables-legacy: leave

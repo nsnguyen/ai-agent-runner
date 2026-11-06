@@ -258,13 +258,13 @@ volumes:
 ```
 
 ```sh
-runner exec demo -- sh -c 'cd /home/agent/work/app && docker compose up -d'   # Postgres, inside demo
+runner exec demo -d /home/agent/work/app -- docker compose up -d   # Postgres, inside demo
 runner proxy demo 5432                         # in another terminal: demo's Postgres at localhost:5432
 psql -h localhost -U postgres                  # from the laptop, password dev
 runner exec demo -- docker system df           # what images and volumes take of demo's disk
 ```
 
-Or ask Claude in `runner claude demo` to bring it up. `restart: unless-stopped` brings it back each time demo starts. Images, containers and volumes are on demo's disk, so checkpoints, sleep, export and forks keep them. A rebase doesn't: it keeps `/home`, not `/var/lib/docker`, so after one, `docker compose up -d` pulls again and a named volume starts empty. Images pulled in demo aren't in your other VMs.
+Or ask Claude in `runner claude demo` to bring it up. `restart: unless-stopped` brings it back each time demo starts. `runner stop` gives demo 30 seconds to shut down cleanly before it kills it and loses what that boot wrote, so keep a service's `stop_grace_period` at Compose's 10 seconds or so. Images, containers and volumes are on demo's disk, so checkpoints, sleep, export and forks keep them. A rebase doesn't: it keeps `/home`, not `/var/lib/docker`, so after one, `docker compose up -d` pulls again and a named volume starts empty. Images pulled in demo aren't in your other VMs.
 
 On a VM kept to a few sites (section 10), let Docker Hub in first:
 

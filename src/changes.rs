@@ -88,8 +88,23 @@ pub const BOOT_ONLY: &[(&str, Part)] = &[
     ("/var/lib/apt/daily_lock", Part::File),
     // ldconfig.service's cache, at the first boot.
     ("/var/cache/ldconfig/aux-cache", Part::File),
+    // containerd's and dockerd's state, which they make at their first
+    // start, at a VM's first boot (#170). Once it's there, what the agent's
+    // images, containers and volumes add under it is listed, but each start
+    // rewrites these bolt databases. Measured on base's own Docker, started
+    // twice on a copy of its disk.
+    ("/var/lib/containerd", Part::New),
+    (
+        "/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db",
+        Part::File,
+    ),
     // The first boot's tmpfiles links it to /etc/machine-id (dbus.conf).
     ("/var/lib/dbus/machine-id", Part::File),
+    // As /var/lib/containerd.
+    ("/var/lib/docker", Part::New),
+    ("/var/lib/docker/buildkit/cache.db", Part::File),
+    ("/var/lib/docker/network/files/local-kv.db", Part::File),
+    ("/var/lib/docker/volumes/metadata.db", Part::File),
     // The first boot's tmpfiles makes it. A user who lingers is listed.
     ("/var/lib/systemd/linger", Part::Empty),
     // systemd-random-seed's seed, saved at every boot and shutdown.
@@ -111,6 +126,9 @@ pub enum Part {
     File,
     /// It added as an empty directory.
     Empty,
+    /// It added as a directory, whatever is under it: a daemon's state, made
+    /// whole at its first start.
+    New,
     /// Deletions under it.
     Deleted,
 }
@@ -126,6 +144,7 @@ fn boot_only(path: &[u8], change: Kind, contains: Option<u64>) -> bool {
             Part::All => path == at || under,
             Part::File => path == at && contains.is_none(),
             Part::Empty => path == at && change == Kind::Added && contains == Some(0),
+            Part::New => path == at && change == Kind::Added && contains.is_some(),
             Part::Deleted => under && change == Kind::Deleted,
         }
     })
