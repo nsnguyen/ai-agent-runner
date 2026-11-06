@@ -393,6 +393,22 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Keep a best of N's best try: `keep dev-2` makes dev-2's disk dev's,
+    /// on top of dev's history, so `undo dev` goes back, and deletes every
+    /// try. dev keeps its name, address, URL, credentials and history.
+    /// Tries whose runs are going are cancelled first. A running dev is
+    /// stopped, which commits its disk, and started again after. Prints the
+    /// kept run's Claude Code session, for `runner run dev --resume`.
+    /// Refused, with nothing changed, for a try still at the disk it forked,
+    /// its run rolled back, for one whose run is going, for one that's up
+    /// other than for its run, and while dev has a run going.
+    Keep {
+        /// A try, like dev-2; with --none, the VM the tries forked.
+        name: String,
+        /// Keep none: delete every try, and leave the VM as it was.
+        #[arg(long)]
+        none: bool,
+    },
     /// Print a run's stream-json, an event per line: what's there now, or
     /// with --follow, all of it as it comes.
     Output {
@@ -863,6 +879,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 print!("{}", now.table(chrono::Utc::now()));
             }
         }
+        Cmd::Keep { name, none } => print!("{}", best::keep(&store, &name, none)?.said()),
         Cmd::Output { run, from, follow } => {
             let run = runs::output(&store, &run, from, follow, &mut std::io::stdout().lock())?;
             if follow {

@@ -315,7 +315,7 @@ N is 2 to 4, and all N start at once, with no queue. Nothing is made, and the er
 - if any of the names `dev-1` to `dev-N` is taken, on any host;
 - if N times dev's memory is more than the host's free memory (MemAvailable) less 1 GiB. The error names the largest N that fits: 3 on the 8 GiB host with a 2 GiB dev stopped. vCPUs aren't counted, since the agents mostly wait on the model;
 - while dev has a run going;
-- while an earlier batch's tries are still VMs, since it's one batch at a time. `runner delete` every try to drop them, the one whose work you want too, once you've taken it.
+- while an earlier batch's tries are still VMs, since it's one batch at a time. `runner keep` (below) deletes them.
 
 The tries are made on dev's host. A try whose run can't start is deleted, with the ones after it, and the runs that started go on. dev records its batch in its directory, in `tries.json`: the prompt, when, the generation the tries forked, and their names and runs. On ext4 each try is a full copy of dev's disk, so put `/var/lib/runner` on XFS or btrfs. Over MCP, `run_best_of` takes `name`, `prompt`, `n`, `dir` and `resume`, and returns the N runs.
 
@@ -329,6 +329,22 @@ dev-3.1  running                -     2h00m  -        -
 ```
 
 STATE is how the run stands, as `runs` says it. TOOK is the result's duration, or how long so far for a run still going. CHANGED counts the paths the result lists and counts past those, less the ones only the VM's boot writes: `runner result dev-1.1` lists them. AGENT SAYS is the first line of the agent's last message that has text on it, quoted, so control characters show escaped, and cut at 60 characters. It's the agent's own word, so check it against CHANGED. `--json` prints the batch's prompt, start and generation, and each try's run with its whole result, the `changed` paths and all of `agent_says` included. `--wait` waits until every try's run has ended, then prints. A try deleted or moved since shows as `gone`, and the rest still show; with no batch, `tries` says `no tries yet`. Over MCP, `list_tries` takes `name` and returns each try's run, and its result once that's over, at once: wait on a run with `run_output`, as for any.
+
+```sh
+runner keep dev-2      # dev gets dev-2's disk; dev-1 to dev-3 are deleted
+runner keep dev --none # or keep none: the tries are deleted, dev is as it was
+```
+
+`keep dev-2` puts dev-2's current disk on top of dev's history as a new generation, as `restore` puts a checkpoint's copy, so `runner undo dev` goes back to dev from before the keep, and deletes every try of the batch, dev-2 too. dev keeps its name, address, URL, credentials, settings and history. It prints the Claude Code session of dev-2's newest run that committed, joined it running, or was taken over (`runner claude --run`), whose conversation is on the disk kept, so `runner run dev --resume <session> "..."` carries that conversation on in dev; a later run that rolled back took its session with its disk, so it isn't named:
+
+```
+kept dev-2 on dev: generation 7 is current, and `runner undo dev` goes back
+cancelled dev-3.1
+deleted dev-1, dev-2 and dev-3
+session 0b5c1e8e-6f1d-4f43-9a7e-2d3c4b5a6978: `runner run dev --resume 0b5c1e8e-6f1d-4f43-9a7e-2d3c4b5a6978 <prompt>` carries on dev-2.1's conversation
+```
+
+A try still at the disk it forked, because its run rolled back or never got going, has nothing of its own to keep, so it's refused, and so is one whose run is still going; any other is kept from its current disk, whatever later runs in it did. A try that's up, say one you started by hand, is refused until you `runner stop` it, whether it's the one kept or one to delete. Tries whose runs booted them and are still going are cancelled first, all at once, then deleted with the rest, and dev's record of the batch goes with them, so `runner tries dev` says `no tries yet` and a VM made later under a try's name isn't taken for one. A running or sleeping dev is stopped, which commits its disk, put on the kept disk and started again, as `restore` does, so what dev wrote since the batch forked is under the keep, where `undo` finds it. keep is refused while dev has a run going. Everything is checked before anything changes. Over MCP, `keep_try` takes a try's `name`, or dev's `name` and `none: true`, and returns the kept try, its run and `session`, dev's `generation`, and the runs cancelled and tries deleted.
 
 ### Checkpoints
 
@@ -460,6 +476,6 @@ Nor do they get `AWS_PROFILE`, or the AWS CLI on PATH, which starting a stopped 
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
-`run_agent`, `run_best_of`, `run_output`, `cancel_run`, `list_runs` and `list_tries` do for an agent what `runner run`, `run --n`, `output`, `cancel`, `runs` and `tries` do for you. `run_agent` returns the run at once, and `run_best_of` the N runs. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it. Each run carries its Claude Code session as `session` once `runner runs` would show it, which `run_agent`'s and `run_best_of`'s `resume` take.
+`run_agent`, `run_best_of`, `run_output`, `cancel_run`, `list_runs`, `list_tries` and `keep_try` do for an agent what `runner run`, `run --n`, `output`, `cancel`, `runs`, `tries` and `keep` do for you. `run_agent` returns the run at once, and `run_best_of` the N runs. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it. Each run carries its Claude Code session as `session` once `runner runs` would show it, which `run_agent`'s and `run_best_of`'s `resume` take.
 
 `list_sessions`, `read_session` and `kill_session` do for an agent what `runner sessions`, `attach` and `kill` do for you. `read_session` returns the last `lines` (100 unless given, at most 2000) of a session's active pane as plain text, history included, cut at 32 KiB from the end.

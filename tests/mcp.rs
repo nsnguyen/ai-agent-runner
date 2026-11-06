@@ -122,6 +122,7 @@ fn lists_its_tools() {
             "delete_vm",
             "doctor",
             "exec",
+            "keep_try",
             "kill_session",
             "list_checkpoints",
             "list_hosts",

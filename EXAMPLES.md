@@ -116,7 +116,18 @@ demo-3.1  exited 0, committed    0     3m40s  9        "All tests pass."
 
 CHANGED is how many paths the runner itself found changed on each try's disk. AGENT SAYS is only what the agent claims, so check it against `runner result` before you trust it. `--json` gives all of it, every try's changed paths included.
 
-Each try is a new copy of `demo`, named `demo-1` to `demo-3`, so `demo` itself stays as it was. Three tries cost three times the tokens, and take three times `demo`'s memory: the runner refuses a batch the server has no room for and says how many fit. Before the next batch, delete every try with `runner delete`, the one whose work you liked too, once you've taken what you want from it.
+Each try is a new copy of `demo`, named `demo-1` to `demo-3`, so `demo` itself stays as it was. Three tries cost three times the tokens, and take three times `demo`'s memory: the runner refuses a batch the server has no room for and says how many fit.
+
+Once you've picked, keep it:
+
+```sh
+runner keep demo-1            # demo gets demo-1's work; all three tries are deleted
+runner run demo --resume <session> "Now add a test for it"   # keep prints the session
+runner undo demo              # demo as it was before the keep
+runner keep demo --none       # or keep none: delete the tries, demo stays as it was
+```
+
+`keep` gives `demo` the kept try's disk, and `demo` keeps its name, address, URL and credentials. A try still running is cancelled first. A try whose run rolled back has nothing of its own to keep, so it's refused. A running `demo` is restarted onto the new disk. A new batch can start once the tries are gone.
 
 ## 5. Checkpoints: an undo button for the whole VM
 

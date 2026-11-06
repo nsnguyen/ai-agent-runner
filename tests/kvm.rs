@@ -17,6 +17,7 @@
 // `a_running_vm_s_export_boots_elsewhere_and_it_carries_on`,
 // `an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints`,
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
+// `best_of_two_keeps_the_winner_on_dev`,
 // `a_process_lives_through_sleep_and_wake`,
 // `a_sleeping_vm_stops_cleanly_and_keeps_what_it_wrote`,
 // `a_sleeping_vm_lives_through_a_host_stop`,
@@ -1770,6 +1771,71 @@ fn an_agent_s_restore_reboots_its_vm_onto_its_checkpoint() {
         top.starts_with("* ") && top.ends_with(&format!("\"restore of {id}\"")),
         "{listed}"
     );
+}
+
+// Best of two under the unit, with no token: RUNNER_CLAUDE is a script put
+// in dev that writes the VM's hostname, its name, to work/who.txt and exits 0
+// only in the fork ending -2. Both tries boot at once; the first rolls back,
+// the second commits, and keep puts its disk on dev and deletes both.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn best_of_two_keeps_the_winner_on_dev() {
+    const SESSION: &str = "4e1f7a2b-9c3d-4e5f-8a6b-7c8d9e0f1a2b";
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("keep-test-{}", std::process::id());
+    let tries = [format!("{name}-1"), format!("{name}-2")];
+    ok(runner(&root, &["create", &name]));
+    // Each try too, should the keep not delete it.
+    let _cleanup = [&name, &tries[0], &tries[1]].map(|n| Cleanup {
+        root: root.clone(),
+        name: n.clone(),
+    });
+    let init = format!(r#"echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'"#);
+    let claude = [
+        "#!/bin/sh",
+        "cat >/dev/null",
+        &init,
+        "me=$(cat /proc/sys/kernel/hostname)",
+        "echo \"$me\" > who.txt && sync",
+        "case $me in *-2) exit 0 ;; esac",
+        "exit 1\n",
+    ]
+    .join("\n");
+    let put = "printf %s \"$1\" > ~/claude && chmod 755 ~/claude";
+    ok(runner(
+        &root,
+        &["exec", &name, "--", "sh", "-c", put, "sh", &claude],
+    ));
+    // Stopped, which commits the script, so both tries fork it.
+    ok(runner(&root, &["stop", &name]));
+
+    let started = ok(cli(&root)
+        .env("RUNNER_CLAUDE", "/home/agent/claude")
+        .args(["run", &name, "--n", "2", "pick one"])
+        .output()
+        .unwrap());
+    assert_eq!(started, format!("{}.1\n{}.1\n", tries[0], tries[1]));
+    let waited = ok(runner(&root, &["tries", &name, "--wait", "--json"]));
+    let now: serde_json::Value = serde_json::from_str(&waited).unwrap();
+    let outcome = |i: usize| now["tries"][i]["run"]["outcome"].as_str().map(String::from);
+    assert_eq!(outcome(0).as_deref(), Some("rolled_back"), "{now}");
+    assert_eq!(outcome(1).as_deref(), Some("committed"), "{now}");
+    let who = serde_json::json!({"path": "/home/agent/work/who.txt", "change": "added"});
+    let paths = now["tries"][1]["result"]["changed"]["paths"].as_array();
+    assert!(paths.is_some_and(|p| p.contains(&who)), "{now}");
+
+    let kept = ok(runner(&root, &["keep", &tries[1]]));
+    assert!(
+        kept.starts_with(&format!("kept {} on {name}: ", tries[1])),
+        "{kept}"
+    );
+    assert!(kept.contains(&format!("--resume {SESSION} ")), "{kept}");
+    let cat = ["exec", &name, "--", "cat", "/home/agent/work/who.txt"];
+    assert_eq!(ok(runner(&root, &cat)), format!("{}\n", tries[1]));
+    let list = ok(runner(&root, &["list"]));
+    let names: Vec<&str> = list.lines().filter_map(|l| l.split(' ').next()).collect();
+    assert!(names.contains(&name.as_str()), "{list}");
+    assert!(!tries.iter().any(|t| names.contains(&t.as_str())), "{list}");
 }
 
 // Booted by hand, so the token comes from this process's environment, the
