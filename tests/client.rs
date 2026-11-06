@@ -160,6 +160,10 @@ state)
   else echo running; fi
   ;;
 start)
+  if [ -e "$AWS_START_FAILS" ]; then
+    echo "An error occurred (UnauthorizedOperation) when calling the StartInstances operation" >&2
+    exit 254
+  fi
   rm -f "$STOPPED"
   echo "$RUNNER_AWS_NAME is up at 203.0.113.7."
   ;;
@@ -182,7 +186,7 @@ esac
         let path = format!(
             "{}:{}",
             self.path("bin").display(),
-            std::env::var("PATH").unwrap()
+            common::path_without_aws()
         );
         let mut cmd = Command::new(shell[0]);
         cmd.args(&shell[1..])
@@ -195,6 +199,7 @@ esac
             .env("AWS_STATE", self.path("aws-state"))
             .env("AWS_SIGNED_OUT", self.path("aws-signed-out"))
             .env("AWS_LOG", self.path("aws-log"))
+            .env("AWS_START_FAILS", self.path("aws-start-fails"))
             .env_remove("RUNNER_AWS_NAME")
             .env_remove("HOST_OUT")
             .env_remove("DROP")
@@ -1254,5 +1259,42 @@ fn a_term_to_runner_reaches_the_command() {
         child.wait().unwrap();
         wait_for("the command to end", || laptop.held().len() == 2);
         assert_eq!(laptop.held(), ["started", "ended"], "{shell:?}");
+    }
+}
+
+// Starting already, by another command, say: aws.sh start waits for it.
+#[test]
+fn a_pending_host_is_waited_for() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .aws_says("pending")
+            .runner(shell, &["list"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+        let err = text(&out.stderr);
+        assert!(err.contains("runner: kvm-host is starting"), "{err}");
+        assert_eq!(laptop.host_calls(), ["list"], "{shell:?}");
+    }
+}
+
+#[test]
+fn a_start_that_fails_runs_nothing() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        laptop.stop_host();
+        fs::write(laptop.path("aws-start-fails"), "").unwrap();
+        let out = laptop.runner(shell, &["list"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        assert!(laptop.host_calls().is_empty(), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("UnauthorizedOperation"), "{err}");
     }
 }

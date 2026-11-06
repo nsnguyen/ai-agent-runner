@@ -4,6 +4,8 @@
 // memory, `calls` what its runner got, and `down` makes ssh time out on it,
 // as `stopped` does until the fake aws.sh beside the laptop's runner, a copy,
 // starts it. No network, no host and no AWS.
+mod common;
+
 use runner::peers;
 use std::fs;
 use std::io::Write;
@@ -322,7 +324,7 @@ impl Fleet {
         let path = format!(
             "{}:{}",
             self.dir.path().join("bin").display(),
-            std::env::var("PATH").unwrap()
+            common::path_without_aws()
         );
         let mut cmd = Command::new(shell[0]);
         cmd.args(&shell[1..])

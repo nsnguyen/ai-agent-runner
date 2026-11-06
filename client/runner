@@ -166,7 +166,7 @@ aws_state() {
 # with aws.sh, and started if AWS has it stopped or stopping, then waited
 # for. With no aws.sh or AWS CLI here nothing is asked, as before. aws.sh's
 # output goes to stderr, since stdout is the command's, MCP's JSON-RPC
-# included. Fails only if a start or the wait after it does.
+# included. Fails only if a start does.
 ready() {
   case " $up " in *" $1 "*) return 0 ;; esac
   case " $stopped " in
@@ -190,14 +190,16 @@ ready() {
   others=
   for s in $stopped; do [ "$s" = "$1" ] || others="$others $s"; done
   stopped=$others
-  # Booted, as AWS sees it, can come before Tailscale and sshd answer.
+  # Booted, as AWS sees it, can come before Tailscale and sshd answer. The
+  # command hasn't gone yet, so after a few minutes it goes anyway: a
+  # passphrase BatchMode can't type gets typed, or ssh says what's wrong.
   tries=0
   # shellcheck disable=SC2086
   until ssh $ask "$1" true >/dev/null 2>&1; do
     tries=$((tries + 1))
     if [ "$tries" -ge 30 ]; then
-      echo "runner: $(name_of "$1") is started, but its SSH hasn't answered for minutes: is Tailscale connected on this laptop?" >&2
-      return 1
+      echo "runner: $(name_of "$1") is started, but hasn't answered BatchMode SSH for minutes, so the command goes as it is" >&2
+      break
     fi
     sleep 2
   done
@@ -297,7 +299,8 @@ survey() {
 # answered CMD: after a survey of CMD, passes on each host's stderr, names
 # each host that didn't answer or failed, and sets $failed if one did. One
 # that didn't answer and AWS has stopped is named so, and noted in $stopped,
-# but not started: the command that goes to it starts it.
+# but not started: the command that goes to it starts it, as it waits for
+# one that's starting.
 answered() {
   failed=
   i=0
@@ -310,10 +313,7 @@ answered() {
     255)
       aws_state "$h" || state=
       case $state in
-      pending)
-        stopped="$stopped $h"
-        echo "runner: $(name_of "$h") is starting" >&2
-        ;;
+      pending) echo "runner: $(name_of "$h") is starting" >&2 ;;
       stopping | stopped)
         stopped="$stopped $h"
         echo "runner: $(name_of "$h") is $state" >&2
