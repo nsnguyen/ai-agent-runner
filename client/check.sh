@@ -17,7 +17,7 @@
 # The host is RUNNER_HOST, else the first host in ~/.config/runner/hosts,
 # else the first line of ~/.config/runner/host, as client/runner has it, and
 # every laptop check runs with RUNNER_HOST set to it. The copy and host/check.sh go in as ubuntu@ that host's name, with
-# client/aws.sh's key (RUNNER_AWS_KEY, else ~/.ssh/kvm-host.pem) when it's
+# client/aws.sh's key (RUNNER_AWS_KEY, else ~/.ssh/$RUNNER_AWS_NAME.pem, kvm-host's by default) when it's
 # there; RUNNER_ADMIN names another login.
 #
 # It ends with a summary: every FAIL again, then the counts. Exit 0 when

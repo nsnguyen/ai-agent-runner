@@ -15,8 +15,8 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 ## 1. Turn the server on and off
 
 ```sh
-client/aws.sh start    # on: a few minutes; it turns itself off after an hour with nothing running
-client/aws.sh stop     # off now: it costs about $0.10 an hour while on, and only its disks while off
+client/aws.sh start    # on, every server: a few minutes; each turns itself off after an hour with nothing running
+client/aws.sh stop     # off now, every server: about $0.10 an hour each while on, and only its disks while off
 client/aws.sh ssh      # log in to the server itself (rarely needed)
 ```
 
@@ -142,7 +142,8 @@ demo carries on while it's exported: the disk is a copy made with demo paused fo
 ## 9. More than one server
 
 ```sh
-runner hosts add runner@kvm-host-2   # once the second server is set up
+RUNNER_AWS_NAME=kvm-host-2 client/aws.sh up   # make a second server, set up like the first
+runner hosts add runner@kvm-host-2   # then add it: the servers learn each other's keys
 runner hosts                         # each server: its VMs, how many are up, its free memory
 runner create demo3                  # goes to the server with the most free memory
 runner list                          # every server's VMs, each line led by its server
@@ -151,7 +152,9 @@ runner create demo4 --host kvm-host  # or pick the server yourself
 runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
 ```
 
-A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed.
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
+
+Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this checkout's, and a plain `client/check.sh` updates only kvm-host. Keep both on the same build (README.md, After merging a change), so a move or Claude reaching across servers finds the same `runner` on both.
 
 `move` keeps the name, your checkpoints, its settings, services and credentials. A running demo3 is shut down first, which ends what runs in it, and started again on the new server; its address and URL change, so it prints the new URL. The copy goes straight from server to server, and demo3 leaves the old one only once the new one has it all, so a move cut off halfway leaves it where it was.
 
@@ -160,7 +163,7 @@ A VM name is used once across all your servers, so `demo3` always means the same
 ```sh
 runner stop demo       # saves its disk
 client/aws.sh close    # no SSH from the internet (Tailscale still works)
-client/aws.sh stop     # turn the server off now, or leave it to turn itself off in an hour
+client/aws.sh stop     # turn the servers off now, or leave them to turn themselves off in an hour
 ```
 
 ## If something's wrong
@@ -172,6 +175,7 @@ client/aws.sh stop     # turn the server off now, or leave it to turn itself off
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |
+| `kvm-host-2 didn't answer: … Permission denied (publickey)`, from a move or Claude | The servers don't trust each other yet, say because one had an older build when you added the other: `runner hosts add runner@kvm-host-2` again. It names any server without a key: update that one first (README.md, After merging a change) |
 | `administratively prohibited` from `runner proxy` | Add `port-forwarding` to the laptop's key line on the server (README.md, Add the laptop's key) |
 
 More detail: README.md.
