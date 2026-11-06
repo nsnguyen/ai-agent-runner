@@ -1406,6 +1406,10 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_then_looks_for_its_session() 
     assert!(first.starts_with("* 2  "), "{listed}");
     assert!(first.ends_with("  \"takeover of dev.1\""), "{listed}");
     assert!(runs::placed(&vm.store, &id).unwrap().taken);
+    // Its session reached dev's disk at the copy, not the disk it booted:
+    // what keep goes by.
+    assert_eq!(runs::taken_onto(&vm.store, &id).unwrap(), Some(2));
+    assert_eq!(runs::reached(&vm.store, &id).unwrap(), Some(2));
 
     // Taken again, it goes on from dev's own disk, where the session is now,
     // and puts nothing back a second time.
@@ -1416,7 +1420,15 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_then_looks_for_its_session() 
     t.wait_for("there, so a restore, undo or rollback since has taken it");
     assert!(!t.seen().contains("put dev.1's disk"), "{}", t.seen());
     assert_eq!(vm.generation(), 2);
+    assert_eq!(runs::taken_onto(&vm.store, &id).unwrap(), Some(2));
     assert_eq!(vm.store.undo("dev").unwrap().generation, 0);
+
+    // An empty mark, as an older runner left, names no copy: the session
+    // reached the disk at the generation the run booted.
+    fs::write(vm.dir.path().join("vms/dev/runs/1/taken"), "").unwrap();
+    assert!(runs::placed(&vm.store, &id).unwrap().taken);
+    assert_eq!(runs::taken_onto(&vm.store, &id).unwrap(), None);
+    assert_eq!(runs::reached(&vm.store, &id).unwrap(), Some(1));
 }
 
 // Putting a rolled-back run's disk back waits for no run, asked before

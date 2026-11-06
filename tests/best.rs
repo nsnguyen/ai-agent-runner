@@ -1044,10 +1044,10 @@ fn a_try_whose_rolled_back_run_was_taken_over_is_kept_with_its_session() {
     let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#);
     fs::write(runs.join("1/stream"), init + "\n").unwrap();
     // The takeover.
-    (h.store)
+    let put = (h.store)
         .restore_generation("dev-2", 1, "takeover of dev-2.1")
         .unwrap();
-    runner::runs::mark_taken(&h.store, "dev-2.1").unwrap();
+    runner::runs::mark_taken(&h.store, "dev-2.1", Some(put.generation)).unwrap();
     let won = current(&h, "dev-2");
     assert!(
         h.ok(&["tries", "dev"])
@@ -1059,6 +1059,61 @@ fn a_try_whose_rolled_back_run_was_taken_over_is_kept_with_its_session() {
         "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-2.1's conversation"
     );
     assert!(out.contains(&want), "{out}");
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
+    assert_eq!(h.vms(), ["dev"]);
+}
+
+// A rolled-back run taken over after a newer run committed: the takeover put
+// the older run's disk back on top, which the newer run's session never
+// reached. So keep names the older run's session, though the newer one
+// committed.
+#[test]
+fn a_try_whose_older_rolled_back_run_was_taken_over_after_a_commit_is_kept_with_its_session() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    finish_third(&h, lock);
+    let init = |s: &str| format!(r#"{{"type":"system","subtype":"init","session_id":"{s}"}}"#);
+    let runs = h.store.runs("dev-2").unwrap();
+    // dev-2.1's boot, generation 1 as its result says, rolled back.
+    let run = h.store.begin_run("dev-2").unwrap();
+    assert_eq!(run.generation, 1);
+    let who = h.dir.path().join("dev-2.who");
+    fs::write(&who, "dev-2.1").unwrap();
+    debugfs(
+        &run.disk,
+        &format!("write {} /home/agent/work/who.txt", who.display()),
+    );
+    drop(run);
+    fs::write(runs.join("1/stream"), init(SESSION) + "\n").unwrap();
+    // dev-2.2's boot, generation 2, committed with a session of its own.
+    let run = h.store.begin_run("dev-2").unwrap();
+    assert_eq!(run.generation, 2);
+    run.commit().unwrap();
+    fs::create_dir_all(runs.join("2")).unwrap();
+    fs::copy(runs.join("1/ask.json"), runs.join("2/ask.json")).unwrap();
+    let newer = "bbbbbbbb-6f1d-4f43-9a7e-2d3c4b5a6978";
+    fs::write(runs.join("2/stream"), init(newer) + "\n").unwrap();
+    let mut committed = result(0, 60_000, Outcome::Committed, &[], "Done.");
+    committed.from_generation = Some(0);
+    committed.generation = Some(2);
+    let committed = serde_json::to_string(&committed).unwrap();
+    fs::write(runs.join("2/result.json"), committed).unwrap();
+    let ended = end("2026-11-06T10:00:00Z", 0, "committed");
+    fs::write(runs.join("2/end.json"), ended.to_string()).unwrap();
+    // The takeover of dev-2.1, which puts generation 1 back on top.
+    let put = (h.store)
+        .restore_generation("dev-2", 1, "takeover of dev-2.1")
+        .unwrap();
+    assert_eq!(put.generation, 3);
+    runner::runs::mark_taken(&h.store, "dev-2.1", Some(put.generation)).unwrap();
+    let won = current(&h, "dev-2");
+
+    let out = h.ok(&["keep", "dev-2"]);
+    let want = format!(
+        "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-2.1's conversation"
+    );
+    assert!(out.contains(&want), "{out}");
+    assert!(!out.contains(newer), "{out}");
     assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
     assert_eq!(h.vms(), ["dev"]);
 }

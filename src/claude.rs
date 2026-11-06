@@ -163,8 +163,9 @@ pub trait Vms {
     /// Whether `user` has Claude Code's record of `session` in the running
     /// VM, under ~/.claude/projects.
     fn has_record(&self, vm: &str, user: &str, session: &str) -> Result<bool>;
-    /// Marks the run, over, as taken over (runs::mark_taken).
-    fn mark_taken(&self, id: &str) -> Result<()>;
+    /// Marks the run, over, as taken over (runs::mark_taken), onto the
+    /// generation its disk was put back as, if it was.
+    fn mark_taken(&self, id: &str, onto: Option<u64>) -> Result<()>;
 }
 
 /// A headless run, as a takeover needs it.
@@ -392,7 +393,7 @@ fn pick_up(vms: &impl Vms, t: &TakeOver, run: Run, notes: &mut impl Write) -> Re
                 ),
             );
             // The session is on dev's own disk from here on, whatever comes.
-            mark(vms, &id, notes);
+            mark(vms, &id, Some(put), notes);
             vms.start(&vm)?;
             format!(
                 "so Claude Code never wrote it on the run's disk, which {vm} runs on now: {back} \
@@ -410,7 +411,7 @@ fn pick_up(vms: &impl Vms, t: &TakeOver, run: Run, notes: &mut impl Write) -> Re
         });
     }
     if !taken && matches!(disk, Disk::Own) {
-        mark(vms, &id, notes);
+        mark(vms, &id, None, notes);
     }
     note(
         notes,
@@ -422,10 +423,11 @@ fn pick_up(vms: &impl Vms, t: &TakeOver, run: Run, notes: &mut impl Write) -> Re
     resume_in(vms, t, &run, &session)
 }
 
-// Without the mark, a takeover after this one would go by how the run ended:
+// Without the mark, a takeover after this one would go by how the run ended,
+// and keep wouldn't know the session reached the disk put back as `onto`:
 // worth a note, not the session.
-fn mark(vms: &impl Vms, id: &str, notes: &mut impl Write) {
-    if let Err(e) = vms.mark_taken(id) {
+fn mark(vms: &impl Vms, id: &str, onto: Option<u64>, notes: &mut impl Write) {
+    if let Err(e) = vms.mark_taken(id, onto) {
         note(
             notes,
             &format!(
@@ -572,8 +574,8 @@ impl Vms for Host<'_> {
         })
     }
 
-    fn mark_taken(&self, id: &str) -> Result<()> {
-        Ok(runs::mark_taken(self.0, id)?)
+    fn mark_taken(&self, id: &str, onto: Option<u64>) -> Result<()> {
+        Ok(runs::mark_taken(self.0, id, onto)?)
     }
 }
 

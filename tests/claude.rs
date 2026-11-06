@@ -131,8 +131,9 @@ impl Vms for Fake {
         Ok((2, 5))
     }
 
-    fn mark_taken(&self, id: &str) -> claude::Result<()> {
-        self.call("mark_taken", format!("mark_taken {id}"))
+    fn mark_taken(&self, id: &str, onto: Option<u64>) -> claude::Result<()> {
+        let onto = onto.map(|g| format!(" onto {g}")).unwrap_or_default();
+        self.call("mark_taken", format!("mark_taken {id}{onto}"))
     }
 
     fn has_record(&self, vm: &str, user: &str, session: &str) -> claude::Result<bool> {
@@ -691,7 +692,7 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_first() {
             "run dev.1",
             "kept dev 3",
             "put_back dev 3 dev.1",
-            "mark_taken dev.1",
+            "mark_taken dev.1 onto 5",
             "start dev",
             format!("has_record dev me {UUID}").as_str(),
             "attach dev"

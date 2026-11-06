@@ -371,8 +371,9 @@ pub struct Kept {
     pub kept: Option<String>,
     /// The kept try's newest run whose work is on the disk kept: one that
     /// committed, joined it running, or was taken over. The one best of N
-    /// started, unless another did one of those in it since. Left out if
-    /// none is.
+    /// started, unless another did one of those in it since. A rolled-back
+    /// run taken over after it ended put its disk back, so it's named over
+    /// every run before that takeover. Left out if none is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     /// That run's Claude Code session, which run_agent's resume takes to
@@ -449,12 +450,7 @@ pub fn keep(store: &Store, name: &str, none: bool) -> Result<Kept> {
         let going = run.filter(|r| r.state == runs::State::Running);
         if Some(t.as_str()) == winner {
             winnable(store, &vm, t, run)?;
-            for run in all {
-                if on_disk(store, &run)? {
-                    kept_run = Some(run);
-                    break;
-                }
-            }
+            kept_run = last_on_disk(store, all)?;
         // A run that booted its try shuts it down once cancelled; one that
         // joined it running leaves it up, as any other try that's up.
         } else if let Some(run) = going.filter(|r| r.boots) {
@@ -592,6 +588,30 @@ fn on_disk(store: &Store, run: &AgentRun) -> Result<bool> {
         || !run.boots
         || run.state == runs::State::TakenOver
         || runs::taken(store, &run.id)?)
+}
+
+// Of a VM's runs, newest first, the one whose session reached its disk
+// last, of those on it: the newest, unless an older one was taken over
+// since onto its own disk put back, as a generation above the one the newer
+// one's session reached (runs::reached). That copy has none of the newer
+// one's work. Where a generation isn't known, the newest wins.
+fn last_on_disk(store: &Store, all: Vec<AgentRun>) -> Result<Option<AgentRun>> {
+    let mut last: Option<(AgentRun, Option<u64>)> = None;
+    for run in all {
+        if !on_disk(store, &run)? {
+            continue;
+        }
+        let later = match (&last, runs::taken_onto(store, &run.id)?) {
+            (None, _) => true,
+            (Some((_, Some(reached))), Some(onto)) => onto > *reached,
+            (Some(_), _) => false,
+        };
+        if later {
+            let reached = runs::reached(store, &run.id)?;
+            last = Some((run, reached));
+        }
+    }
+    Ok(last.map(|(run, _)| run))
 }
 
 // Whether the try `name`, whose newest run is `run`, can be kept: no run is
