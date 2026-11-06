@@ -303,6 +303,66 @@ fn checkpoint_list_and_restore() {
 mod common;
 use common::FakeSystemd;
 
+// base and dev on real ext4 disks, dev with a service and a file the copy
+// has to skip.
+fn with_disks() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let base = common::tree(
+        &dir.path().join("base"),
+        &[
+            ("etc/os-release", "base 2\n"),
+            ("home/agent/.local/share/claude/versions/2", "claude 2"),
+        ],
+    );
+    let dev = common::tree(
+        &dir.path().join("dev"),
+        &[
+            ("etc/os-release", "base 1\n"),
+            ("etc/systemd/system/runner-svc-web.service", "[Service]\n"),
+            ("home/agent/work/notes", "mine\n"),
+            ("home/agent/work/a\"b", "skipped"),
+        ],
+    );
+    for (name, tree) in [("base", base), ("dev", dev)] {
+        let disk = common::image(&tree);
+        let out = runner(dir.path(), &["import", name, disk.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
+    dir
+}
+
+#[test]
+fn rebase_says_what_it_kept_and_warns_about_the_rest() {
+    let dir = with_disks();
+    let out = runner(dir.path(), &["rebase", "dev"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "dev is on base's generation 0 now: generation 1 is current.\n\
+         Kept /home, /root, /etc/machine-id and 1 service (web).\n\
+         Not copied, so gone: \"/home/agent/work/a\\\"b\", as its name holds a newline, a carriage return or a double quote.\n\
+         Anything installed outside those, like apt packages, is gone: runner undo dev brings it back.\n"
+    );
+    let out = runner(dir.path(), &["undo", "dev"]);
+    assert_eq!(text(&out.stdout).split("  ").nth(1), Some("gen 0"));
+
+    // Held, as a boot holds it while the VM is up.
+    let held = Store::new(dir.path()).lock("dev").unwrap();
+    let out = runner(dir.path(), &["rebase", "dev"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        text(&out.stderr),
+        "runner: dev is up, or a run or another runner command holds it: stop it first: runner stop dev\n"
+    );
+    drop(held);
+    let out = runner(dir.path(), &["rebase", "base"]);
+    assert_eq!(
+        text(&out.stderr),
+        "runner: base can't be rebased onto itself\n"
+    );
+}
+
 fn runner_on(root: &Path, systemd: &FakeSystemd, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", root)

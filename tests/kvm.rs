@@ -25,6 +25,7 @@
 // `a_session_outlives_a_dropped_connection`,
 // `a_service_answers_again_after_a_stop_and_start`,
 // `an_imported_export_boots_with_its_files_and_services`,
+// `an_old_vm_rebased_onto_base_gets_its_guest_and_keeps_its_home`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
 // `a_vm_reaches_the_internet_but_not_the_host`,
 // `claude_keeps_running_after_a_detach`,
@@ -406,6 +407,123 @@ fn a_session_outlives_a_dropped_connection() {
     ok(runner(&root, &detach));
     assert_eq!(again.wait().unwrap().code(), Some(0), "{}", t.seen());
     ok(runner(&root, &["kill", &name, "work"]));
+}
+
+// An old VM onto the current base: one forked from a copy of base whose
+// runner-guest has a byte on its end (it still runs) and that lacks Claude
+// Code's managed settings gets base's of both from `runner rebase`, and
+// keeps its files, their owner, and its service. undo brings the old guest
+// back.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn an_old_vm_rebased_onto_base_gets_its_guest_and_keeps_its_home() {
+    use std::io::Write;
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let (old, name) = (
+        format!("rebase-base-{}", std::process::id()),
+        format!("rebase-test-{}", std::process::id()),
+    );
+    let store = runner::store::Store::new(&root);
+    let base = store.get("base").unwrap().generation;
+    let base_disk = store.disk("base", base).unwrap();
+    // Where the root's owner can read the old base to import it.
+    let scratch = tempfile::tempdir_in("/var/tmp").unwrap();
+    std::fs::set_permissions(scratch.path(), Permissions::from_mode(0o755)).unwrap();
+    let (disk, guest) = (
+        scratch.path().join("old-base.ext4"),
+        scratch.path().join("runner-guest"),
+    );
+    let done = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{cmd:?}: {err}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let sum_of = |path: &Path| {
+        let said = done(Command::new("sha256sum").arg(path));
+        said.split_whitespace().next().unwrap().to_string()
+    };
+    done(
+        Command::new("cp")
+            .args(["--reflink=auto", "--sparse=always", "--"])
+            .args([&base_disk, &disk]),
+    );
+    let dump = format!("dump /usr/local/bin/runner-guest {}", guest.display());
+    done(
+        Command::new(runner::host::DEBUGFS)
+            .args(["-R", &dump])
+            .arg(&disk),
+    );
+    let new_guest = sum_of(&guest);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&guest)
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let old_guest = sum_of(&guest);
+    common::debugfs(
+        &disk,
+        &format!(
+            "rm /usr/local/bin/runner-guest\nwrite {} /usr/local/bin/runner-guest\n\
+             sif /usr/local/bin/runner-guest mode 0100755\n\
+             sif /usr/local/bin/runner-guest uid 0\nsif /usr/local/bin/runner-guest gid 0\n\
+             rm /etc/claude-code/managed-settings.json\n",
+            guest.display()
+        ),
+    );
+    std::fs::set_permissions(&disk, Permissions::from_mode(0o644)).unwrap();
+    ok(runner(&root, &["import", &old, disk.to_str().unwrap()]));
+    let _old_cleanup = Cleanup {
+        root: root.clone(),
+        name: old.clone(),
+    };
+    ok(runner(&root, &["create", &name, "--from", &old]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let guest_sum = || {
+        let said = sh("sha256sum /usr/local/bin/runner-guest");
+        said.split_whitespace().next().unwrap().to_string()
+    };
+    let settings = "test -f /etc/claude-code/managed-settings.json && echo there || echo gone";
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    let answers = || http_status(&address, 8080).is_some_and(|l| l.ends_with(" 200 OK"));
+
+    // The old guest, booted.
+    assert_eq!(guest_sum(), old_guest);
+    assert_eq!(sh(settings), "gone\n");
+    sh("echo kept > /home/agent/work/kept.txt");
+    let mut add = vec!["service", "add", &name, "web", "--"];
+    add.extend(["python3", "-m", "http.server", "8080"]);
+    ok(runner(&root, &add));
+    eventually("the service to answer", answers);
+    ok(runner(&root, &["stop", &name]));
+
+    let said = ok(runner(&root, &["rebase", &name]));
+    assert!(
+        said.starts_with(&format!("{name} is on base's generation {base} now: ")),
+        "{said}"
+    );
+    assert!(
+        said.contains("Kept /home, /root, /etc/machine-id and 1 service (web).\n"),
+        "{said}"
+    );
+    assert_eq!(guest_sum(), new_guest);
+    assert_eq!(sh(settings), "there\n");
+    assert_eq!(sh("cat /home/agent/work/kept.txt"), "kept\n");
+    assert_eq!(sh("stat -c %U /home/agent/work/kept.txt"), "agent\n");
+    eventually("the service to answer after the rebase", answers);
+
+    // The boot after the rebase committed a generation of its own, so two
+    // undos go back to before it.
+    ok(runner(&root, &["stop", &name]));
+    ok(runner(&root, &["undo", &name]));
+    ok(runner(&root, &["undo", &name]));
+    assert_eq!(guest_sum(), old_guest);
+    assert_eq!(sh("cat /home/agent/work/kept.txt"), "kept\n");
 }
 
 // What a GET of / at the address gets back first, if anything.

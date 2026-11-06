@@ -17,6 +17,7 @@ use crate::hosts::{self, HostRow};
 use crate::moves::{self, Moved};
 use crate::peers::{Remote, structured};
 use crate::proto::Request;
+use crate::rebase::{self, Rebased};
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
@@ -526,6 +527,17 @@ impl Tools {
         Parameters(NameArg { name }): Parameters<NameArg>,
     ) -> Result<Json<Vm>, String> {
         self.store.undo(&name).map(Json).map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Give a stopped VM the current base's system, runner-guest and Claude Code included, as a new disk generation that keeps its /home, /root, /etc/machine-id and services. Anything else it installed, like apt packages, is gone, and so is what's in `skipped`: undo_vm brings the old disk back. Refused while it's up or a run on it is going: stop_vm first. Can take minutes for a big /home."
+    )]
+    async fn rebase_vm(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<Rebased>, String> {
+        let store = self.store.clone();
+        blocking(move || rebase::rebase(&store, &name)).await
     }
 
     #[tool(

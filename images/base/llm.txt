@@ -15,7 +15,10 @@ you can go back.
   (cargo, rustfmt, clippy), and Claude Code (`claude`).
 - Claude Code stays at the version this image was built with: its updater
   is off, in /etc/claude-code/managed-settings.json. VMs made from a
-  rebuilt base image get a newer one.
+  rebuilt base image get a newer one, and so does this VM when the owner
+  rebases it onto one (`runner rebase`). That keeps /home, /root and the
+  runner's services, but not what you installed elsewhere, like apt
+  packages, nor /var or users you added.
 - /.runner/build records how this VM's base image was built: a fingerprint
   of its inputs, and the ai-agent-runner commit. The host keeps its own
   record from when it brought the image in, so editing this file changes

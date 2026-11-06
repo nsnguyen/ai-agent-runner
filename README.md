@@ -201,7 +201,7 @@ The boot test needs `/dev/kvm` and `firecracker` on PATH. It boots a copy of the
 RUNNER_GUEST_PORT=<port> cargo test --test base_image -- --ignored
 ```
 
-To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`. Claude Code doesn't update itself in a VM: `images/base/managed-settings.json`, which the image installs as `/etc/claude-code/managed-settings.json`, sets `DISABLE_AUTOUPDATER`, so every VM made from a `base` runs the version it was built with, and a newer one comes from rebuilding `base`. A VM forked from an older base keeps updating itself.
+To change versions, edit the `ARG`s at the top of `images/base/Dockerfile` (Node major, Claude Code version) and the kernel pin at the top of `build.sh`. Claude Code doesn't update itself in a VM: `images/base/managed-settings.json`, which the image installs as `/etc/claude-code/managed-settings.json`, sets `DISABLE_AUTOUPDATER`, so every VM made from a `base` runs the version it was built with, and a newer one comes from rebuilding `base`. A VM forked from an older base keeps the Claude Code and runner-guest it came with, and one from before the updater was off keeps updating itself, until `runner rebase` gives it the current base's (Rebase onto a new base).
 
 ## Use it from the laptop
 
@@ -345,6 +345,24 @@ runner-guest restore 4                              # reboots dev onto checkpoin
 ```
 
 Those calls reach dev's own boot over vsock, so a VM can only checkpoint itself. The agent gets 10 checkpoints an hour, and gc keeps the newest 20 of its and runs' together; yours aren't counted, capped or dropped. Its restore is copied first, then dev shuts down cleanly, which commits its disk, so `undo` goes back to it, and the unit boots dev again onto the copy. It's refused while a run is going. Both need a base built with this runner-guest, and the host's unit from `host/install.sh`.
+
+### Rebase onto a new base
+
+```sh
+runner stop dev
+runner rebase dev    # dev on the current base's system, with its own files
+runner undo dev      # dev's disk from before
+```
+
+A VM keeps the system it was forked with: a rebuilt base's runner-guest, Claude Code and packages reach only VMs made from it. `rebase` gives a stopped dev a new disk generation, a copy of base's current disk with dev's `/home`, `/root`, `/etc/machine-id` and services (their units and the links that start them) copied in. Claude Code's install under `/home/agent`, `~/.local/bin/claude` and `~/.local/share/claude`, is base's, which pins its version; the rest of `/home` is dev's, dotfiles and rustup's toolchains included. `/etc/hostname` is base's, which each boot's `ip=` fills in. Everything else dev changed is gone, and the output says so: apt packages and anything else installed outside those paths, users added with `useradd` (their files keep their numeric owners), crontabs and `/var`. So is a file the copy can't take, like one whose name holds a newline or a double quote, or a socket, and the output names each. dev's sizes, kernel, credentials, idle time and URL stay its own.
+
+```
+dev is on base's generation 4 now: generation 13 is current.
+Kept /home, /root, /etc/machine-id and 2 services (api, web).
+Anything installed outside those, like apt packages, is gone: runner undo dev brings it back.
+```
+
+It's refused while dev is up or a run on it is going, as `undo` is, and when base's current disk didn't come from `runner import`: a base that booted has a disk a guest wrote, which the copy's debugfs must never open, so import base again first. The copy reads dev's disk without mounting it, as a run's changes are measured, and writes the new one with e2fsprogs' debugfs (`src/graft.rs`), so it takes about as long as reading and writing dev's `/home`: minutes for a big one, and it gives up past half an hour. A new disk that doesn't fit base's, a `/home` bigger than base's disk, fails and leaves dev as it was. Over MCP: `rebase_vm`.
 
 ### Sleep and wake
 
