@@ -1,7 +1,9 @@
 // The laptop's `runner` (client/runner) against a fake ssh on PATH. The fake
 // records its argv, then runs the remote command through bash, as the host's
 // sshd does for the runner user, where a fake host `runner` records what
-// arrived. No network and no host.
+// arrived. The runner is a copy, with a fake aws.sh beside it, as
+// client/install.sh puts them, so no test ever reaches the real aws.sh. No
+// network, no host and no AWS.
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
@@ -22,6 +24,10 @@ use common::wait_for;
 const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
 
 const HOST: &str = "runner@kvm-host";
+
+// How long a command's ssh waits for its host to take the connection, so a
+// stopped host is found out in seconds, not a TCP timeout's minute or more.
+const CONNECT: &str = "ConnectTimeout=10";
 
 fn client(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -66,15 +72,20 @@ impl Laptop {
         let bin = dir.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(dir.path().join("home")).unwrap();
-        // Every call goes in SSH_LOG too, one record each. A tunnel (-L)
-        // notes the VM's state as it opens, then runs its command as sshd
-        // does: in a session of its own, as if on another machine, with its
-        // stdout read here, so that end closes when this process dies.
+        // Every call goes in SSH_LOG too, one record each. A stopped host
+        // (STOPPED) takes no connection, with ssh's words and exit code. A
+        // tunnel (-L) notes the VM's state as it opens, then runs its command
+        // as sshd does: in a session of its own, as if on another machine,
+        // with its stdout read here, so that end closes when this process dies.
         script(
             &bin.join("ssh"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$SSH_ARGV"
 { for arg; do printf '%s\0' "$arg"; done; printf '\036'; } >>"$SSH_LOG"
-for cmd; do :; done
+for arg; do host=${cmd-}; cmd=$arg; done
+if [ -e "$STOPPED" ]; then
+  echo "ssh: connect to host ${host##*@} port 22: Operation timed out" >&2
+  exit 255
+fi
 for arg; do
   if [ "$arg" = -L ]; then
     cat "$VM_STATE" >"$TUNNEL_SAW" 2>/dev/null
@@ -94,12 +105,14 @@ exec bash -c "$cmd"
         // ones do; HOST_LOG has every call, a line each. `hold` ends at once
         // unless HOLD_ON is set: then it holds until its stdout's far end
         // closes, which a write finds, noting both in HELD. HOLD_OLD makes
-        // it a host runner from before `hold`. `export` prints HOST_EXPORT.
+        // it a host runner from before `hold`. `export` prints HOST_EXPORT,
+        // and any command HOST_OUT first.
         script(
             &bin.join("runner"),
             r#"for arg; do printf '%s\0' "$arg"; done >"$HOST_ARGV"
 printf '%s\n' "$*" >>"$HOST_LOG"
 [ -z "${HOST_STDIN-}" ] || cat >"$HOST_STDIN"
+[ -z "${HOST_OUT-}" ] || printf '%s\n' "$HOST_OUT"
 [ -z "${HOST_EXIT-}" ] || { echo "runner: no VM named $2" >&2; exit "$HOST_EXIT"; }
 case $1 in
 start) echo running >"$VM_STATE" && echo "$2  gen 1  running" ;;
@@ -112,6 +125,33 @@ hold)
   trap '' PIPE
   while echo; do sleep 0.05; done 2>/dev/null
   echo "let go" >>"$HELD"
+  ;;
+esac
+"#,
+        );
+        // The laptop's runner, and the aws.sh beside it: each call in
+        // AWS_LOG, a line each, RUNNER_AWS_NAME first. `state` is AWS_STATE's
+        // word, else stopped or running as the host is, unless signed out
+        // (AWS_SIGNED_OUT); `start` starts the host.
+        let laptop = dir.path().join("laptop");
+        fs::create_dir(&laptop).unwrap();
+        fs::copy(client("runner"), laptop.join("runner")).unwrap();
+        script(
+            &laptop.join("aws.sh"),
+            r#"printf '%s %s\n' "${RUNNER_AWS_NAME-}" "$*" >>"$AWS_LOG"
+case $1 in
+state)
+  if [ -e "$AWS_SIGNED_OUT" ]; then
+    echo "aws.sh: AWS won't take this laptop's credentials: sign in with aws login" >&2
+    exit 1
+  fi
+  if [ -e "$AWS_STATE" ]; then cat "$AWS_STATE"
+  elif [ -e "$STOPPED" ]; then echo stopped
+  else echo running; fi
+  ;;
+start)
+  rm -f "$STOPPED"
+  echo "$RUNNER_AWS_NAME is up at 203.0.113.7."
   ;;
 esac
 "#,
@@ -136,11 +176,17 @@ esac
         );
         let mut cmd = Command::new(shell[0]);
         cmd.args(&shell[1..])
-            .arg(client("runner"))
+            .arg(self.path("laptop/runner"))
             .args(args)
             .env("PATH", path)
             .env("HOME", self.home())
             .env("RUNNER_HOST", HOST)
+            .env("STOPPED", self.path("stopped"))
+            .env("AWS_STATE", self.path("aws-state"))
+            .env("AWS_SIGNED_OUT", self.path("aws-signed-out"))
+            .env("AWS_LOG", self.path("aws-log"))
+            .env_remove("RUNNER_AWS_NAME")
+            .env_remove("HOST_OUT")
             .env("SSH_ARGV", self.path("ssh-argv"))
             .env("SSH_LOG", self.path("ssh-log"))
             .env("HOST_ARGV", self.path("host-argv"))
@@ -195,6 +241,24 @@ esac
         Some(saw.trim().to_string())
     }
 
+    /// The host is stopped, so ssh can't connect until aws.sh starts it.
+    fn stop_host(&self) -> &Laptop {
+        fs::write(self.path("stopped"), "").unwrap();
+        self
+    }
+
+    /// What aws.sh says AWS has the host as, whether ssh connects or not.
+    fn aws_says(&self, state: &str) -> &Laptop {
+        fs::write(self.path("aws-state"), format!("{state}\n")).unwrap();
+        self
+    }
+
+    /// Every aws.sh call: its RUNNER_AWS_NAME, then its arguments.
+    fn aws_calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.path("aws-log")).unwrap_or_default();
+        log.lines().map(str::to_string).collect()
+    }
+
     /// What the host's hold has noted: holding, then let go.
     fn held(&self) -> Vec<String> {
         let held = fs::read_to_string(self.path("held")).unwrap_or_default();
@@ -236,7 +300,15 @@ fn a_command_typed_at_a_terminal_gets_a_tty() {
         // LogLevel=ERROR drops ssh's "Connection to … closed." after each one.
         assert_eq!(
             laptop.ssh_argv(),
-            ["-t", "-o", "LogLevel=ERROR", HOST, "runner shell dev"],
+            [
+                "-t",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                CONNECT,
+                HOST,
+                "runner shell dev"
+            ],
             "{shell:?}"
         );
         assert_eq!(laptop.host_argv(), ["shell", "dev"], "{shell:?}");
@@ -250,7 +322,11 @@ fn output_piped_from_a_terminal_gets_no_tty() {
         let laptop = Laptop::new();
         let out = piped_from_a_terminal(&mut laptop.runner(shell, &["list"]));
         ok(&out);
-        assert_eq!(laptop.ssh_argv(), [HOST, "runner list"], "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            ["-o", CONNECT, HOST, "runner list"],
+            "{shell:?}"
+        );
     }
 }
 
@@ -268,7 +344,11 @@ fn an_export_piped_from_a_terminal_passes_every_byte_through_without_a_tty() {
                 .env("HOST_EXPORT", &stream),
         );
         ok(&out);
-        assert_eq!(laptop.ssh_argv(), [HOST, "runner export dev"], "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            ["-o", CONNECT, HOST, "runner export dev"],
+            "{shell:?}"
+        );
         assert_eq!(laptop.host_argv(), ["export", "dev"], "{shell:?}");
         assert!(
             out.stdout == bytes,
@@ -296,7 +376,15 @@ fn an_export_onto_a_terminal_gets_a_tty_even_without_one_on_stdin() {
             .output()
             .unwrap();
         ok(&out);
-        let tty = ["-tt", "-o", "LogLevel=ERROR", HOST, "runner export dev"];
+        let tty = [
+            "-tt",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            CONNECT,
+            HOST,
+            "runner export dev",
+        ];
         assert_eq!(laptop.ssh_argv(), tty, "{shell:?}");
     }
 }
@@ -325,6 +413,8 @@ fn a_piped_command_gets_no_tty_and_its_stdin_passes_through() {
         assert_eq!(
             laptop.ssh_argv(),
             [
+                "-o",
+                CONNECT,
                 HOST,
                 r#"runner exec dev -- printf '%s\n' 'it'\''s a "test"'"#
             ],
@@ -342,7 +432,15 @@ fn a_piped_command_gets_no_tty_and_its_stdin_passes_through() {
 fn mcp_never_gets_a_tty_or_a_prompt_and_prints_nothing_itself() {
     for shell in SHELLS {
         let laptop = Laptop::new();
-        let mcp = ["-T", "-o", "BatchMode=yes", HOST, "runner mcp"];
+        let mcp = [
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            CONNECT,
+            HOST,
+            "runner mcp",
+        ];
         // Even at a terminal: stdout is for JSON-RPC alone.
         ok(&at_a_terminal(&mut laptop.runner(shell, &["mcp"])));
         assert_eq!(laptop.ssh_argv(), mcp, "{shell:?}");
@@ -372,7 +470,7 @@ fn empty_and_odd_arguments_are_quoted_and_safe_ones_left_bare() {
     ];
     ok(&laptop.runner(SHELLS[0], &args).output().unwrap());
     assert_eq!(
-        laptop.ssh_argv()[1],
+        laptop.ssh_argv().last().unwrap(),
         "runner '' 'a b' '$HOME' '~' '*' 'x\ny' --env K=V user@host:/a/b,c+d%e ''\\'''"
     );
     assert_eq!(laptop.host_argv(), args);
@@ -392,7 +490,11 @@ fn the_host_comes_from_the_config_file_unless_runner_host_is_set() {
             .output()
             .unwrap();
         ok(&out);
-        assert_eq!(laptop.ssh_argv(), ["kvm-host", "runner list"], "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            ["-o", CONNECT, "kvm-host", "runner list"],
+            "{shell:?}"
+        );
 
         let out = laptop
             .runner(shell, &["list"])
@@ -400,7 +502,11 @@ fn the_host_comes_from_the_config_file_unless_runner_host_is_set() {
             .output()
             .unwrap();
         ok(&out);
-        assert_eq!(laptop.ssh_argv(), ["other", "runner list"], "{shell:?}");
+        assert_eq!(
+            laptop.ssh_argv(),
+            ["-o", CONNECT, "other", "runner list"],
+            "{shell:?}"
+        );
     }
 }
 
@@ -496,6 +602,11 @@ fn install_puts_runner_in_local_bin_and_saves_the_host() {
         );
         let mode = fs::metadata(&installed).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
+        // aws.sh beside it, which starts a stopped host.
+        let aws = home.path().join(".local/bin/aws.sh");
+        assert_eq!(fs::read(&aws).unwrap(), fs::read(client("aws.sh")).unwrap());
+        let mode = fs::metadata(&aws).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
         let host = home.path().join(".config/runner/host");
         assert_eq!(fs::read_to_string(&host).unwrap(), format!("{HOST}\n"));
         // The apps don't get the shell's PATH, so it gives the absolute path.
@@ -526,7 +637,9 @@ const HOLD: &str = "runner hold dev";
 // No stdin and no tty: keys typed while the VM boots stay in the terminal,
 // and the address comes back without a \r.
 fn ask(cmd: &str) -> Vec<String> {
-    ["-n", "-T", HOST, cmd].map(str::to_string).to_vec()
+    ["-n", "-T", "-o", CONNECT, HOST, cmd]
+        .map(str::to_string)
+        .to_vec()
 }
 
 // The hold reads nothing, so keys typed while it's up go nowhere either.
@@ -831,5 +944,295 @@ fn a_host_without_hold_ends_the_proxy_and_says_why() {
         assert_eq!(out.status.code(), Some(2), "{shell:?}");
         let err = text(&out.stderr);
         assert!(err.contains("unrecognized subcommand 'hold'"), "{err}");
+    }
+}
+
+// #145: a host aws.sh made, stopped overnight. ssh can't connect, so the
+// laptop asks the aws.sh beside it what AWS has the host as, starts it if
+// it's stopped, waits for SSH, and tries the command once more.
+
+// Where `part` is in `err`, which has to hold it.
+fn at(err: &str, part: &str) -> usize {
+    err.find(part)
+        .unwrap_or_else(|| panic!("no {part:?} in {err}"))
+}
+
+#[test]
+fn a_command_for_a_stopped_host_starts_it_and_runs_once_more() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .runner(shell, &["exec", "dev", "--", "false"])
+            .env("HOST_EXIT", "7")
+            .output()
+            .unwrap();
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(7), "{shell:?}: {err}");
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+        assert_eq!(laptop.host_calls(), ["exec dev -- false"], "{shell:?}");
+        // ssh's words, then the laptop's while the host boots, then aws.sh's,
+        // on stderr: stdout is the command's.
+        assert!(
+            at(&err, "Operation timed out") < at(&err, "runner: kvm-host is stopped")
+                && at(&err, "runner: kvm-host is stopped") < at(&err, "kvm-host is up at"),
+            "{err}"
+        );
+        assert_eq!(text(&out.stdout), "", "{shell:?}");
+        // The command again, as it was.
+        let calls = laptop.ssh_calls();
+        assert_eq!(calls.first(), calls.last(), "{shell:?}: {calls:?}");
+    }
+}
+
+#[test]
+fn a_command_at_a_terminal_for_a_stopped_host_gets_its_tty_once_started() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        laptop.stop_host();
+        let out = at_a_terminal(&mut laptop.runner(shell, &["shell", "dev"]));
+        ok(&out);
+        assert_eq!(
+            laptop.ssh_argv(),
+            [
+                "-t",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                CONNECT,
+                HOST,
+                "runner shell dev"
+            ],
+            "{shell:?}"
+        );
+        assert_eq!(laptop.host_calls(), ["shell dev"], "{shell:?}");
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+    }
+}
+
+// `runner exec` exits 255 for a command it couldn't run: the host answered,
+// so it isn't stopped, and the command isn't run twice.
+#[test]
+fn a_command_that_exits_255_on_a_running_host_starts_nothing() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .runner(shell, &["exec", "dev", "--", "nope"])
+            .env("HOST_EXIT", "255")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        assert_eq!(laptop.host_calls(), ["exec dev -- nope"], "{shell:?}");
+        assert!(laptop.aws_calls().is_empty(), "{shell:?}");
+        assert!(!text(&out.stderr).contains("stopped"), "{shell:?}");
+    }
+}
+
+#[test]
+fn mcp_on_a_stopped_host_prints_nothing_on_stdout_but_the_host_s() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let reply = r#"{"jsonrpc":"2.0","id":0,"result":{}}"#;
+        let mut child = laptop
+            .stop_host()
+            .runner(shell, &["mcp"])
+            .env("HOST_OUT", reply)
+            .env("HOST_STDIN", laptop.path("host-stdin"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // What the MCP client sent first reaches the host started.
+        let init = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}\n";
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(init.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        ok(&out);
+        assert_eq!(text(&out.stdout), format!("{reply}\n"), "{shell:?}");
+        assert!(text(&out.stderr).contains("kvm-host is up at"), "{shell:?}");
+        assert_eq!(
+            fs::read_to_string(laptop.path("host-stdin")).unwrap(),
+            init,
+            "{shell:?}"
+        );
+        assert_eq!(
+            laptop.ssh_argv(),
+            [
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                CONNECT,
+                HOST,
+                "runner mcp"
+            ],
+            "{shell:?}"
+        );
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn proxy_starts_a_stopped_host_before_its_tunnel() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .vm("stopped")
+            .runner(shell, &["proxy", "dev", "3000"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+        assert_eq!(
+            laptop.host_calls(),
+            ["start dev", "ip dev", "hold dev"],
+            "{shell:?}"
+        );
+        assert_eq!(laptop.tunnel_saw().as_deref(), Some("running"), "{shell:?}");
+        let calls = laptop.ssh_calls();
+        assert_eq!(calls.first(), Some(&ask(ASK)), "{shell:?}");
+        assert_eq!(
+            calls.last(),
+            Some(&tunnel(&["localhost:3000:172.16.0.6:3000"])),
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn a_host_aws_sh_didn_t_make_isn_t_started() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .aws_says("none")
+            .runner(shell, &["list"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        assert_eq!(laptop.aws_calls(), ["kvm-host state"], "{shell:?}");
+        assert!(laptop.host_calls().is_empty(), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("Operation timed out"), "{err}");
+        assert!(!err.contains("start"), "{err}");
+    }
+}
+
+// ssh can't connect, but AWS has the host running: the tailnet, say.
+#[test]
+fn a_host_aws_has_running_isn_t_started() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .aws_says("running")
+            .runner(shell, &["list"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        assert_eq!(laptop.aws_calls(), ["kvm-host state"], "{shell:?}");
+        assert!(laptop.host_calls().is_empty(), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("AWS has it running"), "{err}");
+    }
+}
+
+// aws.sh start waits for a stopping host to stop, then starts it.
+#[test]
+fn a_stopping_host_is_started_too() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .aws_says("stopping")
+            .runner(shell, &["list"])
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host state", "kvm-host start"],
+            "{shell:?}"
+        );
+        assert_eq!(laptop.host_calls(), ["list"], "{shell:?}");
+    }
+}
+
+#[test]
+fn signed_out_of_aws_says_so_after_ssh_and_starts_nothing() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        laptop.stop_host();
+        fs::write(laptop.path("aws-signed-out"), "").unwrap();
+        let out = laptop.runner(shell, &["list"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        assert_eq!(laptop.aws_calls(), ["kvm-host state"], "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            at(&err, "Operation timed out") < at(&err, "sign in with aws login"),
+            "{err}"
+        );
+        assert!(laptop.host_calls().is_empty(), "{shell:?}");
+    }
+}
+
+// aws.sh up names the instance as the host's tailnet name, which is the ssh
+// target's host part.
+#[test]
+fn a_host_is_started_by_its_name_without_the_login() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop
+            .stop_host()
+            .runner(shell, &["list"])
+            .env("RUNNER_HOST", "runner@kvm-host-2")
+            .output()
+            .unwrap();
+        ok(&out);
+        assert_eq!(
+            laptop.aws_calls(),
+            ["kvm-host-2 state", "kvm-host-2 start"],
+            "{shell:?}"
+        );
+    }
+}
+
+// A runner installed before aws.sh was, or a host elsewhere: ssh's 255 as is.
+#[test]
+fn without_aws_sh_beside_it_a_stopped_host_s_255_comes_back() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        fs::remove_file(laptop.path("laptop/aws.sh")).unwrap();
+        let out = laptop
+            .stop_host()
+            .runner(shell, &["list"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(255), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("Operation timed out"), "{err}");
+        assert!(!err.contains("runner:"), "{err}");
     }
 }

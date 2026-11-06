@@ -72,6 +72,11 @@ exit "$(cat "$FAKE/rsync-exit" 2>/dev/null || echo 0)"
 "#;
 
 // Returns at once, unless its time is block-at's: then it waits to be killed.
+// check.sh runs this checkout's client/runner, which asks the aws.sh beside
+// it about a host it can't reach: this AWS CLI takes nothing, so no test
+// reaches a real account.
+const NO_AWS: &str = "echo 'aws: no AWS in tests' >&2\nexit 1\n";
+
 const FAKE_SLEEP: &str = r#"echo "$1" >>"$FAKE/sleeps"
 if [ "$1" = "$(cat "$FAKE/block-at" 2>/dev/null)" ]; then
   touch "$FAKE/blocked"
@@ -485,6 +490,7 @@ impl Laptop {
         script(&bin.join("rsync"), FAKE_RSYNC);
         script(&bin.join("sleep"), FAKE_SLEEP);
         script(&bin.join("curl"), FAKE_CURL);
+        script(&bin.join("aws"), NO_AWS);
         script(&laptop.path("host-bin/runner"), FAKE_RUNNER);
         script(
             &laptop
@@ -1030,9 +1036,11 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
         for call in &ssh {
             let last = call.last().unwrap();
             // The move goes through the hosts file, finding the VM's host,
-            // which `runner ip` asks as the checks do.
+            // which `runner ip` asks as the checks do, and asking the target
+            // whether it answers (`true`), so a stopped one starts first.
             let moving = last == "runner list" || last.starts_with("runner move client-check ");
-            if moving || (last == "runner ip client-check" && call[0] == "RUNNER_HOST=") {
+            let asked = ["runner ip client-check", "true"].contains(&last.as_str());
+            if moving || (asked && call[0] == "RUNNER_HOST=") {
                 assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
             } else if [
                 "runner exec client-check -- cat /home/agent/moved",

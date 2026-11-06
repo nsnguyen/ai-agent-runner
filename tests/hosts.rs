@@ -1,8 +1,9 @@
 // The laptop's `runner` (client/runner) with several hosts in
 // ~/.config/runner/hosts, against a fake ssh on PATH that serves three fake
 // hosts. Each host is a directory: `vms` lists its VMs, `free` its free
-// memory, `calls` what its runner got, and `down` makes ssh time out on it.
-// No network and no host.
+// memory, `calls` what its runner got, and `down` makes ssh time out on it,
+// as `stopped` does until the fake aws.sh beside the laptop's runner, a copy,
+// starts it. No network, no host and no AWS.
 use runner::peers;
 use std::fs;
 use std::io::Write;
@@ -14,6 +15,9 @@ use std::process::{Command, Output, Stdio};
 const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
 
 const HOSTS: [&str; 3] = ["runner@kvm-host", "runner@kvm-host-2", "runner@kvm-host-3"];
+
+// How long a command's ssh waits for its host to take the connection.
+const CONNECT: &str = "ConnectTimeout=10";
 
 fn client(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,7 +60,7 @@ if [ ! -d "$dir" ]; then
   echo "ssh: Could not resolve hostname ${host##*@}: Name or service not known" >&2
   exit 255
 fi
-if [ -e "$dir/down" ]; then
+if [ -e "$dir/down" ] || [ -e "$dir/stopped" ]; then
   echo "ssh: connect to host ${host##*@} port 22: Connection timed out" >&2
   exit 255
 fi
@@ -110,9 +114,11 @@ delete)
   echo "deleted $2  gen 0  6 bytes"
   ;;
 move)
-  # The target is last, as ssh takes it; its name is its directory.
+  # The target is last, as ssh takes it; its name is its directory. A
+  # stopped one doesn't answer, so nothing moves.
   has "$name" || no "$name"
   for to; do :; done
+  if [ -e "$FLEET/${to##*@}/stopped" ]; then echo "runner: ${to##*@} didn't answer" >&2; exit 1; fi
   grep -vx -- "$name" "$HOST_DIR/vms" >"$HOST_DIR/vms.new"
   mv "$HOST_DIR/vms.new" "$HOST_DIR/vms"
   echo "$name" >>"$FLEET/${to##*@}/vms"
@@ -126,6 +132,16 @@ exec)
   ;;
 doctor) echo "ok    kvm  /dev/kvm" ;;
 gc) while read -r v; do echo "$v  nothing to free"; done <"$HOST_DIR/vms" ;;
+esac
+"#;
+
+// The laptop's aws.sh: each call in $FLEET/aws-log, RUNNER_AWS_NAME first.
+// `state` says stopped for a host with `stopped`, running for the rest;
+// `start` starts it.
+const AWS_SH: &str = r#"printf '%s %s\n' "${RUNNER_AWS_NAME-}" "$*" >>"$FLEET/aws-log"
+case $1 in
+state) if [ -e "$FLEET/$RUNNER_AWS_NAME/stopped" ]; then echo stopped; else echo running; fi ;;
+start) rm -f "$FLEET/$RUNNER_AWS_NAME/stopped"; echo "$RUNNER_AWS_NAME is up at 203.0.113.7." ;;
 esac
 "#;
 
@@ -164,6 +180,10 @@ impl Fleet {
         fs::create_dir(&bin).unwrap();
         script(&bin.join("ssh"), SSH);
         script(&bin.join("runner"), RUNNER);
+        let laptop = dir.path().join("laptop");
+        fs::create_dir(&laptop).unwrap();
+        fs::copy(client("runner"), laptop.join("runner")).unwrap();
+        script(&laptop.join("aws.sh"), AWS_SH);
         let fleet = Fleet { dir };
         fleet.host("kvm-host", &["base", "dev"], 2 << 30);
         fleet.host("kvm-host-2", &["base", "web"], 6 << 30);
@@ -230,6 +250,17 @@ impl Fleet {
         fs::write(self.dir.path().join("fleet").join(name).join("down"), "").unwrap();
     }
 
+    /// Stopped on AWS, until aws.sh starts it.
+    fn stop(&self, name: &str) {
+        fs::write(self.dir.path().join("fleet").join(name).join("stopped"), "").unwrap();
+    }
+
+    /// Every aws.sh call: its RUNNER_AWS_NAME, then its arguments.
+    fn aws_calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.dir.path().join("fleet/aws-log")).unwrap_or_default();
+        log.lines().map(str::to_string).collect()
+    }
+
     fn home(&self) -> PathBuf {
         self.dir.path().join("home")
     }
@@ -289,11 +320,12 @@ impl Fleet {
         );
         let mut cmd = Command::new(shell[0]);
         cmd.args(&shell[1..])
-            .arg(client("runner"))
+            .arg(self.dir.path().join("laptop/runner"))
             .args(args)
             .env("PATH", path)
             .env("HOME", self.home())
             .env("FLEET", self.dir.path().join("fleet"))
+            .env_remove("RUNNER_AWS_NAME")
             .env("SSH_LOG", self.dir.path().join("ssh-log"))
             .env_remove("RUNNER_HOST")
             .stdin(Stdio::null());
@@ -938,7 +970,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
             "runner mcp --name runner@kvm-host --peer runner@kvm-host-2 --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
+            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[0], peers]],
             "{shell:?}"
         );
         assert_eq!(fleet.calls("kvm-host"), [&peers[7..]], "{shell:?}");
@@ -948,7 +980,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
         let peers = "runner mcp --user bob --name runner@kvm-host-2 --peer runner@kvm-host --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", HOSTS[1], peers]],
+            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[1], peers]],
             "{shell:?}"
         );
 
@@ -963,7 +995,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
         let peers = "runner mcp --name runner@kvm-host --peer runner@kvm-host-2";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
+            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[0], peers]],
             "{shell:?}"
         );
 
@@ -984,6 +1016,8 @@ fn mcp_passes_the_other_hosts_as_peers() {
                     "-T",
                     "-o",
                     "BatchMode=yes",
+                    "-o",
+                    CONNECT,
                     "runner@kvm-host-2",
                     "runner mcp"
                 ],
@@ -991,6 +1025,8 @@ fn mcp_passes_the_other_hosts_as_peers() {
                     "-T",
                     "-o",
                     "BatchMode=yes",
+                    "-o",
+                    CONNECT,
                     "runner@kvm-host-3",
                     "runner mcp"
                 ]
@@ -1039,7 +1075,7 @@ fn runner_host_still_means_that_host_alone() {
         ok(&out);
         assert_eq!(
             fleet.ssh_calls(),
-            [["runner@kvm-host-2", "runner list"]],
+            [["-o", CONNECT, "runner@kvm-host-2", "runner list"]],
             "{shell:?}"
         );
         // One host's list as the host prints it: no host column.
@@ -1333,8 +1369,13 @@ fn a_hosts_file_of_one_host_runs_as_one_host_always_has() {
         assert_eq!(
             fleet.ssh_calls(),
             [
-                vec!["runner@kvm-host-2", "runner list"],
-                vec!["runner@kvm-host-2", "runner exec web -- true"]
+                vec!["-o", CONNECT, "runner@kvm-host-2", "runner list"],
+                vec![
+                    "-o",
+                    CONNECT,
+                    "runner@kvm-host-2",
+                    "runner exec web -- true"
+                ]
             ],
             "{shell:?}"
         );
@@ -1371,7 +1412,7 @@ fn a_program_s_own_host_option_reaches_the_host() {
             }
             assert_eq!(
                 fleet.ssh_calls(),
-                [["runner@kvm-host-2", want.as_str()]],
+                [["-o", CONNECT, "runner@kvm-host-2", want.as_str()]],
                 "{shell:?}"
             );
             // Several: to web's host, still as typed.
@@ -1920,4 +1961,122 @@ fn a_peer_line_reformatted_by_hand_still_goes() {
     );
     ok(&fleet.run(SHELLS[0], &["hosts", "rm", "kvm-host-2"]));
     assert_eq!(fleet.authorized_keys("kvm-host"), trusting(&[]));
+}
+
+// #145: a stopped host aws.sh made is started by a command that goes to it,
+// and by no other.
+
+#[test]
+fn list_starts_no_host_and_names_the_stopped_ones() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.stop("kvm-host-2");
+        fleet.down("kvm-host-3");
+        let out = fleet.run(shell, &["list"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        assert_eq!(
+            text(&out.stdout),
+            "kvm-host  base  gen 0  6 bytes  4096 bytes used\n\
+             kvm-host  dev  gen 0  6 bytes  4096 bytes used\n",
+            "{shell:?}"
+        );
+        let err = text(&out.stderr);
+        assert!(err.contains("runner: kvm-host-2 is stopped\n"), "{err}");
+        // Down, but AWS has it running: the network, say.
+        assert!(err.contains("runner: kvm-host-3 didn't answer\n"), "{err}");
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-2 state", "kvm-host-3 state"],
+            "{shell:?}"
+        );
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+    }
+}
+
+#[test]
+fn a_command_for_a_vm_on_a_stopped_host_starts_only_that_host() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["list"]));
+        fleet.forget_calls();
+        fleet.stop("kvm-host-2");
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["exec", "web", "--", "true"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("runner: kvm-host-2 is stopped, so starting it"),
+            "{err}"
+        );
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-2 state", "kvm-host-3 state", "kvm-host-2 start"],
+            "{shell:?}"
+        );
+        assert_eq!(
+            fleet.commands("kvm-host-2"),
+            ["exec web -- true"],
+            "{shell:?}"
+        );
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+        // Found stopped by every host's list, so the command waits for the
+        // start, and is sent once.
+        let sent = fleet
+            .ssh_calls()
+            .into_iter()
+            .filter(|c| c.last().is_some_and(|l| l == "runner exec web -- true"))
+            .count();
+        assert_eq!(sent, 1, "{shell:?}");
+    }
+}
+
+#[test]
+fn host_naming_a_stopped_host_starts_it() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.stop("kvm-host-2");
+        let out = fleet.run(shell, &["list", "--host", "kvm-host-2"]);
+        ok(&out);
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-2 state", "kvm-host-2 start"],
+            "{shell:?}"
+        );
+        assert_eq!(fleet.calls("kvm-host-2"), ["list"], "{shell:?}");
+        assert!(fleet.calls("kvm-host").is_empty(), "{shell:?}");
+    }
+}
+
+// The VM's host streams it to the target over ssh, so a stopped target is
+// started before the move goes to the VM's host.
+#[test]
+fn move_to_a_stopped_target_starts_it() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["list"]));
+        fleet.forget_calls();
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["move", "web", "kvm-host-3"]);
+        ok(&out);
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-3 state", "kvm-host-3 start"],
+            "{shell:?}"
+        );
+        assert_eq!(fleet.vms("kvm-host-3"), ["web"], "{shell:?}");
+        assert_eq!(
+            fleet.commands("kvm-host-2"),
+            ["move web runner@kvm-host-3"],
+            "{shell:?}"
+        );
+    }
+}
+
+// A running target answers, so AWS isn't asked.
+#[test]
+fn move_to_a_running_target_asks_aws_nothing() {
+    let fleet = Fleet::new();
+    ok(&fleet.run(SHELLS[0], &["list"]));
+    ok(&fleet.run(SHELLS[0], &["move", "web", "kvm-host-3"]));
+    assert!(fleet.aws_calls().is_empty());
 }
