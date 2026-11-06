@@ -32,7 +32,7 @@ const NAT: &str = "table ip runner {
 \tchain forward {
 \t\ttype filter hook forward priority filter; policy accept;
 \t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
-\t\tiifname != @listed ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
+\t\tiifname \"fc*\" iifname != @listed ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
 \t\tiifname \"fc*\" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
 \t\tiifname @listed jump listed
 \t}
@@ -100,7 +100,7 @@ fn without_lists(rules: &str) -> String {
             skipping = true;
         }
         if !skipping && words != "iifname @listed jump listed" {
-            kept += &line.replace("iifname != @listed", "iifname \"fc*\"");
+            kept += &line.replace(" iifname != @listed", "");
         }
         if skipping && words == "}" {
             skipping = false;

@@ -563,7 +563,7 @@ fn dns_policy(store: &Store, name: &str, fence: &Arc<Fence>) -> dns::Policy {
             follows.track(list.as_ref());
             Ok(list)
         }),
-        hand_on: Arc::new(move |addresses| hands.hand_on(addresses)),
+        hand_on: Arc::new(move |asked, addresses| hands.hand_on(asked, addresses)),
     }
 }
 

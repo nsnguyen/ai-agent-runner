@@ -5,6 +5,7 @@
 mod common;
 
 use common::resolver::{Resolver, answer_to, query, read_framed, write_framed};
+use hickory_proto::rr::Name;
 use runner::dns::{Address, List, Policy, Relay};
 use runner::fence::{self, Fence};
 use runner::host;
@@ -831,16 +832,19 @@ fn a_listed_vm_reaches_only_the_addresses_paired_with_its_tap() {
     let names = List::new(["example.com".parse().unwrap()]);
     let fence = Fence::start(&nft, "dev", &net.tap, Some(&names)).unwrap();
     let ttl = Duration::from_secs(60);
-    fence.hand_on(&[
-        Address {
-            ip: ip("203.0.113.1"),
-            ttl,
-        },
-        Address {
-            ip: ip("192.168.77.2"),
-            ttl,
-        },
-    ]);
+    fence.hand_on(
+        &Name::from_ascii("example.com").unwrap(),
+        &[
+            Address {
+                ip: ip("203.0.113.1"),
+                ttl,
+            },
+            Address {
+                ip: ip("192.168.77.2"),
+                ttl,
+            },
+        ],
+    );
     // In for ten minutes, not the TTL's one.
     let reach = nft_ok("list set ip runner reach");
     assert!(reach.contains("timeout 10m"), "{reach}");

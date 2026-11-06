@@ -20,6 +20,7 @@
 use crate::dns::{Address, List};
 use crate::host;
 use crate::store::{Error, Result};
+use hickory_proto::rr::Name;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Write};
@@ -90,18 +91,21 @@ impl Fence {
         if state.ended {
             return Ok(());
         }
-        match (&state.list, list) {
-            (None, None) => {}
-            (None, Some(_)) => self.put_in(&mut state)?,
-            (Some(_), None) => self.take_out(&mut state)?,
-            (Some(was), Some(now)) => {
-                if was.names().iter().any(|n| !now.names().contains(n)) {
-                    self.flush(&mut state)?;
-                }
+        let changed = match (&state.list, list) {
+            (None, None) => false,
+            (None, Some(_)) => self.put_in(&mut state).map(|()| true)?,
+            (Some(_), None) => self.take_out(&mut state).map(|()| true)?,
+            (Some(was), Some(now)) if was.names().iter().any(|n| !now.names().contains(n)) => {
+                self.flush(&mut state).map(|()| true)?
             }
-        }
+            (Some(_), Some(_)) => false,
+        };
         state.list = list.cloned();
-        state.said = None;
+        // Read each second: only a change clears a failure noted, so one
+        // that repeats elsewhere isn't noted again each time.
+        if changed {
+            state.said = None;
+        }
         Ok(())
     }
 
@@ -119,10 +123,12 @@ impl Fence {
 
     /// Pairs each address with the tap, for its TTL, at least MIN_HOLD and
     /// at most MAX_HOLD, unless it's in for about as long already. Only
-    /// while the tap is held to a list. A failure is noted.
-    pub fn hand_on(&self, addresses: &[Address]) {
+    /// while the tap is held to a list that still answers `asked`: a query
+    /// judged before a name came off, and answered after, puts nothing back.
+    /// A failure is noted.
+    pub fn hand_on(&self, asked: &Name, addresses: &[Address]) {
         let mut state = self.state();
-        if state.list.is_none() {
+        if !state.list.as_ref().is_some_and(|list| list.answers(asked)) {
             return;
         }
         let now = Instant::now();
@@ -144,7 +150,8 @@ impl Fence {
         }
         let timed = self.timed(fresh.iter().map(|(ip, hold)| (*ip, *hold)));
         let keys = self.keys(fresh.keys().copied());
-        // An add alone leaves a pair that's in already with the time it had.
+        // An add alone leaves a pair that's in already with the time it had
+        // on older kernels, and sets it on newer ones: this sets it on both.
         let script = format!(
             "add element {table} {REACH} {{ {timed} }}; delete element {table} {REACH} {{ {keys} }}; \
              add element {table} {REACH} {{ {timed} }}",
@@ -187,8 +194,11 @@ impl Fence {
             );
         }
         let pairs = state.pairs.len();
+        // Under the lock, so a list dropped or a name taken off meanwhile
+        // can't be undone by this.
+        let put = self.nft(&[&script]);
         drop(state);
-        match self.nft(&[&script]) {
+        match put {
             Ok(_) => note(format_args!(
                 "{}'s tap was out of the host's rules, as after a firewall reload: it's back \
                  in, with {pairs} addresses",

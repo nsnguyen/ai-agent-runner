@@ -4,6 +4,7 @@
 mod common;
 
 use common::FakeNft;
+use hickory_proto::rr::Name;
 use runner::dns::{Address, List};
 use runner::fence::{Fence, MAX_HOLD, MIN_HOLD};
 use std::path::Path;
@@ -41,6 +42,11 @@ fn nft() -> Nft {
 
 fn list(names: &[&str]) -> List {
     List::new(names.iter().map(|n| n.parse().unwrap()))
+}
+
+// The name a query asked, as the VM's DNS hands it on with its answer.
+fn asked(name: &str) -> Name {
+    Name::from_ascii(name).unwrap()
 }
 
 fn addr(ip: &str, secs: u64) -> Address {
@@ -119,7 +125,7 @@ fn an_unlisted_vm_s_tap_is_taken_out_only_if_a_killed_boot_left_it_in() {
     let fence = Fence::start(&fake.bin, "dev", TAP, None).unwrap();
     assert_eq!(fake.calls(), [GET]);
     // Nothing to hand on to, or put back.
-    fence.hand_on(&[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 60)]);
     fence.look();
     fence.end();
     assert_eq!(fake.calls(), [GET]);
@@ -150,11 +156,14 @@ fn each_answer_s_addresses_go_in_for_their_ttl_but_at_least_ten_minutes() {
     fake.forget();
     // At most a week: nft refuses timeouts far past that, and DNS allows
     // TTLs of 68 years.
-    fence.hand_on(&[
-        addr("203.0.113.1", 30),
-        addr("203.0.113.2", 3600),
-        addr("203.0.113.3", u64::from(u32::MAX)),
-    ]);
+    fence.hand_on(
+        &asked("www.github.com"),
+        &[
+            addr("203.0.113.1", 30),
+            addr("203.0.113.2", 3600),
+            addr("203.0.113.3", u64::from(u32::MAX)),
+        ],
+    );
     let week = MAX_HOLD.as_secs();
     assert_eq!(week, 7 * 24 * 3600);
     let want = put_in(&[
@@ -171,17 +180,20 @@ fn an_address_in_for_as_long_already_isn_t_put_in_again() {
     let fake = &nft.fake;
     let fence = listed(fake, &["github.com"]);
     fake.forget();
-    fence.hand_on(&[addr("203.0.113.1", 30)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 30)]);
     // Asked again and again, as programs do.
-    fence.hand_on(&[addr("203.0.113.1", 30)]);
-    fence.hand_on(&[addr("203.0.113.1", 600)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 30)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 600)]);
     assert_eq!(fake.calls(), [put_in(&[("203.0.113.1", 600)])]);
     // An answer that keeps it longer puts it in again, for that long.
-    fence.hand_on(&[addr("203.0.113.1", 3600)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 3600)]);
     assert_eq!(fake.calls().len(), 2);
     assert_eq!(fake.calls()[1], put_in(&[("203.0.113.1", 3600)]));
     // The same address twice in an answer goes in once, for the longer.
-    fence.hand_on(&[addr("203.0.113.2", 700), addr("203.0.113.2", 900)]);
+    fence.hand_on(
+        &asked("www.github.com"),
+        &[addr("203.0.113.2", 700), addr("203.0.113.2", 900)],
+    );
     assert_eq!(fake.calls()[2], put_in(&[("203.0.113.2", 900)]));
 }
 
@@ -190,7 +202,7 @@ fn taking_a_name_off_flushes_the_vm_s_pairs_and_adding_one_doesn_t() {
     let nft = nft();
     let fake = &nft.fake;
     let fence = listed(fake, &["github.com", "example.com"]);
-    fence.hand_on(&[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("example.com"), &[addr("203.0.113.1", 60)]);
     fake.forget();
     fence
         .follow(Some(&list(&["github.com", "example.com", "rust-lang.org"])))
@@ -205,9 +217,14 @@ fn taking_a_name_off_flushes_the_vm_s_pairs_and_adding_one_doesn_t() {
         .unwrap();
     let gone = take_out(&["203.0.113.1", "203.0.113.7"]);
     assert_eq!(fake.calls(), [LIST.to_string(), gone]);
-    // So the next answer puts it in again.
+    // An answer for the name taken off, asked before it came off and
+    // answered after, puts nothing back.
     fake.forget();
-    fence.hand_on(&[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("example.com"), &[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("www.example.com."), &[addr("203.0.113.1", 60)]);
+    assert_eq!(fake.calls(), Vec::<String>::new());
+    // A listed name's next answer puts it in again.
+    fence.hand_on(&asked("WWW.GitHub.com."), &[addr("203.0.113.1", 60)]);
     assert_eq!(fake.calls(), [put_in(&[("203.0.113.1", 600)])]);
 }
 
@@ -216,7 +233,7 @@ fn dropping_the_list_takes_the_tap_out_with_its_pairs_and_a_new_list_puts_it_bac
     let nft = nft();
     let fake = &nft.fake;
     let fence = listed(fake, &["github.com"]);
-    fence.hand_on(&[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 60)]);
     fake.forget();
     fence.follow(None).unwrap();
     let gone = take_out(&["203.0.113.1"]);
@@ -226,7 +243,7 @@ fn dropping_the_list_takes_the_tap_out_with_its_pairs_and_a_new_list_puts_it_bac
     );
     // Unlisted, nothing goes in, nor back.
     fake.forget();
-    fence.hand_on(&[addr("203.0.113.2", 60)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.2", 60)]);
     fence.look();
     fence.follow(None).unwrap();
     assert_eq!(fake.calls(), Vec::<String>::new());
@@ -239,7 +256,10 @@ fn a_tap_the_rules_lost_is_put_back_with_its_pairs_at_the_next_look() {
     let nft = nft();
     let fake = &nft.fake;
     let fence = listed(fake, &["github.com"]);
-    fence.hand_on(&[addr("203.0.113.1", 3600), addr("203.0.113.2", 60)]);
+    fence.hand_on(
+        &asked("www.github.com"),
+        &[addr("203.0.113.1", 3600), addr("203.0.113.2", 60)],
+    );
     fake.forget();
     fence.look();
     assert_eq!(fake.calls(), [GET]);
@@ -310,7 +330,7 @@ fn end_takes_the_tap_and_its_pairs_out_and_nothing_goes_in_after() {
     let nft = nft();
     let fake = &nft.fake;
     let fence = listed(fake, &["github.com"]);
-    fence.hand_on(&[addr("203.0.113.1", 60)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.1", 60)]);
     fake.forget();
     fence.end();
     let gone = take_out(&["203.0.113.1"]);
@@ -320,7 +340,7 @@ fn end_takes_the_tap_and_its_pairs_out_and_nothing_goes_in_after() {
     );
     // A query that outlasts the boot hands on nothing, and the list no longer counts.
     fake.forget();
-    fence.hand_on(&[addr("203.0.113.2", 60)]);
+    fence.hand_on(&asked("www.github.com"), &[addr("203.0.113.2", 60)]);
     fence.follow(Some(&list(&["github.com"]))).unwrap();
     fence.look();
     fence.end();

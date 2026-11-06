@@ -45,7 +45,7 @@ table ip runner {
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		iifname "fc*" ip saddr != @NET@ drop
-		iifname != @listed ip daddr != @NET@ meta l4proto { tcp, udp } th dport 53 accept
+		iifname "fc*" iifname != @listed ip daddr != @NET@ meta l4proto { tcp, udp } th dport 53 accept
 		iifname "fc*" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
 		iifname @listed jump listed
 	}
