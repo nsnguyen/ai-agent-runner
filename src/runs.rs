@@ -1086,8 +1086,8 @@ pub fn mark_taken(store: &Store, id: &str, onto: Option<u64>) -> Result<()> {
 pub fn taken_onto(store: &Store, id: &str) -> Result<Option<u64>> {
     let (vm, n) = parse_id(id)?;
     let path = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(text.trim().parse().ok()),
+    match fs::read(&path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).trim().parse().ok()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(format!("reading {}", path.display()))(e)),
     }

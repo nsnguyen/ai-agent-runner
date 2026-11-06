@@ -1063,18 +1063,32 @@ fn a_try_whose_rolled_back_run_was_taken_over_is_kept_with_its_session() {
     assert_eq!(h.vms(), ["dev"]);
 }
 
-// A rolled-back run taken over after a newer run committed: the takeover put
-// the older run's disk back on top, which the newer run's session never
-// reached. So keep names the older run's session, though the newer one
-// committed.
-#[test]
-fn a_try_whose_older_rolled_back_run_was_taken_over_after_a_commit_is_kept_with_its_session() {
-    let h = host(false);
-    let lock = three_tries(&h);
-    finish_third(&h, lock);
-    let init = |s: &str| format!(r#"{{"type":"system","subtype":"init","session_id":"{s}"}}"#);
+const NEWER: &str = "bbbbbbbb-6f1d-4f43-9a7e-2d3c4b5a6978";
+
+// A run of dev-2's numbered `n`, over, as `runner drive` leaves it: its
+// session, and a result and end saying it committed `generation`.
+fn committed_run(h: &Host, n: u32, session: &str, generation: u64) {
     let runs = h.store.runs("dev-2").unwrap();
-    // dev-2.1's boot, generation 1 as its result says, rolled back.
+    let dir = runs.join(n.to_string());
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(runs.join("1/ask.json"), dir.join("ask.json")).unwrap();
+    let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{session}"}}"#);
+    fs::write(dir.join("stream"), init + "\n").unwrap();
+    let mut committed = result(0, 60_000, Outcome::Committed, &[], "Done.");
+    committed.from_generation = Some(generation - 1);
+    committed.generation = Some(generation);
+    let committed = serde_json::to_string(&committed).unwrap();
+    fs::write(dir.join("result.json"), committed).unwrap();
+    let ended = end("2026-11-06T10:00:00Z", 0, "committed");
+    fs::write(dir.join("end.json"), ended.to_string()).unwrap();
+}
+
+// dev-2.1 rolls back (generation 1), dev-2.2 commits generation 2 with a
+// session of its own, then dev-2.1 is taken over, which puts generation 1
+// back on top as generation 3, without dev-2.2's work.
+fn taken_over_after_a_commit(h: &Host) {
+    let lock = three_tries(h);
+    finish_third(h, lock);
     let run = h.store.begin_run("dev-2").unwrap();
     assert_eq!(run.generation, 1);
     let who = h.dir.path().join("dev-2.who");
@@ -1084,28 +1098,28 @@ fn a_try_whose_older_rolled_back_run_was_taken_over_after_a_commit_is_kept_with_
         &format!("write {} /home/agent/work/who.txt", who.display()),
     );
     drop(run);
-    fs::write(runs.join("1/stream"), init(SESSION) + "\n").unwrap();
-    // dev-2.2's boot, generation 2, committed with a session of its own.
+    let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#);
+    let runs = h.store.runs("dev-2").unwrap();
+    fs::write(runs.join("1/stream"), init + "\n").unwrap();
     let run = h.store.begin_run("dev-2").unwrap();
     assert_eq!(run.generation, 2);
     run.commit().unwrap();
-    fs::create_dir_all(runs.join("2")).unwrap();
-    fs::copy(runs.join("1/ask.json"), runs.join("2/ask.json")).unwrap();
-    let newer = "bbbbbbbb-6f1d-4f43-9a7e-2d3c4b5a6978";
-    fs::write(runs.join("2/stream"), init(newer) + "\n").unwrap();
-    let mut committed = result(0, 60_000, Outcome::Committed, &[], "Done.");
-    committed.from_generation = Some(0);
-    committed.generation = Some(2);
-    let committed = serde_json::to_string(&committed).unwrap();
-    fs::write(runs.join("2/result.json"), committed).unwrap();
-    let ended = end("2026-11-06T10:00:00Z", 0, "committed");
-    fs::write(runs.join("2/end.json"), ended.to_string()).unwrap();
-    // The takeover of dev-2.1, which puts generation 1 back on top.
+    committed_run(h, 2, NEWER, 2);
     let put = (h.store)
         .restore_generation("dev-2", 1, "takeover of dev-2.1")
         .unwrap();
     assert_eq!(put.generation, 3);
     runner::runs::mark_taken(&h.store, "dev-2.1", Some(put.generation)).unwrap();
+}
+
+// A rolled-back run taken over after a newer run committed: the takeover put
+// the older run's disk back on top, which the newer run's session never
+// reached. So keep names the older run's session, though the newer one
+// committed.
+#[test]
+fn a_try_whose_older_rolled_back_run_was_taken_over_after_a_commit_is_kept_with_its_session() {
+    let h = host(false);
+    taken_over_after_a_commit(&h);
     let won = current(&h, "dev-2");
 
     let out = h.ok(&["keep", "dev-2"]);
@@ -1113,7 +1127,29 @@ fn a_try_whose_older_rolled_back_run_was_taken_over_after_a_commit_is_kept_with_
         "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-2.1's conversation"
     );
     assert!(out.contains(&want), "{out}");
-    assert!(!out.contains(newer), "{out}");
+    assert!(!out.contains(NEWER), "{out}");
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
+    assert_eq!(h.vms(), ["dev"]);
+}
+
+// A run that committed after that takeover booted the disk it put back, so
+// its session is the one that reached the disk last.
+#[test]
+fn a_run_committed_after_a_takeover_is_kept_with_its_session() {
+    let h = host(false);
+    taken_over_after_a_commit(&h);
+    let run = h.store.begin_run("dev-2").unwrap();
+    assert_eq!(run.generation, 4);
+    run.commit().unwrap();
+    let latest = "cccccccc-6f1d-4f43-9a7e-2d3c4b5a6978";
+    committed_run(&h, 3, latest, 4);
+    let won = current(&h, "dev-2");
+
+    let out = h.ok(&["keep", "dev-2"]);
+    let want = format!(
+        "session {latest}: `runner run dev --resume {latest} <prompt>` carries on dev-2.3's conversation"
+    );
+    assert!(out.contains(&want), "{out}");
     assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
     assert_eq!(h.vms(), ["dev"]);
 }
