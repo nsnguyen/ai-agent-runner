@@ -2,7 +2,8 @@
 //
 //   <root>/vms/<name>/gens/<n>.ext4  one disk per generation; a run writes a new one
 //   <root>/vms/<name>/gens/<n>.json  its note: when it was made, a comment, whether it's a checkpoint and whose, and what an imported disk says it was built from (image.rs)
-//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done; or its export's copy, unlinked once open
+//   <root>/vms/<name>/gens/<n>.part  a running VM's checkpoint being copied, renamed to <n>.ext4 when done; or its export's copy, unlinked once open; or a rebase's disk being made
+//   <root>/vms/<name>/gens/<n>.part.graft/  the files a rebase is copying into its part (graft.rs)
 //   <root>/vms/<name>/history        committed generations, one per line; the last is current
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
@@ -72,6 +73,14 @@ pub enum Error {
     NoCheckpoint(String, u64),
     #[error("{0} has never booted, so it has no running disk to copy")]
     NeverBooted(String),
+    #[error("{0} can't be rebased onto itself")]
+    OntoItself(String),
+    /// Base's current disk didn't come from an import, so a guest may have
+    /// written it (Store::rebase).
+    #[error(
+        "base's current generation, {onto}, came from {made_by:?}, not an import, so a guest may have written it. Import base again first: runner import base --replace <disk>"
+    )]
+    NotImported { onto: u64, made_by: String },
     #[error("{0}")]
     BadConfig(String),
     #[error(
@@ -921,6 +930,79 @@ impl Store {
         gens.push(staged.generation);
         write_history(&dir, &gens)?;
         read_vm(name, &dir)
+    }
+
+    /// A new disk for the VM `name`, made from a copy of base's current disk,
+    /// which `fill` writes into from the VM's own, and put on top of its
+    /// history, as a restore's copy is: `undo` goes back to the disk from
+    /// before it. Its settings stay as they are. `fill` gets the VM's
+    /// current disk, base's, and the new one, and what it returns comes back
+    /// with the VM and base's generation.
+    ///
+    /// Under the VM's lock all the while, which its boot holds while it's up
+    /// and a run holds until it ends, so that's `Busy`. Base's current
+    /// generation must be one an import made, a disk no guest has written,
+    /// since `fill` may hand the copy to debugfs (graft.rs): a base that ran
+    /// is `NotImported`. On any error the new disk goes and history stays as
+    /// it was. One that's killed leaves a part, which the VM's next copy
+    /// clears, and what `fill` staged beside it, which this clears.
+    pub fn rebase<T, E: From<Error>>(
+        &self,
+        name: &str,
+        fill: impl FnOnce(&Path, &Path, &Path) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(Vm, u64, T), E> {
+        if name == BASE {
+            return Err(Error::OntoItself(name.to_string()).into());
+        }
+        let dir = self.existing(name)?;
+        let base = self.existing(BASE)?;
+        let _lock = take_lock(&dir, name)?;
+        // A stage_disk's copy, which needs no lock, takes its number first.
+        let freezer = self.hold_checkpoints(name)?;
+        let onto = current(&base)?;
+        let note = read_note(&base, onto)?;
+        if !note
+            .as_ref()
+            .is_some_and(|n| n.auto && n.comment.as_deref() == Some("import"))
+        {
+            let made_by = note.and_then(|n| n.comment);
+            let made_by = made_by.unwrap_or_else(|| "nothing it noted".to_string());
+            return Err(Error::NotImported { onto, made_by }.into());
+        }
+        let (from, base_disk) = (disk_of(&dir, current(&dir)?), disk_of(&base, onto));
+        freezer.clear_parts()?;
+        clear_staged(&dir)?;
+        let why = format!("rebase onto base gen {onto}");
+        let id = next_generation(&dir)?;
+        // Taken first, as Freezer::copy takes one, and the owner's until
+        // it's in history, so gc keeps it.
+        write_note(&dir, id, &Note::frozen(Some(&why), Maker::Owner))?;
+        let (part, disk) = (part_of(&dir, id), disk_of(&dir, id));
+        let made = (|| -> std::result::Result<T, E> {
+            clone(&base_disk, &part)?;
+            let filled = fill(&from, &base_disk, &part)?;
+            File::open(&part)
+                .and_then(|f| f.sync_all())
+                .map_err(at(&part))?;
+            fs::rename(&part, &disk).map_err(at(&disk))?;
+            sync_dir(&dir.join("gens"))?;
+            write_note(&dir, id, &Note::auto(&why).built(image::read(&disk)))?;
+            let mut gens = history(&dir)?;
+            gens.push(id);
+            write_history(&dir, &gens)?;
+            Ok(filled)
+        })();
+        let filled = match made {
+            Ok(filled) => filled,
+            Err(e) => {
+                let _ = fs::remove_file(&part);
+                let _ = fs::remove_file(&disk);
+                let _ = fs::remove_file(note_of(&dir, id));
+                let _ = clear_staged(&dir);
+                return Err(e);
+            }
+        };
+        Ok((read_vm(name, &dir)?, onto, filled))
     }
 
     /// What the VM's current disk says it was built from, as noted when it
@@ -2038,6 +2120,18 @@ fn sweep_staging(vms: &Path) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+// What a rebase killed partway staged beside its part (graft::staging).
+fn clear_staged(dir: &Path) -> Result<()> {
+    let gens = dir.join("gens");
+    for entry in fs::read_dir(&gens).map_err(at(&gens))? {
+        let path = entry.map_err(at(&gens))?.path();
+        if path.extension().is_some_and(|e| e == "graft") {
+            fs::remove_dir_all(&path).map_err(at(&path))?;
+        }
+    }
+    Ok(())
 }
 
 // Past every disk and note on hand, failed runs' included, so none is
