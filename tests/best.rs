@@ -918,6 +918,11 @@ fn a_try_still_going_rolled_back_or_up_isn_t_kept() {
         "{err}"
     );
     commit_try(&h, "dev-2");
+    // One to delete that's up outside a run, as by hand, is refused too.
+    h.sd.set_vm_state("dev-1", "active");
+    let err = h.refused(&["keep", "dev-2"]);
+    assert!(err.contains("dev-1 is running: stop it first"), "{err}");
+    h.sd.set_vm_state("dev-1", "inactive");
     h.sd.set_vm_state("dev-2", "active");
     let err = h.refused(&["keep", "dev-2"]);
     assert!(err.contains("dev-2 is running: stop it first"), "{err}");
