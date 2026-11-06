@@ -22,8 +22,12 @@ const TOKEN: &str = "sk-ant-oat01-SECRET-TOKEN";
 
 // Every fake, laptop's and host's, logs its argv to $FAKE/log: who ran it
 // (laptop, or the host's directory), then each arg, split by US, a record
-// ending in RS, since args can span lines.
-const LOG: &str = r#"log() { { printf '%s\037' "${WHO:-laptop}" "$@"; printf '\036'; } >>"$FAKE/log"; }
+// ending in RS, since args can span lines, in one write, since the two ends
+// of a pipe log at once.
+const LOG: &str = r#"log() {
+  log_rec=$(printf '%s\037' "${WHO:-laptop}" "$@"; printf '\036')
+  printf '%s' "$log_rec" >>"$FAKE/log"
+}
 "#;
 
 // Each aws call's argv on a line, its args split by US, in $FAKE/calls. A file

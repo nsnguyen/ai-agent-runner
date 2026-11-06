@@ -29,10 +29,13 @@ const PRELUDE: &str = r#"wrong() { grep -qx "$1" "$FAKE/wrong" 2>/dev/null; }
 "#;
 
 // Every call on a line in ssh-calls: RUNNER_HOST as it was, then the argv,
-// split by US. A tunnel (-L) notes what it forwards, and runs its command as
+// split by US, in one write, since the client asks every host at once. A tunnel (-L) notes what it forwards, and runs its command as
 // is, so the proxy's pid is the hold's, as a real ssh's end is the hold's end.
 // With -tt, lines end in CRLF, as a terminal's do.
-const FAKE_SSH: &str = r#"{ printf 'RUNNER_HOST=%s' "${RUNNER_HOST-}"; for arg; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$FAKE/ssh-calls"
+const FAKE_SSH: &str = r#"us=$(printf '\037')
+call="RUNNER_HOST=${RUNNER_HOST-}"
+for arg; do call="$call$us$arg"; done
+printf '%s\n' "$call" >>"$FAKE/ssh-calls"
 tunnel=
 tty=
 while [ $# -gt 0 ]; do
