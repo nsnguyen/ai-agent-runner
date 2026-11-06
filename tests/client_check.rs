@@ -1035,12 +1035,15 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
         assert!(!ssh.is_empty());
         for call in &ssh {
             let last = call.last().unwrap();
+            // The client asks a host whether it answers (`true`, as runner)
+            // before a command goes there, so a stopped one starts first.
+            if last == "true" && call[call.len() - 2].starts_with("runner@") {
+                continue;
+            }
             // The move goes through the hosts file, finding the VM's host,
-            // which `runner ip` asks as the checks do, and asking the target
-            // whether it answers (`true`), so a stopped one starts first.
+            // which `runner ip` asks as the checks do.
             let moving = last == "runner list" || last.starts_with("runner move client-check ");
-            let asked = ["runner ip client-check", "true"].contains(&last.as_str());
-            if moving || (asked && call[0] == "RUNNER_HOST=") {
+            if moving || (last == "runner ip client-check" && call[0] == "RUNNER_HOST=") {
                 assert_eq!(call[0], "RUNNER_HOST=", "{call:?}");
             } else if [
                 "runner exec client-check -- cat /home/agent/moved",

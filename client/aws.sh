@@ -636,9 +636,9 @@ start)
   stopping=$(printf '%s\n' "$list" | awk '$3 == "stopping" {printf "%s%s", n++ ? " " : "", $2}')
   # shellcheck disable=SC2086
   [ -z "$stopping" ] || aws ec2 wait instance-stopped --instance-ids $stopping
-  # A host powers itself off when idle. One launched before up said stop
-  # would be terminated then, and its VMs with it. The loop reads $list, so
-  # aws reads nothing.
+  # A host powers itself off when idle, and one set to terminate at a
+  # power-off would be gone then, and its VMs with it. The loop reads $list,
+  # so aws reads nothing.
   while read -r n i _; do
     does=$(aws ec2 describe-instance-attribute --instance-id "$i" \
       --attribute instanceInitiatedShutdownBehavior \

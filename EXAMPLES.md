@@ -174,8 +174,8 @@ client/aws.sh stop     # turn the servers off now, or leave them to turn themsel
 | You see | Do |
 |---|---|
 | `AWS won't take this laptop's credentials` | `aws login --profile runner` |
-| `runner list` can't find `kvm-host`, or says `AWS has it running` | Connect Tailscale |
-| A server that's off stays off: `runner list` only times out | Rerun `client/install.sh`, which puts `aws.sh` beside `runner`, and `export AWS_PROFILE=runner` |
+| `runner list` hangs, or can't find `kvm-host` | Connect Tailscale, and check the server is on (`client/aws.sh state`) |
+| A server that's off stays off | Rerun `client/install.sh`, which puts `aws.sh` beside `runner`, and `export AWS_PROFILE=runner` |
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |

@@ -1186,15 +1186,22 @@ fn state_with_no_aws_cli_is_none() {
     // A laptop with no AWS stays quiet.
     for shell in SHELLS {
         let aws = Aws::new();
-        // The fakes, but no aws, and none of this machine's.
+        // The fakes, but no aws, and none of this machine's, where a real
+        // one may be: the shell by its full path, and PATH only the fakes.
         let bin = aws.dir.path().join("no-aws");
         fs::create_dir(&bin).unwrap();
         script(&bin.join("curl"), &format!("echo {LAPTOP_IP}\n"));
         script(&bin.join("ssh"), FAKE_SSH);
         script(&bin.join("rsync"), FAKE_RSYNC);
+        let found = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|d| d.join(shell[0]))
+            .find(|p| p.is_file())
+            .unwrap();
+        let mut full = vec![found.to_str().unwrap()];
+        full.extend(&shell[1..]);
         let out = aws
-            .cmd(shell, &["state"])
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .cmd(&full, &["state"])
+            .env("PATH", &bin)
             .output()
             .unwrap();
         assert_eq!(ok(&out), "none\n");

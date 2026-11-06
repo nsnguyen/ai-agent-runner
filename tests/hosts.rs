@@ -16,9 +16,6 @@ const SHELLS: &[&[&str]] = &[&["sh"], &["bash", "--posix"]];
 
 const HOSTS: [&str; 3] = ["runner@kvm-host", "runner@kvm-host-2", "runner@kvm-host-3"];
 
-// How long a command's ssh waits for its host to take the connection.
-const CONNECT: &str = "ConnectTimeout=10";
-
 fn client(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("client")
@@ -250,9 +247,18 @@ impl Fleet {
         fs::write(self.dir.path().join("fleet").join(name).join("down"), "").unwrap();
     }
 
+    /// The AWS CLI is here, so the runner asks a host it hasn't reached
+    /// whether it answers before a command goes there, and aws.sh about one
+    /// that doesn't. The fake aws.sh never calls it.
+    fn aws_cli(&self) {
+        let aws = self.dir.path().join("bin/aws");
+        script(&aws, "echo 'aws: not in these tests' >&2\nexit 1\n");
+    }
+
     /// Stopped on AWS, until aws.sh starts it.
     fn stop(&self, name: &str) {
         fs::write(self.dir.path().join("fleet").join(name).join("stopped"), "").unwrap();
+        self.aws_cli();
     }
 
     /// Every aws.sh call: its RUNNER_AWS_NAME, then its arguments.
@@ -970,7 +976,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
             "runner mcp --name runner@kvm-host --peer runner@kvm-host-2 --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[0], peers]],
+            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
             "{shell:?}"
         );
         assert_eq!(fleet.calls("kvm-host"), [&peers[7..]], "{shell:?}");
@@ -980,7 +986,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
         let peers = "runner mcp --user bob --name runner@kvm-host-2 --peer runner@kvm-host --peer runner@kvm-host-3";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[1], peers]],
+            [["-T", "-o", "BatchMode=yes", HOSTS[1], peers]],
             "{shell:?}"
         );
 
@@ -995,7 +1001,7 @@ fn mcp_passes_the_other_hosts_as_peers() {
         let peers = "runner mcp --name runner@kvm-host --peer runner@kvm-host-2";
         assert_eq!(
             fleet.ssh_calls(),
-            [["-T", "-o", "BatchMode=yes", "-o", CONNECT, HOSTS[0], peers]],
+            [["-T", "-o", "BatchMode=yes", HOSTS[0], peers]],
             "{shell:?}"
         );
 
@@ -1016,8 +1022,6 @@ fn mcp_passes_the_other_hosts_as_peers() {
                     "-T",
                     "-o",
                     "BatchMode=yes",
-                    "-o",
-                    CONNECT,
                     "runner@kvm-host-2",
                     "runner mcp"
                 ],
@@ -1025,8 +1029,6 @@ fn mcp_passes_the_other_hosts_as_peers() {
                     "-T",
                     "-o",
                     "BatchMode=yes",
-                    "-o",
-                    CONNECT,
                     "runner@kvm-host-3",
                     "runner mcp"
                 ]
@@ -1075,7 +1077,7 @@ fn runner_host_still_means_that_host_alone() {
         ok(&out);
         assert_eq!(
             fleet.ssh_calls(),
-            [["-o", CONNECT, "runner@kvm-host-2", "runner list"]],
+            [["runner@kvm-host-2", "runner list"]],
             "{shell:?}"
         );
         // One host's list as the host prints it: no host column.
@@ -1369,13 +1371,8 @@ fn a_hosts_file_of_one_host_runs_as_one_host_always_has() {
         assert_eq!(
             fleet.ssh_calls(),
             [
-                vec!["-o", CONNECT, "runner@kvm-host-2", "runner list"],
-                vec![
-                    "-o",
-                    CONNECT,
-                    "runner@kvm-host-2",
-                    "runner exec web -- true"
-                ]
+                vec!["runner@kvm-host-2", "runner list"],
+                vec!["runner@kvm-host-2", "runner exec web -- true"]
             ],
             "{shell:?}"
         );
@@ -1412,7 +1409,7 @@ fn a_program_s_own_host_option_reaches_the_host() {
             }
             assert_eq!(
                 fleet.ssh_calls(),
-                [["-o", CONNECT, "runner@kvm-host-2", want.as_str()]],
+                [["runner@kvm-host-2", want.as_str()]],
                 "{shell:?}"
             );
             // Several: to web's host, still as typed.
@@ -2076,6 +2073,7 @@ fn move_to_a_stopped_target_starts_it() {
 #[test]
 fn move_to_a_running_target_asks_aws_nothing() {
     let fleet = Fleet::new();
+    fleet.aws_cli();
     ok(&fleet.run(SHELLS[0], &["list"]));
     ok(&fleet.run(SHELLS[0], &["move", "web", "kvm-host-3"]));
     assert!(fleet.aws_calls().is_empty());
