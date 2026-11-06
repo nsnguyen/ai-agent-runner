@@ -620,8 +620,8 @@ fn a_service_answers_through_its_url_after_the_vm_slept() {
     eventually("the URL to answer again", answers);
 }
 
-// The host drops what a VM opens to it, but the VM still has the internet,
-// DNS included, through the host.
+// The host drops what a VM opens to it, but the VM still has the internet
+// through the host, and DNS from its boot, on its gateway.
 #[test]
 #[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
 fn a_vm_reaches_the_internet_but_not_the_host() {
@@ -683,6 +683,17 @@ except OSError as e:
         }
         None => eprintln!("no IPv6 on {tap}, so no IPv6 to try"),
     }
+    // The kernel's /proc/net/pnp, from the boot argument.
+    let resolv = ok(runner(
+        &root,
+        &["exec", &name, "--", "cat", "/etc/resolv.conf"],
+    ));
+    let servers: Vec<&str> = resolv
+        .lines()
+        .filter_map(|line| line.strip_prefix("nameserver "))
+        .collect();
+    assert_eq!(servers, [gateway.as_str()], "{resolv}");
+    // Which looks up example.com.
     let web = [
         "curl",
         "-fsS",
