@@ -403,22 +403,39 @@ fn a_home_bigger_than_base_s_disk_comes_on_dev_s_bigger_one() {
 // goes, staged files too, and history stays as it was.
 #[test]
 fn a_failed_copy_leaves_the_vm_as_it_was() {
-    // dev's disk is base's size, and base's system takes much of it.
-    let s = setup_with(
-        |at| with_big(at, base_tree, "usr/lib/big", 20),
-        |at| with_big(at, |at| tree(at, &[]), "home/agent/big", 20),
-        "32M",
-    );
-    let before = s.gens("dev");
+    // base's system takes 20M of its 32M. dev's disk is base's size, then
+    // bigger, so its copy is grown before it fills.
+    for (size, home) in [("32M", 20), ("48M", 30)] {
+        let s = setup_with(
+            |at| with_big(at, base_tree, "usr/lib/big", 20),
+            |at| with_big(at, |at| tree(at, &[]), "home/agent/big", home),
+            size,
+        );
+        let before = s.gens("dev");
 
-    let failed = rebase::rebase(&s.store, "dev").unwrap_err();
-    assert!(
-        failed.to_string().contains("no room for the copy"),
-        "{failed}"
-    );
-    assert_eq!(s.gens("dev"), before);
-    assert_eq!(s.store.get("dev").unwrap().generation, 0);
-    assert_eq!(s.store.checkpoints("dev").unwrap().len(), 1);
+        let failed = rebase::rebase(&s.store, "dev").unwrap_err();
+        assert!(
+            failed.to_string().contains("no room for the copy"),
+            "{size}: {failed}"
+        );
+        assert_eq!(s.gens("dev"), before, "{size}");
+        assert_eq!(s.store.get("dev").unwrap().generation, 0);
+        assert_eq!(s.store.checkpoints("dev").unwrap().len(), 1);
+    }
+}
+
+// A dev smaller than base comes out base's size: a disk only grows.
+#[test]
+fn a_vm_smaller_than_base_gets_base_s_size() {
+    let s = setup_sized(dev_tree, "16M");
+    assert_eq!(s.store.get("dev").unwrap().bytes, 16 << 20);
+
+    let done = rebase::rebase(&s.store, "dev").unwrap();
+
+    assert_eq!(done.vm.bytes, 32 << 20);
+    assert_clean(&s.current("dev"));
+    let fs = fs_of(&s.current("dev"));
+    assert_eq!(read(&fs, "/home/agent/work/main.rs"), "fn main() {}\n");
 }
 
 // What the copy can't take is named, and the rest comes.
