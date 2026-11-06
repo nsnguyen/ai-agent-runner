@@ -221,7 +221,7 @@ exit "$code"
 /// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that
 /// file exists. A `stop` runs `on-stop` first if a test put one there, as the
 /// unit runs its ExecStop, and a `start` runs `on-start`, as the unit's boot
-/// would. journalctl logs its argv and prints one line; loginctl logs its argv
+/// would, each with systemctl's arguments, the unit second. journalctl logs its argv and prints one line; loginctl logs its argv
 /// and prints the sessions `set_logins` gave.
 pub struct FakeSystemd {
     pub bin: PathBuf,
@@ -238,9 +238,9 @@ impl FakeSystemd {
                 r#"echo "systemctl $*" >> "{d}/calls"
 if [ -f "{d}/fail" ]; then cat "{d}/fail" >&2; exit 1; fi
 case "$1" in
-  start) if [ -x "{d}/on-start" ]; then "{d}/on-start" || exit 1; fi
+  start) if [ -x "{d}/on-start" ]; then "{d}/on-start" "$@" || exit 1; fi
     echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
-  stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" || exit 1; fi
+  stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" "$@" || exit 1; fi
     echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
   show) cat "{d}/state.$4" 2>/dev/null || cat "{d}/state" 2>/dev/null || echo inactive ;;
 esac

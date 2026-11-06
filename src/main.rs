@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use runner::best;
 use runner::checkpoint;
 use runner::claude::{self, Claude};
 use runner::creds::{self, Cred};
@@ -315,6 +316,8 @@ enum Cmd {
     /// anything else rolls that back. A running VM is checkpointed and joined
     /// as it is, and left running however the run ends: `restore` that
     /// checkpoint to roll a failed run back. One run per VM at a time.
+    /// With --n, best of N: the prompt runs in N new forks instead, each its
+    /// own run, and the VM itself isn't touched.
     Run {
         name: String,
         /// What to ask Claude Code. It reaches claude on its stdin.
@@ -330,6 +333,17 @@ enum Cmd {
         /// The user Claude Code runs as.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
+        /// Best of N, 2 to 4: fork the VM into <name>-1 to <name>-N, start
+        /// the prompt in each at once as an ordinary run, and print each
+        /// run's id. Each fork is new and stopped, so its run boots it. A
+        /// stopped VM's current disk is forked; a running or sleeping one is
+        /// checkpointed first, and that's forked. The forks get the default
+        /// credentials. Refused if a name is taken, if this host's free
+        /// memory less 1 GiB can't hold N of the VM, while the VM has a run
+        /// going, and while an earlier batch's tries are still VMs. Tokens
+        /// cost N times one run's.
+        #[arg(long = "n", value_name = "N")]
+        n: Option<u32>,
     },
     /// List a VM's runs, newest first: id, when it started, how it stands,
     /// and its prompt.
@@ -713,6 +727,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             dir,
             resume,
             user,
+            n,
         } => {
             let start = runs::Start {
                 vm: &name,
@@ -721,8 +736,12 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 resume: resume.as_deref(),
                 user: &user,
             };
-            let run = runs::start(&store, &std::env::current_exe()?, &start)?;
-            println!("{}", run.id);
+            let exe = std::env::current_exe()?;
+            let started = match n {
+                None => vec![runs::start(&store, &exe, &start)?],
+                Some(n) => best::start(&store, &exe, &start, n)?,
+            };
+            started.iter().for_each(|run| println!("{}", run.id));
         }
         Cmd::Runs { name } => {
             let all = runs::list(&store, &name)?;

@@ -7,6 +7,7 @@
 // ask every host, create_vm places a VM as the laptop's `runner create`
 // does, and a call naming a VM or a run goes, as it came, to the VM's host,
 // through one `ssh <peer> runner mcp` each (peers::Remote).
+use crate::best;
 use crate::checkpoint;
 use crate::claude;
 use crate::creds;
@@ -223,6 +224,21 @@ pub struct RunAgentArgs {
     /// Where in the VM Claude Code runs; it has to exist. Defaults to /home/agent/work.
     dir: Option<String>,
     /// A Claude Code session to carry on: the session_id in an earlier run's init event.
+    resume: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct BestOfArgs {
+    /// The VM to fork. It isn't touched: a running or sleeping one is
+    /// checkpointed, and the forks copy that.
+    name: String,
+    /// What to ask Claude Code in each fork.
+    prompt: String,
+    /// How many forks: 2 to 4. Each run costs its own tokens.
+    n: u32,
+    /// Where in each fork Claude Code runs; it has to exist. Defaults to /home/agent/work.
+    dir: Option<String>,
+    /// A Claude Code session each fork carries on: the session_id in an earlier run's init event.
     resume: Option<String>,
 }
 
@@ -688,6 +704,29 @@ impl Tools {
                 user: &user,
             };
             runs::start(&store, &exe, &start).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Best of N: fork a VM into <name>-1 to <name>-<n>, n from 2 to 4, start the prompt in each at once as an ordinary run, and return the n runs; read each with run_output, as any run. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its result measures what that try changed against the VM's disk. The VM itself isn't touched: a stopped one's current disk is forked, and a running or sleeping one is checkpointed first (kind run), and that's forked. The forks get the default credentials, claude only, and the VM's sizes. Refused, with nothing made, if a fork's name is taken, if the host's free memory less 1 GiB can't hold n of the VM, while the VM has a run going, and while an earlier batch's forks are still VMs. Tokens cost n times one run's."
+    )]
+    async fn run_best_of(
+        &self,
+        Parameters(args): Parameters<BestOfArgs>,
+    ) -> Result<Json<RunList>, String> {
+        let (store, user) = (self.store.clone(), self.user.clone());
+        blocking(move || {
+            let exe = std::env::current_exe().map_err(|e| format!("finding runner: {e}"))?;
+            let start = runs::Start {
+                vm: &args.name,
+                prompt: &args.prompt,
+                dir: args.dir.as_deref().unwrap_or(claude::DIR),
+                resume: args.resume.as_deref(),
+                user: &user,
+            };
+            let runs = best::start(&store, &exe, &start, args.n).map_err(|e| e.to_string())?;
+            Ok::<_, String>(RunList { runs })
         })
         .await
     }

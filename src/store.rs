@@ -19,6 +19,7 @@
 //   <root>/vms/<name>/rollback       a run's ask that its boot not commit, naming the run
 //   <root>/vms/<name>/booted         the generations of its latest boot: the one it cloned, and its own
 //   <root>/vms/<name>/runs/          its headless runs: their streams, how each ended, and its result (runs.rs)
+//   <root>/vms/<name>/tries.json     its latest best-of-N batch: what was asked, when, the generation its tries forked, and their names and runs (best.rs)
 //   <root>/vms/.new-<name>-<pid>/    a VM being created or imported, renamed into place when done
 //   <root>/vms/.del-<name>-<pid>/    a VM being deleted, renamed out of the way first
 //   <root>/kernel/vmlinux            the kernel a VM boots unless its config names one
@@ -376,6 +377,20 @@ impl Store {
         self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
     }
 
+    /// A fork of generation `generation` of `from`, which has to be on hand,
+    /// like a checkpoint: with `from`'s sizes and kernel, and whatever `over`
+    /// sets in their place.
+    pub fn fork_at(&self, from: &str, generation: u64, name: &str, over: &Config) -> Result<Vm> {
+        let src = self.existing(from)?;
+        let config = read_config(&src)?.with(over);
+        let disk = disk_of(&src, generation);
+        if !disk.is_file() {
+            return Err(Error::NoCheckpoint(from.to_string(), generation));
+        }
+        let why = format!("fork of {from}'s generation {generation}");
+        self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
+    }
+
     // A new VM with `disk` as its only generation, noted as `note` says,
     // given it.
     fn make(
@@ -668,6 +683,11 @@ impl Store {
     /// Where the VM's headless runs keep their records (runs.rs).
     pub fn runs(&self, name: &str) -> Result<PathBuf> {
         Ok(self.existing(name)?.join("runs"))
+    }
+
+    /// Where the VM records its latest batch of best-of-N tries (best.rs).
+    pub fn tries(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.existing(name)?.join("tries.json"))
     }
 
     /// Asks the boot running the VM to roll back, not commit, however its
