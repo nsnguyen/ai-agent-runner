@@ -48,6 +48,8 @@ command -v curl >/dev/null || missing+=(curl)
 command -v pkaction >/dev/null || missing+=(polkit)
 # It makes runner's SSH key.
 command -v ssh-keygen >/dev/null || missing+=(openssh-client)
+# The runner copies trees into a disk with debugfs, by this path (src/graft.rs).
+[[ -x /usr/sbin/debugfs ]] || missing+=(e2fsprogs)
 if ((${#missing[@]})); then
   say "installing ${missing[*]}"
   if command -v apt-get >/dev/null; then
