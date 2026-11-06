@@ -1093,7 +1093,9 @@ impl Store {
     /// A new disk for the VM `name`, made from a copy of base's current disk,
     /// which `fill` writes into from the VM's own, and put on top of its
     /// history, as a restore's copy is: `undo` goes back to the disk from
-    /// before it. Its settings stay as they are. `fill` gets the VM's
+    /// before it. Its settings stay as they are, and so does its disk's size
+    /// when it's bigger than base's, a resize's say: the copy is grown to it
+    /// before `fill`, as Store::resize grows one. `fill` gets the VM's
     /// current disk, base's, and the new one, and what it returns comes back
     /// with the VM and base's generation.
     ///
@@ -1125,6 +1127,7 @@ impl Store {
             return Err(Error::NotImported { onto, made_by }.into());
         }
         let (from, base_disk) = (disk_of(&dir, current(&dir)?), disk_of(&base, onto));
+        let own = fs::metadata(&from).map_err(at(&from))?.len();
         freezer.clear_parts()?;
         clear_staged(&dir)?;
         let why = format!("rebase onto base gen {onto}");
@@ -1142,6 +1145,11 @@ impl Store {
                 let made_by = again.and_then(|n| n.comment);
                 let made_by = made_by.unwrap_or_else(|| "nothing it noted".to_string());
                 return Err(Error::NotImported { onto, made_by }.into());
+            }
+            // The VM's size stays its own, a resize's too, when it's
+            // bigger than base's: a disk only grows.
+            if own > fs::metadata(&part).map_err(at(&part))?.len() {
+                grow_disk(&part, own)?;
             }
             let filled = fill(&from, &base_disk, &part)?;
             File::open(&part)
