@@ -7,7 +7,7 @@
 //   <root>/vms/<name>/lock           flock'd by the process running the VM, one at a time
 //   <root>/vms/<name>/freeze.lock    flock'd while a running VM's checkpoint is made, one at a time
 //   <root>/vms/<name>/use.lock       flock'd shared by each command using the VM, and touched; exclusive by its boot as it sleeps it (idle.rs)
-//   <root>/vms/<name>/config.json    sizes, kernel, idle time and URL, only where they differ from the defaults
+//   <root>/vms/<name>/config.json    sizes, kernel, idle time, URL and list of names (dns.rs), only where they differ from the defaults
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
@@ -28,6 +28,7 @@
 // The range slots carve up is the host's, in /etc/runner/net (host.rs).
 use crate::calls;
 use crate::creds::{self, Cred, DEFAULT};
+use crate::dns::{self, Hostname, List};
 use crate::idle::Idle;
 use crate::image::{self, Build};
 use crate::net::{DEFAULT_SUBNET, Net, Subnet};
@@ -183,8 +184,8 @@ pub enum Source<'a> {
     Stream(&'a mut dyn Read),
 }
 
-/// A VM's sizes, kernel, idle time and URL as stored: each one left out is
-/// the default.
+/// A VM's sizes, kernel, idle time, URL and list of names as stored: each
+/// one left out is the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -200,6 +201,10 @@ pub struct Config {
     /// Its URL on the tailnet: on, and to port 8080 in the VM, unless set (url.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<Setting>,
+    /// The names its DNS answers, each with every name under it, and
+    /// dns::ALWAYS besides; with none, every name (dns.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<Hostname>>,
 }
 
 impl Config {
@@ -211,6 +216,7 @@ impl Config {
             kernel: over.kernel.clone().or(self.kernel),
             idle: over.idle.or(self.idle),
             url: over.url.or(self.url),
+            allow: over.allow.clone().or(self.allow),
         }
     }
 
@@ -581,7 +587,10 @@ impl Store {
     /// Sets how long the VM goes unused before it sleeps. A running VM's boot
     /// reads it at each look, so it counts from now on.
     pub fn set_idle(&self, name: &str, idle: Idle) -> Result<Idle> {
-        self.set_config(name, |config| config.idle = Some(idle))?;
+        self.set_config(name, |config| {
+            config.idle = Some(idle);
+            Ok(())
+        })?;
         Ok(idle)
     }
 
@@ -593,17 +602,85 @@ impl Store {
     /// Sets the VM's URL. A running VM's boot reads it every second, so it
     /// counts from then on.
     pub fn set_url(&self, name: &str, url: Setting) -> Result<Setting> {
-        self.set_config(name, |config| config.url = Some(url))?;
+        self.set_config(name, |config| {
+            config.url = Some(url);
+            Ok(())
+        })?;
         Ok(url)
     }
 
-    // Changes one setting in the VM's config, keeping the rest, and writes it
-    // whole, so a boot reading it sees the old one or the new. An imported
-    // VM's kernel needn't be on this host: only its boot needs it.
-    fn set_config(&self, name: &str, change: impl FnOnce(&mut Config)) -> Result<()> {
+    /// The names the VM's DNS answers, each with every name under it, and
+    /// api.anthropic.com always: None if it has no list, and every name is
+    /// answered.
+    pub fn allowed(&self, name: &str) -> Result<Option<List>> {
+        Ok(self.config(name)?.allow.map(List::new))
+    }
+
+    /// Puts `hosts` on the VM's list, making one if it has none. A running
+    /// VM's boot reads it every second, so it counts from then on.
+    pub fn allow(&self, name: &str, hosts: &[Hostname]) -> Result<List> {
+        let mut now = Vec::new();
+        self.set_config(name, |config| {
+            let names = config.allow.get_or_insert_with(Vec::new);
+            names.extend_from_slice(hosts);
+            names.sort();
+            names.dedup();
+            now.clone_from(names);
+            Ok(())
+        })?;
+        Ok(List::new(now))
+    }
+
+    /// Takes `hosts` off the VM's list, all or none, and keeps the list even
+    /// once only api.anthropic.com is left. Refuses that one, a name that
+    /// isn't on it, and a VM with no list.
+    pub fn deny(&self, name: &str, hosts: &[Hostname]) -> Result<List> {
+        let mut now = Vec::new();
+        self.set_config(name, |config| {
+            let Some(names) = config.allow.as_mut() else {
+                return Err(Error::BadConfig(format!(
+                    "{name} has no list of names to take one off: it reaches every name"
+                )));
+            };
+            let list = List::new(names.clone());
+            for host in hosts {
+                if dns::ALWAYS.contains(&host.as_str()) {
+                    return Err(Error::BadConfig(format!(
+                        "{host} is on every list, so Claude Code keeps working: it can't be \
+                         taken off"
+                    )));
+                }
+                if !names.contains(host) {
+                    let why = match list.covering(host) {
+                        Some(by) => format!("{host} isn't on {name}'s list: {by} covers it"),
+                        None => format!("{host} isn't on {name}'s list"),
+                    };
+                    return Err(Error::BadConfig(why));
+                }
+            }
+            names.retain(|n| !hosts.contains(n));
+            now.clone_from(names);
+            Ok(())
+        })?;
+        Ok(List::new(now))
+    }
+
+    /// Drops the VM's list, so its DNS answers every name again.
+    pub fn allow_all(&self, name: &str) -> Result<()> {
+        self.set_config(name, |config| {
+            config.allow = None;
+            Ok(())
+        })
+    }
+
+    // Changes the VM's config, keeping the rest, and writes it whole, so a
+    // boot reading it sees the old one or the new. An imported VM's kernel
+    // needn't be on this host: only its boot needs it. A change that fails
+    // writes nothing.
+    fn set_config(&self, name: &str, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
         let dir = self.existing(name)?;
         let mut config = read_config(&dir)?;
-        change(&mut config);
+        change(&mut config)?;
         config.check_values()?;
         let path = dir.join(CONFIG);
         let mut text =

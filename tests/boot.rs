@@ -228,6 +228,31 @@ fn a_tap_that_can_t_be_made_stops_the_boot_before_firecracker() {
     h.store.delete("dev").unwrap();
 }
 
+// A VM with a list of names needs its boot to serve its DNS, or the list
+// would hold nothing: one whose boot can't, as with this fake ip's missing
+// tap, doesn't boot. An unlisted one falls back to the host's resolvers
+// (boot_runs_the_next_generation_and_a_clean_halt_commits_it).
+#[test]
+fn a_listed_vm_whose_boot_can_t_serve_its_dns_doesn_t_boot() {
+    let h = Host::new();
+    let github = "github.com".parse().unwrap();
+    h.store.allow("dev", &[github]).unwrap();
+    let out = finish(h.boot("dev"));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("dev has a list of names"), "{err}");
+    assert!(err.contains("can't serve its DNS"), "{err}");
+    assert!(!h.fc.started());
+    assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    // Its tap went, and with it dev.
+    assert_eq!(
+        h.ip_calls().last().unwrap(),
+        &format!("link del dev {}", h.store.net("dev").unwrap().tap)
+    );
+    h.store.delete("dev").unwrap();
+}
+
 // The unit gives boot CAP_NET_ADMIN for the tap and CAP_NET_BIND_SERVICE
 // for the VM's DNS; Firecracker, which a guest could break into, mustn't
 // keep either. Run as root:
@@ -328,6 +353,7 @@ fn a_vm_boots_with_its_own_sizes_and_kernel() {
         kernel: Some(kernel.clone()),
         idle: None,
         url: None,
+        allow: None,
     };
     h.store.delete("dev").unwrap();
     h.store.fork_with("base", "dev", &config).unwrap();

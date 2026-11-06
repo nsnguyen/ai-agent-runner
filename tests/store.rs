@@ -1,6 +1,7 @@
 // The VM store on a temp directory: no KVM needed.
 use chrono::SubsecRound;
 use runner::creds::{Cred, DEFAULT};
+use runner::dns::{Hostname, List};
 use runner::store::{
     Booted, Checkpoint, Config, Error, KEEP_CHECKPOINTS, Machine, Maker, Slept, Source, Store, Vm,
     check_name, parse_mem,
@@ -293,6 +294,7 @@ fn sizes_are_stored_and_a_fork_starts_from_its_parents() {
         kernel: Some(kernel.clone()),
         idle: None,
         url: None,
+        allow: None,
     };
     store.fork_with("base", "big", &big).unwrap();
     assert_eq!(store.config("big").unwrap(), big);
@@ -1621,4 +1623,169 @@ fn an_unreadable_note_is_not_parked() {
     assert_eq!((run.generation, run.parked()), (2, None));
     drop(run);
     store.delete("dev").unwrap();
+}
+
+fn hosts(names: &[&str]) -> Vec<Hostname> {
+    names.iter().map(|n| n.parse().unwrap()).collect()
+}
+
+fn shown(list: Option<List>) -> Option<Vec<String>> {
+    list.map(|l| l.names().iter().map(|h| h.to_string()).collect())
+}
+
+#[test]
+fn a_vm_s_list_of_names_reads_back_as_set_and_always_has_api_anthropic_com() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    // No list: every name.
+    assert_eq!(store.allowed("base").unwrap(), None);
+    let set = store
+        .allow("base", &hosts(&["registry.npmjs.org", "GitHub.com."]))
+        .unwrap();
+    let want = ["api.anthropic.com", "github.com", "registry.npmjs.org"];
+    assert_eq!(shown(Some(set)), Some(want.map(String::from).to_vec()));
+    assert_eq!(
+        shown(store.allowed("base").unwrap()),
+        Some(want.map(String::from).to_vec())
+    );
+    // Beside the rest of its config, which stays.
+    let config = fs::read_to_string(dir.path().join("root/vms/base/config.json")).unwrap();
+    assert!(config.contains("\"allow\""), "{config}");
+    store.set_idle("base", runner::idle::Idle::Never).unwrap();
+    assert_eq!(shown(store.allowed("base").unwrap()).unwrap().len(), 3);
+
+    // Once each.
+    store.allow("base", &hosts(&["github.com"])).unwrap();
+    assert_eq!(shown(store.allowed("base").unwrap()).unwrap().len(), 3);
+
+    // Taking names off keeps the list, even once it's down to the one.
+    let less = store.deny("base", &hosts(&["github.com"])).unwrap();
+    assert_eq!(
+        shown(Some(less)).unwrap(),
+        ["api.anthropic.com", "registry.npmjs.org"]
+    );
+    store.deny("base", &hosts(&["registry.npmjs.org"])).unwrap();
+    assert_eq!(
+        shown(store.allowed("base").unwrap()),
+        Some(vec!["api.anthropic.com".to_string()])
+    );
+
+    // api.anthropic.com can't be taken off, nor a name that isn't on it.
+    let err = store
+        .deny("base", &hosts(&["api.anthropic.com"]))
+        .unwrap_err();
+    assert!(err.to_string().contains("Claude Code"), "{err}");
+    store.allow("base", &hosts(&["github.com"])).unwrap();
+    let err = store
+        .deny("base", &hosts(&["api.github.com", "github.com"]))
+        .unwrap_err();
+    assert!(err.to_string().contains("api.github.com"), "{err}");
+    assert!(err.to_string().contains("github.com covers it"), "{err}");
+    // All or nothing: github.com is still on.
+    assert_eq!(shown(store.allowed("base").unwrap()).unwrap().len(), 2);
+
+    // Allowing every name drops the list, and there's then nothing to take off.
+    store.allow_all("base").unwrap();
+    assert_eq!(store.allowed("base").unwrap(), None);
+    let err = store.deny("base", &hosts(&["github.com"])).unwrap_err();
+    assert!(err.to_string().contains("every name"), "{err}");
+    assert!(matches!(store.allowed("nope"), Err(Error::NoVm(_))));
+    assert!(matches!(
+        store.allow("nope", &hosts(&["github.com"])),
+        Err(Error::NoVm(_))
+    ));
+}
+
+#[test]
+fn a_fork_keeps_its_parent_s_list() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    store.allow("base", &hosts(&["github.com"])).unwrap();
+    store.fork("base", "dev").unwrap();
+    assert_eq!(
+        store.allowed("dev").unwrap(),
+        store.allowed("base").unwrap()
+    );
+    let bigger = Config {
+        cpus: Some(4),
+        ..Config::default()
+    };
+    store.fork_with("base", "big", &bigger).unwrap();
+    assert!(store.allowed("big").unwrap().is_some());
+    // Its own from then on.
+    store.allow_all("dev").unwrap();
+    assert!(store.allowed("base").unwrap().is_some());
+}
+
+#[test]
+fn a_name_that_is_not_a_hostname_is_refused_with_why() {
+    let long_label = format!("{}.com", "a".repeat(64));
+    let long_name = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+    let refused = [
+        ("1.2.3.4", "an address"),
+        ("::1", "an address"),
+        ("10.0.0.1.", "an address"),
+        ("*.github.com", "wildcard"),
+        ("github.*", "wildcard"),
+        ("", "empty"),
+        ("github..com", "empty label"),
+        (".github.com", "empty label"),
+        ("com", "one label"),
+        ("localhost", "one label"),
+        ("git hub.com", "letters, digits and hyphens"),
+        ("github.com/x", "letters, digits and hyphens"),
+        ("git_hub.com", "letters, digits and hyphens"),
+        ("bücher.de", "letters, digits and hyphens"),
+        ("-github.com", "hyphen"),
+        ("github-.com", "hyphen"),
+        ("1.2.3", "number"),
+        (long_label.as_str(), "63"),
+        (long_name.as_str(), "253"),
+    ];
+    for (name, why) in refused {
+        let err = name.parse::<Hostname>().unwrap_err().to_string();
+        assert!(err.contains(why), "{name:?}: {err}");
+        assert!(err.contains(&format!("{name:?}")), "{name:?}: {err}");
+    }
+    for (name, as_kept) in [
+        ("github.com", "github.com"),
+        ("API.GitHub.com.", "api.github.com"),
+        ("xn--bcher-kva.de", "xn--bcher-kva.de"),
+        ("1password.com", "1password.com"),
+        ("a-b.c-d.io", "a-b.c-d.io"),
+    ] {
+        let host: Hostname = name.parse().unwrap();
+        assert_eq!(host.to_string(), as_kept);
+    }
+}
+
+// An import, or a hand edit, can't slip a bad name past the store.
+#[test]
+fn a_config_whose_list_holds_a_bad_name_is_an_error() {
+    let (dir, store) = store();
+    store.import("base", &disk(dir.path(), b"rootfs")).unwrap();
+    let config = dir.path().join("root/vms/base/config.json");
+    fs::write(&config, "{\"allow\": [\"*.example.com\"]}\n").unwrap();
+    let err = store.allowed("base").unwrap_err();
+    assert!(err.to_string().contains("wildcard"), "{err}");
+    fs::write(&config, "{\"allow\": []}\n").unwrap();
+    assert_eq!(
+        shown(store.allowed("base").unwrap()),
+        Some(vec!["api.anthropic.com".to_string()])
+    );
+}
+
+proptest::proptest! {
+    // Any text is a hostname that reads back as itself, or refused: never
+    // a panic, and never one with a byte a DNS label can't hold.
+    #[test]
+    fn any_text_is_a_hostname_or_refused(s in "[a-zA-Z0-9.*_ -]{0,40}") {
+        if let Ok(host) = s.parse::<Hostname>() {
+            let kept = host.to_string();
+            proptest::prop_assert_eq!(kept.parse::<Hostname>().unwrap(), host);
+            proptest::prop_assert!(kept.split('.').count() >= 2);
+            proptest::prop_assert!(kept.bytes().all(|b| b.is_ascii_lowercase()
+                || b.is_ascii_digit() || b == b'-' || b == b'.'));
+        }
+    }
 }

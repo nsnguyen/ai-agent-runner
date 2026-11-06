@@ -40,7 +40,9 @@ pub struct Imported {
 pub enum Error {
     #[error(transparent)]
     Store(#[from] store::Error),
-    #[error("the export is format {0}, and this runner reads format {FORMAT}: upgrade the runner")]
+    #[error(
+        "the export is format {0}, and this runner reads formats 1 to {FORMAT}: upgrade the runner"
+    )]
     Format(u32),
     #[error("the stream ended at {at} bytes, in {within}: was it cut off?")]
     Cut { at: u64, within: String },
@@ -154,7 +156,7 @@ fn read_manifest<R: Read>(
         format: u32,
     }
     let Format { format } = serde_json::from_slice(&json).map_err(bad)?;
-    if format != FORMAT {
+    if !(1..=FORMAT).contains(&format) {
         return Err(Error::Format(format));
     }
     let manifest: Manifest = serde_json::from_slice(&json).map_err(bad)?;

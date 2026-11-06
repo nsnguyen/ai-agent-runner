@@ -376,6 +376,7 @@ impl Tools {
             kernel: args.kernel,
             idle: args.idle.as_deref().map(str::parse).transpose()?,
             url: None,
+            allow: None,
         };
         self.store
             .fork_with(from, &args.name, &config)

@@ -87,6 +87,11 @@ pub enum Error {
     Io { what: String, source: io::Error },
     #[error("firecracker exited before its API came up ({0})")]
     EarlyExit(ExitStatus),
+    #[error(
+        "{name} has a list of names, and only its boot's DNS holds it to them, but boot \
+         can't serve its DNS: {why}"
+    )]
+    NoDns { name: String, why: String },
     #[error("firecracker's API didn't come up within {}s", API_WAIT.as_secs())]
     NoApi,
     #[error(
@@ -167,7 +172,14 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         }
     };
     // On the tap's address, so after it, and dropped just before it.
-    let (relay, ip_arg) = serve_dns(name, &net, run.parked().is_some());
+    let (relay, ip_arg) = match serve_dns(store, name, &net, run.parked().is_some()) {
+        Ok(served) => served,
+        Err(e) => {
+            drop(tap);
+            run.discard();
+            return Err(e);
+        }
+    };
     let api_sock = run.api_socket();
     let vsock = run.vsock();
     let creds_sock = run.creds_socket();
@@ -430,31 +442,61 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
 // the guest there. A boot that can't serve it, with a resolver already on
 // port 53 of every address, say, gives the guest the host's resolvers, which
 // the host's rules let it reach if they're off the host. A parked VM that
-// resumes keeps the server it booted with, likely its gateway.
-fn serve_dns(name: &str, net: &Net, parked: bool) -> (Option<dns::Relay>, String) {
+// resumes keeps the server it booted with, likely its gateway. A VM with a
+// list of names doesn't boot at all then: only its boot holds it to them.
+fn serve_dns(
+    store: &Store,
+    name: &str,
+    net: &Net,
+    parked: bool,
+) -> Result<(Option<dns::Relay>, String)> {
+    let listed = store.allowed(name)?.is_some();
+    let no_dns = |why: String| {
+        Err(Error::NoDns {
+            name: name.to_string(),
+            why,
+        })
+    };
     let resolvers = net::dns(&HOST_RESOLV_CONFS.map(Path::new));
     if resolvers.is_empty() {
-        note(format_args!(
-            "{name} boots without DNS: no IPv4 nameserver in {}",
-            HOST_RESOLV_CONFS.join(" or ")
-        ));
-        return (None, net.boot_arg_with(name, &[]));
+        let why = format!("no IPv4 nameserver in {}", HOST_RESOLV_CONFS.join(" or "));
+        if listed {
+            return no_dns(why);
+        }
+        note(format_args!("{name} boots without DNS: {why}"));
+        return Ok((None, net.boot_arg_with(name, &[])));
     }
-    match dns::Relay::bind(net, &resolvers) {
-        Ok(relay) => (Some(relay), net.boot_arg(name)),
+    match dns::Relay::bind(net, &resolvers, dns_policy(store, name)) {
+        Ok(relay) => Ok((Some(relay), net.boot_arg(name))),
+        Err(e) if listed => no_dns(e.to_string()),
         Err(e) if parked => {
             note(format_args!(
                 "boot can't serve {name}'s DNS on {e}: resumed, its guest gets no answer \
                  at its gateway until it boots again"
             ));
-            (None, net.boot_arg_with(name, &resolvers))
+            Ok((None, net.boot_arg_with(name, &resolvers)))
         }
         Err(e) => {
             note(format_args!(
                 "{name}'s DNS goes straight to the host's resolvers: boot can't serve it on {e}"
             ));
-            (None, net.boot_arg_with(name, &resolvers))
+            Ok((None, net.boot_arg_with(name, &resolvers)))
         }
+    }
+}
+
+// The VM's list, as the store has it each time the relay looks, and where
+// its allowed answers' addresses go. Nothing takes them yet: until the
+// host's rules hold a listed VM to them, it reaches any address it has.
+fn dns_policy(store: &Store, name: &str) -> dns::Policy {
+    let (store, name) = (store.clone(), name.to_string());
+    dns::Policy {
+        list: Box::new(move || {
+            store
+                .allowed(&name)
+                .map_err(|e| format!("{name}'s list of names: {e}"))
+        }),
+        hand_on: Arc::new(|_| {}),
     }
 }
 

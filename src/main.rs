@@ -578,6 +578,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 kernel: kernel.map(absolute_kernel).transpose()?,
                 idle,
                 url: None,
+                allow: None,
             };
             show(&store.fork_with(&from, &name, &config)?);
         }

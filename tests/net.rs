@@ -5,7 +5,7 @@
 mod common;
 
 use common::resolver::{Resolver, answer_to, query, read_framed, write_framed};
-use runner::dns::Relay;
+use runner::dns::{Policy, Relay};
 use runner::host;
 use runner::net::{DEFAULT_SUBNET, Net, Subnet, Tap, dns};
 use runner::store::Error;
@@ -537,8 +537,8 @@ fn a_vm_s_dns_is_its_own_boot_and_no_other() {
     let (own_net, other_net) = (own.clone(), other.clone());
     let _boots = inside(&host, move || {
         let resolvers = [Ipv4Addr::LOCALHOST];
-        let own = Relay::bind(&own_net, &resolvers).unwrap();
-        (own, Relay::bind(&other_net, &resolvers).unwrap())
+        let own = Relay::bind(&own_net, &resolvers, Policy::default()).unwrap();
+        (own, Relay::bind(&other_net, &resolvers, Policy::default()).unwrap())
     });
     let at = |address: Ipv4Addr| SocketAddr::new(address.into(), 53);
     let (own_boot, other_boot) = (at(own.gateway), at(other.gateway));
@@ -595,7 +595,7 @@ fn a_vm_whose_boot_can_t_serve_its_dns_doesn_t_reach_the_host_s() {
     // So the boot can't bind port 53 on the gateway.
     let own = net.clone();
     let bound = inside(&host, move || {
-        Relay::bind(&own, &[Ipv4Addr::LOCALHOST])
+        Relay::bind(&own, &[Ipv4Addr::LOCALHOST], Policy::default())
             .map(drop)
             .map_err(|e| e.kind())
     });

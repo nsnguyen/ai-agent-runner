@@ -289,6 +289,8 @@ fn dev(host: &Host) -> (Checkpoint, Checkpoint) {
     store
         .set_creds("dev", &[Cred::Github, Cred::Claude])
         .unwrap();
+    let github = "github.com".parse().unwrap();
+    store.allow("dev", &[github]).unwrap();
     let first = store.checkpoint("dev", Some("first")).unwrap();
     rewrite(&store, "dev", 2);
     let second = store.checkpoint("dev", Some("tests\npass")).unwrap();
@@ -923,8 +925,11 @@ fn an_import_gives_back_each_disk_sparse_with_my_checkpoints_and_settings() {
     assert!(!undo.status.success());
     assert!(text(&undo.stderr).contains("no earlier generation"));
 
-    // Its settings, a slot of its own, and claude only, as a fork gets.
+    // Its settings, its list of names among them, a slot of its own, and
+    // claude only, as a fork gets.
     assert_eq!(store.config("dev2").unwrap(), store.config("dev").unwrap());
+    let names = store.allowed("dev2").unwrap().expect("no list");
+    assert_eq!(Some(names), store.allowed("dev").unwrap());
     let slot = |vm| store.net(vm).unwrap().slot;
     assert_ne!(slot("dev2"), slot("dev"));
     assert_eq!(store.creds("dev2").unwrap(), [Cred::Claude]);
@@ -1078,7 +1083,25 @@ fn an_unknown_format_is_refused() {
     });
     let err = host.refused_import(&together(&entries));
     assert!(err.contains("format 99"), "{err}");
-    assert!(err.contains(&format!("reads format {FORMAT}")), "{err}");
+    assert!(err.contains(&format!("reads formats 1 to {FORMAT}")), "{err}");
+}
+
+// A config's list of names is a field format 1's import doesn't know, so
+// exports are format 2 now; an export from before it still imports.
+#[test]
+fn an_export_from_before_lists_of_names_still_imports() {
+    assert_eq!(FORMAT, 2);
+    let host = Host::new();
+    let mut entries = small(&host);
+    edit_manifest(&mut entries, |j| {
+        let to = j.replacen(&format!("\"format\": {FORMAT}"), "\"format\": 1", 1);
+        assert_ne!(to, j);
+        to
+    });
+    let path = host.path("old.tar");
+    fs::write(&path, together(&entries)).unwrap();
+    host.imported(&["dev2", "-"], Some(&path));
+    same(&host.current("dev2"), &host.current("dev"));
 }
 
 #[test]
