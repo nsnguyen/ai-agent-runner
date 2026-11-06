@@ -208,6 +208,11 @@ pub struct AgentRun {
     /// is over.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Claude Code's session id, once Claude Code has started and named it
+    /// in its init event: what resume takes to carry the session on. Missing
+    /// until then, and for a run whose Claude Code never started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// The stream's size so far, in bytes.
     pub bytes: u64,
     /// The prompt, cut at 200 characters.
@@ -253,6 +258,42 @@ impl End {
             _ => State::Exited,
         }
     }
+}
+
+/// How far into a run's stream its init event is looked for.
+pub const SESSION_WITHIN: u64 = 64 * 1024;
+
+/// The Claude Code session a run's stream names: the session_id of its
+/// first init event (`"type":"system","subtype":"init"`), if that ends
+/// within the stream's first SESSION_WITHIN bytes. The guest wrote it, and
+/// `--resume` hands it to claude as an argument, so it's kept only if it
+/// looks like a UUID, as Claude Code's do.
+pub fn session(stream: impl Read) -> io::Result<Option<String>> {
+    let mut r = BufReader::new(stream.take(SESSION_WITHIN));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if r.read_until(b'\n', &mut line)? == 0 {
+            return Ok(None);
+        }
+        // A line the cap cut short isn't JSON.
+        let Ok(event) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if event["type"] == "system" && event["subtype"] == "init" {
+            let id = event["session_id"].as_str().filter(|id| is_uuid(id));
+            return Ok(id.map(str::to_string));
+        }
+    }
+}
+
+// 8-4-4-4-12 hex digits.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 /// A run's id: the VM's name, a dot, and the run's number in that VM.
@@ -709,7 +750,9 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
     let dir = runs.join(n.to_string());
     let run_id = id(vm, n);
     let ask: Ask = read_json(&dir.join(ASK))?.ok_or_else(|| Error::NoRun(run_id.clone()))?;
-    let bytes = size(&dir.join(STREAM))?;
+    let stream = dir.join(STREAM);
+    let bytes = size(&stream)?;
+    let session = stream_session(&stream)?;
     let mut end: Option<End> = read_json(&dir.join(END))?;
     // The process writes the end before it lets go of the lock, so a run with
     // no end and no one driving it is lost, unless it ended since the read.
@@ -751,9 +794,19 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
         checkpoint: end.checkpoint,
         error: end.error,
         stderr,
+        session,
         bytes,
         prompt: shown(&ask.prompt),
     })
+}
+
+// The session the stream at `path` names so far; None if there's no stream.
+fn stream_session(path: &Path) -> Result<Option<String>> {
+    let what = || format!("reading {}", path.display());
+    match File::open(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        r => session(r.map_err(io_err(what()))?).map_err(io_err(what())),
+    }
 }
 
 // Whether run `n` is the newest and something holds the run lock: the

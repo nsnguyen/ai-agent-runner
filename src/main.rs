@@ -334,8 +334,8 @@ enum Cmd {
         /// Where Claude Code runs. It has to exist.
         #[arg(short, long, default_value = claude::DIR)]
         dir: String,
-        /// Carry on this Claude Code session: the session_id in an earlier
-        /// run's init event.
+        /// Carry on this Claude Code session: an earlier run's, as `runner
+        /// runs` shows it.
         #[arg(long)]
         resume: Option<String>,
         /// The user Claude Code runs as.
@@ -354,7 +354,8 @@ enum Cmd {
         n: Option<u32>,
     },
     /// List a VM's runs, newest first: id, when it started, how it stands,
-    /// and its prompt.
+    /// its Claude Code session, `-` until Claude Code names it, and its
+    /// prompt.
     Runs { name: String },
     /// Show the tries of a VM's latest best of N side by side, a row per
     /// try: its run, how it stands, its exit code, how long it took, how many
@@ -1081,7 +1082,9 @@ fn up(store: &Store, name: &str, e: &store::Error) -> Option<State> {
 // The prompt is quoted, so one with a newline in it still takes one line.
 fn run_row(r: &AgentRun) -> String {
     let started = r.started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    format!("{}  {started}  {}  {:?}", r.id, runs::describe(r), r.prompt)
+    let session = r.session.as_deref().unwrap_or("-");
+    let how = runs::describe(r);
+    format!("{}  {started}  {how}  {session}  {:?}", r.id, r.prompt)
 }
 
 fn session_row(s: &Session) -> String {

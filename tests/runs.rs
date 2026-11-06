@@ -22,7 +22,8 @@ use tempfile::TempDir;
 // systemctl says, whose guest is up either way, and a `claude` for it to
 // run. A running one has a stand-in for its boot (joined), as runs that join
 // it checkpoint it, and a restore of that checkpoint stops it. The fake
-// writes what it was given into `ctl`, prints an init event, waits for
+// writes what it was given into `ctl`, waits while there's a `ctl/hold`,
+// prints an init event (`ctl/init` in its place if there is one), waits for
 // `ctl/go`, then prints `ctl/events` more (3 unless set), a result event
 // saying `ctl/says` if there is one, and exits with `ctl/exit` (0 unless
 // set).
@@ -64,7 +65,12 @@ fn vm(running: bool) -> Vm {
 printf '%s\n' "$@" > "$c/argv"
 pwd > "$c/pwd"
 cat > "$c/prompt"
-echo '{{"type":"system","subtype":"init","session_id":"s-1"}}'
+while [ -e "$c/hold" ]; do sleep 0.01; done
+if [ -e "$c/init" ]; then
+  cat "$c/init"
+else
+  echo '{{"type":"system","subtype":"init","session_id":"s-1"}}'
+fi
 while [ ! -e "$c/go" ]; do sleep 0.01; done
 n=$(cat "$c/events" 2>/dev/null || echo 3)
 i=1
@@ -946,6 +952,147 @@ fn mcp_cancels_a_run() {
     assert_eq!(again["isError"], json!(true));
 }
 
+const UUID: &str = "0f8b2c4e-1a2b-4c3d-9e8f-123456789abc";
+
+// Claude Code's init event, naming `session`, as a line of its stream.
+fn init(session: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": session})
+    )
+}
+
+// list_runs' runs, newest first.
+fn listed(s: &mut Mcp, id: u64) -> Vec<Value> {
+    let list = s.call(id, "list_runs", json!({"name": "dev"}));
+    let runs = list["structuredContent"]["runs"].as_array();
+    runs.unwrap_or_else(|| panic!("{list}")).clone()
+}
+
+// Once Claude Code's init event names its session, `runs` shows it between
+// how the run stands and its prompt, and MCP's runs carry it as `session`.
+// Until then, `-` and nothing.
+#[test]
+fn a_run_names_its_session_once_claude_code_has_started() {
+    let vm = vm(true);
+    fs::write(vm.ctl.join("hold"), "").unwrap();
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("hi");
+    wait_for("claude to start", || vm.started());
+    let mut s = mcp(&vm);
+    let row = vm.row(&id);
+    assert!(row.ends_with(r#"Z  running  -  "hi""#), "{row}");
+    assert_eq!(listed(&mut s, 2)[0].get("session"), None);
+
+    fs::remove_file(vm.ctl.join("hold")).unwrap();
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+    let row = vm.row(&id);
+    assert!(row.ends_with(&format!(r#"Z  running  {UUID}  "hi""#)), "{row}");
+    assert_eq!(listed(&mut s, 3)[0]["session"], json!(UUID));
+
+    vm.go(1, 0);
+    let row = vm.wait_until_ended(&id);
+    assert!(
+        row.ends_with(&format!(r#"  exited 0, joined  {UUID}  "hi""#)),
+        "{row}"
+    );
+    let args = json!({"run": id, "wait_secs": 0});
+    let out = s.call(4, "run_output", args);
+    assert_eq!(out["structuredContent"]["run"]["session"], json!(UUID));
+}
+
+// The guest wrote the stream, so a session_id that isn't a UUID, as Claude
+// Code's are, is left out, and a run with no init event has none.
+#[test]
+fn a_run_names_no_session_without_a_uuid_in_its_init_event() {
+    let cases = [
+        ("the fake's own, s-1", None),
+        ("no init event", Some(String::new())),
+        ("an argument", Some(init("--dangerously-skip-permissions"))),
+    ];
+    for (what, line) in cases {
+        let vm = vm(true);
+        if let Some(line) = line {
+            fs::write(vm.ctl.join("init"), line).unwrap();
+        }
+        let id = vm.start("hi");
+        vm.go(1, 0);
+        let row = vm.wait_until_ended(&id);
+        assert!(row.ends_with(r#"  exited 0, joined  -  "hi""#), "{what}: {row}");
+        let mut s = mcp(&vm);
+        assert_eq!(listed(&mut s, 2)[0].get("session"), None, "{what}");
+    }
+}
+
+#[test]
+fn the_session_is_found_past_a_torn_or_non_json_first_line() {
+    let found = |stream: &str| runs::session(stream.as_bytes()).unwrap();
+    let line = init(UUID);
+    let uuid = Some(UUID.to_string());
+    assert_eq!(found(&line), uuid);
+    assert_eq!(found(&format!("{{\"type\":\"assis\n{line}")), uuid);
+    assert_eq!(found(&format!("not json\n\n{line}")), uuid);
+    // A hook's event can come first.
+    let hook = r#"{"type":"system","subtype":"hook_response","session_id":"x"}"#;
+    assert_eq!(found(&format!("{hook}\n{line}")), uuid);
+    // The last line of a stream needn't end in a newline.
+    assert_eq!(found(line.trim_end()), uuid);
+    // The first init event is the session's.
+    let other = init("11111111-2222-3333-4444-555555555555");
+    assert_eq!(found(&format!("{line}{other}")), uuid);
+    // Nothing else names it.
+    let said = format!(r#"{{"type":"assistant","session_id":"{UUID}"}}"#);
+    assert_eq!(found(&said), None);
+    assert_eq!(found(""), None);
+}
+
+#[test]
+fn only_a_uuid_is_taken_for_the_session() {
+    let found = |session: Value| {
+        let line = json!({"type": "system", "subtype": "init", "session_id": session});
+        runs::session(format!("{line}\n").as_bytes()).unwrap()
+    };
+    assert_eq!(found(json!(UUID)), Some(UUID.to_string()));
+    let upper = UUID.to_uppercase();
+    assert_eq!(found(json!(upper)), Some(upper));
+    for bad in [
+        "s-1",
+        "",
+        "0f8b2c4e-1a2b-4c3d-9e8f-123456789ab",
+        "0f8b2c4e-1a2b-4c3d-9e8f-123456789abcd",
+        "0f8b2c4e_1a2b-4c3d-9e8f-123456789abc",
+        "0f8b2c4e-1a2b-4c3d-9e8f-12345678 abc",
+        "0f8b2c4e-1a2b-4c3d-9e8f-123456789abg",
+        "0f8b2c4e1a2b4c3d9e8f123456789abc----",
+        "--resume",
+    ] {
+        assert_eq!(found(json!(bad)), None, "{bad:?}");
+    }
+    assert_eq!(found(json!(7)), None);
+    assert_eq!(found(Value::Null), None);
+}
+
+#[test]
+fn an_init_event_past_the_first_64_kib_isn_t_found() {
+    let found = |stream: &str| runs::session(stream.as_bytes()).unwrap();
+    let within = runs::SESSION_WITHIN as usize;
+    let init = init(UUID);
+    // A line of `n` bytes, its newline included, that isn't JSON.
+    let pad = |n: usize| format!("{}\n", "x".repeat(n - 1));
+    // Ending at 64 KiB, it's found.
+    let last = format!("{}{init}", pad(within - init.len()));
+    assert_eq!(last.len(), within);
+    assert_eq!(found(&last), Some(UUID.to_string()));
+    // Its newline past it, too.
+    assert_eq!(
+        found(&format!("{}{init}", pad(within - init.len() + 1))),
+        Some(UUID.to_string())
+    );
+    // Cut short by the end of the 64 KiB, it isn't, nor past it.
+    assert_eq!(found(&format!("{}{init}", pad(within - init.len() + 2))), None);
+    assert_eq!(found(&format!("{}{init}", pad(within))), None);
+}
+
 struct Mcp {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -1002,4 +1149,36 @@ fn mcp(vm: &Vm) -> Mcp {
     s.reply(1);
     s.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     s
+}
+
+proptest! {
+    // Whatever comes before it, the init event is found if, and only if, it
+    // ends within the stream's first 64 KiB.
+    #[test]
+    fn the_init_event_is_found_only_within_64_kib(
+        // Lines before it: each so many of one byte.
+        before in prop::collection::vec((0usize..4000, prop::sample::select(b"x{\"}".to_vec())), 0..40),
+        id: u128,
+    ) {
+        let uuid = format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            id >> 96,
+            (id >> 80) & 0xffff,
+            (id >> 64) & 0xffff,
+            (id >> 48) & 0xffff,
+            id & 0xffff_ffff_ffff
+        );
+        let mut stream = Vec::new();
+        for &(len, byte) in &before {
+            stream.extend(std::iter::repeat_n(byte, len));
+            stream.push(b'\n');
+        }
+        let line = init(&uuid);
+        // Where its JSON ends, short of its newline.
+        let ends = stream.len() + line.len() - 1;
+        stream.extend(line.as_bytes());
+        let found = runs::session(&stream[..]).unwrap();
+        let within = ends <= runs::SESSION_WITHIN as usize;
+        prop_assert_eq!(found, within.then_some(uuid));
+    }
 }
