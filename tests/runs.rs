@@ -584,6 +584,7 @@ fn a_joined_run_whose_claude_never_started_leaves_its_vm_running() {
     let id = text(&id.stdout).trim().to_string();
     let row = vm.wait_until_ended(&id);
     assert!(row.contains("  failed, joined: "), "{row}");
+    assert!(row.ends_with(r#"  -  "hi""#), "{row}");
     assert!(
         !vm.sd
             .calls()
@@ -1028,6 +1029,21 @@ fn a_run_names_no_session_without_a_uuid_in_its_init_event() {
         let mut s = mcp(&vm);
         assert_eq!(listed(&mut s, 2)[0].get("session"), None, "{what}");
     }
+}
+
+// The session is only shown, so a stream it can't be read from costs only
+// the session, not the run.
+#[test]
+fn a_stream_that_can_t_be_read_costs_only_the_session() {
+    let vm = vm(true);
+    let run = vm.dir.path().join("vms/dev/runs/1");
+    fs::create_dir_all(run.join("stream")).unwrap();
+    let ask = json!({"prompt": "hi", "dir": "/w", "resume": null, "user": "agent", "boots": true, "started": "2026-11-06T15:00:00Z"});
+    fs::write(run.join("ask.json"), ask.to_string()).unwrap();
+    let end = json!({"ended": "2026-11-06T15:01:00Z", "exit_code": 0, "signal": null, "cancelled": false, "outcome": "committed", "error": null});
+    fs::write(run.join("end.json"), end.to_string()).unwrap();
+    let row = vm.row("dev.1");
+    assert!(row.ends_with(r#"  exited 0, committed  -  "hi""#), "{row}");
 }
 
 #[test]

@@ -210,7 +210,8 @@ pub struct AgentRun {
     pub stderr: Option<String>,
     /// Claude Code's session id, once Claude Code has started and named it
     /// in its init event: what resume takes to carry the session on. Missing
-    /// until then, and for a run whose Claude Code never started.
+    /// until then, for a run whose Claude Code never started, and if the
+    /// init event isn't in the stream's first 64 KiB or its id isn't a UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// The stream's size so far, in bytes.
@@ -752,7 +753,7 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
     let ask: Ask = read_json(&dir.join(ASK))?.ok_or_else(|| Error::NoRun(run_id.clone()))?;
     let stream = dir.join(STREAM);
     let bytes = size(&stream)?;
-    let session = stream_session(&stream)?;
+    let session = stream_session(&stream);
     let mut end: Option<End> = read_json(&dir.join(END))?;
     // The process writes the end before it lets go of the lock, so a run with
     // no end and no one driving it is lost, unless it ended since the read.
@@ -800,13 +801,11 @@ fn load(store: &Store, vm: &str, n: u64) -> Result<AgentRun> {
     })
 }
 
-// The session the stream at `path` names so far; None if there's no stream.
-fn stream_session(path: &Path) -> Result<Option<String>> {
-    let what = || format!("reading {}", path.display());
-    match File::open(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        r => session(r.map_err(io_err(what()))?).map_err(io_err(what())),
-    }
+// The session the stream at `path` names so far. It's only shown, so a
+// stream that can't be read costs only the session: reading the stream
+// itself says why.
+fn stream_session(path: &Path) -> Option<String> {
+    File::open(path).and_then(session).ok().flatten()
 }
 
 // Whether run `n` is the newest and something holds the run lock: the
