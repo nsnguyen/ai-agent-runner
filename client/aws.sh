@@ -12,6 +12,8 @@
 #   client/aws.sh close     let nothing in, once the host is on the tailnet
 #   client/aws.sh stop      stop every host: then only their disks cost
 #   client/aws.sh start     start every host again, at new addresses
+#   client/aws.sh state     print pending, running, stopping or stopped, or
+#                           none when there's no host up made of that name
 #
 # The host is an m7i-flex.large with nested virtualization on, which gives it
 # /dev/kvm at a regular instance's price, running Ubuntu 24.04, with a 40 GiB
@@ -37,6 +39,14 @@
 # with no instance of that name and key pair, one aws.sh didn't make, is
 # named and left alone. With RUNNER_AWS_NAME set,
 # or no hosts file, they act on that one host, as every other command does.
+# start also has each host stop, not terminate, when it powers itself off.
+#
+# state is what runner on the laptop asks when ssh to a host fails, so it's
+# always the one host, and asks AWS nothing for a name up doesn't give, or
+# with no AWS CLI here: it prints none.
+#
+# up and setup copy the checkout aws.sh is in to the host, so they run only
+# from one; an installed copy, in ~/.local/bin, does the rest.
 #
 # RUNNER_AWS_NAME names the instance, its key pair and its security group
 # (kvm-host), and is the tailnet name ssh dials once SSH is closed: the host
@@ -76,7 +86,7 @@ say() {
 }
 
 usage() {
-  sed -n '6,14s/^# //p' "$0" >&2
+  sed -n '6,16s/^# //p' "$0" >&2
   exit 2
 }
 
@@ -548,6 +558,7 @@ up() {
     --security-groups "$name" \
     --block-device-mappings "$disks" \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
+    --instance-initiated-shutdown-behavior stop \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$name}]" \
     --query 'Instances[0].InstanceId' --output text)
   printf 'Launched %s (%s), waiting a few minutes for it to boot...\n' "$name" "$id"
@@ -560,8 +571,20 @@ up() {
 [ $# -gt 0 ] || usage
 case $1 in
 up | setup)
+  # An installed copy has no checkout around it: it would copy ~/.local.
+  for f in host/install.sh Cargo.toml; do
+    [ -f "$(dirname "$0")/../$f" ] ||
+      die "up and setup copy the checkout aws.sh is in, so run them from one: client/aws.sh up"
+  done
   tailnet_name "$name" || die "RUNNER_AWS_NAME=$name: the host's tailnet name too, so lowercase letters, digits and dashes only"
   [ -z "$from" ] || tailnet_name "$from" || die "RUNNER_AWS_TOKEN_FROM=$from: a tailnet name, so lowercase letters, digits and dashes only"
+  ;;
+state)
+  # No host up made, and nothing asked of AWS.
+  if ! tailnet_name "$name" || ! command -v aws >/dev/null; then
+    echo none
+    exit 0
+  fi
   ;;
 esac
 command -v aws >/dev/null || die "needs the AWS CLI: brew install awscli, then aws login"
@@ -613,6 +636,20 @@ start)
   stopping=$(printf '%s\n' "$list" | awk '$3 == "stopping" {printf "%s%s", n++ ? " " : "", $2}')
   # shellcheck disable=SC2086
   [ -z "$stopping" ] || aws ec2 wait instance-stopped --instance-ids $stopping
+  # A host powers itself off when idle, and one set to terminate at a
+  # power-off would be gone then, and its VMs with it. The loop reads $list,
+  # so aws reads nothing.
+  while read -r n i _; do
+    does=$(aws ec2 describe-instance-attribute --instance-id "$i" \
+      --attribute instanceInitiatedShutdownBehavior \
+      --query InstanceInitiatedShutdownBehavior.Value --output text </dev/null)
+    [ "$does" != stop ] || continue
+    aws ec2 modify-instance-attribute --instance-id "$i" \
+      --instance-initiated-shutdown-behavior Value=stop </dev/null
+    printf '%s stops at a power-off now, rather than being terminated.\n' "$n"
+  done <<EOF
+$list
+EOF
   # shellcheck disable=SC2086
   aws ec2 start-instances --instance-ids $ids >/dev/null
   # Each one's status checks, which pass once it has booted, so the first
@@ -627,6 +664,15 @@ start)
     address
     printf '%s is up at %s.\n' "$name" "$addr"
   done
+  ;;
+state)
+  found=$(keyed=1 instance)
+  if [ -z "$found" ]; then
+    echo none
+  else
+    parse
+    printf '%s\n' "$state"
+  fi
   ;;
 *) usage ;;
 esac

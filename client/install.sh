@@ -1,8 +1,10 @@
 #!/bin/sh
-# Installs the laptop's runner to ~/.local/bin. Pass the host, as ssh takes it,
-# to save it to ~/.config/runner/host, and with several hosts in
-# ~/.config/runner/hosts (`runner hosts add`), to put it first there, the one
-# MCP uses; a rerun without one keeps them. Rerun after a git pull to upgrade.
+# Installs the laptop's runner to ~/.local/bin, with aws.sh beside it, which
+# runner runs to start a host aws.sh made that it finds stopped. Pass the
+# host, as ssh takes it, to save it to ~/.config/runner/host, and with several
+# hosts in ~/.config/runner/hosts (`runner hosts add`), to put it first there,
+# the one MCP uses; a rerun without one keeps them. Rerun after a git pull to
+# upgrade.
 #
 #   client/install.sh runner@kvm-host
 set -eu
@@ -24,10 +26,12 @@ if [ $# -gt 0 ]; then
 fi
 
 mkdir -p "$bin"
-cp "$here/runner" "$bin/runner.new"
-chmod 0755 "$bin/runner.new"
-mv -f "$bin/runner.new" "$bin/runner"
-echo "Installed $bin/runner"
+for f in runner aws.sh; do
+  cp "$here/$f" "$bin/$f.new"
+  chmod 0755 "$bin/$f.new"
+  mv -f "$bin/$f.new" "$bin/$f"
+done
+echo "Installed $bin/runner, and $bin/aws.sh beside it"
 
 if [ $# -gt 0 ]; then
   mkdir -p "$conf"

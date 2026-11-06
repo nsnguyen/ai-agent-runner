@@ -1153,6 +1153,12 @@ done
 exec sh -c "$cmd"
 "#,
     );
+    // The client asks the aws.sh beside it about a host it can't reach: this
+    // AWS CLI takes nothing, so the test never reaches a real account.
+    common::script(
+        &bin.join("aws"),
+        "echo 'aws: no AWS in tests' >&2\nexit 1\n",
+    );
     let cmd = cli(root);
     let quote = |arg: &std::ffi::OsStr| {
         let arg = arg.to_str().unwrap();

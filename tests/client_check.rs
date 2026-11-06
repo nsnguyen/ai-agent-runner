@@ -29,10 +29,13 @@ const PRELUDE: &str = r#"wrong() { grep -qx "$1" "$FAKE/wrong" 2>/dev/null; }
 "#;
 
 // Every call on a line in ssh-calls: RUNNER_HOST as it was, then the argv,
-// split by US. A tunnel (-L) notes what it forwards, and runs its command as
+// split by US, in one write, since the client asks every host at once. A tunnel (-L) notes what it forwards, and runs its command as
 // is, so the proxy's pid is the hold's, as a real ssh's end is the hold's end.
 // With -tt, lines end in CRLF, as a terminal's do.
-const FAKE_SSH: &str = r#"{ printf 'RUNNER_HOST=%s' "${RUNNER_HOST-}"; for arg; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$FAKE/ssh-calls"
+const FAKE_SSH: &str = r#"us=$(printf '\037')
+call="RUNNER_HOST=${RUNNER_HOST-}"
+for arg; do call="$call$us$arg"; done
+printf '%s\n' "$call" >>"$FAKE/ssh-calls"
 tunnel=
 tty=
 while [ $# -gt 0 ]; do
@@ -72,6 +75,11 @@ exit "$(cat "$FAKE/rsync-exit" 2>/dev/null || echo 0)"
 "#;
 
 // Returns at once, unless its time is block-at's: then it waits to be killed.
+// check.sh runs this checkout's client/runner, which asks the aws.sh beside
+// it about a host it can't reach: this AWS CLI takes nothing, so no test
+// reaches a real account.
+const NO_AWS: &str = "echo 'aws: no AWS in tests' >&2\nexit 1\n";
+
 const FAKE_SLEEP: &str = r#"echo "$1" >>"$FAKE/sleeps"
 if [ "$1" = "$(cat "$FAKE/block-at" 2>/dev/null)" ]; then
   touch "$FAKE/blocked"
@@ -485,6 +493,7 @@ impl Laptop {
         script(&bin.join("rsync"), FAKE_RSYNC);
         script(&bin.join("sleep"), FAKE_SLEEP);
         script(&bin.join("curl"), FAKE_CURL);
+        script(&bin.join("aws"), NO_AWS);
         script(&laptop.path("host-bin/runner"), FAKE_RUNNER);
         script(
             &laptop
@@ -1029,6 +1038,11 @@ fn with_a_hosts_file_the_checks_go_to_its_first_host() {
         assert!(!ssh.is_empty());
         for call in &ssh {
             let last = call.last().unwrap();
+            // The client asks a host whether it answers (`true`, as runner)
+            // before a command goes there, so a stopped one starts first.
+            if last == "true" && call[call.len() - 2].starts_with("runner@") {
+                continue;
+            }
             // The move goes through the hosts file, finding the VM's host,
             // which `runner ip` asks as the checks do.
             let moving = last == "runner list" || last.starts_with("runner move client-check ");

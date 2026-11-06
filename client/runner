@@ -7,7 +7,9 @@
 # ~/.config/runner/host is the only one; RUNNER_HOST names one host alone.
 # With several, a command naming a VM goes to the host that has it (README.md,
 # Several hosts), and move's target is passed on as listed, since that host's
-# ssh reaches it. POSIX sh only, since macOS's /bin/sh runs it.
+# ssh reaches it. A host aws.sh made that a command finds stopped is started
+# first, by the aws.sh beside this script (README.md, Day to day). POSIX sh
+# only, since macOS's /bin/sh runs it.
 
 # No argument or host name is ever a glob.
 set -f
@@ -97,6 +99,15 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then rm -f "$new"; exit 1; fi
 mv -f "$new" "$k" || { rm -f "$new"; exit 1; }
 exit "$rc"'
 
+# A host `client/aws.sh up` made that a command finds stopped is started by
+# the aws.sh beside this script, where client/install.sh puts it (README.md,
+# Day to day). $up holds the hosts this run has reached, and $stopped those
+# it found stopped, a word each.
+aws_sh=$(dirname "$0")/aws.sh
+aws_failed=
+up=
+stopped=
+
 # ssh hands the remote shell one string, so each argument is quoted for it:
 # bare when it's only safe characters, else in single quotes, with ' as '\''.
 # quote ARG sets $arg to ARG quoted.
@@ -123,6 +134,76 @@ quote() {
 
 # A host's name, as runner shows it: the ssh target without its user@.
 name_of() { printf '%s' "${1##*@}"; }
+
+# aws_state HOST: sets $state to what AWS has HOST as, asking aws.sh by its
+# name, as aws.sh up names the instance: pending, running, stopping, stopped,
+# or none for a host aws.sh didn't make. Fails with no aws.sh, or when it
+# can't say, as when signed out of AWS, once it has said why; it isn't asked
+# again this run then. No stdin, so a command's is left for it.
+aws_state() {
+  state=
+  if [ -n "$aws_failed" ] || [ ! -x "$aws_sh" ]; then return 1; fi
+  if ! state=$(RUNNER_AWS_NAME=$(name_of "$1") "$aws_sh" state </dev/null); then
+    aws_failed=1
+    state=
+    return 1
+  fi
+  case $state in
+  pending | running | stopping | stopped | none) ;;
+  *)
+    state=
+    return 1
+    ;;
+  esac
+}
+
+# ready HOST: before a command goes to HOST, starts it if it's stopped. Only
+# a failure to connect counts, so a host this run hasn't reached is asked
+# first, over BatchMode SSH, never the command's exit: ssh's 255 is also a
+# command that couldn't run, or a session dropped as its host stopped, and a
+# command that ran never runs again. One that doesn't answer is looked up
+# with aws.sh, and started if AWS has it stopped or stopping, then waited
+# for. With no aws.sh or AWS CLI here nothing is asked, as before. aws.sh's
+# output goes to stderr, since stdout is the command's, MCP's JSON-RPC
+# included. Fails only if a start does.
+ready() {
+  case " $up " in *" $1 "*) return 0 ;; esac
+  case " $stopped " in
+  *" $1 "*) state=stopped ;;
+  *)
+    if [ ! -x "$aws_sh" ] || ! command -v aws >/dev/null 2>&1; then return 0; fi
+    # shellcheck disable=SC2086 # $ask is options, split.
+    if ssh $ask "$1" true >/dev/null 2>&1; then
+      up="$up $1"
+      return 0
+    fi
+    # The command goes as it would have: ssh says why, or a passphrase
+    # BatchMode can't type gets typed.
+    aws_state "$1" || return 0
+    case $state in pending | stopping | stopped) ;; *) return 0 ;; esac
+    ;;
+  esac
+  case $state in pending) said=starting ;; *) said="stopped, so starting it" ;; esac
+  echo "runner: $(name_of "$1") is $said with aws.sh start: a few minutes" >&2
+  RUNNER_AWS_NAME=$(name_of "$1") "$aws_sh" start </dev/null >&2 || return 1
+  others=
+  for s in $stopped; do [ "$s" = "$1" ] || others="$others $s"; done
+  stopped=$others
+  # Booted, as AWS sees it, can come before Tailscale and sshd answer. The
+  # command hasn't gone yet, so after a few minutes it goes anyway: a
+  # passphrase BatchMode can't type gets typed, or ssh says what's wrong.
+  tries=0
+  # shellcheck disable=SC2086
+  until ssh $ask "$1" true >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+      echo "runner: $(name_of "$1") is started, but hasn't answered BatchMode SSH for minutes, so the command goes as it is" >&2
+      break
+    fi
+    sleep 2
+  done
+  up="$up $1"
+}
 
 # The hosts file's lines, the old host file's first line if there's no hosts
 # file, or nothing, a host a line. RUNNER_HOST isn't in it: it's for this run.
@@ -215,7 +296,10 @@ survey() {
 }
 
 # answered CMD: after a survey of CMD, passes on each host's stderr, names
-# each host that didn't answer or failed, and sets $failed if one did.
+# each host that didn't answer or failed, and sets $failed if one did. One
+# that didn't answer and AWS has stopped is named so, and noted in $stopped,
+# but not started: the command that goes to it starts it, as it waits for
+# one that's starting.
 answered() {
   failed=
   i=0
@@ -224,9 +308,17 @@ answered() {
     cat "$tmp/$i.err" >&2
     read -r rc <"$tmp/$i.rc"
     case $rc in
-    0) ;;
+    0) up="$up $h" ;;
     255)
-      echo "runner: $(name_of "$h") didn't answer" >&2
+      aws_state "$h" || state=
+      case $state in
+      pending) echo "runner: $(name_of "$h") is starting" >&2 ;;
+      stopping | stopped)
+        stopped="$stopped $h"
+        echo "runner: $(name_of "$h") is $state" >&2
+        ;;
+      *) echo "runner: $(name_of "$h") didn't answer" >&2 ;;
+      esac
       failed=1
       ;;
     *)
@@ -312,6 +404,7 @@ locate() {
     quote "$1"
     # shellcheck disable=SC2086,SC2029 # $ask is options, split; $arg is quoted for the host.
     if ssh $ask "$at" "runner ip $arg" >/dev/null 2>&1; then
+      up="$up $at"
       return
     fi
   fi
@@ -386,7 +479,8 @@ pick() {
 }
 
 # go HOST [keep]: the command on HOST, with a terminal only when typed at
-# one, then exit with its exit code. With keep, return it instead.
+# one, then exit with its exit code. With keep, return it instead. A host
+# found stopped is started first.
 go() {
   h=$1
   keep=${2-}
@@ -404,6 +498,7 @@ go() {
   else
     set --
   fi
+  ready "$h" || exit 255
   # shellcheck disable=SC2029 # $remote is quoted for the host's shell, here.
   if [ -z "$keep" ]; then
     clean
@@ -830,8 +925,9 @@ if [ "${1-}" = proxy ]; then
   # start boots a stopped VM, wakes a sleeping one, and leaves a running one be.
   quote "$vm"
   vmq=$arg
-  # No stdin, so keys typed while the VM boots stay in the terminal, and no
-  # tty, whose \r would spoil the address.
+  # A stopped host is started first. No stdin, so keys typed while the VM
+  # boots stay in the terminal, and no tty, whose \r would spoil the address.
+  ready "$host" || exit 255
   # shellcheck disable=SC2029 # $vmq is quoted for the host's shell, here.
   addr=$(ssh -n -T "$host" "runner start $vmq >/dev/null && runner ip $vmq") || exit
   case $addr in '' | *[!0-9.]*)
@@ -952,6 +1048,8 @@ move)
     echo "runner: $vm is on $(name_of "$to") already" >&2
     exit 1
   fi
+  # The VM's host streams it to the target, so a stopped target starts first.
+  ready "$to" || exit 255
   # The VM's host gets the target as listed, which its ssh reaches.
   remote=runner
   i=0

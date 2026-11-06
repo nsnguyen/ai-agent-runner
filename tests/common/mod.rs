@@ -17,6 +17,33 @@ pub fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// This process's PATH with no `aws` on it: each directory that holds one
+/// stands in as a directory of links to the rest of what it holds, made once.
+/// The laptop's runner asks a host first only with the AWS CLI on PATH, so a
+/// test says whether it's there, not the machine it runs on.
+pub fn path_without_aws() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let farms = tempfile::tempdir().unwrap().keep();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::env::split_paths(&path).enumerate().map(|(i, dir)| {
+            if !dir.join("aws").exists() {
+                return dir;
+            }
+            let farm = farms.join(i.to_string());
+            fs::create_dir(&farm).unwrap();
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if entry.file_name() != "aws" {
+                    let _ = std::os::unix::fs::symlink(entry.path(), farm.join(entry.file_name()));
+                }
+            }
+            farm
+        });
+        std::env::join_paths(dirs).unwrap().into_string().unwrap()
+    })
+    .clone()
+}
+
 pub fn script(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
