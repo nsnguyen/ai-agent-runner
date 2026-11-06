@@ -1020,6 +1020,49 @@ fn a_try_whose_run_was_taken_over_is_kept_with_its_session() {
     assert_eq!(h.vms(), ["dev"]);
 }
 
+// A try whose batch run rolled back and was taken over after it ended:
+// `runner claude --run` put the run's disk back on top of the try's history
+// and marked the run taken, and the clean stop since committed what its
+// session wrote. The run still says it rolled back, but its session is on
+// the disk kept.
+#[test]
+fn a_try_whose_rolled_back_run_was_taken_over_is_kept_with_its_session() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    finish_third(&h, lock);
+    // dev-2.1's boot, generation 1 as its result says, rolled back.
+    let run = h.store.begin_run("dev-2").unwrap();
+    assert_eq!(run.generation, 1);
+    let who = h.dir.path().join("dev-2.who");
+    fs::write(&who, "dev-2").unwrap();
+    debugfs(
+        &run.disk,
+        &format!("write {} /home/agent/work/who.txt", who.display()),
+    );
+    drop(run);
+    let runs = h.store.runs("dev-2").unwrap();
+    let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#);
+    fs::write(runs.join("1/stream"), init + "\n").unwrap();
+    // The takeover.
+    (h.store)
+        .restore_generation("dev-2", 1, "takeover of dev-2.1")
+        .unwrap();
+    runner::runs::mark_taken(&h.store, "dev-2.1").unwrap();
+    let won = current(&h, "dev-2");
+    assert!(
+        h.ok(&["tries", "dev"])
+            .contains("dev-2.1  exited 1, rolled back")
+    );
+
+    let out = h.ok(&["keep", "dev-2"]);
+    let want = format!(
+        "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-2.1's conversation"
+    );
+    assert!(out.contains(&want), "{out}");
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
+    assert_eq!(h.vms(), ["dev"]);
+}
+
 #[test]
 fn keep_none_deletes_the_tries_and_leaves_dev_as_it_was() {
     let h = host(false);

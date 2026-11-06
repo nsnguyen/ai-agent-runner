@@ -1053,14 +1053,20 @@ pub fn placed(store: &Store, id: &str) -> Result<Placed> {
     let path = store.runs(&vm)?.join(n.to_string()).join(ASK);
     let ask: Ask = read_json(&path)?.ok_or_else(|| Error::NoRun(id.to_string()))?;
     let run = load(store, &vm, n)?;
-    let taken = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
     Ok(Placed {
         generation: read_result(store, &vm, n)?.and_then(|r| r.generation),
-        taken: taken.exists(),
+        taken: taken(store, id)?,
         run,
         dir: ask.dir,
         user: ask.user,
     })
+}
+
+/// Whether the run was taken over after it ended (mark_taken), so its
+/// session goes on on the VM's own disk, whatever its outcome says.
+pub fn taken(store: &Store, id: &str) -> Result<bool> {
+    let (vm, n) = parse_id(id)?;
+    Ok(store.runs(&vm)?.join(n.to_string()).join(TAKEN).exists())
 }
 
 /// Marks a run that's over as taken over by `runner claude --run`, so the

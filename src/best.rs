@@ -449,7 +449,12 @@ pub fn keep(store: &Store, name: &str, none: bool) -> Result<Kept> {
         let going = run.filter(|r| r.state == runs::State::Running);
         if Some(t.as_str()) == winner {
             winnable(store, &vm, t, run)?;
-            kept_run = all.into_iter().find(on_disk);
+            for run in all {
+                if on_disk(store, &run)? {
+                    kept_run = Some(run);
+                    break;
+                }
+            }
         // A run that booted its try shuts it down once cancelled; one that
         // joined it running leaves it up, as any other try that's up.
         } else if let Some(run) = going.filter(|r| r.boots) {
@@ -580,9 +585,13 @@ fn forked(store: &Store, name: &str) -> Result<String> {
 // Whether the run's work, and so its Claude Code session, is on its VM's
 // disk: it committed, joined the VM running, or was taken over, which
 // leaves the VM up on the run's disk; a clean stop commits those two. A
-// rolled-back run's went with the disk it ran.
-fn on_disk(run: &AgentRun) -> bool {
-    run.outcome == Some(Outcome::Committed) || !run.boots || run.state == runs::State::TakenOver
+// rolled-back run's went with the disk it ran, unless it was taken over
+// after it ended, which put that disk back on the VM (runs::taken).
+fn on_disk(store: &Store, run: &AgentRun) -> Result<bool> {
+    Ok(run.outcome == Some(Outcome::Committed)
+        || !run.boots
+        || run.state == runs::State::TakenOver
+        || runs::taken(store, &run.id)?)
 }
 
 // Whether the try `name`, whose newest run is `run`, can be kept: no run is

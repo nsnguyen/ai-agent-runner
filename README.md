@@ -337,7 +337,7 @@ runner keep dev-2      # dev gets dev-2's disk; dev-1 to dev-3 are deleted
 runner keep dev --none # or keep none: the tries are deleted, dev is as it was
 ```
 
-`keep dev-2` puts dev-2's current disk on top of dev's history as a new generation, as `restore` puts a checkpoint's copy, so `runner undo dev` goes back to dev from before the keep, and deletes every try of the batch, dev-2 too. dev keeps its name, address, URL, credentials, settings and history. It prints the Claude Code session of dev-2's newest run that committed, joined it running, or was taken over (`runner claude --run`), whose conversation is on the disk kept, so `runner run dev --resume <session> "..."` carries that conversation on in dev; a later run that rolled back took its session with its disk, so it isn't named:
+`keep dev-2` puts dev-2's current disk on top of dev's history as a new generation, as `restore` puts a checkpoint's copy, so `runner undo dev` goes back to dev from before the keep, and deletes every try of the batch, dev-2 too. dev keeps its name, address, URL, credentials, settings and history. It prints the Claude Code session of dev-2's newest run that committed, joined it running, or was taken over (`runner claude --run`), whose conversation is on the disk kept, so `runner run dev --resume <session> "..."` carries that conversation on in dev; a later run that rolled back took its session with its disk, so it isn't named, unless `runner claude --run` took it over since and put that disk back:
 
 ```
 kept dev-2 on dev: generation 7 is current, and `runner undo dev` goes back
