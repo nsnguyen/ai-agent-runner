@@ -15,8 +15,8 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 ## 1. Turn the server on and off
 
 ```sh
-client/aws.sh start    # on: a few minutes
-client/aws.sh stop     # off: stop it when you're done, it costs about $0.10 an hour while on
+client/aws.sh start    # on: a few minutes (every server, if you have more than one)
+client/aws.sh stop     # off: stop it when you're done, it costs about $0.10 an hour while on (every server)
 client/aws.sh ssh      # log in to the server itself (rarely needed)
 ```
 
@@ -150,10 +150,9 @@ runner list                          # every server's VMs, each line led by its 
 runner shell demo3                   # finds demo3's server for you
 runner create demo4 --host kvm-host  # or pick the server yourself
 runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
-RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop  # it costs too: stop it when you're done
 ```
 
-A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed. Every `client/aws.sh` command takes `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, it means `kvm-host`.
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
 
 Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this checkout's, and a plain `client/check.sh` updates only kvm-host. Keep both on the same build (README.md, After merging a change), so a move or Claude reaching across servers finds the same `runner` on both.
 
@@ -164,7 +163,7 @@ Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this 
 ```sh
 runner stop demo       # saves its disk
 client/aws.sh close    # no SSH from the internet (Tailscale still works)
-client/aws.sh stop     # turn the server off
+client/aws.sh stop     # turn the servers off
 ```
 
 ## If something's wrong

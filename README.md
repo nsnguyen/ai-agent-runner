@@ -11,11 +11,11 @@ For a host already set up as Set up a host and On AWS below say: `kvm-host` on t
 ```sh
 aws login --profile runner      # only if aws.sh says AWS won't take the credentials: a login lasts 12 hours
 export AWS_PROFILE=runner       # or put it in ~/.zshrc once
-client/aws.sh start             # a few minutes: it waits until the host has booted
+client/aws.sh start             # a few minutes: it waits until every host has booted
 runner list                     # over the tailnet; base and your VMs
 ```
 
-The host comes back at a new public address, which doesn't matter: Tailscale reaches it as `kvm-host`.
+The host comes back at a new public address, which doesn't matter: Tailscale reaches it as `kvm-host`. With several hosts (Several hosts), `start` and `stop` take every one `runner hosts` lists, side by side (On AWS).
 
 ### 2. Claude Code in a VM
 
@@ -53,10 +53,10 @@ Then, in `claude` on the laptop, `/mcp` shows `runner` connected, and you can as
 ```sh
 runner stop dev           # a clean shutdown saves the VM's disk: list shows its gen go up
 client/aws.sh close       # SSH from the internet off again, if `open` let you in; says so if it's off already
-client/aws.sh stop        # the host: about $0.10 an hour while it runs, only its disks while stopped
+client/aws.sh stop        # every host: about $0.10 an hour each while it runs, only its disks while stopped
 ```
 
-`client/aws.sh stop` waits until the host has stopped. A VM left asleep sleeps on through it, and `runner start dev`, or a command that wakes it, resumes it where it was; one left running shuts down cleanly, as a `runner stop` does. Next time, start again at step 1.
+`client/aws.sh stop` waits until every host has stopped. A VM left asleep sleeps on through it, and `runner start dev`, or a command that wakes it, resumes it where it was; one left running shuts down cleanly, as a `runner stop` does. Next time, start again at step 1.
 
 ### After merging a change
 
@@ -163,6 +163,8 @@ If `aws login` refuses because the default profile already holds access keys, `a
 Each step checks first, so after a failure, fix what it says and rerun `client/aws.sh setup` (with the same `RUNNER_AWS_NAME`): it redoes nothing that's done, and `up` on a host that's there does the same. Until `close`, each run first lets in this laptop's address as it is now, as `open` does; after it, the run goes over the tailnet. The name is the host's tailnet name too, so lowercase letters, digits and dashes. It ends with the next step on the laptop, `runner hosts add runner@<name>`; the first host goes in with `client/install.sh runner@kvm-host` (Use it from the laptop). The same steps by hand, for a host elsewhere, are in docs/host.md (A host aws.sh didn't make).
 
 Once closed, `client/aws.sh ssh` goes over the tailnet, as `kvm-host`, and `client/check.sh` upgrades and checks the host (After merging a change). After the laptop's address changes, `client/aws.sh open` lets in the new one and no other, until the next `close`. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
+
+With several hosts, `stop` and `start` take every host in the laptop's `~/.config/runner/hosts` (Several hosts), by its name: `runner@kvm-host-2` is the instance `kvm-host-2`. They ask AWS for all of them in one call and wait for them side by side. A listed host with no instance of that name, one aws.sh didn't make, is named and left alone. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` stops that one alone, and every other command (`up`, `setup`, `ip`, `ssh`, `open`, `close`) acts on one host, `RUNNER_AWS_NAME`'s or `kvm-host`.
 
 ## Build the base image
 
