@@ -1,0 +1,14 @@
+# runner-host-idle.timer, which host/install.sh installs and enables
+# unless the host's idle time is never: a look every minute at whether the
+# host is idle (runner-host-idle.service). The look counts the idle time
+# from the host's boot at the earliest, so a host just started gets all of it.
+[Unit]
+Description=runner: look every minute whether the host is idle
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

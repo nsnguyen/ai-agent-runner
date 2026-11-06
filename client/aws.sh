@@ -316,14 +316,20 @@ fi
 EOF
 }
 
-# host/install.sh is safe to rerun, and cargo builds only what changed.
+# host/install.sh is safe to rerun, and cargo builds only what changed. A
+# host this made powers itself off once idle for an hour, unless it has an
+# idle time already, which install.sh keeps.
 install_sh() {
   cat <<'EOF'
 set -eu
 [ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
 cd ai-agent-runner
 cargo build --release
-sudo host/install.sh
+if [ -f /etc/runner/host-idle ]; then
+  sudo host/install.sh
+else
+  sudo RUNNER_HOST_IDLE=1h host/install.sh
+fi
 EOF
 }
 

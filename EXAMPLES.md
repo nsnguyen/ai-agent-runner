@@ -15,8 +15,8 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 ## 1. Turn the server on and off
 
 ```sh
-client/aws.sh start    # on: a few minutes (every server, if you have more than one)
-client/aws.sh stop     # off: stop it when you're done, it costs about $0.10 an hour while on (every server)
+client/aws.sh start    # on, every server: a few minutes; each turns itself off after an hour with nothing running
+client/aws.sh stop     # off now, every server: about $0.10 an hour each while on, and only its disks while off
 client/aws.sh ssh      # log in to the server itself (rarely needed)
 ```
 
@@ -163,7 +163,7 @@ Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this 
 ```sh
 runner stop demo       # saves its disk
 client/aws.sh close    # no SSH from the internet (Tailscale still works)
-client/aws.sh stop     # turn the servers off
+client/aws.sh stop     # turn the servers off now, or leave them to turn themselves off in an hour
 ```
 
 ## If something's wrong

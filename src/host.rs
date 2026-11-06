@@ -30,6 +30,20 @@ pub fn nat_rules(net: &Subnet) -> String {
 /// The runner carves each VM's /30 from the same file, so the two agree.
 pub const NET: &str = "/etc/runner/net";
 
+/// The host's idle time, in `runner idle`'s syntax, as host/install.sh keeps
+/// it from RUNNER_HOST_IDLE: once nothing has used the host for that long,
+/// it powers itself off (src/power.rs). Missing, as before install.sh wrote
+/// it, is never.
+pub const HOST_IDLE: &str = "/etc/runner/host-idle";
+/// The look at whether the host is idle, and the timer that starts it every
+/// minute, as host/install.sh installs them.
+pub const IDLE_SERVICE: &str = "runner-host-idle.service";
+pub const IDLE_TIMER: &str = "runner-host-idle.timer";
+pub const IDLE_SERVICE_UNIT: &str = include_str!("../host/runner-host-idle.service");
+pub const IDLE_TIMER_UNIT: &str = include_str!("../host/runner-host-idle.timer");
+/// How long since the host booted, in seconds, first on its line.
+pub const UPTIME: &str = "/proc/uptime";
+
 // By full path, because sshd gives the runner user a PATH without /usr/sbin.
 pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
 pub const NFT: &str = "/usr/sbin/nft";
