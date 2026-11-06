@@ -2258,10 +2258,15 @@ fn clear_staged(dir: &Path) -> Result<()> {
 
 // Past every disk and note on hand, failed runs' included, so none is
 // overwritten and no new disk is read with an old note.
+// Past every number on hand, and past the latest boot's own, which gc may
+// have dropped: a rolled-back run's result names that disk by number, and a
+// takeover goes by it (claude.rs), so no other disk takes it. A note of the
+// boot that won't read only costs that.
 fn next_generation(dir: &Path) -> Result<u64> {
     let mut all = numbered(dir, ".ext4")?;
     all.extend(numbered(dir, ".json")?);
     all.extend(numbered(dir, PART)?);
+    all.extend(read_booted(dir).ok().flatten().map(|b| b.generation));
     Ok(all.into_iter().max().unwrap_or(0) + 1)
 }
 

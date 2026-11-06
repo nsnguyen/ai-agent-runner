@@ -400,7 +400,8 @@ fn a_discarded_run_leaves_no_disk() {
     run.discard();
     assert!(!path.exists());
     assert_eq!(store.get("dev").unwrap(), vm("dev", 0, 2));
-    assert_eq!(store.begin_run("dev").unwrap().generation, 1);
+    // Its number isn't given again, as no boot's is.
+    assert_eq!(store.begin_run("dev").unwrap().generation, 2);
 }
 
 #[test]
@@ -930,6 +931,18 @@ fn a_rolled_back_run_s_disk_goes_on_top_of_history_as_a_copy() {
     fs::write(gen_disk(dir.path(), "dev", 3), b"scribbled").unwrap();
     assert_eq!(fs::read(gen_disk(dir.path(), "dev", 2)).unwrap(), b"rolled");
     assert_eq!(store.undo("dev").unwrap(), vm("dev", 1, 2));
+}
+
+// A rolled-back run's result names its disk by number, and a takeover goes
+// by it: once gc drops that disk, the next boot's mustn't take the number.
+#[test]
+fn the_number_of_the_newest_disk_gc_dropped_isn_t_given_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = committed(&dir, 1);
+    drop(store.begin_run("dev").unwrap());
+    let store = store.keeping(0);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2]);
+    assert_eq!(store.begin_run("dev").unwrap().generation, 3);
 }
 
 #[test]
