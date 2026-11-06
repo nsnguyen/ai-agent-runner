@@ -200,16 +200,20 @@ fn unit_state(name: &str) -> Result<State> {
     })
 }
 
-pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
-    let vm = store.get(name)?;
-    let mut state = unit_state(name)?;
+/// Only the VM's state, of all `status` says: its unit's, or sleeping.
+pub fn state(store: &Store, name: &str) -> Result<State> {
     // Only while its boot is up: one killed asleep leaves its snapshot. One
     // parked has no boot up, and sleeps on.
-    match state {
-        State::Running if store.sleeping(name)?.is_some() => state = State::Sleeping,
-        State::Stopped if store.parked(name)? => state = State::Sleeping,
-        _ => {}
-    }
+    Ok(match unit_state(name)? {
+        State::Running if store.sleeping(name)?.is_some() => State::Sleeping,
+        State::Stopped if store.parked(name)? => State::Sleeping,
+        state => state,
+    })
+}
+
+pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
+    let vm = store.get(name)?;
+    let state = state(store, name)?;
     // A start or stop that worked shouldn't be reported as failed for want
     // of an address.
     let address = store.net(name).ok().map(|net| net.address);

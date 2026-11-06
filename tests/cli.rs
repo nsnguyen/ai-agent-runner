@@ -646,6 +646,7 @@ fn doctor_prints_a_line_per_check_and_fails_on_any_failure() {
         "nat",
         "unit",
         "key",
+        "host-idle",
     ];
     assert_eq!(names, all, "{stdout}");
     for l in &lines {

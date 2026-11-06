@@ -15,8 +15,8 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 ## 1. Turn the server on and off
 
 ```sh
-client/aws.sh start    # on: a few minutes
-client/aws.sh stop     # off: stop it when you're done, it costs about $0.10 an hour while on
+client/aws.sh start    # on: a few minutes; it turns itself off after an hour with nothing running
+client/aws.sh stop     # off now: it costs about $0.10 an hour while on, and only its disks while off
 client/aws.sh ssh      # log in to the server itself (rarely needed)
 ```
 
@@ -160,7 +160,7 @@ A VM name is used once across all your servers, so `demo3` always means the same
 ```sh
 runner stop demo       # saves its disk
 client/aws.sh close    # no SSH from the internet (Tailscale still works)
-client/aws.sh stop     # turn the server off
+client/aws.sh stop     # turn the server off now, or leave it to turn itself off in an hour
 ```
 
 ## If something's wrong

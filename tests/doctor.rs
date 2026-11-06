@@ -4,6 +4,7 @@
 use runner::doctor::{self, Host, Ran, Report, Status};
 use runner::host;
 use runner::net::DEFAULT_SUBNET;
+use runner::power;
 use runner::store::Store;
 use std::collections::HashMap;
 use std::fs;
@@ -76,7 +77,7 @@ fn without_ip6(rules: &str) -> String {
     format!("{}{}", &rules[..start], &rules[end..])
 }
 
-const NAMES: [&str; 8] = [
+const NAMES: [&str; 9] = [
     "kvm",
     "firecracker",
     "reflink",
@@ -85,6 +86,7 @@ const NAMES: [&str; 8] = [
     "nat",
     "unit",
     "key",
+    "host-idle",
 ];
 
 // The faked user's home, where its SSH key is.
@@ -121,6 +123,16 @@ fn list_nat6() -> String {
     format!("{} list table ip6 runner", host::NFT)
 }
 
+fn timer() -> String {
+    format!("systemctl is-active {}", host::IDLE_TIMER)
+}
+
+// Polkit's answer for this process, which runs the checks.
+fn pkcheck() -> String {
+    let pid = std::process::id();
+    format!("pkcheck --action-id {} --process {pid}", power::POWER_OFF)
+}
+
 fn ran(ok: bool, stdout: &str, stderr: &str) -> Result<Ran, ErrorKind> {
     Ok(Ran {
         ok,
@@ -147,6 +159,8 @@ impl Fake {
                 public_key().into(),
                 Ok(format!("ssh-ed25519 {ED25519} runner@host\n")),
             ),
+            (host::HOST_IDLE.into(), Ok("1h\n".to_string())),
+            (power::busy_lock(root), Ok(String::new())),
         ];
         let runs = [
             (version(), ran(true, &pinned, "")),
@@ -156,6 +170,8 @@ impl Fake {
             ),
             (list_nat(), ran(true, NAT, "")),
             (list_nat6(), ran(true, NAT6, "")),
+            (timer(), ran(true, "active\n", "")),
+            (pkcheck(), ran(true, "", "")),
         ];
         Fake {
             files: files.into_iter().collect(),
@@ -536,6 +552,51 @@ fn key_warns_when_runner_has_no_key() {
     let mut homeless = fake();
     homeless.home = Err(ErrorKind::NotFound);
     assert_verdict(homeless, &store, "key", Status::Warn, "not found");
+}
+
+// The host's idle time, and whether it can power itself off once idle:
+// the timer looking, polkit letting this user, and the busy lock open to
+// commands. A host that stays up still runs VMs, so it only warns.
+#[test]
+fn host_idle_shows_the_setting_and_whether_the_host_can_power_itself_off() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let report = assert_verdict(fake(), &store, "host-idle", Status::Ok, "1h");
+    assert!(
+        verdict(&report, "host-idle")
+            .1
+            .contains("powers itself off")
+    );
+
+    // Never needs none of it.
+    let never = fake()
+        .file(host::HOST_IDLE, Ok("never\n"))
+        .cmd(&timer(), ran(false, "inactive\n", ""))
+        .cmd(&pkcheck(), ran(false, "", "Not authorized."));
+    let report = assert_verdict(never, &store, "host-idle", Status::Ok, "never");
+    assert!(verdict(&report, "host-idle").1.contains("RUNNER_HOST_IDLE"));
+
+    // install.sh writes it only when RUNNER_HOST_IDLE sets it, so
+    // aws.sh's setup can tell a host that has none.
+    let unset = fake()
+        .file(host::HOST_IDLE, Err(ErrorKind::NotFound))
+        .cmd(&timer(), ran(false, "inactive\n", ""));
+    assert_verdict(unset, &store, "host-idle", Status::Ok, "never");
+    let bad = fake().file(host::HOST_IDLE, Ok("soon\n"));
+    let report = assert_verdict(bad, &store, "host-idle", Status::Warn, "soon");
+    assert!(verdict(&report, "host-idle").1.contains("RUNNER_HOST_IDLE"));
+    let stopped = fake().cmd(&timer(), ran(false, "inactive\n", ""));
+    let report = assert_verdict(stopped, &store, "host-idle", Status::Warn, host::IDLE_TIMER);
+    assert!(verdict(&report, "host-idle").1.contains("inactive"));
+    let refused = fake().cmd(&pkcheck(), ran(false, "", "Not authorized."));
+    let report = assert_verdict(refused, &store, "host-idle", Status::Warn, "polkit");
+    assert!(verdict(&report, "host-idle").1.contains("host/install.sh"));
+    let no_pkcheck = fake().cmd(&pkcheck(), Err(ErrorKind::NotFound));
+    assert_verdict(no_pkcheck, &store, "host-idle", Status::Warn, "pkcheck");
+    let lock = power::busy_lock(store.root());
+    let unlocked = fake().file(&lock, Err(ErrorKind::PermissionDenied));
+    let report = assert_verdict(unlocked, &store, "host-idle", Status::Warn, "busy.lock");
+    assert!(verdict(&report, "host-idle").1.contains("host/install.sh"));
 }
 
 #[test]

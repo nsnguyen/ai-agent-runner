@@ -265,12 +265,15 @@ impl ServerHandler for Tools {
         ServerConfig::new(tools).with_server_info(me)
     }
 
-    // A call for a VM or run on a peer goes there; the rest run here.
+    // A call for a VM or run on a peer goes there; the rest run here. Each
+    // holds this host up while it works, a peer's too, and the session
+    // between calls doesn't (src/power.rs).
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let _busy = crate::power::Busy::take(self.store.root());
         if !self.peers.is_empty() {
             let there = match self.route(&request).await {
                 Ok(None) => None,
