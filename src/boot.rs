@@ -22,6 +22,11 @@
 // And it puts the VM to sleep once it has gone unused for its idle time: every
 // few seconds it looks at whether anything is using it (src/idle.rs).
 //
+// At a host shutdown, a sleeping VM's boot parks it and ends without
+// committing (src/sleep.rs). The next boot of a parked VM boots no fresh copy:
+// it loads the snapshot onto the disk it was parked on, and sets the guest's
+// clock, as a wake does. One that can't boots its last committed disk.
+//
 // It serves the VM's URL on the tailnet, too (src/url.rs), for as long as it's
 // up: a connection to a sleeping VM has the loop wake it, as a `runner wake`
 // does.
@@ -118,6 +123,8 @@ pub enum Ended {
     Down,
     /// Down, with a restore the guest asked for made current: boot it again.
     Restart,
+    /// Parked at a host shutdown, asleep, for its next boot to resume.
+    Parked,
 }
 
 fn io_err(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
@@ -135,11 +142,14 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     firecracker::check_version(bin)?;
     let net = store.net(name)?;
     let keyring = credentials(store, name)?;
-    let run = store.begin_run(name)?;
+    let mut run = store.begin_run(name)?;
     // What a killed boot noted isn't this boot's guest's, and a snapshot one
-    // left asleep is of a disk no boot can run again.
+    // left asleep is of a disk no boot can run again. A parked VM's are its
+    // own: its guest holds those credentials, and the snapshot is to resume.
     let handed = run.handed();
-    if let Err(e) = handed.clear().and_then(|()| run.snapshot().clear()) {
+    if run.parked().is_none()
+        && let Err(e) = handed.clear().and_then(|()| run.snapshot().clear())
+    {
         run.discard();
         return Err(e.into());
     }
@@ -205,9 +215,47 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             return Err(e);
         }
     };
-    let mut child = firecracker(bin, &api_sock, name, run.hold()?)?;
-
     let api = Api::new(&api_sock);
+    // A parked VM resumes where it slept, on the disk, tap and sockets it
+    // slept with.
+    let mut resumed = None;
+    if run.parked().is_some() {
+        let began = Instant::now();
+        match load(bin, &api, &api_sock, &vsock, name, &run) {
+            Ok(child) => resumed = Some((child, began)),
+            Err(Unwoken::Asleep(why) | Unwoken::Lost(why)) => {
+                let kept = run.generation;
+                match run.unpark().and_then(|fresh| Ok((handed.clear(), fresh))) {
+                    Ok((cleared, fresh)) => {
+                        run = fresh;
+                        if let Err(e) = cleared {
+                            note(format_args!("{e}"));
+                        }
+                    }
+                    Err(e) => {
+                        drop(url);
+                        drop(asks);
+                        drop(calls);
+                        drop(offer);
+                        let _ = remove_sockets(&sockets);
+                        drop(tap);
+                        return Err(e.into());
+                    }
+                }
+                note(format_args!(
+                    "{name} couldn't resume ({why}), so its snapshot is dropped: it boots \
+                     generation {}, its last committed disk, and generation {kept}, where \
+                     it was parked, is kept for a look",
+                    run.from
+                ));
+            }
+        }
+    }
+    let (mut child, resumed) = match resumed {
+        Some((child, began)) => (child, Some(began)),
+        None => (firecracker(bin, &api_sock, name, run.hold()?)?, None),
+    };
+
     let guest = Guest {
         kernel: &machine.kernel,
         disk: &run.disk,
@@ -231,13 +279,23 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         epoch: 0,
         halting: false,
         dropped: None,
+        parked: false,
         uses,
         timer: Timer::new(Instant::now()),
     };
-    let started = wait_for_api(&mut child, &api_sock)
-        .and_then(|()| Ok(up.api.configure(&guest)?))
-        .and_then(|()| Ok(up.api.start()?))
-        .and_then(|()| up.watch(&child));
+    let started = match resumed {
+        // The snapshot goes first, credentials and all: the guest runs now,
+        // and writes to its disk, so it can't be resumed again.
+        Some(_) => run
+            .snapshot()
+            .clear()
+            .map_err(Error::from)
+            .and_then(|()| up.watch(&child)),
+        None => wait_for_api(&mut child, &api_sock)
+            .and_then(|()| Ok(up.api.configure(&guest)?))
+            .and_then(|()| Ok(up.api.start()?))
+            .and_then(|()| up.watch(&child)),
+    };
     if let Err(e) = started {
         let _ = child.kill();
         let _ = child.wait();
@@ -252,10 +310,25 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         return Err(e);
     }
     up.fc = Some(child);
-    note(format_args!(
-        "{name} is running generation {}",
-        run.generation
-    ));
+    match resumed {
+        Some(began) => {
+            let took = began.elapsed();
+            if let Err(e) = set_clock(&vsock) {
+                note(format_args!(
+                    "{name}'s clock is behind by as long as it was parked: setting it \
+                     failed: {e}"
+                ));
+            }
+            note(format_args!(
+                "{name} resumed generation {} where it was parked, in {took:.1?}",
+                run.generation
+            ));
+        }
+        None => note(format_args!(
+            "{name} is running generation {}",
+            run.generation
+        )),
+    }
     // Without systemd there's no one to tell, and with it a failure here
     // shows up as a start that times out.
     if let Err(e) = systemd::notify_ready() {
@@ -271,7 +344,10 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     // Before the clear, so a handoff in flight can't note after it.
     drop(offer);
     let _ = remove_sockets(&sockets);
-    if let Err(e) = handed.clear() {
+    // A parked VM's guest still holds what it was handed.
+    if !matches!(over, Over::Parked)
+        && let Err(e) = handed.clear()
+    {
         note(format_args!("{e}"));
     }
     drop(tap);
@@ -289,6 +365,16 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
                 current: store.get(name)?.generation,
                 kept: run.generation,
             });
+        }
+        // Uncommitted: its disk stays as its snapshot left it.
+        Over::Parked => {
+            drop_restore(store, name, restore, "it was parked");
+            note(format_args!(
+                "{name} is parked: generation {} and its memory stay, for its next \
+                 boot to resume",
+                run.generation
+            ));
+            return Ok(Ended::Parked);
         }
     };
     // A clean shutdown under a run that hadn't ended cleanly (src/runs.rs).
@@ -389,6 +475,8 @@ enum Over {
     Exited(io::Result<ExitStatus>),
     /// It was asleep and couldn't wake, so its snapshot is gone.
     Dropped(String),
+    /// It was asleep, and is parked: its snapshot stays.
+    Parked,
 }
 
 // Why a wake didn't happen.
@@ -443,6 +531,8 @@ struct Up<'a> {
     halting: bool,
     /// Why a snapshot that couldn't wake was dropped, which ends the boot.
     dropped: Option<String>,
+    /// Parked at a host shutdown, which ends the boot.
+    parked: bool,
     /// The VM's use lock, which commands using it hold (src/idle.rs).
     uses: Uses,
     /// Since the VM was last seen in use, or last woke.
@@ -496,10 +586,14 @@ impl Up<'_> {
                             Err(Unwoken::Lost(why)) => Err(self.lose(why)),
                         },
                         Ask::Halt => self.halt(),
+                        Ask::Park => self.park(),
                     };
                     let _ = reply.send(done.map_or_else(Reply::Refused, |()| Reply::Done));
                     if let Some(why) = self.dropped.take() {
                         return Over::Dropped(why);
+                    }
+                    if self.parked {
+                        return Over::Parked;
                     }
                 }
             }
@@ -615,6 +709,7 @@ impl Up<'_> {
         let slept = Slept {
             generation: self.run.generation,
             at: Utc::now(),
+            parked: false,
         };
         snap.note(&slept).map_err(|e| e.to_string())?;
         let began = Instant::now();
@@ -674,27 +769,13 @@ impl Up<'_> {
         // Firecracker may have been upgraded while the VM slept.
         firecracker::check_version(self.bin).map_err(|e| asleep(&e))?;
         let began = Instant::now();
-        remove_sockets(&[self.api_sock, self.vsock]).map_err(|e| asleep(&e))?;
-        let lock = self.run.hold().map_err(|e| asleep(&e))?;
-        let mut child = firecracker(self.bin, self.api_sock, name, lock).map_err(|e| asleep(&e))?;
+        let mut child = load(self.bin, &self.api, self.api_sock, self.vsock, name, self.run)?;
         self.epoch += 1;
-        let loaded = match wait_for_api(&mut child, self.api_sock) {
-            Err(e) => Err(asleep(&e)),
-            Ok(()) => match self.api.load(&snap.vmstate(), &snap.mem()) {
-                Ok(()) => self.watch(&child).map_err(|e| Unwoken::Lost(e.to_string())),
-                // Refused, so Firecracker never ran the guest.
-                Err(e @ (firecracker::Error::Api { .. } | firecracker::Error::NotListening(_))) => {
-                    Err(asleep(&e))
-                }
-                // No answer: it may have.
-                Err(e) => Err(Unwoken::Lost(e.to_string())),
-            },
-        };
-        if let Err(e) = loaded {
+        if let Err(e) = self.watch(&child) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = remove_sockets(&[self.api_sock, self.vsock]);
-            return Err(e);
+            return Err(Unwoken::Lost(e.to_string()));
         }
         self.fc = Some(child);
         // Its memory file stays open in Firecracker, which reads pages from
@@ -709,6 +790,24 @@ impl Up<'_> {
             ));
         }
         note(format_args!("{name} woke in {took:.1?}"));
+        Ok(())
+    }
+
+    // At a host shutdown: a sleeping VM is parked, which ends the boot. An
+    // awake one isn't, and sleeps no more, so its unit's stop, which comes
+    // next, shuts it down cleanly.
+    fn park(&mut self) -> std::result::Result<(), String> {
+        let name = self.name;
+        if self.fc.is_some() {
+            self.halting = true;
+            return Err(format!(
+                "{name} is awake: it isn't parked, and shuts down cleanly as its unit stops"
+            ));
+        }
+        self.run
+            .park()
+            .map_err(|e| format!("{name} isn't parked, and wakes to shut down: {e}"))?;
+        self.parked = true;
         Ok(())
     }
 
@@ -756,6 +855,43 @@ impl Up<'_> {
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+// A fresh Firecracker on the boot's sockets, with the VM's snapshot loaded
+// into it and running: what a wake starts, and a parked VM's boot. On a
+// failure it's gone, and so are its sockets.
+fn load(
+    bin: &Path,
+    api: &Api,
+    api_sock: &Path,
+    vsock: &Path,
+    name: &str,
+    run: &Run,
+) -> std::result::Result<Child, Unwoken> {
+    let asleep = |e: &dyn std::fmt::Display| Unwoken::Asleep(e.to_string());
+    let snap = run.snapshot();
+    remove_sockets(&[api_sock, vsock]).map_err(|e| asleep(&e))?;
+    let lock = run.hold().map_err(|e| asleep(&e))?;
+    let mut child = firecracker(bin, api_sock, name, lock).map_err(|e| asleep(&e))?;
+    let loaded = match wait_for_api(&mut child, api_sock) {
+        Err(e) => Err(asleep(&e)),
+        Ok(()) => match api.load(&snap.vmstate(), &snap.mem()) {
+            Ok(()) => Ok(()),
+            // Refused, so Firecracker never ran the guest.
+            Err(e @ (firecracker::Error::Api { .. } | firecracker::Error::NotListening(_))) => {
+                Err(asleep(&e))
+            }
+            // No answer: it may have.
+            Err(e) => Err(Unwoken::Lost(e.to_string())),
+        },
+    };
+    if let Err(e) = loaded {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = remove_sockets(&[api_sock, vsock]);
+        return Err(e);
+    }
+    Ok(child)
 }
 
 // What a look asks about this boot's VM (src/idle.rs).

@@ -1,0 +1,22 @@
+# runner-park.service, as `runner unit --park` writes it and host/install.sh
+# installs it. At a host shutdown, it parks each sleeping VM before the VMs'
+# units stop (src/sleep.rs): the VM's boot ends, leaving its snapshot and
+# disk, and its next start resumes it. Write it again after moving the
+# runner binary or its root.
+[Unit]
+Description=runner: sleeping VMs sleep on through a host shutdown
+RequiresMountsFor=/var/lib/runner
+
+[Service]
+# Up from the host's start, with nothing to run: its stop is what it's for.
+# Each firecracker@ unit is ordered Before= this one, so this one stops first.
+Type=oneshot
+RemainAfterExit=yes
+User=runner
+Environment=RUNNER_ROOT=/var/lib/runner
+ExecStop=/usr/local/bin/runner park --all
+# Each park syncs its VM's memory file, which takes a while for a big VM.
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

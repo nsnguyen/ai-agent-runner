@@ -1275,8 +1275,12 @@ fn a_boot_clears_a_snapshot_an_earlier_one_left() {
     fs::write(snap.vmstate(), "state").unwrap();
     fs::write(snap.mem(), "memory").unwrap();
     let at = chrono::Utc::now();
-    snap.note(&runner::store::Slept { generation: 1, at })
-        .unwrap();
+    snap.note(&runner::store::Slept {
+        generation: 1,
+        at,
+        parked: false,
+    })
+    .unwrap();
     let boot = h.boot("dev");
     let _up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
     assert_eq!(h.ready(), "READY=1");
@@ -1292,6 +1296,178 @@ fn a_stopped_vm_has_no_boot_to_ask() {
     let err = sleep::sleep(&h.store, "dev").unwrap_err();
     assert!(matches!(err, sleep::Error::NoBoot(_)), "{err}");
     assert!(err.to_string().contains("dev has no boot to ask"), "{err}");
+}
+
+// Parking (src/sleep.rs): what a host shutdown does to a sleeping VM, through
+// `runner park`, which runner-park.service runs before the VMs' units stop.
+
+// dev booted, put to sleep, and parked: its boot has ended.
+fn parked(h: &Host) {
+    let (boot, _up) = booted(h);
+    sleep::sleep(&h.store, "dev").unwrap();
+    let park = h.runner(&["park", "--all"]).output().unwrap();
+    assert!(park.status.success(), "{}", text(&park.stderr));
+    // base has no boot to ask.
+    assert_eq!(text(&park.stdout), "dev  parked\n");
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let notes = text(&out.stderr);
+    assert!(notes.contains("dev is parked"), "{notes}");
+}
+
+#[test]
+fn parking_a_sleeping_vm_leaves_its_snapshot_and_disk_and_commits_nothing() {
+    let h = Host::new();
+    let dev = h.vm_dir("dev");
+    parked(&h);
+    let slept = h.store.sleeping("dev").unwrap().expect("no snapshot");
+    assert!(slept.parked, "{slept:?}");
+    assert_eq!(slept.generation, 1);
+    let snap = dev.join("snapshot");
+    assert!(snap.join("vmstate").exists() && snap.join("mem").exists());
+    assert!(dev.join("gens/1.ext4").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    // Its guest still holds what it was handed.
+    assert!(h.store.handed("dev").unwrap().is_some());
+    // The boot let go of all it held, the tap last but the lock.
+    assert!(!dev.join("boot.sock").exists());
+    assert!(!dev.join(format!("vsock.sock_{}", creds::PORT)).exists());
+    let net = h.store.net("dev").unwrap();
+    assert_eq!(
+        h.ip_calls().last().unwrap(),
+        &format!("link del dev {}", net.tap)
+    );
+    assert_eq!(h.held_at_tap_removal(), "held");
+    // Asleep, with nothing to hold it: busy, as a sleeping VM is.
+    assert!(matches!(h.store.undo("dev"), Err(Error::Busy(_))));
+    assert!(matches!(h.store.gc("dev", false), Err(Error::Busy(_))));
+    assert!(matches!(h.store.delete("dev"), Err(Error::Busy(_))));
+    // The unit's ExecStop, which runs after a main process that exited on
+    // its own, finds nothing to do.
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    assert!(h.store.sleeping("dev").unwrap().unwrap().parked);
+}
+
+#[test]
+fn the_next_boot_loads_a_parked_snapshot_onto_its_disk() {
+    let h = Host::new();
+    parked(&h);
+    let dev = h.vm_dir("dev");
+    let snap = dev.join("snapshot");
+    let boot = h.boot("dev");
+    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let resumed = chrono::Utc::now();
+    // No boot of its own: the snapshot, with the disk, tap and sockets it
+    // slept with.
+    assert_eq!(
+        up.api.calls(),
+        [(
+            "PUT /snapshot/load".to_string(),
+            json!({"snapshot_path": snap.join("vmstate"),
+                   "mem_backend": {"backend_type": "File", "backend_path": snap.join("mem")},
+                   "resume_vm": true})
+        )]
+    );
+    let net = h.store.net("dev").unwrap();
+    assert!(h.ip_calls().contains(&format!("tuntap add dev {} mode tap", net.tap)));
+    // Its clock is set, as at a wake.
+    let asked = up.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].argv[..3], ["date", "-u", "-s"]);
+    let secs: f64 = asked[0].argv[3].strip_prefix('@').unwrap().parse().unwrap();
+    assert!((resumed.timestamp() as f64 - secs).abs() < 5.0);
+    // The snapshot, credentials and all, goes at the resume, and nothing
+    // new was cloned.
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!snap.join("vmstate").exists() && !snap.join("mem").exists());
+    assert!(!dev.join("gens/2.ext4").exists());
+    // Its guest took its credentials before it slept, and isn't asked
+    // again: it can sleep again.
+    assert!(h.store.handed("dev").unwrap().is_some());
+    sleep::sleep(&h.store, "dev").unwrap();
+    let woke = std::thread::spawn({
+        let store = h.store.clone();
+        move || sleep::wake(&store, "dev")
+    });
+    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    woke.join().unwrap().unwrap();
+
+    // A clean shutdown commits the disk it ran all along.
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert!(out.status.success(), "{notes}");
+    assert!(notes.contains("dev resumed generation 1"), "{notes}");
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+    assert_eq!(up.api.calls().last().unwrap().0, "PUT /actions");
+}
+
+// After a Firecracker upgrade, say. The snapshot and its credentials go, the
+// disk it was parked on stays, and the VM boots its last committed disk.
+#[test]
+fn a_parked_vm_that_can_t_resume_boots_its_last_committed_disk() {
+    let h = Host::new();
+    parked(&h);
+    let dev = h.vm_dir("dev");
+    let boot = h.boot("dev");
+    let refuse = |req: &Request| {
+        if req.path == "/snapshot/load" {
+            let fault = json!({"fault_message": "Cannot restore microvm state"});
+            return (400, Some(fault.to_string()));
+        }
+        (204, None)
+    };
+    let _refused = next_firecracker(&h, refuse);
+    let up = next_firecracker(&h, guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    let calls = up.api.calls();
+    assert_eq!(calls.first().unwrap().0, "PUT /boot-source");
+    let drive = calls.iter().find(|c| c.0 == "PUT /drives/rootfs").unwrap();
+    assert_eq!(
+        drive.1["path_on_host"],
+        json!(dev.join("gens/2.ext4")),
+        "not a fresh copy of the current disk"
+    );
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
+    assert!(!dev.join("snapshot/mem").exists());
+    assert!(dev.join("gens/1.ext4").exists());
+    // A cold boot: its guest asks for its credentials again.
+    assert_eq!(h.store.handed("dev").unwrap(), None);
+
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert!(out.status.success(), "{notes}");
+    assert!(notes.contains("dev couldn't resume"), "{notes}");
+    assert!(notes.contains("Cannot restore microvm state"), "{notes}");
+    assert!(
+        notes.contains("generation 1, where it was parked, is kept for a look"),
+        "{notes}"
+    );
+    assert_eq!(h.store.get("dev").unwrap().generation, 2);
+}
+
+// Only a sleeping VM is parked. An awake one sleeps no more, and its unit's
+// stop shuts it down cleanly, as ever.
+#[test]
+fn an_awake_vm_isn_t_parked_and_shuts_down_as_ever() {
+    let h = Host::new();
+    let (boot, _up) = booted(&h);
+    let park = h.runner(&["park", "dev"]).output().unwrap();
+    assert!(!park.status.success());
+    let err = text(&park.stderr);
+    assert!(err.contains("dev is awake"), "{err}");
+    let err = sleep::sleep(&h.store, "dev").unwrap_err();
+    assert!(err.to_string().contains("dev is shutting down"), "{err}");
+    let halt = h.runner(&["halt", "dev"]).output().unwrap();
+    assert!(halt.status.success(), "{}", text(&halt.stderr));
+    assert!(finish(boot).status.success());
+    assert_eq!(h.store.get("dev").unwrap().generation, 1);
+    assert_eq!(h.store.sleeping("dev").unwrap(), None);
 }
 
 // Sleep when idle (src/idle.rs). Boot looks as often as the VM's idle time,

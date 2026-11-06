@@ -220,7 +220,8 @@ exit "$code"
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
 /// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that
 /// file exists. A `stop` runs `on-stop` first if a test put one there, as the
-/// unit runs its ExecStop. journalctl logs its argv and prints one line.
+/// unit runs its ExecStop, and a `start` runs `on-start`, as the unit's boot
+/// would. journalctl logs its argv and prints one line.
 pub struct FakeSystemd {
     pub bin: PathBuf,
 }
@@ -236,7 +237,8 @@ impl FakeSystemd {
                 r#"echo "systemctl $*" >> "{d}/calls"
 if [ -f "{d}/fail" ]; then cat "{d}/fail" >&2; exit 1; fi
 case "$1" in
-  start) echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
+  start) if [ -x "{d}/on-start" ]; then "{d}/on-start" || exit 1; fi
+    echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
   stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" || exit 1; fi
     echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
   show) cat "{d}/state.$4" 2>/dev/null || cat "{d}/state" 2>/dev/null || echo inactive ;;
@@ -639,7 +641,8 @@ pub fn debugfs(disk: &Path, requests: &str) {
 /// A VM's boot as src/sleep.rs asks it, standing in for `runner boot`: it
 /// holds the VM as a boot does, notes a snapshot when asked to sleep and
 /// clears it when asked to wake, and at a halt clears it and commits its run,
-/// as waking and shutting down cleanly would. It records each ask, and
+/// as waking and shutting down cleanly would; a park lets go of the run,
+/// parked, as a boot that ends does. It records each ask, and
 /// refuses with the text in `refuse` while there is one.
 pub struct StandIn {
     asked: Arc<Mutex<Vec<runner::sleep::Ask>>>,
@@ -666,9 +669,20 @@ impl StandIn {
                 Ask::Sleep => {
                     snap.make_room().unwrap();
                     let at = chrono::Utc::now();
-                    snap.note(&runner::store::Slept { generation, at }).unwrap();
+                    snap.note(&runner::store::Slept {
+                        generation,
+                        at,
+                        parked: false,
+                    })
+                    .unwrap();
                 }
                 Ask::Wake => snap.clear().unwrap(),
+                // Its boot ends, leaving the snapshot for the next one.
+                Ask::Park => {
+                    if let Some(run) = run.lock().unwrap().take() {
+                        run.park().unwrap();
+                    }
+                }
                 Ask::Halt => {
                     snap.clear().unwrap();
                     if let Some(run) = run.lock().unwrap().take() {

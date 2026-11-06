@@ -24,6 +24,18 @@
 // collects around it. `restore` stops the VM first (src/checkpoint.rs), and
 // a sleeping VM's stop wakes it to shut it down cleanly. A boot that dies
 // asleep leaves its snapshot for the next boot to clear.
+//
+// But a host shutdown parks it: runner-park.service, which stops before the
+// VMs' units, runs `runner park --all`, and the boot of each sleeping VM syncs
+// its snapshot and disk, notes them parked (store::Run::park), and ends
+// without committing. Its unit stops with it, and its next boot, at a
+// `start` or `wake`, gets that run back and loads the snapshot onto that disk,
+// with its tap and sockets where they were, and sets the guest's clock, as a
+// wake does. One that can't load boots the last committed disk instead, and
+// the parked disk stays for a look (src/boot.rs). Until then the store holds
+// a parked VM busy itself, as a sleeping VM's boot does, and status says
+// sleeping. Only a host shutdown parks: `stop`, `restore` and the rest wake a
+// sleeping VM, and resume a parked one, to shut it down cleanly.
 use crate::proto;
 use crate::store::{self, Store};
 use serde::{Deserialize, Serialize};
@@ -58,6 +70,10 @@ pub enum Ask {
     /// Shut it down, cleanly: wake it if it's asleep, then Ctrl-Alt-Del, as
     /// `runner halt` does. Sleeps are refused from then on.
     Halt,
+    /// The host is shutting down: if it's asleep, park it, and end the boot.
+    /// One awake is refused, and sleeps are refused from then on, so its
+    /// unit's stop shuts it down cleanly.
+    Park,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +108,14 @@ pub fn sleep(store: &Store, name: &str) -> Result<()> {
 /// Wakes the VM, through its boot.
 pub fn wake(store: &Store, name: &str) -> Result<()> {
     ask(store, name, Ask::Wake)
+}
+
+/// Parks the sleeping VM, through its boot, and returns once that boot has
+/// let go of it. Refused if it's awake.
+pub fn park(store: &Store, name: &str) -> Result<()> {
+    ask(store, name, Ask::Park)?;
+    store.wait_idle(name)?;
+    Ok(())
 }
 
 /// Asks the VM's boot, and waits for it to be done.

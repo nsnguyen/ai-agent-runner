@@ -7,6 +7,8 @@ Description=Firecracker microVM %i
 After=network.target runner-nat.service
 # Stopped before its disks' filesystem is unmounted, at host shutdown too.
 RequiresMountsFor=/var/lib/runner
+# And after runner-park.service, which parks it first if it's asleep.
+Before=runner-park.service
 
 [Service]
 # Ready once the guest is started; until then the VM is booting. Booting
