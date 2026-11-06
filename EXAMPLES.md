@@ -15,10 +15,13 @@ Every command here runs on your laptop, in this repo's folder. The `runner` on y
 ## 1. Turn the server on and off
 
 ```sh
+runner list            # turns the server on first if it's off, a few minutes, then lists its VMs
 client/aws.sh start    # on, every server: a few minutes; each turns itself off after an hour with nothing running
 client/aws.sh stop     # off now, every server: about $0.10 an hour each while on, and only its disks while off
 client/aws.sh ssh      # log in to the server itself (rarely needed)
 ```
+
+Any `runner` command turns its server on if it's off, saying so while it boots, then runs. With more than one server, only the one the command goes to (section 9).
 
 ## 2. Make, list and remove VMs
 
@@ -152,7 +155,7 @@ runner create demo4 --host kvm-host  # or pick the server yourself
 runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
 ```
 
-A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed: `runner list` turns none on, but a command naming a VM on it, or `--host kvm-host-2`, turns that one on. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
 
 Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this checkout's, and a plain `client/check.sh` updates only kvm-host. Keep both on the same build (README.md, After merging a change), so a move or Claude reaching across servers finds the same `runner` on both.
 
@@ -171,7 +174,8 @@ client/aws.sh stop     # turn the servers off now, or leave them to turn themsel
 | You see | Do |
 |---|---|
 | `AWS won't take this laptop's credentials` | `aws login --profile runner` |
-| `runner list` hangs, or can't find `kvm-host` | Connect Tailscale, and check the server is on (`client/aws.sh start`) |
+| `runner list` can't find `kvm-host`, or says `AWS has it running` | Connect Tailscale |
+| A server that's off stays off: `runner list` only times out | Rerun `client/install.sh`, which puts `aws.sh` beside `runner`, and `export AWS_PROFILE=runner` |
 | `connection to runner-guest closed` right after a restore | Normal: the VM rebooted. Run your command again |
 | `demo is busy` | It's running or sleeping: `runner stop demo` first |
 | A VM won't start | `runner logs demo` shows why |
