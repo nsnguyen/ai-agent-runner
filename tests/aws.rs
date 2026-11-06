@@ -905,7 +905,10 @@ fn runner_aws_name_stops_and_starts_only_that_host() {
         let aws = Aws::new();
         aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
         aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
-        aws.has("instances.kvm-host-2", &format!("i-0b\trunning\t{HOST_IP}\n"));
+        aws.has(
+            "instances.kvm-host-2",
+            &format!("i-0b\trunning\t{HOST_IP}\n"),
+        );
         ok(&aws.run_as(shell, "kvm-host-2", &["stop"], ""));
         let stop = aws.call("stop-instances").expect("no stop-instances");
         assert_eq!(values(&stop, "--instance-ids"), ["i-0b"]);
@@ -928,7 +931,10 @@ fn a_listed_host_aws_sh_didnt_make_is_left_alone() {
         let stop = aws.call("stop-instances").expect("no stop-instances");
         // kvm-host listed twice is stopped once.
         assert_eq!(values(&stop, "--instance-ids"), ["i-0a"]);
-        assert!(err.contains("homelab") && err.contains("box.example.com"), "{err}");
+        assert!(
+            err.contains("homelab") && err.contains("box.example.com"),
+            "{err}"
+        );
     }
 }
 
@@ -950,7 +956,10 @@ fn start_waits_only_for_the_stopping_hosts() {
     for shell in SHELLS {
         let aws = Aws::new();
         aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
-        aws.has("instances.kvm-host", &format!("i-0a\tstopping\t{HOST_IP}\n"));
+        aws.has(
+            "instances.kvm-host",
+            &format!("i-0a\tstopping\t{HOST_IP}\n"),
+        );
         aws.has("instances.kvm-host-2", "i-0b\tstopped\tNone\n");
         let out = ok(&aws.run(shell, &["start"]));
         let calls = aws.calls();
