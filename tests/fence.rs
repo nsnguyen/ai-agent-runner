@@ -278,8 +278,7 @@ fn a_tap_that_can_t_go_in_is_an_error_that_says_why() {
     // As on a host whose rules are from before the sets.
     fake.fail("ip runner");
     let err = Fence::start(&fake.bin, "dev", TAP, Some(&list(&["github.com"])))
-        .err()
-        .expect("the tap went in");
+        .expect_err("the tap went in");
     let msg = err.to_string();
     assert!(msg.contains(LIST), "{msg}");
     assert!(msg.contains("No such file or directory"), "{msg}");
@@ -287,8 +286,7 @@ fn a_tap_that_can_t_go_in_is_an_error_that_says_why() {
     fake.heal();
     fake.fail(ADD_TAP);
     let err = Fence::start(&fake.bin, "dev", TAP, Some(&list(&["github.com"])))
-        .err()
-        .expect("the tap went in");
+        .expect_err("the tap went in");
     assert!(err.to_string().contains(ADD_TAP), "{err}");
 }
 
@@ -333,8 +331,7 @@ fn end_takes_the_tap_and_its_pairs_out_and_nothing_goes_in_after() {
 fn a_missing_nft_is_an_error_not_a_panic() {
     let missing = Path::new("/nonexistent/nft");
     let err = Fence::start(missing, "dev", TAP, Some(&list(&["github.com"])))
-        .err()
-        .expect("the tap went in");
+        .expect_err("the tap went in");
     assert!(err.to_string().contains("/nonexistent/nft"), "{err}");
     // Unlisted, there's nothing to take out.
     let fence = Fence::start(missing, "dev", TAP, None).unwrap();
