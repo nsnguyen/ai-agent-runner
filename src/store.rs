@@ -617,7 +617,9 @@ impl Store {
     }
 
     /// Puts `hosts` on the VM's list, making one if it has none. A running
-    /// VM's boot reads it every second, so it counts from then on.
+    /// VM's boot reads it every second, so it counts from then on, unless
+    /// that boot couldn't serve its DNS and gave it the host's resolvers:
+    /// then from its next boot, which doesn't start without serving it.
     pub fn allow(&self, name: &str, hosts: &[Hostname]) -> Result<List> {
         let mut now = Vec::new();
         self.set_config(name, |config| {

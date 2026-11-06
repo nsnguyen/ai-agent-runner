@@ -462,6 +462,74 @@ fn a_listed_vm_s_query_that_is_not_one_plain_question_is_not_passed_on() {
     assert_eq!(both(vm.at, &plain), [answer_to(&plain), answer_to(&plain)]);
 }
 
+// Nor in what rides along with a listed name: what goes on is rebuilt from
+// its question, with the guest's ID, its recursion-desired bit, and an OPT
+// only if it sent one, saying just its DO bit and a payload size.
+#[test]
+fn a_listed_vm_s_allowed_query_goes_on_rebuilt_without_what_else_it_carried() {
+    let resolver = Resolver::start(true);
+    let vm = listed(&[resolver.at], Some(list(&["github.com"])));
+    let plain = query(1, "github.com");
+    let secret = b"AWS_SECRET_ACCESS_KEY=xyz";
+    let mut q = plain.clone();
+    // AD and the reserved Z bit set, and an OPT record, DO and a 4096-byte
+    // payload, with an option of its own.
+    q[3] |= 0x60;
+    q[11] = 1;
+    q.extend([0, 0, 41, 0x10, 0, 0, 0, 0x80, 0]);
+    let len = u16::try_from(secret.len()).unwrap();
+    let option = [&0xfde9u16.to_be_bytes()[..], &len.to_be_bytes(), secret].concat();
+    q.extend(u16::try_from(option.len()).unwrap().to_be_bytes());
+    q.extend(&option);
+    for answer in both(vm.at, &q) {
+        assert_eq!(rcode(&q, &answer), NOERROR);
+        assert_eq!(answers(&answer), 1);
+    }
+    let heard = resolver.heard();
+    assert_eq!(heard.len(), 2);
+    let mut header = plain[..12].to_vec();
+    header[11] = 1;
+    for h in heard {
+        assert!(!h.windows(secret.len()).any(|w| w == secret), "{h:?}");
+        assert_eq!(h[..12], header);
+        assert_eq!(h[12..plain.len()], plain[12..]);
+        assert_eq!(
+            h[plain.len()..],
+            [0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0]
+        );
+    }
+    // One with no OPT goes on as it came.
+    assert_eq!(both(vm.at, &plain), [answer_to(&plain), answer_to(&plain)]);
+}
+
+// A listed name's answer counts whatever CNAMEs it goes through: a CDN's
+// addresses are handed on too.
+#[test]
+fn a_listed_name_s_addresses_are_handed_on_through_its_cnames() {
+    let q = query(1, "github.com");
+    let mut a = q.clone();
+    a[2] |= 0x80;
+    a[7] = 2;
+    // github.com is cdn.example.net, whose name is at offset 40, the CNAME's
+    // data; and cdn.example.net is 203.0.113.7 for 30s.
+    a.extend([0xc0, 12, 0, 5, 0, 1, 0, 0, 1, 0, 0, 17]);
+    a.extend([
+        3, b'c', b'd', b'n', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'n', b'e', b't', 0,
+    ]);
+    a.extend([0xc0, 40, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 7]);
+    assert!(matches!(
+        dns::judge(&q, &list(&["github.com"])),
+        Verdict::Ask(_)
+    ));
+    assert_eq!(
+        dns::addresses(&a),
+        [Address {
+            ip: Ipv4Addr::new(203, 0, 113, 7),
+            ttl: Duration::from_secs(30)
+        }]
+    );
+}
+
 #[test]
 fn a_list_changed_while_the_relay_runs_is_used_within_a_second() {
     let resolver = Resolver::start(true);
@@ -520,7 +588,7 @@ fn the_list_is_read_before_the_first_query_and_an_unreadable_one_stops_the_relay
 fn what_the_relay_does_with_a_query_is_the_verdict() {
     let github = list(&["github.com"]);
     let q = query(1, "www.github.com");
-    assert_eq!(dns::judge(&q, &github), Verdict::Ask);
+    assert_eq!(dns::judge(&q, &github), Verdict::Ask(q.clone()));
     let Verdict::Answer(refused) = dns::judge(&query(2, "example.com"), &github) else {
         panic!("example.com asked");
     };

@@ -6,8 +6,9 @@
 //
 // Unless the VM has a list of names (Store::allow), which the boot reads
 // before it serves and each second after. Then only a name on the list, or
-// under one, goes on, as one plain question: everything else gets REFUSED
-// from here, so data can't leave in a name either. A listed name's answer
+// under one, goes on, as one plain question rebuilt from the guest's:
+// everything else gets REFUSED from here, so data can't leave in a name, or
+// ride along with one. A listed name's answer
 // counts whatever CNAMEs it goes through, and each A record in it is handed
 // on (Policy::hand_on) before the guest gets it. AAAA is answered empty
 // here: VMs have no IPv6. api.anthropic.com is on every list (ALWAYS).
@@ -23,7 +24,7 @@
 // no resolver answers holds up no other. Past that a datagram is dropped and
 // a connection closed, as a busy server would, and the guest asks again.
 use crate::net::Net;
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -243,8 +244,8 @@ impl Default for Policy {
 /// What a listed VM's boot does with a query from its guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Passes it on to the host's resolvers.
-    Ask,
+    /// Passes this on to the host's resolvers in its place.
+    Ask(Vec<u8>),
     /// Answers it from here: REFUSED, an empty answer, or FORMERR.
     Answer(Vec<u8>),
     /// Nothing: it isn't even a DNS header.
@@ -280,7 +281,10 @@ pub fn judge(query: &[u8], list: &List) -> Verdict {
     if question.query_type == RecordType::AAAA {
         return reply(query, &msg, ResponseCode::NoError);
     }
-    Verdict::Ask
+    match rebuilt(&msg, question) {
+        Some(asked) => Verdict::Ask(asked),
+        None => reply(query, &msg, ResponseCode::ServFail),
+    }
 }
 
 /// The A records in an answer, with their TTLs.
@@ -299,6 +303,23 @@ pub fn addresses(answer: &[u8]) -> Vec<Address> {
             _ => None,
         })
         .collect()
+}
+
+// What goes on for an allowed query: its ID and question, its RD and CD
+// bits, and an OPT only if it sent one, with its DO bit and a payload size,
+// and no options. Nothing else the guest sent rides along.
+fn rebuilt(msg: &Message, question: &Query) -> Option<Vec<u8>> {
+    let mut asked = Message::new(msg.metadata.id, MessageType::Query, OpCode::Query);
+    asked.metadata.recursion_desired = msg.metadata.recursion_desired;
+    asked.metadata.checking_disabled = msg.metadata.checking_disabled;
+    asked.add_query(question.clone());
+    if let Some(theirs) = &msg.edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(theirs.max_payload().clamp(512, PAYLOAD));
+        edns.set_dnssec_ok(theirs.flags().dnssec_ok);
+        asked.edns = Some(edns);
+    }
+    asked.to_vec().ok()
 }
 
 // This relay's own answer to `msg`: its question, as asked, and no records.
@@ -574,8 +595,8 @@ fn answer(
     match judge(query, &list) {
         Verdict::Drop => None,
         Verdict::Answer(answer) => Some(answer),
-        Verdict::Ask => {
-            let answer = ask(query, shared)?;
+        Verdict::Ask(asked) => {
+            let answer = ask(&asked, shared)?;
             let got = addresses(&answer);
             if !got.is_empty() {
                 (shared.hand_on)(&got);

@@ -1077,7 +1077,7 @@ fn an_unknown_format_is_refused() {
     let host = Host::new();
     let mut entries = small(&host);
     edit_manifest(&mut entries, |j| {
-        let to = j.replacen(&format!("\"format\": {FORMAT}"), "\"format\": 99", 1);
+        let to = j.replacen("\"format\": 1", "\"format\": 99", 1);
         assert_ne!(to, j);
         to
     });
@@ -1089,22 +1089,33 @@ fn an_unknown_format_is_refused() {
     );
 }
 
-// A config's list of names is a field format 1's import doesn't know, so
-// exports are format 2 now; an export from before it still imports.
+// A config's list of names is a field format 1's import doesn't know, so an
+// export with one is format 2. One with none is still format 1, which an
+// older runner imports, as this one does.
 #[test]
-fn an_export_from_before_lists_of_names_still_imports() {
+fn only_an_export_with_a_list_of_names_is_format_2() {
     assert_eq!(FORMAT, 2);
     let host = Host::new();
-    let mut entries = small(&host);
-    edit_manifest(&mut entries, |j| {
-        let to = j.replacen(&format!("\"format\": {FORMAT}"), "\"format\": 1", 1);
-        assert_ne!(to, j);
-        to
-    });
+    let entries = small(&host);
+    let json = text(&entries[0].1);
+    assert!(json.contains("\"format\": 1"), "{json}");
+    assert!(!json.contains("allow"), "{json}");
     let path = host.path("old.tar");
     fs::write(&path, together(&entries)).unwrap();
     host.imported(&["dev2", "-"], Some(&path));
     same(&host.current("dev2"), &host.current("dev"));
+    // With a list: format 2, and it imports with it.
+    let github = "github.com".parse().unwrap();
+    host.store().allow("dev", &[github]).unwrap();
+    let tar = host.path("listed.tar");
+    host.exported(&["dev"], &tar);
+    let json = text(&apart(&fs::read(&tar).unwrap())[0].1);
+    assert!(json.contains("\"format\": 2"), "{json}");
+    host.imported(&["dev3", &tar.display().to_string()], None);
+    assert_eq!(
+        host.store().allowed("dev3").unwrap(),
+        host.store().allowed("dev").unwrap()
+    );
 }
 
 #[test]

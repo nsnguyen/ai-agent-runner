@@ -478,7 +478,8 @@ fn serve_dns(
         }
         Err(e) => {
             note(format_args!(
-                "{name}'s DNS goes straight to the host's resolvers: boot can't serve it on {e}"
+                "{name}'s DNS goes straight to the host's resolvers: boot can't serve it on \
+                 {e}. A list of names set on it now counts only from its next boot"
             ));
             Ok((None, net.boot_arg_with(name, &resolvers)))
         }
