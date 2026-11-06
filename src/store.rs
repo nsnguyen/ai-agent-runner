@@ -630,11 +630,13 @@ impl Store {
     /// VM's boot reads it every second, so it counts from then on, unless
     /// that boot couldn't serve its DNS and gave it the host's resolvers:
     /// then from its next boot, which doesn't start without serving it.
+    /// api.anthropic.com, on every list, isn't kept among the owner's.
     pub fn allow(&self, name: &str, hosts: &[Hostname]) -> Result<List> {
         let mut now = Vec::new();
         self.set_config(name, |config| {
             let names = config.allow.get_or_insert_with(Vec::new);
-            names.extend_from_slice(hosts);
+            let own = hosts.iter().filter(|h| !dns::ALWAYS.contains(&h.as_str()));
+            names.extend(own.cloned());
             names.sort();
             names.dedup();
             now.clone_from(names);

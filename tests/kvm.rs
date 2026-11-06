@@ -828,9 +828,10 @@ except OSError as e:
     ok(runner(&root, &exec));
 }
 
-// A list made on a running VM holds it to its names within a second: other
-// names aren't answered, an address it didn't look up is dropped, and so is
-// another resolver. Dropping the list opens it again, with no reboot.
+// A list made on a running VM holds it to its names within a second, and
+// the names under them: other names aren't answered, an address it didn't
+// look up is dropped, and so is another resolver. A name taken off goes the
+// same way, and dropping the list opens it again, with no reboot.
 #[test]
 #[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
 fn a_listed_vm_reaches_only_its_names() {
@@ -894,9 +895,18 @@ except TimeoutError:
         curl("https://example.com").status.code() == Some(6)
     });
     ok(curl("https://github.com"));
+    // A name under one on the list is on it too.
+    ok(curl("https://api.github.com"));
     let reached = ok(in_vm(&["python3", "-c", connect, &example]));
     assert_eq!(reached, "timed out\n", "{example}:443");
     assert_eq!(ok(in_vm(&["python3", "-c", ask, "1.1.1.1"])), "no answer\n");
+
+    // Taken off while it runs, github.com goes as example.com did.
+    let only = ok(runner(&root, &["net", &name, "deny", "github.com"]));
+    assert_eq!(only, format!("{name}  allows only api.anthropic.com\n"));
+    eventually("github.com to stop resolving", || {
+        curl("https://github.com").status.code() == Some(6)
+    });
 
     let open = ok(runner(&root, &["net", &name, "open"]));
     assert_eq!(open, format!("{name}  open: the whole internet\n"));

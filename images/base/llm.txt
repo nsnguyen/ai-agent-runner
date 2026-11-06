@@ -54,13 +54,13 @@ you can go back.
 
 ## The network
 
-- You reach the internet, but not the host, its LAN or other VMs. Your one
-  DNS server is your gateway, which the host answers.
+- You reach the internet, but not the host, its LAN or other VMs, except
+  for DNS. Your one DNS server is your gateway, which the host answers.
 - The owner can keep this VM to a list of names, with `runner net` on the
   host. Then only those names, and the names under them, resolve, with
   api.anthropic.com always, so Claude Code keeps working. Every other name
-  gets REFUSED, and an address you didn't get from those answers doesn't
-  connect at all.
+  gets REFUSED, and a new connection to an address you didn't get from
+  those answers goes nowhere.
 - A name that gets REFUSED is off the owner's list for this VM. That's
   the owner's call, not a broken network, so don't work around it: not
   through another resolver, an address, a proxy or a mirror. Stop, and
