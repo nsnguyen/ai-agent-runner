@@ -15,12 +15,15 @@
 // under the run user's ~/.claude/projects. One that committed or joined dev
 // left it on dev's own, so dev is started if it's stopped. One that rolled
 // back left it on the run's own generation, kept in dev's gens/ until gc: a
-// copy of that goes on top of dev's history, as a restore's does, so `undo`
-// goes back, and dev boots onto it. That needs dev stopped, which would end
-// its sessions, so it's refused while dev is up. Either way the record is
-// looked for before claude starts, since a restore, undo or rollback since
-// can have taken it.
+// copy of that goes on top of dev's history, as a restore's does, and dev
+// boots onto it. That needs dev stopped, which would end its sessions, so
+// it's refused while dev is up. Either way the record is looked for before
+// claude starts, since a restore, undo or rollback since can have taken it.
+// The run is marked taken then (runs::mark_taken), and from then on, as for
+// one taken over while it went, its session is on dev's own disk, or in
+// dev's claude session if that's there.
 use crate::exec;
+use crate::idle::InUse;
 use crate::proto::{Exit, Request, WinSize};
 use crate::result::Outcome;
 use crate::runs;
@@ -87,15 +90,17 @@ pub enum Error {
         vm: String,
         generation: u64,
     },
+    /// `since` says how it can have gone.
     #[error(
         "{id}'s session isn't on {vm}'s disk: {user} has no ~/.claude/projects/*/{session}.jsonl \
-         there, so a restore, undo or rollback since has taken it"
+         there, {since}"
     )]
     NotOnDisk {
         id: String,
         vm: String,
         user: String,
         session: String,
+        since: String,
     },
     #[error("looking for {session}'s record in {vm}: {why}")]
     Look {
@@ -151,12 +156,15 @@ pub trait Vms {
     /// Whether the VM still has this generation's disk: gc drops it.
     fn kept(&self, vm: &str, generation: u64) -> Result<bool>;
     /// Puts a copy of this generation on top of the stopped VM's history,
-    /// for run `run`'s takeover, and returns the copy's generation. Refused
-    /// while the VM is up or a run is going on it.
-    fn put_back(&self, vm: &str, generation: u64, run: &str) -> Result<u64>;
+    /// for run `run`'s takeover, and returns the generation that was current
+    /// before and the copy's. Refused while a run is going on the VM, then
+    /// while the VM is up (Up).
+    fn put_back(&self, vm: &str, generation: u64, run: &str) -> Result<(u64, u64)>;
     /// Whether `user` has Claude Code's record of `session` in the running
     /// VM, under ~/.claude/projects.
     fn has_record(&self, vm: &str, user: &str, session: &str) -> Result<bool>;
+    /// Marks the run, over, as taken over (runs::mark_taken).
+    fn mark_taken(&self, id: &str) -> Result<()>;
 }
 
 /// A headless run, as a takeover needs it.
@@ -178,6 +186,8 @@ pub struct Run {
     pub outcome: Option<Outcome>,
     /// The generation it booted, once it's over: its result's.
     pub generation: Option<u64>,
+    /// Taken over already after it ended (runs::mark_taken).
+    pub taken: bool,
 }
 
 impl From<runs::Placed> for Run {
@@ -193,13 +203,14 @@ impl From<runs::Placed> for Run {
             boots: p.run.boots,
             outcome: p.run.outcome,
             generation: p.generation,
+            taken: p.taken,
         }
     }
 }
 
 // Where a run that's over left its session's record.
 enum Disk {
-    // The VM's own: it committed, or joined the VM.
+    // The VM's own: it committed, or joined the VM, or it was taken over.
     Own,
     // Its own generation, rolled back.
     Run(u64),
@@ -333,57 +344,73 @@ pub fn take_over(vms: &impl Vms, t: &TakeOver, notes: &mut impl Write) -> Result
 
 // A run that's over: its session goes on from the disk it ended on, with the
 // VM up on that disk. Refused before anything starts or changes unless that
-// disk is known and there, and once it is, unless the record is on it.
+// disk is known and there, and once it is, unless the record is on it. Then
+// the run is marked taken, so a takeover after this one goes on from the
+// VM's own disk, as for a run taken over while it went.
 fn pick_up(vms: &impl Vms, t: &TakeOver, run: Run, notes: &mut impl Write) -> Result<Exit> {
     let (id, vm) = (run.id.clone(), run.vm.clone());
-    match run.state {
-        runs::State::TakenOver => return Err(Error::TakenOver { id, vm }),
-        runs::State::Lost => return Err(Error::NoDisk { id, how: run.how }),
-        _ => {}
+    if run.state == runs::State::Lost {
+        return Err(Error::NoDisk { id, how: run.how });
     }
     let Some(session) = run.session.clone() else {
         return Err(Error::NeverNamed { id, how: run.how });
     };
-    let disk = match (run.boots, run.outcome, run.generation) {
-        (_, Some(Outcome::RolledBack), Some(generation)) => Disk::Run(generation),
-        (false, _, _) | (true, Some(Outcome::Committed), _) => Disk::Own,
+    let taken = run.state == runs::State::TakenOver || run.taken;
+    let disk = match (taken, run.boots, run.outcome, run.generation) {
+        (true, ..) => Disk::Own,
+        (_, _, Some(Outcome::RolledBack), Some(generation)) => Disk::Run(generation),
+        (_, false, ..) | (_, true, Some(Outcome::Committed), _) => Disk::Own,
         _ => return Err(Error::NoDisk { id, how: run.how }),
     };
-    match disk {
+    // How the record can have gone, if it isn't there.
+    let since = match disk {
         // tmux would attach to a claude session that's there as if it were
-        // the run's; one just started has none.
+        // the run's; one just started has none. A takeover's own is there to
+        // reattach to.
         Disk::Own => {
             if !vms.running(&vm)? {
                 vms.start(&vm)?;
             } else if vms.has_session(&vm, &run.user, SESSION)? {
-                return Err(Error::SessionThere { vm });
+                return Err(match taken {
+                    true => Error::TakenOver { id, vm },
+                    false => Error::SessionThere { vm },
+                });
             }
+            "so a restore, undo or rollback since has taken it".to_string()
         }
         Disk::Run(generation) => {
             if !vms.kept(&vm, generation)? {
                 return Err(Error::Dropped { id, vm, generation });
             }
-            if vms.running(&vm)? {
-                return Err(Error::Up { id, vm });
-            }
-            let put = vms.put_back(&vm, generation, &id)?;
+            let (before, put) = vms.put_back(&vm, generation, &id)?;
+            let back = format!("`runner restore {vm} {before}`");
             note(
                 notes,
                 &format!(
                     "put {id}'s disk, generation {generation}, back on {vm} as generation \
-                     {put}: `runner undo {vm}` goes back"
+                     {put}, over generation {before}: {back} brings that back"
                 ),
             );
+            // The session is on dev's own disk from here on, whatever comes.
+            mark(vms, &id, notes);
             vms.start(&vm)?;
+            format!(
+                "so Claude Code never wrote it on the run's disk, which {vm} runs on now: {back} \
+                 brings back the disk from before"
+            )
         }
-    }
+    };
     if !vms.has_record(&vm, &run.user, &session)? {
         return Err(Error::NotOnDisk {
             id,
             vm,
             user: run.user,
             session,
+            since,
         });
+    }
+    if !taken && matches!(disk, Disk::Own) {
+        mark(vms, &id, notes);
     }
     note(
         notes,
@@ -393,6 +420,19 @@ fn pick_up(vms: &impl Vms, t: &TakeOver, run: Run, notes: &mut impl Write) -> Re
         ),
     );
     resume_in(vms, t, &run, &session)
+}
+
+// Without the mark, a takeover after this one would go by how the run ended:
+// worth a note, not the session.
+fn mark(vms: &impl Vms, id: &str, notes: &mut impl Write) {
+    if let Err(e) = vms.mark_taken(id) {
+        note(
+            notes,
+            &format!(
+                "couldn't mark {id} taken over, so taking it over again goes by how it ended: {e}"
+            ),
+        );
+    }
 }
 
 // This terminal on `claude --resume <session>` and the arguments after `--`,
@@ -476,12 +516,22 @@ impl Vms for Host<'_> {
     }
 
     // Under the run lock, as a restore is: a run starting meanwhile would
-    // boot the disk from before.
-    fn put_back(&self, vm: &str, generation: u64, run: &str) -> Result<u64> {
+    // boot the disk from before. Asked first, so a run that booted the VM
+    // isn't met with advice to stop it.
+    fn put_back(&self, vm: &str, generation: u64, run: &str) -> Result<(u64, u64)> {
+        // An idle sleep holds the run lock while it lasts: wait it out.
+        let _in_use = InUse::take(self.0, vm)?;
         let _no_run = runs::hold(self.0, vm)?;
+        if systemd::status(self.0, vm)?.state != State::Stopped {
+            return Err(Error::Up {
+                id: run.to_string(),
+                vm: vm.to_string(),
+            });
+        }
+        let before = self.0.get(vm)?.generation;
         let why = format!("takeover of {run}");
         match self.0.restore_generation(vm, generation, &why) {
-            Ok(put) => Ok(put.generation),
+            Ok(put) => Ok((before, put.generation)),
             Err(store::Error::NoGeneration(..)) => Err(Error::Dropped {
                 id: run.to_string(),
                 vm: vm.to_string(),
@@ -521,12 +571,16 @@ impl Vms for Host<'_> {
             why,
         })
     }
+
+    fn mark_taken(&self, id: &str) -> Result<()> {
+        Ok(runs::mark_taken(self.0, id)?)
+    }
 }
 
-// Exits 0 if the user has Claude Code's record of session $1, 1 if not.
-// Claude Code keeps each session as <session>.jsonl in a directory per
-// project under ~/.claude/projects.
-const RECORD: &str = r#"for f in "$HOME"/.claude/projects/*/"$1".jsonl; do
+/// For `sh -c`: exits 0 if the user has Claude Code's record of session $1,
+/// 1 if not. Claude Code keeps each session as <session>.jsonl in a
+/// directory per project under ~/.claude/projects.
+pub const RECORD: &str = r#"for f in "$HOME"/.claude/projects/*/"$1".jsonl; do
   [ -f "$f" ] && exit 0
 done
 exit 1"#;

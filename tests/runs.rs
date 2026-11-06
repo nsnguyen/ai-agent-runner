@@ -1385,12 +1385,13 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_then_looks_for_its_session() 
     let mut taking = t.spawn(vm.runner(&["claude", "--run", &id]));
     assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
     t.wait_for(
-        "runner: put dev.1's disk, generation 1, back on dev as generation 2: `runner undo dev` \
-         goes back",
+        "runner: put dev.1's disk, generation 1, back on dev as generation 2, over generation 0: \
+         `runner restore dev 0` brings that back",
     );
     t.wait_for(&format!(
         "runner: dev.1's session isn't on dev's disk: {} has no \
-         ~/.claude/projects/*/{UUID}.jsonl there",
+         ~/.claude/projects/*/{UUID}.jsonl there, so Claude Code never wrote it on the run's \
+         disk",
         me()
     ));
     assert_eq!(vm.generation(), 2);
@@ -1404,32 +1405,69 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_then_looks_for_its_session() 
     let first = listed.lines().next().unwrap();
     assert!(first.starts_with("* 2  "), "{listed}");
     assert!(first.ends_with("  \"takeover of dev.1\""), "{listed}");
+    assert!(runs::placed(&vm.store, &id).unwrap().taken);
+
+    // Taken again, it goes on from dev's own disk, where the session is now,
+    // and puts nothing back a second time.
+    vm.sd.set_state("inactive");
+    let t = common::pty(24, 200);
+    let mut taking = t.spawn(vm.runner(&["claude", "--run", &id]));
+    assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
+    t.wait_for("there, so a restore, undo or rollback since has taken it");
+    assert!(!t.seen().contains("put dev.1's disk"), "{}", t.seen());
+    assert_eq!(vm.generation(), 2);
     assert_eq!(vm.store.undo("dev").unwrap().generation, 0);
 }
 
-// The host's half: putting a rolled-back run's disk back waits for no run,
-// and once gc has dropped the disk, says so.
+// Putting a rolled-back run's disk back waits for no run, asked before
+// whether dev is up, since a run that booted dev has it up, and stopping dev
+// would end that run. Once gc has dropped the disk, it says so.
 #[test]
-fn a_rolled_back_run_s_disk_isn_t_put_back_under_a_run_or_once_gc_dropped_it() {
+fn a_rolled_back_run_s_disk_isn_t_put_back_under_a_run_on_a_dev_that_s_up_or_once_gc_dropped_it() {
     let vm = vm(false);
     let _boot = boot(&vm);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
     let id = vm.start("break it");
-    wait_for("claude to start", || vm.started());
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
     vm.go(0, 3);
     vm.wait_until_ended(&id);
+    // The runner on a terminal: its error, and that it failed.
+    let refused = || {
+        let t = common::pty(24, 200);
+        let mut taking = t.spawn(vm.runner(&["claude", "--run", &id]));
+        assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
+        wait_for("its error", || t.seen().contains('\n'));
+        t.seen()
+    };
+    vm.sd.set_state("active");
+    let starting = runs::hold(&vm.store, "dev").unwrap();
+    let seen = refused();
+    assert!(
+        seen.contains("dev already has a run starting: one run per VM"),
+        "{seen}"
+    );
+    drop(starting);
+    let seen = refused();
+    assert!(
+        seen.contains(
+            "dev.1 rolled back, so taking it over puts its disk back on dev, which needs dev \
+             stopped and would end its sessions: `runner stop dev` first"
+        ),
+        "{seen}"
+    );
+    vm.sd.set_state("inactive");
     let host = claude::Host(&vm.store);
     assert!(host.kept("dev", 1).unwrap());
-    let starting = runs::hold(&vm.store, "dev").unwrap();
-    let err = host.put_back("dev", 1, &id).unwrap_err().to_string();
-    assert_eq!(err, "dev already has a run starting: one run per VM");
-    drop(starting);
     vm.store.clone().keeping(0).gc("dev", false).unwrap();
     assert!(!host.kept("dev", 1).unwrap());
-    let err = host.put_back("dev", 1, &id).unwrap_err().to_string();
-    assert_eq!(
-        err,
-        "dev.1 rolled back, and its disk, dev's generation 1, is gone: gc dropped it at a \
-         later commit, and the session with it"
+    let seen = refused();
+    assert!(
+        seen.contains(
+            "dev.1 rolled back, and its disk, dev's generation 1, is gone: gc dropped it at a \
+             later commit, and the session with it"
+        ),
+        "{seen}"
     );
     assert_eq!(vm.generation(), 0);
+    assert!(!runs::placed(&vm.store, &id).unwrap().taken);
 }

@@ -1267,18 +1267,26 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         row.unwrap_or_else(|| panic!("{rows}")).to_string()
     };
     let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    // A wait each for the boot and Claude Code's start, then its two turns.
+    eventually("the run's session in runs", || {
+        !row().contains("Z  running  -  ")
+    });
     // The file is there, and Claude Code has written the prompt to its
     // session, by the time it runs the sleep.
-    eventually("claude -p to write started.txt and run sleep 300", || {
-        let sleeping = r#"[ -f /home/agent/work/started.txt ] || exit 0
-        for c in /proc/[0-9]*/cmdline; do
+    eventually("claude -p to write started.txt", || {
+        in_vm("[ -f /home/agent/work/started.txt ] && echo found || true").contains("found")
+    });
+    eventually("claude -p to run sleep 300", || {
+        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
             [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
         done; true"#;
         in_vm(sleeping).contains("found")
     });
-    ok(runner(&root, &["cancel", &id]));
-    let ended = row();
-    assert!(ended.contains("Z  cancelled, rolled back  "), "{ended}");
+    // It can still be measuring the run's disk when cancel gives up waiting.
+    runner(&root, &["cancel", &id]);
+    eventually("the run to end rolled back", || {
+        row().contains("Z  cancelled, rolled back  ")
+    });
     let result = ok(runner(&root, &["result", &id]));
     let result: serde_json::Value = serde_json::from_str(&result).unwrap();
     let booted = result["generation"].as_u64().expect("the run's generation");

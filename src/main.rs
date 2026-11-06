@@ -313,7 +313,7 @@ enum Cmd {
         /// and while the VM has a claude session. One that's over resumes
         /// from the disk it ended on: the VM's own if it committed or joined,
         /// started if it's stopped; if it rolled back, a copy of the run's
-        /// disk put on top of the stopped VM's history, which undo takes back.
+        /// disk put on top of the stopped VM's history, as a restore's is.
         #[arg(long, value_name = "RUN")]
         run: Option<String>,
         /// Arguments for claude, after `--`, like --continue. With --run,

@@ -121,13 +121,18 @@ impl Vms for Fake {
         Ok(!self.dropped)
     }
 
-    fn put_back(&self, vm: &str, generation: u64, run: &str) -> claude::Result<u64> {
+    // On generation 2, as the Host's does, refused while the VM is up.
+    fn put_back(&self, vm: &str, generation: u64, run: &str) -> claude::Result<(u64, u64)> {
         self.call("put_back", format!("put_back {vm} {generation} {run}"))?;
-        assert!(
-            !self.running(vm).unwrap(),
-            "put a disk back on running {vm}"
-        );
-        Ok(5)
+        if self.running(vm).unwrap() {
+            let (id, vm) = (run.to_string(), vm.to_string());
+            return Err(claude::Error::Up { id, vm });
+        }
+        Ok((2, 5))
+    }
+
+    fn mark_taken(&self, id: &str) -> claude::Result<()> {
+        self.call("mark_taken", format!("mark_taken {id}"))
     }
 
     fn has_record(&self, vm: &str, user: &str, session: &str) -> claude::Result<bool> {
@@ -381,6 +386,7 @@ fn going() -> Run {
         boots: true,
         outcome: None,
         generation: None,
+        taken: false,
     }
 }
 
@@ -612,6 +618,7 @@ fn a_committed_run_s_takeover_starts_a_stopped_dev_then_resumes_where_it_ran() {
             "running dev",
             "start dev",
             format!("has_record dev me {UUID}").as_str(),
+            "mark_taken dev.1",
             "attach dev"
         ]
     );
@@ -647,6 +654,7 @@ fn a_joined_run_s_takeover_resumes_on_dev_as_it_runs() {
             "running dev",
             "has_session dev me claude",
             format!("has_record dev me {UUID}").as_str(),
+            "mark_taken dev.1",
             "attach dev"
         ]
     );
@@ -682,8 +690,8 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_first() {
         [
             "run dev.1",
             "kept dev 3",
-            "running dev",
             "put_back dev 3 dev.1",
+            "mark_taken dev.1",
             "start dev",
             format!("has_record dev me {UUID}").as_str(),
             "attach dev"
@@ -692,8 +700,8 @@ fn a_rolled_back_run_s_takeover_puts_its_disk_back_first() {
     assert_eq!(fake.attached(), resumed(&t));
     assert_eq!(
         notes,
-        "runner: put dev.1's disk, generation 3, back on dev as generation 5: `runner undo \
-         dev` goes back\n\
+        "runner: put dev.1's disk, generation 3, back on dev as generation 5, over generation \
+         2: `runner restore dev 2` brings that back\n\
          runner: dev.1's session goes on in dev's claude session, which `runner claude dev` \
          reattaches\n"
     );
@@ -711,7 +719,10 @@ fn a_rolled_back_run_s_disk_isn_t_put_back_on_a_dev_that_s_up_or_once_gc_dropped
         "dev.1 rolled back, so taking it over puts its disk back on dev, which needs dev \
          stopped and would end its sessions: `runner stop dev` first"
     );
-    assert_eq!(fake.calls(), ["run dev.1", "kept dev 3", "running dev"]);
+    assert_eq!(
+        fake.calls(),
+        ["run dev.1", "kept dev 3", "put_back dev 3 dev.1"]
+    );
 
     let mut fake = Fake::with("dev", true);
     fake.run = Some(rolled_back());
@@ -751,16 +762,6 @@ fn a_run_that_s_over_without_a_session_or_a_known_disk_is_refused() {
         ),
         (
             Run {
-                state: State::TakenOver,
-                how: "taken over".to_string(),
-                outcome: None,
-                ..going()
-            },
-            "dev.1 is taken over already: its session goes on in dev's claude session, which \
-             `runner claude dev` reattaches",
-        ),
-        (
-            Run {
                 generation: None,
                 ..rolled_back()
             },
@@ -793,4 +794,92 @@ fn a_session_whose_record_isn_t_on_the_disk_is_named() {
         )
     );
     assert!(!fake.calls().contains(&"attach dev".to_string()));
+    assert!(!fake.calls().contains(&"mark_taken dev.1".to_string()));
+
+    // On a disk just put back, it was never written there, and the disk
+    // from before is a restore away.
+    let mut fake = Fake::with("dev", false);
+    fake.run = Some(rolled_back());
+    fake.unrecorded = true;
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        format!(
+            "dev.1's session isn't on dev's disk: me has no ~/.claude/projects/*/{UUID}.jsonl \
+             there, so Claude Code never wrote it on the run's disk, which dev runs on now: \
+             `runner restore dev 2` brings back the disk from before"
+        )
+    );
+}
+
+// A run taken over already, while it went or since it ended, has its session
+// on dev's own disk, or in dev's claude session if that's there: then the
+// takeover points at `runner claude dev`, which reattaches. Its disk isn't
+// put back again.
+#[test]
+fn a_run_taken_over_already_reattaches_or_goes_on_from_dev_s_own_disk() {
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(Run {
+        state: State::TakenOver,
+        how: "taken over".to_string(),
+        ..going()
+    });
+    fake.session = true;
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        "dev.1 is taken over already: its session goes on in dev's claude session, which \
+         `runner claude dev` reattaches"
+    );
+    assert_eq!(
+        fake.calls(),
+        ["run dev.1", "running dev", "has_session dev me claude"]
+    );
+
+    let mut fake = Fake::with("dev", false);
+    fake.run = Some(Run {
+        taken: true,
+        ..rolled_back()
+    });
+    let t = take(&[]);
+    let (_, got) = take_over(&fake, &t);
+    assert_eq!(got.unwrap(), Exit::Code(0));
+    assert_eq!(
+        fake.calls(),
+        [
+            "run dev.1",
+            "running dev",
+            "start dev",
+            format!("has_record dev me {UUID}").as_str(),
+            "attach dev"
+        ]
+    );
+    assert_eq!(fake.attached(), resumed(&t));
+}
+
+// The record is looked for as the run's user, under its home.
+#[test]
+fn the_record_is_any_project_s_session_file_in_the_user_s_home() {
+    let home = tempfile::tempdir().unwrap();
+    let look = |session: &str| {
+        Command::new("sh")
+            .args(["-c", claude::RECORD, "sh", session])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .status()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(look(UUID), Some(1));
+    let project = home.path().join(".claude/projects/-home-agent-src");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("4c1e0b2a-1a2b-4c3d-9e8f-123456789abc.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+    assert_eq!(look(UUID), Some(1));
+    fs::write(project.join(format!("{UUID}.jsonl")), "{}\n").unwrap();
+    assert_eq!(look(UUID), Some(0));
 }

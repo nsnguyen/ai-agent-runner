@@ -20,6 +20,8 @@
 //   <vm>/runs/<n>/takeover  there once `runner claude --run` has asked to
 //                           take the run over, until Claude Code is done
 //   <vm>/runs/<n>/result.json  what the runner measured once it was over
+//   <vm>/runs/<n>/taken     there once `runner claude --run` has taken the
+//                           run over after it ended (claude.rs)
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
 // A run on a stopped VM boots it, which runs a new disk generation as every
@@ -52,8 +54,8 @@
 // together, as any boot does. One that joined it keeps its checkpoint. The
 // run ends taken over, with no outcome and nothing measured: the disk is
 // still in use. A run that's over is taken over from the disk it ended on,
-// which claude.rs works out from its outcome and its result's generation,
-// and nothing here changes.
+// which claude.rs works out from its outcome and its result's generation.
+// How it ended stays as it was; only the taken mark says it was taken over.
 use crate::changes;
 use crate::checkpoint;
 use crate::exec::{self, Streamed};
@@ -114,6 +116,7 @@ const CANCEL: &str = "cancel";
 const TAKEOVER: &str = "takeover";
 const RESULT: &str = "result.json";
 const END: &str = "end.json";
+const TAKEN: &str = "taken";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1039,6 +1042,9 @@ pub struct Placed {
     /// Once it's over, the disk generation it booted, as its result has it:
     /// where a run that rolled back left its session.
     pub generation: Option<u64>,
+    /// Taken over after it ended (mark_taken): its session goes on from the
+    /// VM's own disk since.
+    pub taken: bool,
 }
 
 /// The run with this id, and where its Claude Code runs.
@@ -1047,12 +1053,22 @@ pub fn placed(store: &Store, id: &str) -> Result<Placed> {
     let path = store.runs(&vm)?.join(n.to_string()).join(ASK);
     let ask: Ask = read_json(&path)?.ok_or_else(|| Error::NoRun(id.to_string()))?;
     let run = load(store, &vm, n)?;
+    let taken = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
     Ok(Placed {
         generation: read_result(store, &vm, n)?.and_then(|r| r.generation),
+        taken: taken.exists(),
         run,
         dir: ask.dir,
         user: ask.user,
     })
+}
+
+/// Marks a run that's over as taken over by `runner claude --run`, so the
+/// next takeover goes on from the VM's own disk, where the session is now.
+pub fn mark_taken(store: &Store, id: &str) -> Result<()> {
+    let (vm, n) = parse_id(id)?;
+    let path = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
+    fs::write(&path, "").map_err(io_err(format!("writing {}", path.display())))
 }
 
 // Leaves `mark` for the process driving the run, which stops Claude Code on

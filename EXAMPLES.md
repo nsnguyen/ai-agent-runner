@@ -102,7 +102,7 @@ The same command picks up a run that's over, one that failed or that you cancell
 runner claude --run demo.1   # starts demo if it's stopped, then opens the run's conversation
 ```
 
-If the run's changes were thrown away, the takeover brings them back first: demo has to be stopped for that (`runner stop demo`), and `runner undo demo` goes back to the disk from before. Once a later run has kept its changes, the thrown-away ones may be cleaned up, and then the takeover says they're gone.
+If the run's changes were thrown away, the takeover brings them back first. demo has to be stopped for that (`runner stop demo`), and the takeover prints the `runner restore` that gets back the disk from before. Once a later run has kept its changes, the thrown-away ones may be cleaned up, and then the takeover says they're gone. Taking the same run over again later carries on where you left it, and never brings the old changes back a second time.
 
 To have several agents try the same thing at once and keep the best, give `--n`:
 
