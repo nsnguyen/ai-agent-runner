@@ -33,6 +33,7 @@
 // `a_headless_run_on_a_listed_vm_reaches_claude_code_s_api`,
 // `claude_keeps_running_after_a_detach`,
 // `claude_code_in_a_vm_has_its_updater_off`,
+// `agent_runs_docker_in_a_vm_without_sudo`,
 // `a_headless_run_edits_a_file_and_commits_it` and
 // `a_run_taken_over_carries_on_in_claude_s_session`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
@@ -40,8 +41,8 @@
 // root's owner. The unit boots them with the installed runner, so rerun
 // host/install.sh after a build. The headless runs need the host's Claude
 // Code token in /etc/credstore (docs/host.md, step 6). The agent's own
-// checkpoints need a base built with this runner-guest, and the updater test
-// needs a base built from this images/base (images/base/build.sh).
+// checkpoints need a base built with this runner-guest, and the updater and
+// Docker tests need a base built from this images/base (images/base/build.sh).
 mod common;
 
 use std::fs::Permissions;
@@ -1058,6 +1059,35 @@ fn claude_code_in_a_vm_has_its_updater_off() {
     in_vm(&["tmux", "detach-client", "-s", "=claude"]);
     assert_eq!(claude.wait().unwrap().code(), Some(0), "{}", t.seen());
     in_vm(&["tmux", "kill-server"]);
+}
+
+// Docker in a fork of base, as agent with no sudo, as exec runs commands
+// right after `runner create`: dockerd runs on the guest kernel, pulls from
+// Docker Hub, and starts a container on its bridge.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
+fn agent_runs_docker_in_a_vm_without_sudo() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("docker-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let in_vm = |argv: &[&str]| {
+        let exec = ["exec", name.as_str(), "--"];
+        let all: Vec<&str> = exec.iter().chain(argv).copied().collect();
+        ok(runner(&root, &all))
+    };
+
+    let who = in_vm(&["id", "-un"]);
+    assert_eq!(who.trim(), "agent");
+    let hello = in_vm(&["docker", "run", "--rm", "hello-world"]);
+    assert!(hello.contains("Hello from Docker!"), "{hello}");
+    // Ubuntu's build prints its version without upstream's "v".
+    let compose = in_vm(&["docker", "compose", "version", "--short"]);
+    let version = compose.trim().trim_start_matches('v');
+    assert!(version.starts_with("2."), "{compose}");
 }
 
 // A real `claude -p` under the unit: the run boots the VM, Claude Code edits

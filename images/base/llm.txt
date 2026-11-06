@@ -52,6 +52,30 @@ you can go back.
   what one runs, `sudo systemctl restart runner-svc-<name>`; `journalctl -u
   runner-svc-<name>` shows its output. They get no credentials.
 
+## Docker
+
+- Docker Engine and Compose v2 are here, and dockerd starts at boot. You're
+  in the docker group, so `docker compose up -d` brings up your project's
+  Postgres or Redis without sudo. A container with a restart policy, like
+  `restart: unless-stopped`, comes back when the VM boots again.
+- Images, containers and volumes live in /var/lib/docker on this disk, so
+  they persist as everything else on it does (What persists). A rebase onto
+  a new base doesn't keep /var, so they go then: keep data you can't lose
+  in a bind mount under /home/agent.
+- This disk's size (`df -h /`) and the VM's memory (`free -h`) are what
+  limit Docker here, and images fill a disk fast: `docker system df` shows
+  what they take. If you need more, ask: the owner can give the VM more
+  disk and memory.
+- Images you pull here aren't in another VM, unless the owner forks this
+  one: each VM pulls its own.
+- A published port, like `ports: ["5432:5432"]`, listens on this VM's
+  address, where the owner reaches it with `runner proxy`.
+- The kernel has no nf_tables, so iptables here is iptables-legacy: leave
+  it, or Docker's networking stops.
+- On a VM kept to a list of names (The network), Docker Hub needs
+  registry-1.docker.io, auth.docker.io and production.cloudflare.docker.com
+  on it. A pull refused for one of those is the list: ask the owner.
+
 ## The network
 
 - You reach the internet, but not the host, its LAN or other VMs, except
