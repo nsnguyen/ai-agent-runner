@@ -172,7 +172,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             HOST_RESOLV_CONFS.join(" or ")
         ));
     }
-    let ip_arg = net.boot_arg(name, &dns);
+    let ip_arg = net.boot_arg_with(name, &dns);
     let api_sock = run.api_socket();
     let vsock = run.vsock();
     let creds_sock = run.creds_socket();

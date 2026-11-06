@@ -164,7 +164,7 @@ fn boot_calls(root: &Path, kernel: &Path, cpus: u32, mem: u32) -> Vec<(String, V
     // The DNS servers are this machine's, as boot reads them.
     let net = Store::new(root).net("dev").unwrap();
     let dns = net::dns(&HOST_RESOLV_CONFS.map(Path::new));
-    let args = format!("{BOOT_ARGS} {}", net.boot_arg("dev", &dns));
+    let args = format!("{BOOT_ARGS} {}", net.boot_arg_with("dev", &dns));
     vec![
         call(
             "PUT /boot-source",

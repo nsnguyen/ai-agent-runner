@@ -7,6 +7,7 @@ pub mod changes;
 pub mod checkpoint;
 pub mod claude;
 pub mod creds;
+pub mod dns;
 pub mod doctor;
 pub mod exec;
 pub mod export;

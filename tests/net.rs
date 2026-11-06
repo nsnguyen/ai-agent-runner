@@ -110,19 +110,30 @@ fn each_slot_is_a_slash_30_with_its_own_tap() {
     assert_eq!(subnet("10.254.0.0/16").net(1).unwrap().tap, "fc0afe0004");
 }
 
+// The guest's DNS is its boot, on its gateway (src/dns.rs).
 #[test]
-fn the_boot_argument_sets_address_gateway_hostname_and_dns() {
+fn the_boot_argument_sets_address_gateway_hostname_and_the_gateway_as_dns() {
+    let net = DEFAULT_SUBNET.net(1).unwrap();
+    assert_eq!(
+        net.boot_arg("dev"),
+        "ip=172.16.0.6::172.16.0.5:255.255.255.252:dev:eth0:off:172.16.0.5"
+    );
+}
+
+// A boot that can't serve DNS gives the guest the host's resolvers instead.
+#[test]
+fn the_boot_argument_can_name_other_dns_servers() {
     let net = DEFAULT_SUBNET.net(1).unwrap();
     let head = "ip=172.16.0.6::172.16.0.5:255.255.255.252:dev:eth0:off";
-    assert_eq!(net.boot_arg("dev", &[]), head);
+    assert_eq!(net.boot_arg_with("dev", &[]), head);
     assert_eq!(
-        net.boot_arg("dev", &[ip("8.8.8.8")]),
+        net.boot_arg_with("dev", &[ip("8.8.8.8")]),
         format!("{head}:8.8.8.8")
     );
     // The kernel takes two.
     let three = [ip("8.8.8.8"), ip("1.1.1.1"), ip("9.9.9.9")];
     assert_eq!(
-        net.boot_arg("dev", &three),
+        net.boot_arg_with("dev", &three),
         format!("{head}:8.8.8.8:1.1.1.1")
     );
 }
