@@ -34,8 +34,25 @@ pub const TIME: Duration = Duration::from_secs(600);
 
 const MAX_DEPTH: usize = 256;
 const MAX_ENTRIES: u64 = 10_000_000;
+
+/// How far reading a disk a guest wrote may go: how many directories deep,
+/// how many entries in all, and for how long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub depth: usize,
+    pub entries: u64,
+    pub time: Duration,
+}
+
+/// What measuring a run may read, which a copy out of a disk
+/// (src/graft.rs) keeps to as well.
+pub const LIMITS: Limits = Limits {
+    depth: MAX_DEPTH,
+    entries: MAX_ENTRIES,
+    time: TIME,
+};
 // Longer than any path a link can hold.
-const MAX_LINK: u64 = 4096;
+pub(crate) const MAX_LINK: u64 = 4096;
 // How often measuring asks whether to stop, in entries and blocks read.
 const ASK_EVERY: u32 = 1024;
 
@@ -174,17 +191,12 @@ pub fn between_until(
     time: Duration,
     stop: &dyn Fn() -> bool,
 ) -> Result<Changes> {
+    let limits = Limits { time, ..LIMITS };
     let mut walk = Walk {
         before: Disk::load(before)?,
         after: Disk::load(after)?,
         cap,
-        budget: Budget {
-            entries: MAX_ENTRIES,
-            until: Instant::now() + time,
-            time,
-            stop,
-            asked: Cell::new(0),
-        },
+        budget: Budget::new(limits, "measuring", stop),
         listed: 0,
         out: Changes::default(),
     };
@@ -192,18 +204,23 @@ pub fn between_until(
     Ok(walk.out)
 }
 
-struct Disk<'a> {
-    fs: Ext4,
-    path: &'a Path,
+pub(crate) struct Disk<'a> {
+    pub(crate) fs: Ext4,
+    pub(crate) path: &'a Path,
 }
 
 impl<'a> Disk<'a> {
-    fn load(path: &'a Path) -> Result<Self> {
+    pub(crate) fn load(path: &'a Path) -> Result<Self> {
         let fs = Ext4::load_from_path(path).map_err(read(path))?;
         Ok(Disk { fs, path })
     }
 
-    fn entries(&self, dir: &InPathBuf, budget: &mut Budget) -> Result<BTreeMap<Vec<u8>, Metadata>> {
+    // Each entry in `dir` but . and .., by name.
+    pub(crate) fn entries(
+        &self,
+        dir: &InPathBuf,
+        budget: &mut Budget,
+    ) -> Result<BTreeMap<Vec<u8>, Metadata>> {
         let mut out = BTreeMap::new();
         for entry in self.fs.read_dir(dir).map_err(read(self.path))? {
             let entry = entry.map_err(read(self.path))?;
@@ -218,9 +235,7 @@ impl<'a> Disk<'a> {
 
     // Everything under `dir`, counted.
     fn count(&self, dir: &InPathBuf, depth: usize, budget: &mut Budget) -> Result<u64> {
-        if depth > MAX_DEPTH {
-            return Err(self.unbounded(too_deep()));
-        }
+        budget.deep(depth).map_err(|why| self.unbounded(why))?;
         let mut n = 0;
         for (name, m) in self.entries(dir, budget)? {
             n += 1;
@@ -231,21 +246,21 @@ impl<'a> Disk<'a> {
         Ok(n)
     }
 
-    fn open(&self, path: &InPathBuf) -> Result<File> {
+    pub(crate) fn open(&self, path: &InPathBuf) -> Result<File> {
         self.fs.open(path).map_err(read(self.path))
     }
 
-    fn link(&self, path: &InPathBuf) -> Result<InPathBuf> {
+    pub(crate) fn link(&self, path: &InPathBuf) -> Result<InPathBuf> {
         self.fs.read_link(path).map_err(read(self.path))
     }
 
-    fn unbounded(&self, why: String) -> Error {
+    pub(crate) fn unbounded(&self, why: String) -> Error {
         let disk = self.path.to_path_buf();
         Error::Unbounded { disk, why }
     }
 }
 
-fn read(disk: &Path) -> impl Fn(Ext4Error) -> Error + use<> {
+pub(crate) fn read(disk: &Path) -> impl Fn(Ext4Error) -> Error + use<> {
     let disk = disk.to_path_buf();
     move |source| Error::Read {
         disk: disk.clone(),
@@ -253,36 +268,56 @@ fn read(disk: &Path) -> impl Fn(Ext4Error) -> Error + use<> {
     }
 }
 
-fn too_deep() -> String {
-    format!("more than {MAX_DEPTH} directories deep; does a directory contain itself?")
-}
-
-struct Budget<'a> {
+// What's left of the limits as a walk goes. Each error says which limit ran
+// out.
+pub(crate) struct Budget<'a> {
+    limits: Limits,
+    // What the walk is for, as its errors say it: "measuring".
+    doing: &'static str,
     entries: u64,
     until: Instant,
-    time: Duration,
     stop: &'a dyn Fn() -> bool,
     // How often it's been asked whether to go on.
     asked: Cell<u32>,
 }
 
-impl Budget<'_> {
-    fn entry(&mut self) -> std::result::Result<(), String> {
-        self.entries = self
-            .entries
-            .checked_sub(1)
-            .ok_or(format!("more than {MAX_ENTRIES} entries"))?;
+impl<'a> Budget<'a> {
+    pub(crate) fn new(limits: Limits, doing: &'static str, stop: &'a dyn Fn() -> bool) -> Self {
+        Budget {
+            limits,
+            doing,
+            entries: limits.entries,
+            until: Instant::now() + limits.time,
+            stop,
+            asked: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn deep(&self, depth: usize) -> std::result::Result<(), String> {
+        if depth > self.limits.depth {
+            let max = self.limits.depth;
+            return Err(format!(
+                "more than {max} directories deep; does a directory contain itself?"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn entry(&mut self) -> std::result::Result<(), String> {
+        let max = self.limits.entries;
+        self.entries = (self.entries.checked_sub(1)).ok_or(format!("more than {max} entries"))?;
         self.in_time()
     }
 
-    fn in_time(&self) -> std::result::Result<(), String> {
+    pub(crate) fn in_time(&self) -> std::result::Result<(), String> {
         if Instant::now() >= self.until {
-            return Err(format!("measuring took over {}s", self.time.as_secs_f32()));
+            let secs = self.limits.time.as_secs_f32();
+            return Err(format!("{} took over {secs}s", self.doing));
         }
         let asked = self.asked.get();
         self.asked.set(asked.wrapping_add(1));
         if asked.is_multiple_of(ASK_EVERY) && (self.stop)() {
-            return Err("measuring was stopped".to_string());
+            return Err(format!("{} was stopped", self.doing));
         }
         Ok(())
     }
@@ -302,9 +337,8 @@ impl Walk<'_> {
     // A directory on both disks. Limits that run out name the run's disk,
     // `after`, which is the one a guest could have shaped.
     fn dir(&mut self, dir: &InPathBuf, depth: usize) -> Result<()> {
-        if depth > MAX_DEPTH {
-            return Err(self.after.unbounded(too_deep()));
-        }
+        let deep = self.budget.deep(depth);
+        deep.map_err(|why| self.after.unbounded(why))?;
         let old = self.before.entries(dir, &mut self.budget)?;
         let new = self.after.entries(dir, &mut self.budget)?;
         let names: BTreeSet<_> = old.keys().chain(new.keys()).collect();
@@ -408,7 +442,7 @@ impl Walk<'_> {
 
 // Names are bytes and JSON is text. Escaping the backslash too keeps two
 // different names from ever printing the same.
-fn shown(path: &[u8]) -> String {
+pub(crate) fn shown(path: &[u8]) -> String {
     let mut out = String::new();
     for chunk in path.utf8_chunks() {
         out.push_str(&chunk.valid().replace('\\', r"\\"));
@@ -419,7 +453,7 @@ fn shown(path: &[u8]) -> String {
     out
 }
 
-fn fill(file: &mut File, buf: &mut [u8]) -> std::result::Result<usize, Ext4Error> {
+pub(crate) fn fill(file: &mut File, buf: &mut [u8]) -> std::result::Result<usize, Ext4Error> {
     let mut n = 0;
     while n < buf.len() {
         match file.read_bytes(&mut buf[n..])? {
