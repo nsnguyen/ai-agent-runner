@@ -1,0 +1,16 @@
+# runner-host-idle.service, which runner-host-idle.timer starts every
+# minute and host/install.sh installs: one look at whether the host has
+# been idle for its idle time (/etc/runner/host-idle), and if it has, a
+# power-off, which on EC2 stops the instance (src/power.rs).
+[Unit]
+Description=runner: power the host off once it's idle
+# The VMs and the busy lock are there.
+RequiresMountsFor=/var/lib/runner
+
+[Service]
+Type=oneshot
+# The polkit rule host/install.sh writes lets runner power the host off, and
+# nothing more.
+User=runner
+Environment=RUNNER_ROOT=/var/lib/runner
+ExecStart=/usr/local/bin/runner host-idle

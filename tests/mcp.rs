@@ -274,6 +274,51 @@ fn start_status_and_stop_through_systemd() {
     );
 }
 
+// Each call holds the host up while it works, and the session between calls
+// doesn't, so a `runner mcp` left open on the laptop lets the host power off
+// (src/power.rs).
+#[test]
+fn a_tool_call_holds_the_busy_lock_and_the_session_doesn_t() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    Store::new(dir.path()).import("base", &disk).unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    let d = sd.bin.display();
+    common::script(
+        &sd.bin.join("systemctl"),
+        &format!(
+            r#"case "$1" in
+start) touch "{d}/started"; while [ ! -e "{d}/go" ]; do sleep 0.01; done ;;
+show) echo active ;;
+esac
+"#
+        ),
+    );
+    let lock = runner::power::busy_lock(dir.path());
+    let free = || {
+        let file = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock);
+        file.unwrap().try_lock().is_ok()
+    };
+
+    let mut s = start_with_path(dir.path(), &sd.path());
+    let got = s.call(2, "list_vms", json!({}));
+    assert_ne!(got["isError"], json!(true), "{got}");
+    assert!(free(), "held between calls");
+    let params = json!({"name": "start_vm", "arguments": {"name": "base"}});
+    s.send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": params}));
+    common::wait_for("the start", || sd.bin.join("started").exists());
+    assert!(!free(), "free while start_vm works");
+    fs::write(sd.bin.join("go"), "").unwrap();
+    let got = s.reply(3)["result"].clone();
+    assert_eq!(got["structuredContent"]["state"], json!("running"), "{got}");
+    assert!(free(), "held after start_vm");
+}
+
 // With no peers, this host only: its VMs, the ones up, and MemAvailable, as
 // `runner hosts` counts them. tests/mcp_hosts.rs has the rest.
 #[test]

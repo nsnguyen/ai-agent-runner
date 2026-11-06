@@ -9,6 +9,7 @@ use runner::idle::Idle;
 use runner::image;
 use runner::import;
 use runner::peers;
+use runner::power;
 use runner::proto::{Exit, Request};
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
@@ -393,6 +394,18 @@ enum Cmd {
     /// tunnel, so the VM doesn't idle-sleep under it.
     #[command(hide = true)]
     Hold { name: String },
+    /// Power the host off if it has been idle for its idle time, saying
+    /// why first: what runner-host-idle.timer runs every minute
+    /// (src/power.rs).
+    #[command(hide = true)]
+    HostIdle {
+        /// The host's idle time, as host/install.sh keeps it.
+        #[arg(long, default_value = runner::host::HOST_IDLE)]
+        setting: PathBuf,
+        /// How long the host has been up.
+        #[arg(long, default_value = runner::host::UPTIME)]
+        uptime: PathBuf,
+    },
     /// Run what another host's key may run here, from SSH_ORIGINAL_COMMAND:
     /// `runner mcp` or `runner import <vm> -`, and nothing else. The forced
     /// command of every host's key line on the others (src/peers.rs).
@@ -467,6 +480,19 @@ fn main() -> ExitCode {
 }
 
 fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> {
+    // Every command holds the host up while it works (src/power.rs), but
+    // these: mcp holds it per call, hold's VM is up, a VM's own unit runs
+    // boot and halt, and boot stays up while its VM sleeps, peer runs a
+    // command that holds it itself, and host-idle is the look.
+    let _busy = match cmd {
+        Cmd::Mcp { .. }
+        | Cmd::Hold { .. }
+        | Cmd::Boot { .. }
+        | Cmd::Halt { .. }
+        | Cmd::Peer
+        | Cmd::HostIdle { .. } => None,
+        _ => power::Busy::take(store.root()),
+    };
     match cmd {
         Cmd::Import {
             name,
@@ -728,6 +754,9 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         Cmd::Hold { name } => exec::hold(&store, &name, std::io::stdout())?,
         Cmd::Drive { name, n, claude } => runs::drive(&store, &name, n, &claude)?,
         Cmd::Peer => return peer(root, store),
+        Cmd::HostIdle { setting, uptime } => {
+            power::look(&store, &setting, &uptime)?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

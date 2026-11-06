@@ -178,17 +178,7 @@ fn awake(store: &Store, name: &str, state: State) -> Result<bool> {
 
 pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
     let vm = store.get(name)?;
-    let unit = unit_name(name);
-    let active = systemctl(name, &["show", "--property=ActiveState", "--value", &unit])?;
-    let active = active.trim();
-    let mut state = State::from_active_state(active).ok_or_else(|| Error::UnknownState {
-        unit,
-        state: active.to_string(),
-    })?;
-    // Only while its boot is up: one killed asleep leaves its snapshot.
-    if state == State::Running && store.sleeping(name)?.is_some() {
-        state = State::Sleeping;
-    }
+    let state = state(store, name)?;
     // A start or stop that worked shouldn't be reported as failed for want
     // of an address.
     let address = store.net(name).ok().map(|net| net.address);
@@ -204,6 +194,22 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
         creds,
         url,
     })
+}
+
+/// Only the VM's state, of all `status` says: its unit's, or sleeping.
+pub fn state(store: &Store, name: &str) -> Result<State> {
+    let unit = unit_name(name);
+    let active = systemctl(name, &["show", "--property=ActiveState", "--value", &unit])?;
+    let active = active.trim();
+    let state = State::from_active_state(active).ok_or_else(|| Error::UnknownState {
+        unit,
+        state: active.to_string(),
+    })?;
+    // Only while its boot is up: one killed asleep leaves its snapshot.
+    if state == State::Running && store.sleeping(name)?.is_some() {
+        return Ok(State::Sleeping);
+    }
+    Ok(state)
 }
 
 /// The VM's journal: its serial console and the runner's own lines, on this

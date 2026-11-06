@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod moves;
 pub mod net;
 pub mod peers;
+pub mod power;
 pub mod proto;
 pub mod result;
 pub mod runs;

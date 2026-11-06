@@ -216,11 +216,12 @@ exit "$code"
     }
 }
 
-/// systemctl and journalctl on PATH. systemctl logs its argv to `calls`,
+/// systemctl, journalctl and loginctl on PATH. systemctl logs its argv to `calls`,
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
 /// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that
 /// file exists. A `stop` runs `on-stop` first if a test put one there, as the
-/// unit runs its ExecStop. journalctl logs its argv and prints one line.
+/// unit runs its ExecStop. journalctl logs its argv and prints one line;
+/// loginctl logs its argv and prints the sessions `set_logins` gave.
 pub struct FakeSystemd {
     pub bin: PathBuf,
 }
@@ -250,7 +251,29 @@ esac
                 "echo \"journalctl $*\" >> \"{d}/calls\"\necho 'fake console: Linux version 6.1'\n"
             ),
         );
+        script(
+            &bin.join("loginctl"),
+            &format!(
+                "echo \"loginctl $*\" >> \"{d}/calls\"\ncat \"{d}/sessions\" 2>/dev/null || true\n"
+            ),
+        );
         FakeSystemd { bin }
+    }
+
+    /// Who loginctl says is logged in: a session for each user, in the
+    /// columns `loginctl list-sessions --no-legend` prints them in, systemd
+    /// 255's.
+    pub fn set_logins(&self, users: &[&str]) {
+        let lines: String = (users.iter().enumerate())
+            .map(|(i, user)| {
+                format!(
+                    "{:>7} {:>4} {user} -    pts/{i} active no   -\n",
+                    i + 3,
+                    1000 + i
+                )
+            })
+            .collect();
+        fs::write(self.bin.join("sessions"), lines).unwrap();
     }
 
     /// PATH with the fakes first.
