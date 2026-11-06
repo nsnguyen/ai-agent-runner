@@ -576,8 +576,12 @@ fn host_idle_shows_the_setting_and_whether_the_host_can_power_itself_off() {
     let report = assert_verdict(never, &store, "host-idle", Status::Ok, "never");
     assert!(verdict(&report, "host-idle").1.contains("RUNNER_HOST_IDLE"));
 
-    let unset = fake().file(host::HOST_IDLE, Err(ErrorKind::NotFound));
-    assert_verdict(unset, &store, "host-idle", Status::Warn, "host/install.sh");
+    // install.sh writes it only when RUNNER_HOST_IDLE sets it, so
+    // aws.sh's setup can tell a host that has none.
+    let unset = fake()
+        .file(host::HOST_IDLE, Err(ErrorKind::NotFound))
+        .cmd(&timer(), ran(false, "inactive\n", ""));
+    assert_verdict(unset, &store, "host-idle", Status::Ok, "never");
     let bad = fake().file(host::HOST_IDLE, Ok("soon\n"));
     let report = assert_verdict(bad, &store, "host-idle", Status::Warn, "soon");
     assert!(verdict(&report, "host-idle").1.contains("RUNNER_HOST_IDLE"));

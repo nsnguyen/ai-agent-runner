@@ -465,6 +465,7 @@ fn key(host: &impl Host) -> Verdict {
 // still runs VMs, so none of it fails.
 fn host_idle(host: &impl Host, root: &Path) -> Verdict {
     let path = host::HOST_IDLE;
+    // None there is never, as install.sh leaves it unless told otherwise.
     let idle = match host.read(Path::new(path)) {
         Ok(text) => match text.trim().parse::<Idle>() {
             Ok(idle) => idle,
@@ -474,9 +475,7 @@ fn host_idle(host: &impl Host, root: &Path) -> Verdict {
                 ));
             }
         },
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return warn(format!("no {path}, so the host stays up: rerun {INSTALL}"));
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Idle::Never,
         Err(e) => return warn(format!("{path}: {e}")),
     };
     if idle == Idle::Never {

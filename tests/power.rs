@@ -485,3 +485,154 @@ fn a_runner_command_holds_the_busy_lock_while_it_works() {
     let since = SystemTime::now().duration_since(mtime(&h.lock())).unwrap();
     assert!(since < MIN, "let go {since:?} ago");
 }
+
+// A journal followed until Ctrl-C does no work on the host, so one left
+// open on the laptop doesn't keep it up, as an idle `runner mcp` doesn't.
+#[test]
+fn following_a_vm_s_logs_doesn_t_hold_the_host_up() {
+    let h = host("1h", 3 * HOUR);
+    let d = h.sd.bin.display();
+    script(
+        &h.sd.bin.join("journalctl"),
+        &format!("touch \"{d}/started\"\nwhile [ ! -e \"{d}/go\" ]; do sleep 0.01; done\n"),
+    );
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(h.lock())
+        .unwrap();
+    for args in [&["logs", "dev", "--follow"][..], &["logs", "dev"]] {
+        let _ = fs::remove_file(h.sd.bin.join("go"));
+        let _ = fs::remove_file(h.sd.bin.join("started"));
+        let mut logs = Command::new(env!("CARGO_BIN_EXE_runner"))
+            .env("RUNNER_ROOT", h.store.root())
+            .env("PATH", h.sd.path())
+            .args(args)
+            .spawn()
+            .unwrap();
+        common::wait_for("journalctl", || h.sd.bin.join("started").exists());
+        let free = lock.try_lock().is_ok();
+        let _ = lock.unlock();
+        fs::write(h.sd.bin.join("go"), "").unwrap();
+        assert!(logs.wait().unwrap().success());
+        assert_eq!(free, args.len() == 3, "{args:?}");
+    }
+}
+
+#[test]
+fn sessions_are_read_by_their_first_three_columns() {
+    let listed = "\
+SESSION  UID USER   SEAT  TTY   STATE  IDLE SINCE
+      3 1000 ubuntu -     pts/0 active no   -
+     c1  999 runner seat0 tty1
+      7 1001 nguyen -    -      user   pts/1 no -
+No sessions.
+
+3 sessions listed.
+";
+    assert_eq!(
+        power::parse_sessions(listed),
+        ["ubuntu", "runner", "nguyen"]
+    );
+    assert_eq!(power::parse_sessions(""), Vec::<String>::new());
+}
+
+#[test]
+fn uptime_is_proc_uptime_s_first_figure() {
+    let up = power::parse_uptime("350735.47 234388.90\n");
+    assert_eq!(up, Some(Duration::from_millis(350_735_470)));
+    for bad in ["", "\n", "up 3 days", "-1 0", "NaN 0", "inf 0"] {
+        assert_eq!(power::parse_uptime(bad), None, "{bad:?}");
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn the_parsers_take_any_text_without_panicking(text in "\\PC*") {
+        power::parse_uptime(&text);
+        power::parse_sessions(&text);
+    }
+}
+
+fn install_sh() -> String {
+    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/host/install.sh")).unwrap()
+}
+
+// install.sh's own check of RUNNER_HOST_IDLE, run in bash, against what the
+// runner reads (src/idle.rs): the same, but for counts of more than six
+// digits, which it refuses so none overflows the runner's.
+#[test]
+fn install_sh_takes_the_idle_times_the_runner_reads() {
+    let script = install_sh();
+    let start = script.find("bad_idle=").unwrap();
+    let end = start + script[start..].find("\nfi\n").unwrap() + "\nfi\n".len();
+    let check = &script[start..end];
+    let mut values = vec!["never", "Never", "-1", "1.5h", " 1h", "1h ", "1 h", "h"];
+    let counts = [
+        "",
+        "0",
+        "00",
+        "1",
+        "007",
+        "10",
+        "999999",
+        "1000000",
+        "4294967295",
+    ];
+    let units = ["", "s", "m", "h", "d", "ms"];
+    let made: Vec<String> = (counts.iter())
+        .flat_map(|c| units.iter().map(move |u| format!("{c}{u}")))
+        .collect();
+    values.extend(made.iter().map(String::as_str));
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "die() {{ echo bad; exit; }}\nfor idle; do (\n{check}echo ok\n); done"
+        ))
+        .arg("bash")
+        .args(&values)
+        .output()
+        .unwrap();
+    let said = text(&out.stdout);
+    let verdicts: Vec<&str> = said.lines().collect();
+    assert_eq!(verdicts.len(), values.len(), "{said}{}", text(&out.stderr));
+    for (value, verdict) in values.iter().zip(verdicts) {
+        let runner = value.parse::<Idle>().is_ok();
+        let digits = value.bytes().filter(u8::is_ascii_digit).count();
+        let want = runner && digits <= 6;
+        assert_eq!(
+            verdict == "ok",
+            want,
+            "{value:?}: install.sh {verdict}, runner {runner}"
+        );
+    }
+}
+
+#[test]
+fn install_sh_installs_the_units_and_grants_only_the_power_off() {
+    let script = install_sh();
+    for unit in [host::IDLE_SERVICE, host::IDLE_TIMER] {
+        let line = format!("install -m 0644 \"$here/{unit}\" /etc/systemd/system/{unit}\n");
+        assert!(script.contains(&line), "{line}");
+    }
+    assert!(script.contains(&format!("systemctl enable {}\n", host::IDLE_TIMER)));
+    assert!(script.contains(&format!("systemctl disable --now {}\n", host::IDLE_TIMER)));
+    let rule = format!(
+        "if (action.id == \"{}\" && subject.user == \"runner\") {{",
+        power::POWER_OFF
+    );
+    assert!(script.contains(&rule), "{rule}");
+    let login1: Vec<&str> = (script.lines())
+        .filter(|l| l.contains("org.freedesktop.login1"))
+        .collect();
+    assert_eq!(login1, [format!("  {rule}")], "only the one action");
+    // Only with an idle time.
+    let at = script.find(&rule).unwrap();
+    let before = &script[..at];
+    let opened = before.rfind("if [[ $idle != never ]]; then").unwrap();
+    assert!(
+        !before[opened..].contains("\nfi\n"),
+        "the rule is outside the if"
+    );
+}

@@ -20,12 +20,12 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 
 ## Idle power-off
 
-A host can power itself off once nothing has used it for its idle time, which on EC2 stops the instance (docs/design.md, The host stops itself when idle). `client/aws.sh setup` sets an hour on a host it made; `host/install.sh` alone sets never, so a host it didn't make stays up.
+A host can power itself off once nothing has used it for its idle time, which on EC2 stops the instance (docs/design.md, The host stops itself when idle). `client/aws.sh setup` sets an hour on a host it made that has no idle time yet; `host/install.sh` alone leaves it never, so a host aws.sh didn't make stays up.
 
-- `sudo RUNNER_HOST_IDLE=2h host/install.sh` sets it, in `runner idle`'s syntax (`90s`, `60m`, `2h`), or `never`. It's kept in `/etc/runner/host-idle`, so reruns keep it.
+- `sudo RUNNER_HOST_IDLE=2h host/install.sh` sets it, in `runner idle`'s syntax (`90s`, `60m`, `2h`), or `never`. It's kept in `/etc/runner/host-idle`, so reruns keep it; install.sh writes that file only once one is set.
 - With a time set, install.sh enables `runner-host-idle.timer`, which runs `runner host-idle` as runner every minute, and adds a polkit rule letting runner power the host off and nothing more: not past an inhibitor (`systemd-inhibit`), and not while anyone else is logged in, since logind then asks for another action. With `never`, it disables the timer and leaves the rule out.
 - Use is a VM running, booting or stopping (a run, a shell, a proxy or a URL connection keeps one running), a login by any user but runner (your admin SSH, or `host/check.sh`), or a runner command at work, which holds `/var/lib/runner/busy.lock`. runner's own SSH sessions don't count unless a command is running in one. The idle time counts from the last use or the host's boot, whichever is later, so a host just started gets all of it.
-- The look writes nothing to its journal until it powers off, then says why first: `journalctl -b -1 -u runner-host-idle` after the next boot. `runner doctor`'s `host-idle` line shows the setting, and warns if the timer isn't active, polkit won't let runner power off, or the busy lock won't open.
+- Past systemd's own lines as it starts each minute, the look writes nothing to its journal until it powers off, and then says why first: `journalctl -b -1 -u runner-host-idle` after the next boot. `runner doctor`'s `host-idle` line shows the setting, and warns if the timer isn't active, polkit won't let runner power off, or the busy lock won't open.
 
 ## A host aws.sh didn't make
 

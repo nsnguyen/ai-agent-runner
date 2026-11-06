@@ -497,12 +497,14 @@ fn main() -> ExitCode {
 
 fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> {
     // Every command holds the host up while it works (src/power.rs), but
-    // these: mcp holds it per call, hold's VM is up, units run boot, halt
-    // and park, and boot stays up while its VM sleeps, peer runs a command
-    // that holds it itself, and host-idle is the look.
+    // these: mcp holds it per call, hold's VM is up, a journal followed
+    // until Ctrl-C does no work, units run boot, halt and park, and boot
+    // stays up while its VM sleeps, peer runs a command that holds it
+    // itself, and host-idle is the look.
     let _busy = match cmd {
         Cmd::Mcp { .. }
         | Cmd::Hold { .. }
+        | Cmd::Logs { follow: true, .. }
         | Cmd::Boot { .. }
         | Cmd::Halt { .. }
         | Cmd::Park { .. }

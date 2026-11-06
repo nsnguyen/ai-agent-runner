@@ -229,7 +229,8 @@ pub fn parse_uptime(text: &str) -> Option<Duration> {
 /// The user of each line `loginctl list-sessions --no-legend` prints, whose
 /// first three columns are the session, its user's uid, and its user, in
 /// every systemd from 219 on. A line that isn't one, like "No sessions.", is
-/// skipped.
+/// skipped. From systemd 256, a lingering user's manager is listed too, and
+/// counts as that user logged in; Ubuntu 24.04 has 255.
 pub fn parse_sessions(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {

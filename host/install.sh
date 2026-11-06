@@ -128,10 +128,16 @@ fi
 say "/var/lib/runner"
 install -d -o runner -g runner -m 0750 /var/lib/runner /var/lib/runner/kernel
 # Every runner command holds it while it works, so the host stays up. runner
-# has to own it, or a command run as root first would leave it root's.
+# has to own it: one a command run as root left root's goes, and so does
+# anything but a plain file, a link above all, which runner could point
+# anywhere. runner makes it anew, with only runner's rights.
 busy=/var/lib/runner/busy.lock
-[[ -e $busy ]] || install -o runner -g runner -m 0644 /dev/null "$busy"
-chown runner:runner "$busy"
+if [[ -L $busy || -e $busy ]]; then
+  if [[ -L $busy || ! -f $busy ]] || [[ $(stat -c %U "$busy") != runner ]]; then
+    rm -rf -- "$busy"
+  fi
+fi
+runuser -u runner -- touch "$busy"
 
 say "polkit rule"
 cat >"$tmp/50-runner.rules" <<'EOF'
@@ -191,8 +197,11 @@ systemctl enable runner-park.service
 systemctl start runner-park.service
 
 say "host idle: $idle"
-echo "$idle" >"$tmp/host-idle"
-install -m 0644 "$tmp/host-idle" /etc/runner/host-idle
+# Only one that was set, so client/aws.sh's setup can tell a host with none.
+if [[ -n ${RUNNER_HOST_IDLE:-} || -e /etc/runner/host-idle ]]; then
+  echo "$idle" >"$tmp/host-idle"
+  install -m 0644 "$tmp/host-idle" /etc/runner/host-idle
+fi
 install -m 0644 "$here/runner-host-idle.service" /etc/systemd/system/runner-host-idle.service
 install -m 0644 "$here/runner-host-idle.timer" /etc/systemd/system/runner-host-idle.timer
 systemctl daemon-reload
