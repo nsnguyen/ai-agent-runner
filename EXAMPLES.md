@@ -52,6 +52,18 @@ Anything installed outside those, like apt packages, is gone, and so are users a
 
 So reinstall your apt packages after it. Claude Code comes from base, at base's version.
 
+A VM gets 2 CPUs, 2 GB of memory and base's 20 GB disk unless you say otherwise. To give one more, stop it first:
+
+```sh
+runner stop demo
+runner resize demo --disk 40G --mem 8G --cpus 4    # any of the three; it's that big from its next start
+runner status demo                                 # shows its disk, cpus and memory
+runner undo demo                                   # the disk as it was before the resize
+runner create big --disk 40G --mem 8G              # or make a new VM that big from the start
+```
+
+A disk only grows, and your files stay as they were.
+
 ## 3. Work in a VM
 
 ```sh

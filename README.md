@@ -346,6 +346,20 @@ session 0b5c1e8e-6f1d-4f43-9a7e-2d3c4b5a6978: `runner run dev --resume 0b5c1e8e-
 
 A try still at the disk it forked, because its run rolled back or never got going, has nothing of its own to keep, so it's refused, and so is one whose run is still going; any other is kept from its current disk, whatever later runs in it did. A try that's up, say one you started by hand, is refused until you `runner stop` it, whether it's the one kept or one to delete. Tries whose runs booted them and are still going are cancelled first, all at once, then deleted with the rest, and dev's record of the batch goes with them, so `runner tries dev` says `no tries yet` and a VM made later under a try's name isn't taken for one. A running or sleeping dev is stopped, which commits its disk, put on the kept disk and started again, as `restore` does, so what dev wrote since the batch forked is under the keep, where `undo` finds it. keep is refused while dev has a run going. Everything is checked before anything changes. Over MCP, `keep_try` takes a try's `name`, or dev's `name` and `none: true`, and returns the kept try, its run and `session`, dev's `generation`, and the runs cancelled and tries deleted.
 
+### Sizes
+
+```sh
+runner create big --cpus 4 --mem 8G --disk 40G   # a fork with sizes of its own, its disk grown as it's made
+runner stop dev
+runner resize dev --disk 40G --mem 4G --cpus 4   # any of the three, from dev's next boot
+runner status dev                                # dev  gen 7  42949672960 bytes  cpus 4  mem 4G  stopped
+runner undo dev                                  # the disk as it was before the resize
+```
+
+A VM gets 2 vCPUs and 2 GiB of memory unless `create --cpus --mem` says otherwise, and the disk of the VM it forks: 20 GiB from a base built as it comes. `list` and `status` show each VM's disk in bytes, its vCPUs and its memory. `resize` changes a stopped VM's. Memory and vCPUs go in its config, as `create`'s do, and count from its next boot. The disk only grows, since shrinking means moving the guest's data: the bigger one is a new generation, noted `resize to 40G` in `runner checkpoints`, so `undo` takes it back. It's a reflink copy of the current disk, lengthened with a hole so it stays sparse, then `e2fsck -f -p` and `resize2fs` on the copy, never on the disk dev had. Its files are as they were, and the guest's `df -h /` shows the new size at its next boot. A step that fails drops the copy, and dev stays as it was. It's refused, with nothing changed, while dev is running, booting, stopping or sleeping (`runner stop dev` first: a sleeping VM's snapshot is tied to its disk and memory), for a disk no bigger than the one it has, and for a size `--mem` wouldn't take: MiB, or a whole number with M, G or T. `create --disk` forks and grows in one step, its source untouched; the source's own size makes a plain fork, and a smaller one is refused. MCP has `resize_vm`, and `create_vm` takes `disk`. `host/install.sh` installs e2fsprogs, and `runner doctor` warns when it's missing.
+
+`base` can be resized too: forks made after that get the bigger disk, and those made before keep theirs. `host/check.sh`'s `import base --replace` brings base back to the image's size, so for a base that stays bigger, build it bigger: `sudo SIZE=40G images/base/build.sh` (Build the base image). A resized base isn't a disk an import made, so `runner rebase` refuses it until base is imported again.
+
 ### Checkpoints
 
 ```sh

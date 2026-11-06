@@ -204,8 +204,7 @@ fn create_then_list() {
         vm
     };
     let listed = s.call(3, "list_vms", json!({}));
-    let base =
-        json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base"), "cpus": 2, "mem_mib": 2048});
+    let base = json!({"name": "base", "generation": 0, "bytes": 6, "used": used(dir.path(), "base"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(
         listed["structuredContent"],
         json!({"vms": [here(&base), here(&dev)]})
@@ -309,8 +308,7 @@ fn rebase_vm_says_what_it_kept() {
     let mut s = start(dir.path());
     let done = s.call(2, "rebase_vm", json!({"name": "dev"}));
     assert_eq!(done["isError"], json!(false), "{done}");
-    let vm =
-        json!({"name": "dev", "generation": 1, "bytes": 16 << 20, "used": used(dir.path(), "dev"), "cpus": 2, "mem_mib": 2048});
+    let vm = json!({"name": "dev", "generation": 1, "bytes": 16 << 20, "used": used(dir.path(), "dev"), "cpus": 2, "mem_mib": 2048});
     assert_eq!(
         done["structuredContent"],
         json!({
@@ -545,7 +543,11 @@ fn resize_vm_grows_a_disk_and_sets_sizes() {
     let machine = store.machine("dev").unwrap();
     assert_eq!((machine.cpus, machine.mem_mib), (4, 4096));
     let undone = s.call(3, "undo_vm", json!({"name": "dev"}));
-    assert_eq!(undone["structuredContent"]["bytes"], json!(16 << 20), "{undone}");
+    assert_eq!(
+        undone["structuredContent"]["bytes"],
+        json!(16 << 20),
+        "{undone}"
+    );
 
     let bad = s.call(4, "resize_vm", json!({"name": "dev", "disk": "big"}));
     assert_eq!(bad["isError"], json!(true), "{bad}");
@@ -565,10 +567,18 @@ fn resize_vm_grows_a_disk_and_sets_sizes() {
     let args = json!({"name": "app", "from": "dev", "disk": "64M"});
     let made = s.call(7, "create_vm", args);
     assert_eq!(made["isError"], json!(false), "{made}");
-    assert_eq!(made["structuredContent"]["bytes"], json!(64 << 20), "{made}");
+    assert_eq!(
+        made["structuredContent"]["bytes"],
+        json!(64 << 20),
+        "{made}"
+    );
     let after = fs::read_to_string(dir.path().join("vms/dev/history")).unwrap();
     assert_eq!(after, history);
-    let small = s.call(8, "create_vm", json!({"name": "x", "from": "dev", "disk": "8M"}));
+    let small = s.call(
+        8,
+        "create_vm",
+        json!({"name": "x", "from": "dev", "disk": "8M"}),
+    );
     assert_eq!(small["isError"], json!(true), "{small}");
 }
 

@@ -226,10 +226,7 @@ fn firecracker(host: &impl Host) -> Verdict {
 // without them, so a missing one only warns. resize2fs has no version flag:
 // with no disk it prints its version and usage, and exits 1.
 fn e2fsprogs(host: &impl Host) -> Verdict {
-    let tools = [
-        (host::E2FSCK, &["-V"][..]),
-        (host::RESIZE2FS, &[][..]),
-    ];
+    let tools = [(host::E2FSCK, &["-V"][..]), (host::RESIZE2FS, &[][..])];
     let mut version = String::new();
     for (path, args) in tools {
         match host.run(path, args) {
@@ -245,7 +242,11 @@ fn e2fsprogs(host: &impl Host) -> Verdict {
             Err(e) => return warn(format!("{path}: {e}, so runner resize can't grow a disk")),
         }
     }
-    let version = if version.is_empty() { "e2fsck".to_string() } else { version };
+    let version = if version.is_empty() {
+        "e2fsck".to_string()
+    } else {
+        version
+    };
     ok(format!("{version} and resize2fs, for runner resize"))
 }
 

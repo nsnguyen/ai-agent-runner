@@ -49,7 +49,9 @@ fn create_forks_base_and_list_shows_both() {
     let (base, dev) = (used(dir.path(), "base"), used(dir.path(), "dev"));
     assert_eq!(
         text(&out.stdout),
-        format!("base  gen 0  6 bytes  cpus 2  mem 2G  {base} bytes used\ndev  gen 0  6 bytes  cpus 2  mem 2G  {dev} bytes used\n")
+        format!(
+            "base  gen 0  6 bytes  cpus 2  mem 2G  {base} bytes used\ndev  gen 0  6 bytes  cpus 2  mem 2G  {dev} bytes used\n"
+        )
     );
 }
 
@@ -382,10 +384,22 @@ fn start_status_and_stop_drive_the_vms_unit() {
         assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
         text(&out.stdout)
     };
-    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n");
-    assert_eq!(run(&["start", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
-    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
-    assert_eq!(run(&["stop", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n");
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n"
+    );
+    assert_eq!(
+        run(&["start", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n"
+    );
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n"
+    );
+    assert_eq!(
+        run(&["stop", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n"
+    );
     let show = "systemctl show --property=ActiveState --value firecracker@dev.service";
     assert_eq!(
         sd.calls(),
@@ -414,7 +428,10 @@ fn status_shows_the_credentials_the_guest_took_while_it_runs() {
     };
     let handed = dir.path().join("vms/dev/handed");
     sd.set_state("active");
-    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n");
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  running\n"
+    );
     std::fs::write(&handed, "claude\ngithub\n").unwrap();
     assert_eq!(
         run(&["status", "dev"]),
@@ -427,7 +444,10 @@ fn status_shows_the_credentials_the_guest_took_while_it_runs() {
     );
     // What a killed boot left is no VM's credentials.
     sd.set_state("inactive");
-    assert_eq!(run(&["status", "dev"]), "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n");
+    assert_eq!(
+        run(&["status", "dev"]),
+        "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n"
+    );
 }
 
 #[test]
@@ -441,7 +461,10 @@ fn status_says_booting_and_stopping_in_between() {
     ] {
         sd.set_state(active);
         let out = runner_on(dir.path(), &sd, &["status", "base"]);
-        assert_eq!(text(&out.stdout), format!("base  gen 0  6 bytes  cpus 2  mem 2G  {want}\n"));
+        assert_eq!(
+            text(&out.stdout),
+            format!("base  gen 0  6 bytes  cpus 2  mem 2G  {want}\n")
+        );
     }
 }
 

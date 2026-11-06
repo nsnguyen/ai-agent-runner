@@ -586,10 +586,11 @@ impl Tools {
         &self,
         Parameters(args): Parameters<ResizeArgs>,
     ) -> Result<Json<Vm>, String> {
-        let text = |e: crate::store::Error| e.to_string();
+        let disk = args.disk.as_deref().map(parse_disk).transpose();
+        let mem_mib = args.mem.as_deref().map(parse_mem).transpose();
         let sizes = Sizes {
-            disk: args.disk.as_deref().map(parse_disk).transpose().map_err(text)?,
-            mem_mib: args.mem.as_deref().map(parse_mem).transpose().map_err(text)?,
+            disk: disk.map_err(|e| e.to_string())?,
+            mem_mib: mem_mib.map_err(|e| e.to_string())?,
             cpus: args.cpus,
         };
         let store = self.store.clone();

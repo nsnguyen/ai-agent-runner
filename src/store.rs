@@ -470,7 +470,9 @@ impl Store {
             return Err(Error::NoCheckpoint(from.to_string(), generation));
         }
         let why = format!("fork of {from}'s generation {generation}");
-        self.make(name, Source::File(&disk), &config, None, |_| Note::auto(&why))
+        self.make(name, Source::File(&disk), &config, None, |_| {
+            Note::auto(&why)
+        })
     }
 
     // A new VM with `disk` as its only generation, grown to `grow` bytes if
@@ -2563,7 +2565,11 @@ fn disk_tool(prog: &str, args: &[&str], disk: &Path, worst: i32) -> Result<()> {
         Some(code) => format!("exited {code}"),
         None => out.status.to_string(),
     };
-    let why = if last.is_empty() { why } else { format!("{why}: {last}") };
+    let why = if last.is_empty() {
+        why
+    } else {
+        format!("{why}: {last}")
+    };
     Err(Error::Command { cmd, why })
 }
 

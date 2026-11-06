@@ -1293,9 +1293,15 @@ fn a_resized_disk_is_that_big_in_the_guest() {
     sh("echo kept > ~/before-resize");
     ok(runner(&root, &["stop", &name]));
     let said = ok(runner(&root, &["resize", &name, "--disk", "30G"]));
-    assert!(said.contains(&format!("  {} bytes  ", 30u64 << 30)), "{said}");
+    assert!(
+        said.contains(&format!("  {} bytes  ", 30u64 << 30)),
+        "{said}"
+    );
     let size = sh("df -B1 --output=size / | tail -n 1");
-    let size: u64 = size.trim().parse().unwrap_or_else(|_| panic!("df said {size:?}"));
+    let size: u64 = size
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("df said {size:?}"));
     assert!(size > 29 << 30, "/ is {size} bytes");
     assert_eq!(sh("cat ~/before-resize"), "kept\n");
 }

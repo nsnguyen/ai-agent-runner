@@ -215,7 +215,10 @@ impl Fake {
         let runs = [
             (version(), ran(true, &pinned, "")),
             (e2fsck(), ran(true, "", "e2fsck 1.47.0 (5-Feb-2023)\n")),
-            (resize2fs(), ran(false, "", "resize2fs 1.47.0 (5-Feb-2023)\nUsage: ...\n")),
+            (
+                resize2fs(),
+                ran(false, "", "resize2fs 1.47.0 (5-Feb-2023)\nUsage: ...\n"),
+            ),
             (
                 "systemctl is-active runner-nat.service".to_string(),
                 ran(true, "active\n", ""),

@@ -72,8 +72,17 @@ fn history(store: &Store, vm: &str) -> String {
 // The disk passes a forced check that changes nothing.
 #[track_caller]
 fn assert_clean(disk: &Path) {
-    let out = Command::new("e2fsck").arg("-fn").arg(disk).output().unwrap();
-    assert!(out.status.success(), "{}{}", text(&out.stdout), text(&out.stderr));
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(disk)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
 }
 
 #[track_caller]
@@ -141,7 +150,17 @@ fn sizes_parse_as_memory_does_and_print_back() {
     assert_eq!(parse_disk("40gib").unwrap(), 40 * GIB);
     assert_eq!(parse_disk("1T").unwrap(), 1024 * GIB);
     assert_eq!(parse_disk("512").unwrap(), 512 * MIB);
-    for bad in ["", "0", "0G", "-1G", "40GB", "4.5G", "G", "big", "99999999999G"] {
+    for bad in [
+        "",
+        "0",
+        "0G",
+        "-1G",
+        "40GB",
+        "4.5G",
+        "G",
+        "big",
+        "99999999999G",
+    ] {
         let err = parse_disk(bad).unwrap_err().to_string();
         assert!(err.contains("isn't a disk size"), "{bad:?}: {err}");
     }
@@ -161,7 +180,10 @@ fn a_failed_grow_leaves_the_vm_as_it_was() {
     fs::write(&disk, vec![7; MIB as usize]).unwrap();
     store.import("dev", &disk).unwrap();
     let before = (gens(&store, "dev"), history(&store, "dev"));
-    let err = store.resize("dev", &disk_size("2M")).unwrap_err().to_string();
+    let err = store
+        .resize("dev", &disk_size("2M"))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("e2fsck"), "{err}");
     assert_eq!((gens(&store, "dev"), history(&store, "dev")), before);
     assert_eq!(store.get("dev").unwrap().bytes, MIB);
@@ -249,7 +271,10 @@ fn a_fork_can_grow_its_disk_and_its_source_stays_as_it_was() {
     assert_clean(&disk);
     assert_same_files(&disk);
     let noted = store.checkpoints("app").unwrap();
-    assert_eq!(noted[0].comment.as_deref(), Some("fork of dev, resized to 2G"));
+    assert_eq!(
+        noted[0].comment.as_deref(),
+        Some("fork of dev, resized to 2G")
+    );
     assert_eq!((gens(&store, "dev"), history(&store, "dev")), before);
     assert_eq!(store.get("dev").unwrap().bytes, GIB);
 
@@ -275,7 +300,11 @@ struct Host {
 fn host() -> Host {
     let (dir, store) = with_dev();
     let sd = FakeSystemd::new(dir.path());
-    Host { _dir: dir, store, sd }
+    Host {
+        _dir: dir,
+        store,
+        sd,
+    }
 }
 
 impl Host {
@@ -310,16 +339,28 @@ impl Host {
 fn resize_sets_memory_and_vcpus_and_status_shows_them() {
     let h = host();
     let status = h.ok(&["status", "dev"]);
-    assert_eq!(status, format!("dev  gen 0  {GIB} bytes  cpus 2  mem 2G  stopped\n"));
+    assert_eq!(
+        status,
+        format!("dev  gen 0  {GIB} bytes  cpus 2  mem 2G  stopped\n")
+    );
     let said = h.ok(&["resize", "dev", "--mem", "4G", "--cpus", "4"]);
     assert_eq!(said, format!("dev  gen 0  {GIB} bytes  cpus 4  mem 4G\n"));
     let config = config_json(&h.store, "dev").unwrap();
-    assert!(config.contains("\"cpus\":4") && config.contains("\"mem_mib\":4096"), "{config}");
+    assert!(
+        config.contains("\"cpus\":4") && config.contains("\"mem_mib\":4096"),
+        "{config}"
+    );
     let status = h.ok(&["status", "dev"]);
-    assert_eq!(status, format!("dev  gen 0  {GIB} bytes  cpus 4  mem 4G  stopped\n"));
+    assert_eq!(
+        status,
+        format!("dev  gen 0  {GIB} bytes  cpus 4  mem 4G  stopped\n")
+    );
     let listed = h.ok(&["list"]);
     let want = format!("dev  gen 0  {GIB} bytes  cpus 4  mem 4G  ");
-    assert!(listed.starts_with(&want) && listed.ends_with(" bytes used\n"), "{listed}");
+    assert!(
+        listed.starts_with(&want) && listed.ends_with(" bytes used\n"),
+        "{listed}"
+    );
 
     let before = h.unchanged();
     let why = h.fails(&["resize", "dev", "--cpus", "33"]);
@@ -331,7 +372,10 @@ fn resize_sets_memory_and_vcpus_and_status_shows_them() {
 fn resize_grows_the_disk_and_undo_takes_it_back() {
     let h = host();
     let said = h.ok(&["resize", "dev", "--disk", "2G"]);
-    assert_eq!(said, format!("dev  gen 1  {} bytes  cpus 2  mem 2G\n", 2 * GIB));
+    assert_eq!(
+        said,
+        format!("dev  gen 1  {} bytes  cpus 2  mem 2G\n", 2 * GIB)
+    );
     assert_same_files(&h.store.disk("dev", 1).unwrap());
     h.ok(&["undo", "dev"]);
     assert_eq!(h.store.get("dev").unwrap().bytes, GIB);
@@ -344,7 +388,10 @@ fn resize_refuses_bad_sizes_and_changes_nothing() {
     for (args, says) in [
         (&["resize", "dev", "--disk", "1G"][..], "1G already"),
         (&["resize", "dev", "--disk", "40GB"], "isn't a disk size"),
-        (&["resize", "dev", "--disk", "2G", "--mem", "lots"], "isn't a memory size"),
+        (
+            &["resize", "dev", "--disk", "2G", "--mem", "lots"],
+            "isn't a memory size",
+        ),
         (&["resize", "dev"], "--disk"),
     ] {
         let why = h.fails(args);
@@ -357,7 +404,9 @@ fn resize_refuses_bad_sizes_and_changes_nothing() {
 fn resize_refuses_a_vm_that_is_up_or_asleep() {
     let h = host();
     let before = h.unchanged();
-    let resize = ["resize", "dev", "--disk", "2G", "--mem", "4G", "--cpus", "4"];
+    let resize = [
+        "resize", "dev", "--disk", "2G", "--mem", "4G", "--cpus", "4",
+    ];
     for state in ["active", "activating", "deactivating"] {
         h.sd.set_state(state);
         let why = h.fails(&resize);
