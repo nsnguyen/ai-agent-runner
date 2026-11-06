@@ -80,7 +80,7 @@ pub enum Error {
         vm: String,
         name: String,
         started: String,
-        source: runs::Error,
+        source: Box<runs::Error>,
     },
 }
 
@@ -193,7 +193,7 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
                         true => "None of their runs started".to_string(),
                         false => format!("{} started", and(&ids)),
                     },
-                    source,
+                    source: Box::new(source),
                 });
             }
         }

@@ -307,7 +307,8 @@ fn best_of_three_on_a_stopped_vm_runs_the_prompt_in_three_new_forks() {
     for id in ["dev-1.1", "dev-2.1"] {
         let row = h.ended(id);
         assert!(row.contains("  exited 0, "), "{row}");
-        assert_eq!(h.ok(&["result", id]).contains("\"exit_code\": 0"), true);
+        let result = h.ok(&["result", id]);
+        assert!(result.contains("\"exit_code\": 0"), "{result}");
     }
     // dev isn't touched.
     assert_eq!(h.ok(&["runs", "dev"]), "no runs yet\n");
