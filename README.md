@@ -304,7 +304,14 @@ runner run dev --n 3 "Make the flaky test in app/ pass"
 
 forks dev into `dev-1`, `dev-2` and `dev-3`, starts the prompt in each as an ordinary run, and prints `dev-1.1`, `dev-2.1` and `dev-3.1` at once, so three agents try it side by side and you keep the best. Each try is a whole run, so best of 3 costs three times the tokens. `output`, `result`, `cancel` and `runs` work on each try's run as on any, and `--dir` and `--resume` reach every one. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its `result` measures what that try changed against dev's disk. dev itself isn't touched and has no run: a stopped dev's tries fork its current disk, and a running or sleeping one is checkpointed first, `"before best of 3"`, kind `run`, and the tries fork that, so they get what dev has now, not its last commit, while dev and its sessions carry on. The tries get the default credentials, `claude` only, as every fork does, so three agents can't all push with dev's `github`; otherwise they take dev's sizes, kernel, idle time and URL setting.
 
-N is 2 to 4, and all N start at once, with no queue. Nothing is made, and the error says why, if any of the names `dev-1` to `dev-N` is taken; if N times dev's memory is more than the host's free memory (MemAvailable) less 1 GiB, which names the largest N that fits, 3 on the 8 GiB host with a 2 GiB dev stopped (vCPUs aren't counted, since the agents mostly wait on the model); while dev has a run going; and while an earlier batch's tries are still VMs, since it's one batch at a time: `runner delete` each try to drop them. dev records its batch in its directory, in `tries.json`: the prompt, when, the generation the tries forked, and their names and runs. On ext4 each try is a full copy of dev's disk, so put `/var/lib/runner` on XFS or btrfs. With several hosts, the tries are made on dev's host, and their names are checked only there. Over MCP, `run_best_of` takes `name`, `prompt`, `n`, `dir` and `resume`, and returns the N runs.
+N is 2 to 4, and all N start at once, with no queue. Nothing is made, and the error says why:
+
+- if any of the names `dev-1` to `dev-N` is taken, on any host;
+- if N times dev's memory is more than the host's free memory (MemAvailable) less 1 GiB. The error names the largest N that fits: 3 on the 8 GiB host with a 2 GiB dev stopped. vCPUs aren't counted, since the agents mostly wait on the model;
+- while dev has a run going;
+- while an earlier batch's tries are still VMs, since it's one batch at a time. `runner delete` every try to drop them, the one whose work you want too, once you've taken it.
+
+The tries are made on dev's host. A try whose run can't start is deleted, with the ones after it, and the runs that started go on. dev records its batch in its directory, in `tries.json`: the prompt, when, the generation the tries forked, and their names and runs. On ext4 each try is a full copy of dev's disk, so put `/var/lib/runner` on XFS or btrfs. Over MCP, `run_best_of` takes `name`, `prompt`, `n`, `dir` and `resume`, and returns the N runs.
 
 ### Checkpoints
 

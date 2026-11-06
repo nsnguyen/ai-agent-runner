@@ -668,6 +668,29 @@ fn create_refuses_a_name_another_host_has() {
     }
 }
 
+// Best of N makes dev-1 to dev-N on dev's host, so a name another host has
+// is refused here, before anything runs; dev's own host refuses one it has.
+#[test]
+fn run_n_refuses_a_try_s_name_another_host_has() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host-2", &["base", "web", "dev-2"], 6 << 30);
+        for n in [&["--n", "3"][..], &["--n=2"]] {
+            let args = [&["run", "dev"][..], n, &["fix it"]].concat();
+            let out = fleet.run(shell, &args);
+            assert_eq!(out.status.code(), Some(1), "{shell:?} {n:?}");
+            let err = text(&out.stderr);
+            assert!(err.contains("kvm-host-2 has a VM named dev-2"), "{err}");
+            for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+                assert!(fleet.commands(host).is_empty(), "{shell:?} {host}");
+            }
+        }
+        // One try is the host's to refuse; dev-2 isn't one of its names.
+        ok(&fleet.run(shell, &["run", "dev", "--n", "1", "fix it"]));
+        assert_eq!(fleet.commands("kvm-host"), ["run dev --n 1 fix it"]);
+    }
+}
+
 // A host that doesn't answer still has the VMs it had when last listed.
 #[test]
 fn create_counts_the_vms_a_host_that_doesn_t_answer_had() {

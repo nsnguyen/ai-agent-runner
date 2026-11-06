@@ -296,7 +296,13 @@ impl ServerHandler for Tools {
                 Ok(Some((i, request))) => {
                     let changes = self.changes(&request);
                     let moves_to = self.moves_to(&request);
+                    let tries = tries_of(&request);
                     let answer = self.peers[i].call(request).await;
+                    if let Ok(result) = &answer
+                        && result.is_error != Some(true)
+                    {
+                        tries.iter().for_each(|vm| self.note(vm, i, true));
+                    }
                     if let (Ok(result), Some((vm, made))) = (&answer, changes)
                         && result.is_error != Some(true)
                     {
@@ -840,13 +846,52 @@ impl Tools {
             _ => arg("name"),
         };
         let Some(vm) = vm else { return Ok(None) };
-        let Some(i) = self.locate(vm).await? else {
+        let at = self.locate(vm).await?;
+        self.check_tries(request, at).await?;
+        let Some(i) = at else {
             return Ok(None);
         };
         if request.name == "move_vm" {
             return self.move_from(i, vm, request).map(Some);
         }
         Ok(Some((i, request.clone())))
+    }
+
+    /// Refuses run_best_of when a host but the VM's, at `at` (None for this
+    /// one), has a name its tries take, as create_vm refuses one, so nothing
+    /// is made: the VM's host refuses one it has itself.
+    async fn check_tries(
+        &self,
+        request: &CallToolRequestParams,
+        at: Option<usize>,
+    ) -> Result<(), String> {
+        let names = tries_of(request);
+        if names.is_empty() {
+            return Ok(());
+        }
+        let here = self.store.list().map_err(|e| e.to_string())?;
+        let all: Vec<usize> = (0..self.peers.len()).collect();
+        let lists = self.survey(&all).await;
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for name in &names {
+            let has = |l: &Result<Vec<Vm>, String>, i: usize| match l {
+                Ok(l) => l.iter().any(|v| v.name == *name),
+                Err(_) => seen.get(name) == Some(&i),
+            };
+            let on = if at.is_some() && here.iter().any(|v| v.name == *name) {
+                Some(self.name.as_str())
+            } else {
+                (lists.iter().enumerate())
+                    .find(|&(i, l)| Some(i) != at && has(l, i))
+                    .map(|(i, _)| self.peers[i].name.as_str())
+            };
+            if let Some(on) = on {
+                return Err(format!(
+                    "{on} has a VM named {name} already: VM names are one per name across hosts"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// move_vm for a VM on peer `i`, with its host as ssh takes it, which
@@ -1137,6 +1182,22 @@ const ASK_WAIT: Duration = Duration::from_secs(20);
 
 /// Each peer's VMs, in order, or why there are none.
 type Lists = Vec<Result<Vec<Vm>, String>>;
+
+// The VMs a run_best_of call makes, as best::start names them; none for any
+// other call, or an n the tool refuses.
+fn tries_of(request: &CallToolRequestParams) -> Vec<String> {
+    if request.name != "run_best_of" {
+        return Vec::new();
+    }
+    let args = request.arguments.as_ref();
+    let vm = args.and_then(|a| a.get("name")).and_then(Value::as_str);
+    let n = args.and_then(|a| a.get("n")).and_then(Value::as_u64);
+    let n = n.and_then(|n| u32::try_from(n).ok());
+    match (vm, n) {
+        (Some(vm), Some(n)) if (best::MIN..=best::MAX).contains(&n) => best::names(vm, n),
+        _ => Vec::new(),
+    }
+}
 
 // A peer's own row from its list_hosts, under the name this host calls it.
 fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {

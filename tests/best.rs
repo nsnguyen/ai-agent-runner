@@ -383,7 +383,8 @@ fn a_try_s_name_that_s_taken_is_refused_and_named() {
     let h = host(false);
     h.store.fork("dev", "dev-2").unwrap();
     let err = h.refused(&["run", "dev", "--n", "3", "p"]);
-    assert!(err.contains("dev-2"), "{err}");
+    assert!(err.contains("a VM named dev-2 already exists"), "{err}");
+    assert!(err.contains("dev-1 to dev-3"), "{err}");
     assert_eq!(h.vms(), ["dev", "dev-2"]);
     assert_eq!(best::tries(&h.store, "dev").unwrap(), None);
     assert!(!h.sd.calls().iter().any(|c| c.contains("systemctl start")));
@@ -414,9 +415,12 @@ fn one_batch_at_a_time() {
         h.ended(id);
     });
     // Over, but not kept or dropped.
+    let (before, batch) = (h.history(), best::tries(&h.store, "dev").unwrap());
     let err = h.refused(&["run", "dev", "--n", "2", "p"]);
     assert!(err.contains("dev-1 and dev-2"), "{err}");
     assert_eq!(h.vms(), ["dev", "dev-1", "dev-2"]);
+    assert_eq!(h.history(), before);
+    assert_eq!(best::tries(&h.store, "dev").unwrap(), batch);
     // Gone by hand, they're dropped.
     h.ok(&["delete", "dev-1"]);
     h.ok(&["delete", "dev-2"]);
@@ -425,11 +429,31 @@ fn one_batch_at_a_time() {
     assert_eq!(batch.prompt, "again");
 }
 
+// A try whose run can't start goes, with the ones after it, and the runs
+// that started go on.
+#[test]
+fn tries_whose_runs_didn_t_start_are_deleted() {
+    let h = host(false);
+    // Its unit's state is one systemctl never says.
+    h.sd.set_vm_state("dev-2", "bogus");
+    let args = ["run", "dev", "--n", "3", "p", "--dir", h.work_dir()];
+    let err = h.refused(&args);
+    assert!(err.contains("dev-2's run didn't start"), "{err}");
+    assert!(err.contains("dev-1.1 started"), "{err}");
+    assert_eq!(h.vms(), ["dev", "dev-1"]);
+    let batch = best::tries(&h.store, "dev").unwrap().unwrap();
+    let tries: Vec<&str> = batch.tries.iter().map(|t| t.vm.as_str()).collect();
+    assert_eq!(tries, ["dev-1"]);
+    assert_eq!(h.got("dev-1", "prompt"), "p");
+    h.go();
+    h.ended("dev-1.1");
+}
+
 #[test]
 fn mcp_runs_best_of() {
     let h = host(false);
     let mut s = mcp(&h);
-    let args = json!({"name": "dev", "prompt": "hi", "n": 3, "dir": h.work_dir()});
+    let args = json!({"name": "dev", "prompt": "hi", "n": 3, "dir": h.work_dir(), "resume": "s-9"});
     let started = s.call(2, "run_best_of", args);
     let runs = started["structuredContent"]["runs"]
         .as_array()
@@ -440,6 +464,10 @@ fn mcp_runs_best_of() {
     for run in &runs {
         assert_eq!(run["state"], json!("running"));
         assert_eq!(run["boots"], json!(true));
+        let vm = run["vm"].as_str().unwrap();
+        // --resume reaches every try.
+        assert_eq!(h.got(vm, "argv"), format!("{ARGV}--resume\ns-9\n"), "{vm}");
+        assert_eq!(h.got(vm, "prompt"), "hi");
     }
     let bad = s.call(
         3,

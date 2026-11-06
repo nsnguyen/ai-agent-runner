@@ -68,7 +68,7 @@ runner output demo-2.1 --follow                     # watch one try
 runner result demo-3.1                              # what that try changed
 ```
 
-Each try is a new copy of `demo`, named `demo-1` to `demo-3`, so `demo` itself stays as it was. Three tries cost three times the tokens, and take three times `demo`'s memory: the runner refuses a batch the server has no room for and says how many fit. Delete the tries you don't want with `runner delete`, before the next batch.
+Each try is a new copy of `demo`, named `demo-1` to `demo-3`, so `demo` itself stays as it was. Three tries cost three times the tokens, and take three times `demo`'s memory: the runner refuses a batch the server has no room for and says how many fit. Before the next batch, delete every try with `runner delete`, the one whose work you liked too, once you've taken what you want from it.
 
 ## 5. Checkpoints: an undo button for the whole VM
 

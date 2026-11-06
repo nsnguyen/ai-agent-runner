@@ -49,9 +49,10 @@ pub enum Error {
     #[error("--n {0} is out of range: a batch is {MIN} to {MAX} tries")]
     BadN(u32),
     #[error(
-        "a VM named {name} already exists, and {vm}'s tries are named {vm}-1 on: delete {name} first"
+        "a VM named {name} already exists, and {vm}'s {n} tries take the names {vm}-1 to {vm}-{n}: \
+         delete {name} first"
     )]
-    Taken { vm: String, name: String },
+    Taken { vm: String, n: u32, name: String },
     #[error(
         "{vm} has tries on hand from best of {n} at {when}: {left}. One batch at a time: delete them first"
     )]
@@ -75,9 +76,8 @@ pub enum Error {
     },
     #[error("reading this host's free memory: {0}")]
     Mem(io::Error),
-    #[error("{vm}'s tries are made, but {name}'s run didn't start: {source}. {started}")]
+    #[error("{name}'s run didn't start: {source}. {started}")]
     NotStarted {
-        vm: String,
         name: String,
         started: String,
         source: Box<runs::Error>,
@@ -140,6 +140,7 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
         store.check_free(name).map_err(|e| match e {
             store::Error::Exists(name) => Error::Taken {
                 vm: vm.to_string(),
+                n,
                 name,
             },
             e => e.into(),
@@ -174,7 +175,10 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
             })
             .collect(),
     };
-    record(store, vm, &batch)?;
+    if let Err(e) = record(store, vm, &batch) {
+        drop_forks(store, &names);
+        return Err(e);
+    }
     let mut started = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let one = Start { vm: name, ..*s };
@@ -183,16 +187,19 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
                 batch.tries[i].run = Some(run.id.clone());
                 started.push(run);
             }
+            // The tries whose runs started go on; the rest go.
             Err(source) => {
+                drop_forks(store, &names[i..]);
+                batch.tries.truncate(i);
                 record(store, vm, &batch)?;
                 let ids: Vec<&str> = started.iter().map(|r| r.id.as_str()).collect();
+                let started = match ids.is_empty() {
+                    true => "Every try was deleted".to_string(),
+                    false => format!("{} started, and the tries after were deleted", and(&ids)),
+                };
                 return Err(Error::NotStarted {
-                    vm: vm.to_string(),
                     name: name.clone(),
-                    started: match ids.is_empty() {
-                        true => "None of their runs started".to_string(),
-                        false => format!("{} started", and(&ids)),
-                    },
+                    started,
                     source: Box::new(source),
                 });
             }
@@ -263,15 +270,20 @@ fn room(vm: &str, n: u32, each: u64) -> Result<()> {
 fn fork_all(store: &Store, vm: &str, generation: u64, names: &[String]) -> Result<()> {
     for (i, name) in names.iter().enumerate() {
         if let Err(e) = store.fork_at(vm, generation, name, &Config::default()) {
-            for made in &names[..i] {
-                if let Err(e) = store.delete(made) {
-                    eprintln!("runner: deleting {made}: {e}");
-                }
-            }
+            drop_forks(store, &names[..i]);
             return Err(e.into());
         }
     }
     Ok(())
+}
+
+// Tries made that won't run. Each is new and stopped, so a delete takes it.
+fn drop_forks(store: &Store, names: &[String]) {
+    for name in names {
+        if let Err(e) = store.delete(name) {
+            eprintln!("runner: deleting {name}: {e}");
+        }
+    }
 }
 
 fn record(store: &Store, vm: &str, batch: &Batch) -> Result<()> {
