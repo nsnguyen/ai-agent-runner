@@ -296,6 +296,16 @@ The run reads both disks whole, so it goes on looking `running` for a while afte
 
 The stream is kept on the host, in `/var/lib/runner/vms/dev/runs/1/`, beside Claude Code's stderr, so it can be read with dev off, and goes when dev is deleted.
 
+#### Best of N
+
+```sh
+runner run dev --n 3 "Make the flaky test in app/ pass"
+```
+
+forks dev into `dev-1`, `dev-2` and `dev-3`, starts the prompt in each as an ordinary run, and prints `dev-1.1`, `dev-2.1` and `dev-3.1` at once, so three agents try it side by side and you keep the best. Each try is a whole run, so best of 3 costs three times the tokens. `output`, `result`, `cancel` and `runs` work on each try's run as on any, and `--dir` and `--resume` reach every one. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its `result` measures what that try changed against dev's disk. dev itself isn't touched and has no run: a stopped dev's tries fork its current disk, and a running or sleeping one is checkpointed first, `"before best of 3"`, kind `run`, and the tries fork that, so they get what dev has now, not its last commit, while dev and its sessions carry on. The tries get the default credentials, `claude` only, as every fork does, so three agents can't all push with dev's `github`; otherwise they take dev's sizes, kernel, idle time and URL setting.
+
+N is 2 to 4, and all N start at once, with no queue. Nothing is made, and the error says why, if any of the names `dev-1` to `dev-N` is taken; if N times dev's memory is more than the host's free memory (MemAvailable) less 1 GiB, which names the largest N that fits, 3 on the 8 GiB host with a 2 GiB dev stopped (vCPUs aren't counted, since the agents mostly wait on the model); while dev has a run going; and while an earlier batch's tries are still VMs, since it's one batch at a time: `runner delete` each try to drop them. dev records its batch in its directory, in `tries.json`: the prompt, when, the generation the tries forked, and their names and runs. On ext4 each try is a full copy of dev's disk, so put `/var/lib/runner` on XFS or btrfs. With several hosts, the tries are made on dev's host, and their names are checked only there. Over MCP, `run_best_of` takes `name`, `prompt`, `n`, `dir` and `resume`, and returns the N runs.
+
 ### Checkpoints
 
 ```sh
@@ -390,6 +400,6 @@ Restart the app after editing its config.
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
-`run_agent`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
+`run_agent`, `run_best_of`, `run_output`, `cancel_run` and `list_runs` do for an agent what `runner run`, `run --n`, `output`, `cancel` and `runs` do for you. `run_agent` returns the run at once, and `run_best_of` the N runs. `run_output` takes a `cursor`, 0 at first and then the one each reply gives, and returns the events past it, up to 64 KiB, with the run's state; while the run is quiet it waits up to 45 seconds for an event, so an agent can poll it in a loop without holding a connection for the whole run. Once the run is over, the reply that reaches the end of its stream has the run's `result` too, as `runner result` prints it.
 
 `list_sessions`, `read_session` and `kill_session` do for an agent what `runner sessions`, `attach` and `kill` do for you. `read_session` returns the last `lines` (100 unless given, at most 2000) of a session's active pane as plain text, history included, cut at 32 KiB from the end.
