@@ -253,6 +253,7 @@ fn rebase_vm_says_what_it_kept() {
             "services": ["web"],
             "skipped": [{"path": "/home/agent/work/a\nb", "why": "name"}],
             "more": 0,
+            "own_claude": null,
         })
     );
 

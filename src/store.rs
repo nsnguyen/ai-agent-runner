@@ -961,10 +961,7 @@ impl Store {
         let freezer = self.hold_checkpoints(name)?;
         let onto = current(&base)?;
         let note = read_note(&base, onto)?;
-        if !note
-            .as_ref()
-            .is_some_and(|n| n.auto && n.comment.as_deref() == Some("import"))
-        {
+        if !imported(note.as_ref()) {
             let made_by = note.and_then(|n| n.comment);
             let made_by = made_by.unwrap_or_else(|| "nothing it noted".to_string());
             return Err(Error::NotImported { onto, made_by }.into());
@@ -980,6 +977,14 @@ impl Store {
         let (part, disk) = (part_of(&dir, id), disk_of(&dir, id));
         let made = (|| -> std::result::Result<T, E> {
             clone(&base_disk, &part)?;
+            // base taken away and made again since, from a disk a guest
+            // wrote, would be what was cloned: asked again.
+            let again = read_note(&base, onto)?;
+            if current(&base)? != onto || !imported(again.as_ref()) {
+                let made_by = again.and_then(|n| n.comment);
+                let made_by = made_by.unwrap_or_else(|| "nothing it noted".to_string());
+                return Err(Error::NotImported { onto, made_by }.into());
+            }
             let filled = fill(&from, &base_disk, &part)?;
             File::open(&part)
                 .and_then(|f| f.sync_all())
@@ -996,9 +1001,12 @@ impl Store {
             Ok(filled) => filled,
             Err(e) => {
                 let _ = fs::remove_file(&part);
-                let _ = fs::remove_file(&disk);
-                let _ = fs::remove_file(note_of(&dir, id));
                 let _ = clear_staged(&dir);
+                // One that failed after it went into history is current: it stays.
+                if !history(&dir).is_ok_and(|gens| gens.contains(&id)) {
+                    let _ = fs::remove_file(&disk);
+                    let _ = fs::remove_file(note_of(&dir, id));
+                }
                 return Err(e);
             }
         };
@@ -2120,6 +2128,11 @@ fn sweep_staging(vms: &Path) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+// Whether a note is the one `import` writes, for a disk no guest has written.
+fn imported(note: Option<&Note>) -> bool {
+    note.is_some_and(|n| n.auto && n.comment.as_deref() == Some("import"))
 }
 
 // What a rebase killed partway staged beside its part (graft::staging).

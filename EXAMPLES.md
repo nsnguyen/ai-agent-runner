@@ -47,7 +47,7 @@ It prints what it kept and warns about the rest:
 ```
 demo is on base's generation 4 now: generation 13 is current.
 Kept /home, /root, /etc/machine-id and 2 services (api, web).
-Anything installed outside those, like apt packages, is gone: runner undo demo brings it back.
+Anything installed outside those, like apt packages, is gone, and so are users added with useradd, crontabs and /var: runner undo demo brings it back.
 ```
 
 So reinstall your apt packages after it. Claude Code comes from base, at base's version.

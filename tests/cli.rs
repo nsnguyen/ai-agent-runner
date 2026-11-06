@@ -341,7 +341,7 @@ fn rebase_says_what_it_kept_and_warns_about_the_rest() {
         "dev is on base's generation 0 now: generation 1 is current.\n\
          Kept /home, /root, /etc/machine-id and 1 service (web).\n\
          Not copied, so gone: \"/home/agent/work/a\\\"b\", as its name holds a newline, a carriage return or a double quote.\n\
-         Anything installed outside those, like apt packages, is gone: runner undo dev brings it back.\n"
+         Anything installed outside those, like apt packages, is gone, and so are users added with useradd, crontabs and /var: runner undo dev brings it back.\n"
     );
     let out = runner(dir.path(), &["undo", "dev"]);
     assert_eq!(text(&out.stdout).split("  ").nth(1), Some("gen 0"));

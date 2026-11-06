@@ -6,7 +6,9 @@
 // Not /etc/hostname: base ships it empty, and each boot's `ip=` names the
 // VM. Claude Code's install under /home/agent is base's, which pins its
 // version (images/base/Dockerfile), so it's copied back in from base's disk
-// after the VM's /home. The rest of /home is the VM's.
+// after the VM's /home, unless the VM's /home has a link on the way to it,
+// which graft.rs won't write through: the VM keeps its own then, and the
+// output says so. The rest of /home is the VM's.
 //
 // What's lost: apt packages and anything else outside what's kept, users
 // added with useradd (their files keep their numeric owners), crontabs and
@@ -85,13 +87,17 @@ pub struct Rebased {
     pub skipped: Vec<Skip>,
     /// How many more weren't copied than are listed.
     pub more: u64,
+    /// Where the VM's /home has something other than a directory on the
+    /// way to base's Claude Code, like a dotfile manager's link, so the VM
+    /// keeps its own. None when base's came.
+    pub own_claude: Option<String>,
 }
 
 /// Gives the stopped VM `name` the current base's system as a new disk
 /// generation, keeping KEPT and its services, with base's Claude Code.
 /// `Busy` while it's up or a run on it hasn't ended, as undo is.
 pub fn rebase(store: &Store, name: &str) -> Result<Rebased> {
-    let (vm, base_generation, (services, copied)) =
+    let (vm, base_generation, (services, copied, own_claude)) =
         store.rebase(name, |from: &Path, base: &Path, to: &Path| -> Result<_> {
             let (mine, services) = units(from)?;
             // base's own, which the VM's take the place of, gone if it has none.
@@ -100,10 +106,13 @@ pub fn rebase(store: &Store, name: &str) -> Result<Rebased> {
             paths.extend(mine.union(&theirs).cloned());
             let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
             let mut copied = graft::copy(from, to, &paths, LIMITS)?;
-            let claude = graft::copy(base, to, FROM_BASE, LIMITS)?;
-            copied.skipped.extend(claude.skipped);
-            copied.more += claude.more;
-            Ok((services, copied))
+            let own = in_the_way(to)?;
+            if own.is_none() {
+                let claude = graft::copy(base, to, FROM_BASE, LIMITS)?;
+                copied.skipped.extend(claude.skipped);
+                copied.more += claude.more;
+            }
+            Ok((services, copied, own))
         })?;
     Ok(Rebased {
         vm,
@@ -112,6 +121,7 @@ pub fn rebase(store: &Store, name: &str) -> Result<Rebased> {
         services,
         skipped: copied.skipped,
         more: copied.more,
+        own_claude,
     })
 }
 
@@ -129,6 +139,9 @@ pub fn said(r: &Rebased) -> String {
         kept.push(format!("{n} service{s} ({})", r.services.join(", ")));
     }
     out += &format!("Kept {}.\n", listed(&kept));
+    if let Some(at) = &r.own_claude {
+        out += &format!("Claude Code is {name}'s own, not base's: {at} isn't a directory.\n");
+    }
     // Quoted: a name the copy skipped can hold a newline.
     for skip in &r.skipped {
         out += &format!("Not copied, so gone: {:?}, {}.\n", skip.path, why(skip.why));
@@ -137,7 +150,7 @@ pub fn said(r: &Rebased) -> String {
         out += &format!("And {} more not copied.\n", r.more);
     }
     out += &format!(
-        "Anything installed outside those, like apt packages, is gone: runner undo {name} brings it back.\n"
+        "Anything installed outside those, like apt packages, is gone, and so are users added with useradd, crontabs and /var: runner undo {name} brings it back.\n"
     );
     out
 }
@@ -157,6 +170,28 @@ fn why(why: Why) -> &'static str {
         Why::Special => "as it's a socket, a device or a fifo",
         Why::Unreadable => "as ext4-view can't read it",
     }
+}
+
+// The first of FROM_BASE's parents that `to` has as something other than a
+// directory, like a dotfile manager's link, which graft.rs won't write
+// through: the VM keeps its own Claude Code then. One whose inode won't
+// read counts too.
+fn in_the_way(to: &Path) -> Result<Option<String>> {
+    let disk = Disk::load(to)?;
+    for path in FROM_BASE {
+        let (parent, _) = path.rsplit_once('/').expect("an absolute path");
+        let mut at = String::new();
+        for name in parent.split('/').skip(1) {
+            at = format!("{at}/{name}");
+            let found = InPathBuf::try_from(at.as_str()).expect("a plain path");
+            match disk.fs.symlink_metadata(&found) {
+                Ok(m) if m.is_dir() => {}
+                Err(Ext4Error::NotFound) => break,
+                _ => return Ok(Some(at)),
+            }
+        }
+    }
+    Ok(None)
 }
 
 // The runner's services on `disk`: the paths of their units and of each

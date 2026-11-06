@@ -179,6 +179,7 @@ fn a_rebased_vm_has_base_s_system_and_keeps_its_own_files() {
     assert_eq!(done.kept, KEPT);
     assert_eq!(done.services, ["api", "web"]);
     assert!(done.skipped.is_empty() && done.more == 0, "{done:?}");
+    assert_eq!(done.own_claude, None);
     let fs = fs_of(&s.current("dev"));
     // base's system: its /etc, its runner-guest, its hostname.
     assert_eq!(read(&fs, "/etc/os-release"), "base 2\n");
@@ -371,4 +372,42 @@ fn names_the_copy_skips_are_listed() {
     assert_eq!(done.skipped, [skip]);
     let fs = fs_of(&s.current("dev"));
     assert_eq!(read(&fs, "/home/agent/work/ok"), "ok");
+}
+
+// A dotfile manager's link where base's Claude Code would go: dev keeps
+// its own Claude Code, and the rebase says so, rather than failing.
+#[test]
+fn a_linked_local_share_keeps_the_vm_s_own_claude_code() {
+    let s = setup(|at| {
+        let t = tree(
+            at,
+            &[
+                (
+                    "home/agent/dotfiles/share/claude/versions/1.0.0",
+                    "claude 1",
+                ),
+                ("home/agent/work/notes", "mine\n"),
+            ],
+        );
+        fs::create_dir_all(t.join("home/agent/.local")).unwrap();
+        symlink("../dotfiles/share", t.join("home/agent/.local/share")).unwrap();
+        t
+    });
+
+    let done = rebase::rebase(&s.store, "dev").unwrap();
+
+    assert_eq!(done.own_claude.as_deref(), Some("/home/agent/.local/share"));
+    let said = rebase::said(&done);
+    assert!(
+        said.contains(
+            "Claude Code is dev's own, not base's: /home/agent/.local/share isn't a directory.\n"
+        ),
+        "{said}"
+    );
+    let fs = fs_of(&s.current("dev"));
+    assert_eq!(link(&fs, "/home/agent/.local/share"), "../dotfiles/share");
+    assert_eq!(read(&fs, "/home/agent/work/notes"), "mine\n");
+    assert_eq!(read(&fs, "/etc/os-release"), "base 2\n");
+    // base's link to it isn't there: the bin directory was dev's, empty.
+    assert!(!has(&fs, "/home/agent/.local/bin"));
 }
