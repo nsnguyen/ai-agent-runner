@@ -321,11 +321,11 @@ RestartForceExitStatus={RESTART}
 # The serial console.
 StandardOutput=journal
 StandardError=journal
-# For boot to add and remove the VM's tap, and nothing else. Boot clears it
-# before running Firecracker, which doesn't need it, and no setuid program
-# gets it back.
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+# For boot to add and remove the VM's tap and serve the VM's DNS on port 53
+# of its gateway, and nothing else. Boot clears them before running
+# Firecracker, which needs neither, and no setuid program gets them back.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 "
     ))

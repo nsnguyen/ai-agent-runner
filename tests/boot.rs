@@ -228,15 +228,17 @@ fn a_tap_that_can_t_be_made_stops_the_boot_before_firecracker() {
     h.store.delete("dev").unwrap();
 }
 
-// The unit gives boot CAP_NET_ADMIN for the tap; Firecracker, which a guest
-// could break into, mustn't keep it. Run as root:
+// The unit gives boot CAP_NET_ADMIN for the tap and CAP_NET_BIND_SERVICE
+// for the VM's DNS; Firecracker, which a guest could break into, mustn't
+// keep either. Run as root:
 //   cargo test --test boot -- --ignored
 #[test]
 #[ignore = "needs root, to raise an ambient capability with setpriv"]
 fn firecracker_gets_no_capabilities_from_boot() {
     let h = Host::new();
     let mut cmd = Command::new("setpriv");
-    cmd.args(["--inh-caps", "+net_admin", "--ambient-caps", "+net_admin"])
+    let caps = "+net_admin,+net_bind_service";
+    cmd.args(["--inh-caps", caps, "--ambient-caps", caps])
         .arg(env!("CARGO_BIN_EXE_runner"))
         .args(["boot", "dev"]);
     let boot = h
@@ -301,6 +303,16 @@ fn boot_runs_the_next_generation_and_a_clean_halt_commits_it() {
         "{}",
         text(&out.stderr)
     );
+    // The fake ip makes no tap, so boot can't serve the VM's DNS on its
+    // gateway: it says why, and the guest got the host's resolvers instead
+    // (boot_calls).
+    let why = match net::dns(&HOST_RESOLV_CONFS.map(Path::new)).is_empty() {
+        true => "dev boots without DNS",
+        false => {
+            "dev's DNS goes straight to the host's resolvers: boot can't serve it on 172.16.0."
+        }
+    };
+    assert!(text(&out.stderr).contains(why), "{}", text(&out.stderr));
     assert!(!api_sock.exists(), "API socket left behind");
     h.store.delete("dev").unwrap();
 }
