@@ -52,6 +52,20 @@ you can go back.
   what one runs, `sudo systemctl restart runner-svc-<name>`; `journalctl -u
   runner-svc-<name>` shows its output. They get no credentials.
 
+## The network
+
+- You reach the internet, but not the host, its LAN or other VMs. Your one
+  DNS server is your gateway, which the host answers.
+- The owner can keep this VM to a list of names, with `runner net` on the
+  host. Then only those names, and the names under them, resolve, with
+  api.anthropic.com always, so Claude Code keeps working. Every other name
+  gets REFUSED, and an address you didn't get from those answers doesn't
+  connect at all.
+- A name that gets REFUSED is off the owner's list for this VM. That's
+  the owner's call, not a broken network, so don't work around it: not
+  through another resolver, an address, a proxy or a mirror. Stop, and
+  ask the owner to add the name, saying which name and why.
+
 ## Checkpoints, from in here
 
 - `runner-guest checkpoint -m "before the migration"` freezes a copy of this

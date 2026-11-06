@@ -388,6 +388,24 @@ Each VM gets a URL on the tailnet, like a Sprite's but private: open it on the l
 
 The VM's boot holds the URL, so it answers while the VM is up. A connection to a sleeping VM wakes it and waits up to 30 seconds for the guest to take it; one to a stopped VM is refused, as nothing starts it. An open connection counts as use, so the VM doesn't idle-sleep under it; one from a client that went silent, like a laptop that slept, is dropped within a minute and a half. It's tailnet only: it listens only on the host's Tailscale address, never 0.0.0.0, and takes connections only from Tailscale's 100.64.0.0/10, so neither the LAN nor another VM gets in through it. Without Tailscale up there's no URL and `runner url` says so; a running VM's boot binds it once Tailscale is up, and takes `on`, `off` and `--port` within a second. A fork keeps its source's setting, on a port of its own. After an upgrade to this runner, a VM that's already up gets its URL at its next start, since its boot is the old one. MCP's `vm_status` gives the URL as `url`. For HTTPS and a name in place of the address, put `tailscale serve` in front (docs/host.md).
 
+### Names a VM can reach
+
+```sh
+runner net dev allow github.com registry.npmjs.org  # dev reaches only these, and api.anthropic.com
+runner net dev deny registry.npmjs.org              # one off again
+runner net dev list                                 # the list, or that dev is open
+runner net dev open                                 # no list: the whole internet again
+```
+
+A VM is open, reaching the whole internet, until `allow` gives it a list. Then its DNS answers only the names on it, each with every name under it (github.com covers api.github.com), and api.anthropic.com always, so Claude Code keeps working. Every other name gets REFUSED, and the host's rules let the VM reach only the addresses those answers gave (Set up a host, for how, and what a list doesn't close). A running VM takes a change within a second, with no reboot; one whose boot couldn't serve its DNS takes it at its next boot. Each prints the list as it now is:
+
+```
+dev  allows github.com registry.npmjs.org, and always api.anthropic.com
+dev  open: the whole internet
+```
+
+`deny` keeps the list even when it takes the last name off, which leaves only api.anthropic.com; `open` drops it. On a VM with no list, `deny` fails and says it's open: a list allows names, it doesn't block them. A name is a hostname of two labels or more, with no wildcard (none is needed) and no address; one bad name fails the whole command. Two commands at once each keep their change. A fork keeps its source's list, and an export, import or move carries it. Over MCP, `vm_allowlist` reads it, and no tool changes it: a local Claude Code reads VMs' output, so it's what an agent in one would talk into widening its list. In the VM, `/.runner/llm.txt` tells the agent that a REFUSED name is off your list for that VM, and to ask you instead of working around it.
+
 ### Back up and move
 
 ```sh
