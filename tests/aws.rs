@@ -28,14 +28,19 @@ const LOG: &str = r#"log() { { printf '%s\037' "${WHO:-laptop}" "$@"; printf '\0
 
 // Each aws call's argv on a line, its args split by US, in $FAKE/calls. A file
 // in $FAKE says what AWS has: has-key, has-sg, instances (describe-instances'
-// text), perms (the group's IpPermissions, which authorize and revoke set);
-// key-fails and signed-out make those calls fail as AWS does.
+// text; instances.<name> answers for the instance named <name> instead),
+// perms (the group's IpPermissions, which authorize and revoke set);
+// key-fails and signed-out make those calls fail as AWS does. stop-instances
+// and start-instances set each instance they name stopped or running.
 const FAKE_AWS: &str = r#"{ for arg; do printf '%s\037' "$arg"; done; printf '\n'; } >>"$FAKE/calls"
 log aws "$@"
 fail() { echo "An error occurred ($1)" >&2; exit 254; }
 case "$1 $2" in
 "sts get-caller-identity") [ ! -e "$FAKE/signed-out" ] || fail ExpiredToken ;;
-"ec2 describe-instances") cat "$FAKE/instances" 2>/dev/null || true ;;
+"ec2 describe-instances")
+  n=$(printf '%s\n' "$@" | sed -n 's/^Name=tag:Name,Values=//p')
+  if [ -n "$n" ] && [ -e "$FAKE/instances.$n" ]; then cat "$FAKE/instances.$n"
+  else cat "$FAKE/instances" 2>/dev/null || true; fi ;;
 "ec2 describe-key-pairs") [ -e "$FAKE/has-key" ] || fail InvalidKeyPair.NotFound ;;
 "ec2 create-key-pair")
   [ ! -e "$FAKE/key-fails" ] || fail UnauthorizedOperation
@@ -49,7 +54,24 @@ case "$1 $2" in
   while [ $# -gt 0 ]; do [ "$1" != --cidr ] || cidr=$2; shift; done
   printf '[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "%s"}]}]\n' "$cidr" >"$FAKE/perms" ;;
 "ec2 revoke-security-group-ingress") rm -f "$FAKE/perms" ;;
-"ec2 wait"|"ec2 stop-instances"|"ec2 start-instances") ;;
+"ec2 stop-instances"|"ec2 start-instances")
+  to="stopped	None"
+  [ "$2" = stop-instances ] || to="running	$HOST_IP"
+  ids=
+  shift 2
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --instance-ids) shift; while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do ids="$ids $1"; shift; done ;;
+    *) shift ;;
+    esac
+  done
+  for f in "$FAKE"/instances "$FAKE"/instances.*; do
+    [ -e "$f" ] || continue
+    for id in $ids; do
+      sed "s/^$id	.*/$id	$to/" "$f" >"$f.new" && mv "$f.new" "$f"
+    done
+  done ;;
+"ec2 wait") ;;
 *) echo "fake aws: unexpected $*" >&2; exit 99 ;;
 esac
 "#;
@@ -313,6 +335,13 @@ impl Aws {
         fs::write(self.dir.path().join("fake").join(what), body).unwrap();
     }
 
+    /// The laptop's ~/.config/runner/hosts, as `runner hosts add` writes it.
+    fn hosts(&self, lines: &str) {
+        let dir = self.home().join(".config/runner");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hosts"), lines).unwrap();
+    }
+
     fn key(&self) -> PathBuf {
         self.dir.path().join("home/.ssh/kvm-host.pem")
     }
@@ -482,6 +511,16 @@ fn says(r: &[String], part: &str) -> bool {
 }
 
 /// The value after `flag` in `args`.
+/// Every value after `flag`, up to the next flag: --instance-ids takes several.
+fn values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    let at = args.iter().position(|a| a == flag).expect("no flag") + 1;
+    args[at..]
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .collect()
+}
+
 fn after<'a>(args: &'a [String], flag: &str) -> &'a str {
     let at = args
         .iter()
@@ -829,6 +868,101 @@ fn stop_and_start() {
         assert_eq!(after(&start, "--instance-ids"), "i-0old");
         assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
         assert!(out.contains(HOST_IP), "{out}");
+    }
+}
+
+#[test]
+fn stop_and_start_act_on_every_listed_host() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
+        aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
+        aws.has("instances.kvm-host-2", "i-0b\trunning\t192.0.2.8\n");
+        let out = ok(&aws.run(shell, &["stop"]));
+        let stop = aws.call("stop-instances").expect("no stop-instances");
+        assert_eq!(values(&stop, "--instance-ids"), ["i-0a", "i-0b"]);
+        // One wait for both, so they stop side by side.
+        assert_eq!(aws.waits(), ["instance-stopped"]);
+        assert!(
+            out.contains("kvm-host is stopped") && out.contains("kvm-host-2 is stopped"),
+            "{out}"
+        );
+
+        let out = ok(&aws.run(shell, &["start"]));
+        let start = aws.call("start-instances").expect("no start-instances");
+        assert_eq!(values(&start, "--instance-ids"), ["i-0a", "i-0b"]);
+        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        assert!(
+            out.contains("kvm-host is up at") && out.contains("kvm-host-2 is up at"),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn runner_aws_name_stops_and_starts_only_that_host() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
+        aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
+        aws.has("instances.kvm-host-2", &format!("i-0b\trunning\t{HOST_IP}\n"));
+        ok(&aws.run_as(shell, "kvm-host-2", &["stop"], ""));
+        let stop = aws.call("stop-instances").expect("no stop-instances");
+        assert_eq!(values(&stop, "--instance-ids"), ["i-0b"]);
+        ok(&aws.run_as(shell, "kvm-host-2", &["start"], ""));
+        let start = aws.call("start-instances").expect("no start-instances");
+        assert_eq!(values(&start, "--instance-ids"), ["i-0b"]);
+    }
+}
+
+#[test]
+fn a_listed_host_aws_sh_didnt_make_is_left_alone() {
+    // No instance has its name, or its name is no instance's (a dotted one).
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("# mine\nrunner@kvm-host\n\nrunner@homelab\nrunner@box.example.com\nkvm-host\n");
+        aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
+        let out = aws.run(shell, &["stop"]);
+        let err = text(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        let stop = aws.call("stop-instances").expect("no stop-instances");
+        // kvm-host listed twice is stopped once.
+        assert_eq!(values(&stop, "--instance-ids"), ["i-0a"]);
+        assert!(err.contains("homelab") && err.contains("box.example.com"), "{err}");
+    }
+}
+
+#[test]
+fn no_listed_host_with_an_instance_is_an_error() {
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@homelab\n");
+        let err = fails(&aws.run(shell, &["stop"]));
+        assert!(err.contains("homelab"), "{err}");
+        assert_eq!(aws.call("stop-instances"), None);
+    }
+}
+
+#[test]
+fn start_waits_only_for_the_stopping_hosts() {
+    // AWS refuses to start a stopping instance, so those finish stopping
+    // first; a stopped one is started with them.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
+        aws.has("instances.kvm-host", &format!("i-0a\tstopping\t{HOST_IP}\n"));
+        aws.has("instances.kvm-host-2", "i-0b\tstopped\tNone\n");
+        let out = ok(&aws.run(shell, &["start"]));
+        let calls = aws.calls();
+        let wait = calls
+            .iter()
+            .find(|c| c.len() > 2 && c[1] == "wait" && c[2] == "instance-stopped")
+            .expect("no wait for stopping");
+        assert_eq!(values(wait, "--instance-ids"), ["i-0a"]);
+        let start = aws.call("start-instances").expect("no start-instances");
+        assert_eq!(values(&start, "--instance-ids"), ["i-0a", "i-0b"]);
+        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        assert!(out.contains("kvm-host-2 is up at"), "{out}");
     }
 }
 

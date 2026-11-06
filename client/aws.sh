@@ -10,8 +10,8 @@
 #                           tailnet once close has shut SSH to the internet)
 #   client/aws.sh open      let this laptop's address in over SSH (up does)
 #   client/aws.sh close     let nothing in, once the host is on the tailnet
-#   client/aws.sh stop      stop it: then only its disks cost
-#   client/aws.sh start     start it again, at a new address
+#   client/aws.sh stop      stop every host: then only their disks cost
+#   client/aws.sh start     start every host again, at new addresses
 #
 # The host is an m7i-flex.large with nested virtualization on, which gives it
 # /dev/kvm at a regular instance's price, running Ubuntu 24.04, with a 40 GiB
@@ -30,6 +30,12 @@
 # never in an argument, a variable, a file or on the screen here: the Claude
 # token, else it's typed in on the host with echo off, and GH_TOKEN and
 # ANTHROPIC_API_KEY when that host has them.
+#
+# stop and start act on every host in the laptop's ~/.config/runner/hosts
+# (`runner hosts add`), by its ssh target's host part: runner@kvm-host-2 is
+# kvm-host-2, the name up gives its instance. A listed host with no such
+# instance, one aws.sh didn't make, is left alone. With RUNNER_AWS_NAME set,
+# or no hosts file, they act on that one host, as every other command does.
 #
 # RUNNER_AWS_NAME names the instance, its key pair and its security group
 # (kvm-host), and is the tailnet name ssh dials once SSH is closed: the host
@@ -110,6 +116,39 @@ find_host() {
 address() {
   find_host
   [ "$addr" != None ] || die "$name is $state, with no address: $0 start"
+}
+
+# gather: the hosts stop and start act on (see the top), as $list, a
+# "name id state" line each, and their ids, a word each, as $ids. Dies when
+# none has an instance, or one name has two.
+gather() {
+  list='' ids='' seen=' '
+  if [ -n "${RUNNER_AWS_NAME-}" ] || [ ! -s "$HOME/.config/runner/hosts" ]; then
+    find_host
+    list="$name $id $state"
+    ids=$id
+    return
+  fi
+  while read -r h _ || [ -n "$h" ]; do
+    case $h in '' | '#'*) continue ;; esac
+    h=${h##*@}
+    case $seen in *" $h "*) continue ;; esac
+    seen="$seen$h "
+    if ! tailnet_name "$h"; then
+      printf "aws.sh: %s isn't a name aws.sh up gives, so it's left alone\n" "$h" >&2
+      continue
+    fi
+    name=$h
+    found=$(instance)
+    if [ -z "$found" ]; then
+      printf "aws.sh: no instance is named %s, so it's left alone\n" "$h" >&2
+      continue
+    fi
+    parse
+    list="${list:+$list$nl}$name $id $state"
+    ids="${ids:+$ids }$id"
+  done <"$HOME/.config/runner/hosts"
+  [ -n "$ids" ] || die "no host in ~/.config/runner/hosts has an instance aws.sh up made"
 }
 
 # Waits for $id's status checks, which pass once it has booted, so the first
@@ -547,21 +586,34 @@ ssh)
 open) open_ssh ;;
 close) close_ssh ;;
 stop)
-  find_host
-  aws ec2 stop-instances --instance-ids "$id" >/dev/null
-  printf 'Stopping %s (%s)...\n' "$name" "$id"
+  gather
+  # shellcheck disable=SC2086 # $ids: one word an id.
+  aws ec2 stop-instances --instance-ids $ids >/dev/null
+  printf 'Stopping %s...\n' "$(printf '%s\n' "$list" | awk '{printf "%s%s (%s)", NR > 1 ? ", " : "", $1, $2}')"
   # Stopped, not stopping: a start in between gets IncorrectInstanceState.
-  aws ec2 wait instance-stopped --instance-ids "$id"
-  printf '%s is stopped: only its disks cost now.\n' "$name"
+  # shellcheck disable=SC2086
+  aws ec2 wait instance-stopped --instance-ids $ids
+  printf '%s\n' "$list" | while read -r n _; do
+    printf '%s is stopped: only its disks cost now.\n' "$n"
+  done
   ;;
 start)
-  find_host
+  gather
   # AWS refuses to start a stopping instance: IncorrectInstanceState.
-  [ "$state" != stopping ] || aws ec2 wait instance-stopped --instance-ids "$id"
-  aws ec2 start-instances --instance-ids "$id" >/dev/null
-  booted
-  address
-  printf '%s is up at %s.\n' "$name" "$addr"
+  stopping=$(printf '%s\n' "$list" | awk '$3 == "stopping" {printf "%s%s", n++ ? " " : "", $2}')
+  # shellcheck disable=SC2086
+  [ -z "$stopping" ] || aws ec2 wait instance-stopped --instance-ids $stopping
+  # shellcheck disable=SC2086
+  aws ec2 start-instances --instance-ids $ids >/dev/null
+  # Each one's status checks, which pass once it has booted, so the first
+  # ssh gets in.
+  # shellcheck disable=SC2086
+  aws ec2 wait instance-status-ok --instance-ids $ids
+  for n in $(printf '%s\n' "$list" | awk '{print $1}'); do
+    name=$n
+    address
+    printf '%s is up at %s.\n' "$name" "$addr"
+  done
   ;;
 *) usage ;;
 esac
