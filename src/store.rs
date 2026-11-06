@@ -1194,15 +1194,20 @@ impl Store {
             mem_mib: sizes.mem_mib,
             ..Config::default()
         };
+        let sets_config = sizes.cpus.is_some() || sizes.mem_mib.is_some();
         over.check_values()?;
+        // Parked is Busy here too.
         let _lock = take_lock(&dir, name)?;
-        if snapshot(&dir).parked() {
-            return Err(Error::Busy(name.to_string()));
+        // The config as set_config will read it, so one that won't read, or
+        // won't take these, fails before the disk grows. A disk alone
+        // needs none.
+        if sets_config {
+            read_config(&dir)?.with(&over).check_values()?;
         }
         if let Some(bytes) = sizes.disk {
             self.grow_current(name, &dir, bytes)?;
         }
-        if sizes.cpus.is_some() || sizes.mem_mib.is_some() {
+        if sets_config {
             self.set_config(name, |config| {
                 *config = config.clone().with(&over);
                 Ok(())

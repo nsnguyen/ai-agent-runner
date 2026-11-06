@@ -398,14 +398,17 @@ impl Tools {
     #[tool(
         description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist); `disk` grows its disk as it's made. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
     )]
-    fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
+    async fn create_vm(
+        &self,
+        Parameters(args): Parameters<CreateArgs>,
+    ) -> Result<Json<Vm>, String> {
         // Another host's name took the call there (route).
         if let Some(host) = args.host.as_deref()
             && !self.is_me(host)
         {
             return Err(self.no_host(host));
         }
-        let from = args.from.as_deref().unwrap_or(BASE);
+        let from = args.from.unwrap_or_else(|| BASE.to_string());
         let mem_mib = args.mem.as_deref().map(parse_mem).transpose();
         let disk = args.disk.as_deref().map(parse_disk).transpose();
         let disk = disk.map_err(|e| e.to_string())?;
@@ -417,10 +420,9 @@ impl Tools {
             url: None,
             allow: None,
         };
-        self.store
-            .fork_sized(from, &args.name, &config, disk)
-            .map(Json)
-            .map_err(|e| e.to_string())
+        // Growing a disk runs e2fsck and resize2fs, which take a while.
+        let store = self.store.clone();
+        blocking(move || store.fork_sized(&from, &args.name, &config, disk)).await
     }
 
     #[tool(

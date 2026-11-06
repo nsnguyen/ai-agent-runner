@@ -257,6 +257,26 @@ fn memory_and_vcpus_go_in_its_config_and_bad_ones_change_nothing() {
     assert_eq!(config_json(&store, "dev"), config);
 }
 
+// The config is checked before the disk grows, so a resize that can't set
+// memory doesn't leave a bigger disk behind it. A disk alone needs no config.
+#[test]
+fn a_config_that_won_t_read_stops_a_resize_before_the_disk_grows() {
+    let _turn = turn();
+    let (_dir, store) = with_dev();
+    let path = store.root().join("vms/dev/config.json");
+    fs::write(&path, "{\"cpus\": 2, \"from_a_newer_runner\": 1}\n").unwrap();
+    let before = (gens(&store, "dev"), history(&store, "dev"));
+    let both = Sizes {
+        disk: Some(2 * GIB),
+        mem_mib: Some(4096),
+        ..Sizes::default()
+    };
+    store.resize("dev", &both).unwrap_err();
+    assert_eq!((gens(&store, "dev"), history(&store, "dev")), before);
+    let vm = store.resize("dev", &disk_size("2G")).unwrap();
+    assert_eq!((vm.generation, vm.bytes), (1, 2 * GIB));
+}
+
 #[test]
 fn a_fork_can_grow_its_disk_and_its_source_stays_as_it_was() {
     let _turn = turn();
