@@ -1695,6 +1695,11 @@ fn a_vm_s_list_of_names_reads_back_as_set_and_always_has_api_anthropic_com() {
     // Once each.
     store.allow("base", &hosts(&["github.com"])).unwrap();
     assert_eq!(shown(store.allowed("base").unwrap()).unwrap().len(), 3);
+    // What every list has isn't kept as the owner's, which deny would then
+    // refuse to take off.
+    store.allow("base", &hosts(&["API.anthropic.com"])).unwrap();
+    let config = fs::read_to_string(dir.path().join("root/vms/base/config.json")).unwrap();
+    assert!(!config.contains("api.anthropic.com"), "{config}");
 
     // Taking names off keeps the list, even once it's down to the one.
     let less = store.deny("base", &hosts(&["github.com"])).unwrap();

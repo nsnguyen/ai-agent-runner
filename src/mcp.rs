@@ -281,6 +281,17 @@ pub struct RunList {
     runs: Vec<AgentRun>,
 }
 
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct Allowlist {
+    /// The VM's name.
+    name: String,
+    /// True when it has no list, and reaches every name.
+    open: bool,
+    /// With a list, the names its DNS answers, each with every name under
+    /// it, api.anthropic.com always among them. Empty when it's open.
+    names: Vec<String>,
+}
+
 // Named here, or clients see the SDK's own name.
 #[tool_handler]
 impl ServerHandler for Tools {
@@ -368,7 +379,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
+        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist). It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
     )]
     fn create_vm(&self, Parameters(args): Parameters<CreateArgs>) -> Result<Json<Vm>, String> {
         // Another host's name took the call there (route).
@@ -425,6 +436,25 @@ impl Tools {
         systemd::status(&self.store, &name)
             .map(Json)
             .map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Say which names a VM can reach. With open true it has no list, and reaches the whole internet. Otherwise its DNS answers only `names`, each with every name under it (github.com covers api.github.com), api.anthropic.com always among them, and REFUSED for the rest, and the VM reaches only the addresses those answers gave. Read-only: the owner sets the list with `runner net` on the host, and no tool changes it, so for a name that's refused, ask the owner.",
+        annotations(read_only_hint = true)
+    )]
+    fn vm_allowlist(
+        &self,
+        Parameters(NameArg { name }): Parameters<NameArg>,
+    ) -> Result<Json<Allowlist>, String> {
+        let list = self.store.allowed(&name).map_err(|e| e.to_string())?;
+        let names = list.as_ref().map_or_else(Vec::new, |l| {
+            l.names().iter().map(ToString::to_string).collect()
+        });
+        Ok(Json(Allowlist {
+            open: list.is_none(),
+            name,
+            names,
+        }))
     }
 
     #[tool(

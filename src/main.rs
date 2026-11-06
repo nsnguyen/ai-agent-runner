@@ -3,6 +3,7 @@ use runner::best;
 use runner::checkpoint;
 use runner::claude::{self, Claude};
 use runner::creds::{self, Cred};
+use runner::dns::{self, Hostname, List};
 use runner::doctor::{self, System};
 use runner::exec;
 use runner::export;
@@ -164,6 +165,17 @@ enum Cmd {
         /// The port in the VM it goes to, from now on.
         #[arg(long)]
         port: Option<u16>,
+    },
+    /// Show or set the names a VM can reach. It's open, the whole internet,
+    /// until `allow` gives it a list: then its DNS answers only those names,
+    /// each with every name under it, and api.anthropic.com always, and it
+    /// reaches only the addresses those answers gave. A running VM takes a
+    /// change within a second, with no reboot. A fork keeps its source's.
+    Net {
+        name: String,
+        /// Left out, it lists.
+        #[command(subcommand)]
+        action: Option<NetCmd>,
     },
     /// Show a VM's serial console and boot notes, from journald.
     Logs {
@@ -493,6 +505,27 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum NetCmd {
+    /// Put names on the VM's list, making one if it has none: github.com
+    /// covers api.github.com too. Names only, no addresses or wildcards.
+    Allow {
+        #[arg(required = true)]
+        names: Vec<Hostname>,
+    },
+    /// Take names off the VM's list. The list stays even once only
+    /// api.anthropic.com is left: `open` drops it. A VM with no list has
+    /// nothing to take off, since a list allows names, it doesn't block them.
+    Deny {
+        #[arg(required = true)]
+        names: Vec<Hostname>,
+    },
+    /// Show the VM's list, or that it's open.
+    List,
+    /// Drop the VM's list: the whole internet again.
+    Open,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Switch {
     On,
@@ -643,6 +676,18 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 Some(url) => println!("{url}"),
                 None => println!("{name}'s URL is off: `runner url {name} on` turns it on"),
             }
+        }
+        Cmd::Net { name, action } => {
+            let list = match action.unwrap_or(NetCmd::List) {
+                NetCmd::Allow { names } => Some(store.allow(&name, &names)?),
+                NetCmd::Deny { names } => Some(store.deny(&name, &names)?),
+                NetCmd::List => store.allowed(&name)?,
+                NetCmd::Open => {
+                    store.allow_all(&name)?;
+                    None
+                }
+            };
+            println!("{}", net_line(&name, list.as_ref()));
         }
         Cmd::Logs {
             name,
@@ -1115,6 +1160,24 @@ fn session_row(s: &Session) -> String {
 
 fn show(vm: &Vm) {
     println!("{}", line(vm));
+}
+
+// `runner net`'s line: the names on the VM's list, with the ones every list
+// has said apart, or that it has none.
+fn net_line(name: &str, list: Option<&List>) -> String {
+    let Some(list) = list else {
+        return format!("{name}  open: the whole internet");
+    };
+    let always = dns::ALWAYS.join(" ");
+    let own: Vec<&str> = (list.names().iter())
+        .map(Hostname::as_str)
+        .filter(|n| !dns::ALWAYS.contains(n))
+        .collect();
+    if own.is_empty() {
+        format!("{name}  allows only {always}")
+    } else {
+        format!("{name}  allows {}, and always {always}", own.join(" "))
+    }
 }
 
 // A disk of `-` is stdin, which a terminal can't be: it would wait for a

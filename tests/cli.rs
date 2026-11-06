@@ -819,6 +819,121 @@ fn url_prints_turns_off_and_on_and_sets_the_vm_side_port() {
     assert_eq!(store.url("dev").unwrap().guest_port(), 3000);
 }
 
+#[test]
+fn net_allows_denies_lists_and_opens_a_vm_s_names() {
+    let dir = with_base();
+    let ok = |args: &[&str]| {
+        let out = runner(dir.path(), args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    ok(&["create", "dev"]);
+    let open = "dev  open: the whole internet\n";
+    assert_eq!(ok(&["net", "dev", "list"]), open);
+    // With no action, it lists.
+    assert_eq!(ok(&["net", "dev"]), open);
+
+    let both = "dev  allows github.com registry.npmjs.org, and always api.anthropic.com\n";
+    assert_eq!(
+        ok(&["net", "dev", "allow", "github.com", "registry.npmjs.org"]),
+        both
+    );
+    assert_eq!(ok(&["net", "dev", "list"]), both);
+    // Once each, however it's written.
+    assert_eq!(ok(&["net", "dev", "allow", "GitHub.com."]), both);
+
+    assert_eq!(
+        ok(&["net", "dev", "deny", "github.com"]),
+        "dev  allows registry.npmjs.org, and always api.anthropic.com\n"
+    );
+    // Taking the last one off keeps the list.
+    let only = "dev  allows only api.anthropic.com\n";
+    assert_eq!(ok(&["net", "dev", "deny", "registry.npmjs.org"]), only);
+    assert_eq!(ok(&["net", "dev", "list"]), only);
+
+    assert_eq!(ok(&["net", "dev", "open"]), open);
+    assert_eq!(ok(&["net", "dev", "list"]), open);
+    assert_eq!(Store::new(dir.path()).allowed("dev").unwrap(), None);
+}
+
+#[test]
+fn net_refuses_a_bad_name_and_deny_on_an_open_vm_saying_why() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let failed = |args: &[&str]| {
+        let out = runner(dir.path(), args);
+        assert!(!out.status.success(), "{args:?}: {}", text(&out.stdout));
+        assert!(out.stdout.is_empty(), "{args:?}: {}", text(&out.stdout));
+        text(&out.stderr)
+    };
+    let err = failed(&["net", "dev", "allow", "github.com", "1.2.3.4"]);
+    assert!(err.contains("it's an address"), "{err}");
+    let err = failed(&["net", "dev", "allow", "*.github.com"]);
+    assert!(err.contains("wildcard"), "{err}");
+    // Nothing went on: a bad name fails the lot.
+    assert_eq!(Store::new(dir.path()).allowed("dev").unwrap(), None);
+
+    // A list allows; it doesn't block. So there's nothing to take off.
+    let err = failed(&["net", "dev", "deny", "github.com"]);
+    assert!(err.contains("dev is open"), "{err}");
+    assert!(err.contains("runner net dev allow"), "{err}");
+    assert_eq!(Store::new(dir.path()).allowed("dev").unwrap(), None);
+
+    // Neither allow nor deny goes without a name.
+    failed(&["net", "dev", "allow"]);
+    failed(&["net", "dev", "deny"]);
+    let err = failed(&["net", "nope", "list"]);
+    assert!(err.contains("no VM named nope"), "{err}");
+    // api.anthropic.com stays on.
+    runner(dir.path(), &["net", "dev", "allow", "github.com"]);
+    let err = failed(&["net", "dev", "deny", "api.anthropic.com"]);
+    assert!(err.contains("Claude Code"), "{err}");
+}
+
+// Each command reads the config, changes it and writes it back, so two at
+// once would lose one's change without a lock.
+#[test]
+fn net_allows_at_once_each_keep_their_name() {
+    let dir = with_base();
+    runner(dir.path(), &["create", "dev"]);
+    let names: Vec<String> = (0..16).map(|i| format!("n{i}.example.com")).collect();
+    for _ in 0..3 {
+        let children: Vec<_> = (names.iter())
+            .map(|name| {
+                Command::new(env!("CARGO_BIN_EXE_runner"))
+                    .env("RUNNER_ROOT", dir.path())
+                    .args(["net", "dev", "allow", name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", text(&out.stderr));
+        }
+        let list = Store::new(dir.path()).allowed("dev").unwrap().unwrap();
+        let on: Vec<String> = list.names().iter().map(|h| h.to_string()).collect();
+        let lost: Vec<&String> = names.iter().filter(|n| !on.contains(n)).collect();
+        assert!(lost.is_empty(), "lost {lost:?}");
+        runner(dir.path(), &["net", "dev", "open"]);
+    }
+}
+
+#[test]
+fn net_help_names_all_four() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = runner(dir.path(), &["net", "--help"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let help = text(&out.stdout);
+    for action in ["allow", "deny", "list", "open"] {
+        assert!(help.contains(&format!("  {action} ")), "{action}: {help}");
+    }
+    let top = text(&runner(dir.path(), &["--help"]).stdout);
+    assert!(top.contains("  net "), "{top}");
+}
+
 // `runner hosts` on a host: the row the laptop's `runner hosts` shows for it.
 fn meminfo(dir: &Path, available_kib: u64) -> std::path::PathBuf {
     let path = dir.join("meminfo");

@@ -464,6 +464,10 @@ fn a_command_naming_a_vm_reaches_only_its_host() {
         (&["tries", "web", "--wait"], "tries web --wait"),
         (&["keep", "--none", "web"], "keep --none web"),
         (
+            &["net", "web", "allow", "github.com"],
+            "net web allow github.com",
+        ),
+        (
             &["service", "logs", "-n", "50", "web", "srv"],
             "service logs -n 50 web srv",
         ),
