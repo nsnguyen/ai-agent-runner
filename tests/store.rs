@@ -1112,6 +1112,44 @@ fn a_staged_disk_goes_on_top_of_history_once_finished() {
     ));
 }
 
+// best::keep: a try's current disk, under the try's lock so it can't boot
+// meanwhile, staged on dev and finished, as a restore's copy is.
+#[test]
+fn a_try_s_disk_kept_goes_on_top_of_dev_s_history_and_undo_goes_back() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"dev's")).unwrap();
+    store.fork("dev", "dev-2").unwrap();
+    let run = store.begin_run("dev-2").unwrap();
+    fs::write(&run.disk, b"what dev-2's run wrote").unwrap();
+    run.commit().unwrap();
+    let before = store.get("dev").unwrap().generation;
+
+    let held = store.lock("dev-2").unwrap();
+    assert!(matches!(store.begin_run("dev-2"), Err(Error::Busy(_))));
+    let from = held.disk().unwrap();
+    assert_eq!(from, store.disk("dev-2", 1).unwrap());
+    let staged = store
+        .stage_disk("dev", Source::File(&from), "keep of dev-2")
+        .unwrap();
+    let kept = store.finish_restore("dev", &staged).unwrap();
+    assert_eq!(
+        fs::read(store.disk("dev", kept.generation).unwrap()).unwrap(),
+        b"what dev-2's run wrote"
+    );
+    let listed = store.checkpoints("dev").unwrap();
+    assert_eq!(
+        summary(&listed)[0],
+        (kept.generation, true, Some("keep of dev-2"), true)
+    );
+    held.delete().unwrap();
+    assert!(matches!(store.get("dev-2"), Err(Error::NoVm(_))));
+    assert_eq!(store.undo("dev").unwrap().generation, before);
+    assert_eq!(
+        fs::read(store.disk("dev", before).unwrap()).unwrap(),
+        b"dev's"
+    );
+}
+
 #[test]
 fn a_staged_disk_is_refused_at_its_finish_while_the_vm_is_held() {
     let (dir, store) = store();

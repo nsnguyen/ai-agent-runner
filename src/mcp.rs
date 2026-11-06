@@ -7,7 +7,7 @@
 // ask every host, create_vm places a VM as the laptop's `runner create`
 // does, and a call naming a VM or a run goes, as it came, to the VM's host,
 // through one `ssh <peer> runner mcp` each (peers::Remote).
-use crate::best;
+use crate::best::{self, Kept};
 use crate::checkpoint;
 use crate::claude;
 use crate::creds;
@@ -79,6 +79,14 @@ pub struct CreateArgs {
 pub struct NameArg {
     /// The VM's name.
     name: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct KeepArgs {
+    /// A try's name, like dev-2; with none, the VM the tries forked.
+    name: String,
+    /// True to keep none: delete every try and leave the VM as it was.
+    none: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -794,6 +802,14 @@ impl Tools {
     ) -> Result<Json<best::Standing>, String> {
         let now = best::standing(&self.store, &name).map_err(|e| e.to_string())?;
         Ok(Json(now))
+    }
+
+    #[tool(
+        description = "Keep the best try of a best of N (run_best_of). With a try's name, like dev-2, its current disk becomes the disk of the VM the tries forked, on top of that VM's history, so undo_vm goes back, and every try is deleted; the VM keeps its name, address, URL, credentials and history. With that VM's name and none: true, the tries are deleted and the VM is left as it was. Tries whose runs are still going are cancelled first. Refused, with nothing changed, for a try whose run is still going, rolled back or never ran, since it still has the VM's disk; for a try that's up (stop_vm it first); and while the VM has a run going. A running VM is stopped, which commits its disk, and started again after. Returns the kept try's run and its Claude Code session, which run_agent's resume takes to carry that conversation on in the VM."
+    )]
+    async fn keep_try(&self, Parameters(args): Parameters<KeepArgs>) -> Result<Json<Kept>, String> {
+        let store = self.store.clone();
+        blocking(move || best::keep(&store, &args.name, args.none.unwrap_or(false))).await
     }
 
     #[tool(

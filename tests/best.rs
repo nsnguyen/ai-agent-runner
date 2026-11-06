@@ -5,7 +5,8 @@
 // inactive at Ctrl-Alt-Del as a shutdown does. A fork's are linked into its
 // directory as systemctl starts it, since it's made only then. The fake
 // `claude` notes what it got under the name of the VM it runs in, which it
-// reads from its guest's command line, then waits for `ctl/go`.
+// reads from its guest's command line, names the session `ctl/<vm>.session`
+// holds, then waits for `ctl/go`, or `ctl/<vm>/go` for that VM's alone.
 mod common;
 
 use common::wait_for;
@@ -116,8 +117,9 @@ printf '%s\n' "$@" > "$c/$vm/argv"
 pwd > "$c/$vm/pwd"
 cat > "$c/$vm/prompt"
 : > "$c/$vm/started"
-echo '{{"type":"system","subtype":"init","session_id":"s-'"$vm"'"}}'
-while [ ! -e "$c/go" ] && [ -d "$c" ]; do sleep 0.01; done
+s=$(cat "$c/$vm.session" 2>/dev/null || echo "s-$vm")
+echo '{{"type":"system","subtype":"init","session_id":"'"$s"'"}}'
+while [ ! -e "$c/go" ] && [ ! -e "$c/$vm/go" ] && [ -d "$c" ]; do sleep 0.01; done
 exit "$(cat "$c/exit" 2>/dev/null || echo 0)"
 "#,
             ctl.display()
@@ -201,6 +203,26 @@ impl Host {
 
     fn go(&self) {
         fs::write(self.ctl.join("go"), "").unwrap();
+    }
+
+    // Lets the fake claude in `vm` alone exit.
+    fn go_in(&self, vm: &str) {
+        fs::create_dir_all(self.ctl.join(vm)).unwrap();
+        fs::write(self.ctl.join(vm).join("go"), "").unwrap();
+    }
+
+    // The session the fake claude in `vm` names in its init event.
+    fn session(&self, vm: &str, id: &str) {
+        fs::write(self.ctl.join(format!("{vm}.session")), id).unwrap();
+    }
+
+    // As under the unit, `systemctl stop` halts the VM, whose stand-in for
+    // Firecracker's API commits a boot given one and marks the unit inactive.
+    fn stop_halts(&self) {
+        let exe = env!("CARGO_BIN_EXE_runner");
+        let halt =
+            format!("vm=${{2#firecracker@}}; vm=${{vm%.service}}\nexec '{exe}' halt \"$vm\"\n");
+        script(&self.sd.bin.join("on-stop"), &halt);
     }
 
     /// The run as `runner runs <its vm>` lists it, once it has ended.
@@ -796,6 +818,243 @@ fn mcp_runs_best_of() {
     ids.iter().for_each(|id| {
         h.ended(id);
     });
+}
+
+const SESSION: &str = "0b5c1e8e-6f1d-4f43-9a7e-2d3c4b5a6978";
+
+// What a boot does for a try's run that exits 0, which the stand-ins don't:
+// a new generation with work/who.txt on it naming the try, committed, and
+// the run's end saying so.
+fn commit_try(h: &Host, vm: &str) {
+    let run = h.store.begin_run(vm).unwrap();
+    let who = h.dir.path().join(format!("{vm}.who"));
+    fs::write(&who, vm).unwrap();
+    debugfs(
+        &run.disk,
+        &format!("write {} /home/agent/work/who.txt", who.display()),
+    );
+    run.commit().unwrap();
+    let path = h.store.runs(vm).unwrap().join("1/end.json");
+    let mut end: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    end["outcome"] = json!("committed");
+    end["error"] = Value::Null;
+    fs::write(path, end.to_string()).unwrap();
+}
+
+// `vm`'s current disk, whole.
+fn current(h: &Host, vm: &str) -> Vec<u8> {
+    h.disk(vm, h.store.get(vm).unwrap().generation)
+}
+
+// The calls that started or stopped dev's unit, in order.
+fn dev_stops_and_starts(h: &Host) -> Vec<String> {
+    (h.sd.calls().into_iter())
+        .filter(|c| c.ends_with(" firecracker@dev.service") && !c.contains(" show "))
+        .collect()
+}
+
+#[test]
+fn keep_puts_the_winner_s_disk_on_dev_and_deletes_every_try() {
+    let h = host(false);
+    h.session("dev-2", SESSION);
+    h.best_of(3, "fix the tests");
+    h.go_in("dev-1");
+    h.go_in("dev-2");
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    commit_try(&h, "dev-2");
+    h.got("dev-3", "started");
+    let was = h.store.get("dev").unwrap().generation;
+    let won = current(&h, "dev-2");
+
+    let out = h.ok(&["keep", "dev-2"]);
+    let kept = h.store.get("dev").unwrap().generation;
+    assert!(kept != was, "{out}");
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
+    let want = [
+        format!("kept dev-2 on dev: generation {kept} is current, and `runner undo dev` goes back"),
+        "cancelled dev-3.1".to_string(),
+        "deleted dev-1, dev-2 and dev-3".to_string(),
+        format!(
+            "session {SESSION}: `runner run dev --resume {SESSION} <prompt>` carries on dev-2.1's conversation"
+        ),
+    ];
+    assert_eq!(out, want.join("\n") + "\n");
+    assert_eq!(h.vms(), ["dev"]);
+    // Stopped, so it stays down.
+    assert!(dev_stops_and_starts(&h).is_empty());
+    let listed = h.history();
+    let top = listed.iter().find(|c| c.current).unwrap();
+    assert_eq!(top.comment.as_deref(), Some("keep of dev-2"));
+    // On top of dev's history: undo goes back.
+    h.ok(&["undo", "dev"]);
+    assert_eq!(h.store.get("dev").unwrap().generation, was);
+    // And nothing's on hand, so a new batch can start.
+    h.go();
+    for id in h.best_of(2, "again") {
+        h.ended(&id);
+    }
+}
+
+#[test]
+fn a_try_still_going_rolled_back_or_up_isn_t_kept() {
+    let h = host(false);
+    h.best_of(2, "p");
+    h.got("dev-1", "started");
+    let before = h.history();
+    let err = h.refused(&["keep", "dev-1"]);
+    assert!(err.contains("dev-1.1 is still going"), "{err}");
+    // Checked before anything's cancelled.
+    let row = h.ok(&["runs", "dev-2"]);
+    assert!(row.contains("Z  running  "), "{row}");
+
+    h.go();
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    // The stand-ins commit nothing, so each run rolled back.
+    let err = h.refused(&["keep", "dev-1"]);
+    assert!(
+        err.contains("dev-1.1 rolled back, so dev-1 still has dev's disk"),
+        "{err}"
+    );
+    commit_try(&h, "dev-2");
+    h.sd.set_vm_state("dev-2", "active");
+    let err = h.refused(&["keep", "dev-2"]);
+    assert!(err.contains("dev-2 is running: stop it first"), "{err}");
+    assert_eq!(h.vms(), ["dev", "dev-1", "dev-2"]);
+    assert_eq!(h.history(), before);
+}
+
+#[test]
+fn keep_none_deletes_the_tries_and_leaves_dev_as_it_was() {
+    let h = host(false);
+    let err = h.refused(&["keep", "dev", "--none"]);
+    assert!(err.contains("dev has no tries on hand"), "{err}");
+    h.best_of(3, "p");
+    h.go_in("dev-1");
+    h.go_in("dev-2");
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    h.got("dev-3", "started");
+    // A VM that isn't a try, and one that isn't a VM.
+    let err = h.refused(&["keep", "dev"]);
+    assert!(err.contains("dev isn't a try"), "{err}");
+    let err = h.refused(&["keep", "dev-4"]);
+    assert!(err.contains("dev-4 isn't a try"), "{err}");
+    let before = h.history();
+    let was = current(&h, "dev");
+
+    let out = h.ok(&["keep", "dev", "--none"]);
+    let want = [
+        "dev is as it was: generation 0 is current",
+        "cancelled dev-3.1",
+        "deleted dev-1, dev-2 and dev-3",
+    ];
+    assert_eq!(out, want.join("\n") + "\n");
+    assert_eq!(h.vms(), ["dev"]);
+    assert_eq!(h.history(), before);
+    assert!(current(&h, "dev") == was);
+    let err = h.refused(&["keep", "dev", "--none"]);
+    assert!(err.contains("dev has no tries on hand"), "{err}");
+}
+
+#[test]
+fn keep_stops_a_running_dev_and_starts_it_again() {
+    let h = host(true);
+    h.stop_halts();
+    h.best_of(2, "p");
+    h.go();
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    commit_try(&h, "dev-2");
+    let won = current(&h, "dev-2");
+
+    h.ok(&["keep", "dev-2"]);
+    assert_eq!(
+        dev_stops_and_starts(&h),
+        [
+            "systemctl stop firecracker@dev.service",
+            "systemctl start firecracker@dev.service"
+        ]
+    );
+    assert!(current(&h, "dev") == won, "dev's disk isn't dev-2's");
+    assert_eq!(h.vms(), ["dev"]);
+    // Its stop committed the generation it ran, which undo goes back to.
+    assert_eq!(h.store.undo("dev").unwrap().generation, 1);
+}
+
+#[test]
+fn keep_is_refused_while_dev_has_a_run_going() {
+    let h = host(false);
+    h.best_of(2, "p");
+    h.go_in("dev-1");
+    h.go_in("dev-2");
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    commit_try(&h, "dev-2");
+    let run = returns_at_once(h.runner(&["run", "dev", "x", "--dir", h.work_dir()]));
+    assert!(run.status.success(), "{}", text(&run.stderr));
+    h.got("dev", "started");
+    let before = h.history();
+    for args in [&["keep", "dev-2"][..], &["keep", "dev", "--none"]] {
+        let err = h.refused(args);
+        assert!(err.contains("already has a run going, dev.1"), "{err}");
+    }
+    assert_eq!(h.vms(), ["dev", "dev-1", "dev-2"]);
+    assert_eq!(h.history(), before);
+    h.go_in("dev");
+    h.ended("dev.1");
+}
+
+#[test]
+fn mcp_keeps_a_try_or_none() {
+    let h = host(false);
+    h.session("dev-2", SESSION);
+    h.best_of(2, "p");
+    h.go();
+    h.ended("dev-1.1");
+    h.ended("dev-2.1");
+    commit_try(&h, "dev-2");
+    let won = current(&h, "dev-2");
+    let mut s = mcp(&h);
+    let bad = s.call(2, "keep_try", json!({"name": "dev"}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+
+    let got = s.call(3, "keep_try", json!({"name": "dev-2"}));
+    let kept = &got["structuredContent"];
+    let generation = h.store.get("dev").unwrap().generation;
+    assert_eq!(
+        *kept,
+        json!({
+            "vm": "dev",
+            "kept": "dev-2",
+            "run": "dev-2.1",
+            "session": SESSION,
+            "generation": generation,
+            "cancelled": [],
+            "deleted": ["dev-1", "dev-2"],
+        }),
+        "{got}"
+    );
+    assert!(current(&h, "dev") == won);
+
+    // A second batch, dropped.
+    for id in h.best_of(2, "again") {
+        h.ended(&id);
+    }
+    let got = s.call(4, "keep_try", json!({"name": "dev", "none": true}));
+    let dropped = &got["structuredContent"];
+    assert_eq!(
+        *dropped,
+        json!({
+            "vm": "dev",
+            "generation": generation,
+            "cancelled": [],
+            "deleted": ["dev-1", "dev-2"],
+        }),
+        "{got}"
+    );
+    assert_eq!(h.vms(), ["dev"]);
 }
 
 struct Mcp {
