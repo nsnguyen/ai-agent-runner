@@ -224,7 +224,7 @@ pub struct RunAgentArgs {
     prompt: String,
     /// Where in the VM Claude Code runs; it has to exist. Defaults to /home/agent/work.
     dir: Option<String>,
-    /// A Claude Code session to carry on: the session_id in an earlier run's init event.
+    /// A Claude Code session to carry on: an earlier run's `session`, as list_runs gives it.
     resume: Option<String>,
 }
 
@@ -239,7 +239,7 @@ pub struct BestOfArgs {
     n: u32,
     /// Where in each fork Claude Code runs; it has to exist. Defaults to /home/agent/work.
     dir: Option<String>,
-    /// A Claude Code session each fork carries on: the session_id in an earlier run's init event.
+    /// A Claude Code session each fork carries on: an earlier run's `session`, as list_runs gives it.
     resume: Option<String>,
 }
 
@@ -805,7 +805,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, not_rolled_back for one that joined it running and failed or was cancelled, with the checkpoint it took first to restore by hand."
+        description = "List a VM's runs, newest first, each with its state: running, exited (with exit_code, or signal), cancelled, failed (with error) or lost; and its outcome: committed or rolled_back for a run that booted the VM, not_rolled_back for one that joined it running and failed or was cancelled, with the checkpoint it took first to restore by hand; and its session: Claude Code's session id once Claude Code has started, which run_agent's resume takes to carry it on."
     )]
     fn list_runs(
         &self,

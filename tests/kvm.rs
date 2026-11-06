@@ -1080,6 +1080,16 @@ fn a_headless_run_edits_a_file_and_commits_it() {
     let rows = ok(runner(&root, &["runs", &name]));
     assert!(rows.contains("  exited 0, committed  "), "{rows}{stream}");
     assert!(stream.contains(r#""type":"result""#), "{stream}");
+    // Claude Code's own init event names a UUID session, which runs shows
+    // before the prompt.
+    let row = rows
+        .lines()
+        .find(|r| r.starts_with(&format!("{}  ", id.trim())));
+    let row = row.unwrap_or_else(|| panic!("{rows}"));
+    let (before, _) = row.split_once("  \"").unwrap();
+    let session = before.rsplit("  ").next().unwrap();
+    let uuid = session.len() == 36 && session.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit());
+    assert!(uuid, "no session in {row}");
     // The runner read the file off the run's disk itself.
     let result = ok(runner(&root, &["result", id.trim()]));
     let result: serde_json::Value = serde_json::from_str(&result).unwrap();
