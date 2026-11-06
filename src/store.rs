@@ -73,6 +73,8 @@ pub enum Error {
     NothingToUndo(String),
     #[error("{0} has no checkpoint {1}")]
     NoCheckpoint(String, u64),
+    #[error("{0} has no generation {1}: gc has dropped it")]
+    NoGeneration(String, u64),
     #[error("{0} has never booted, so it has no running disk to copy")]
     NeverBooted(String),
     #[error("{0} can't be rebased onto itself")]
@@ -976,14 +978,22 @@ impl Store {
     pub fn restore(&self, name: &str, id: u64) -> Result<Vm> {
         let dir = self.existing(name)?;
         let _lock = take_lock(&dir, name)?;
-        let mut gens = history(&dir)?;
         check_restorable(name, &dir, id)?;
-        let generation = next_generation(&dir)?;
-        clone(&disk_of(&dir, id), &disk_of(&dir, generation))?;
-        write_note(&dir, generation, &Note::auto(&format!("restore of {id}")))?;
-        gens.push(generation);
-        write_history(&dir, &gens)?;
-        read_vm(name, &dir)
+        put_on_top(name, &dir, id, &format!("restore of {id}"))
+    }
+
+    /// `restore` of any generation whose disk is still in gens/, noted as
+    /// `why`: a rolled-back run's, which a takeover carries its session on
+    /// from (claude.rs). `NoGeneration` once gc has dropped it. Under the
+    /// VM's lock, which its boot holds while it's up, so that's `Busy`, and
+    /// gc can't drop the disk while it's copied.
+    pub fn restore_generation(&self, name: &str, generation: u64, why: &str) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        let _lock = take_lock(&dir, name)?;
+        if !disk_of(&dir, generation).is_file() {
+            return Err(Error::NoGeneration(name.to_string(), generation));
+        }
+        put_on_top(name, &dir, generation, why)
     }
 
     /// Copies `disk` into a new generation of the VM, aside from its
@@ -1677,6 +1687,18 @@ pub struct Staged {
     pub generation: u64,
     // What it's noted as once it's in history.
     note: Note,
+}
+
+// A copy of generation `from` on the end of history, noted as `why`, so
+// `undo` goes back to the disk from before it. The caller holds the lock.
+fn put_on_top(name: &str, dir: &Path, from: u64, why: &str) -> Result<Vm> {
+    let mut gens = history(dir)?;
+    let generation = next_generation(dir)?;
+    clone(&disk_of(dir, from), &disk_of(dir, generation))?;
+    write_note(dir, generation, &Note::auto(why))?;
+    gens.push(generation);
+    write_history(dir, &gens)?;
+    read_vm(name, dir)
 }
 
 // What `restore` takes: a checkpoint, or a generation in history, whose disk

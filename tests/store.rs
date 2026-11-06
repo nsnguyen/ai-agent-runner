@@ -903,6 +903,52 @@ fn checkpoint_and_restore_refuse_a_busy_vm() {
     drop(run);
 }
 
+// A run that rolled back leaves its disk in gens/, out of history, which
+// `restore` doesn't take. A takeover of it (claude.rs) puts a copy on top
+// of history, as a restore does, so `undo` goes back.
+#[test]
+fn a_rolled_back_run_s_disk_goes_on_top_of_history_as_a_copy() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"v0")).unwrap();
+    commit_run(&store, "dev", b"v1");
+    let run = store.begin_run("dev").unwrap();
+    fs::write(&run.disk, b"rolled").unwrap();
+    drop(run);
+    assert!(matches!(store.restore("dev", 2), Err(Error::NoCheckpoint(..))));
+
+    let put = store.restore_generation("dev", 2, "takeover of dev.1");
+    assert_eq!(put.unwrap(), vm("dev", 3, 6));
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 3)).unwrap(), b"rolled");
+    assert_eq!(
+        summary(&store.checkpoints("dev").unwrap())[0],
+        (3, true, Some("takeover of dev.1"), true)
+    );
+    // A copy: what dev writes from here on can't reach the run's own disk.
+    fs::write(gen_disk(dir.path(), "dev", 3), b"scribbled").unwrap();
+    assert_eq!(fs::read(gen_disk(dir.path(), "dev", 2)).unwrap(), b"rolled");
+    assert_eq!(store.undo("dev").unwrap(), vm("dev", 1, 2));
+}
+
+#[test]
+fn a_generation_gc_dropped_is_refused_by_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = committed(&dir, 1);
+    drop(store.begin_run("dev").unwrap());
+    let store = store.keeping(0);
+    assert_eq!(store.gc("dev", false).unwrap().generations, [0, 2]);
+    let err = store.restore_generation("dev", 2, "takeover of dev.1");
+    let err = err.unwrap_err();
+    assert!(matches!(&err, Error::NoGeneration(n, 2) if n == "dev"), "{err}");
+    assert_eq!(err.to_string(), "dev has no generation 2: gc has dropped it");
+    assert_eq!(store.get("dev").unwrap(), vm("dev", 1, 2));
+    assert_eq!(on_disk(dir.path()), [1]);
+    // Nor while something holds dev, its boot say.
+    let run = store.begin_run("dev").unwrap();
+    let held = store.restore_generation("dev", 1, "takeover of dev.1");
+    assert!(matches!(held, Err(Error::Busy(_))));
+    drop(run);
+}
+
 // A running VM's boot holds its lock and runs a generation of its own, so
 // its checkpoint is a copy of that one, made with the boot still holding it.
 #[test]
