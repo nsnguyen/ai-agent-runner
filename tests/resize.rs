@@ -170,6 +170,31 @@ fn sizes_parse_as_memory_does_and_print_back() {
     assert_eq!(size_text(6), "6 bytes");
 }
 
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Every whole MiB parse_disk can give, up to its u32 MiB, reads back
+        // from what size_text writes, as errors and `resize` print sizes.
+        #[test]
+        fn size_text_reads_back_as_the_same_disk(mib in 1..=u64::from(u32::MAX)) {
+            let bytes = mib << 20;
+            prop_assert_eq!(parse_disk(&size_text(bytes)).unwrap(), bytes);
+        }
+
+        // Anything else is written in bytes, which isn't read back as a
+        // size it isn't.
+        #[test]
+        fn a_size_not_in_whole_mib_isnt_read_back(bytes in 1..u64::MAX) {
+            prop_assume!(bytes % MIB != 0);
+            let text = size_text(bytes);
+            prop_assert_eq!(text.clone(), format!("{bytes} bytes"));
+            prop_assert!(parse_disk(&text).is_err());
+        }
+    }
+}
+
 #[test]
 fn a_failed_grow_leaves_the_vm_as_it_was() {
     let _turn = turn();
