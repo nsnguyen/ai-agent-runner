@@ -11,7 +11,9 @@ mod common;
 use common::wait_for;
 use common::{FakeApi, FakeSystemd, FakeVsock, Guest, debugfs, image, me, script, text, tree};
 use runner::best;
+use runner::changes::{Change, Changes, Kind};
 use runner::creds::Cred;
+use runner::result::{AgentSays, Changed, Outcome, RunResult};
 use runner::store::{self, Checkpoint, Store};
 use serde_json::{Value, json};
 use std::fs;
@@ -302,8 +304,18 @@ fn best_of_three_on_a_stopped_vm_runs_the_prompt_in_three_new_forks() {
         cancelled.contains("  cancelled, rolled back  "),
         "{cancelled}"
     );
+    // Side by side.
+    let table = h.ok(&["tries", "dev"]);
+    assert!(row(&table, "dev-1.1").contains("  running  "), "{table}");
+    assert!(row(&table, "dev-2.1").contains("  running  "), "{table}");
+    let third = row(&table, "dev-3.1");
+    assert!(third.contains("  cancelled, rolled back  "), "{table}");
 
     h.go();
+    let table = h.ok(&["tries", "dev", "--wait"]);
+    for id in ["dev-1.1", "dev-2.1"] {
+        assert!(row(&table, id).contains("  exited 0, "), "{table}");
+    }
     for id in ["dev-1.1", "dev-2.1"] {
         let row = h.ended(id);
         assert!(row.contains("  exited 0, "), "{row}");
@@ -447,6 +459,253 @@ fn tries_whose_runs_didn_t_start_are_deleted() {
     assert_eq!(h.got("dev-1", "prompt"), "p");
     h.go();
     h.ended("dev-1.1");
+}
+
+// A run as `runner drive` leaves it: what was asked, and once it's over, what
+// the runner measured, then how it ended.
+fn record_run(h: &Host, vm: &str, started: &str, end: Option<(Value, &RunResult)>) {
+    let run = h.store.runs(vm).unwrap().join("1");
+    fs::create_dir_all(&run).unwrap();
+    let ask = json!({"prompt": "fix the tests", "dir": "/home/agent/work", "resume": null, "user": "agent", "boots": true, "started": started});
+    fs::write(run.join("ask.json"), ask.to_string()).unwrap();
+    fs::write(run.join("stream"), "").unwrap();
+    if let Some((end, result)) = end {
+        let result = serde_json::to_string(result).unwrap();
+        fs::write(run.join("result.json"), result).unwrap();
+        fs::write(run.join("end.json"), end.to_string()).unwrap();
+    }
+}
+
+fn end(ended: &str, code: i32, outcome: &str) -> Value {
+    json!({"ended": ended, "exit_code": code, "signal": null, "cancelled": false, "outcome": outcome, "error": null})
+}
+
+fn result(code: i32, ms: u64, outcome: Outcome, paths: &[&str], says: &str) -> RunResult {
+    let paths = (paths.iter())
+        .map(|p| Change {
+            path: p.to_string(),
+            change: Kind::Modified,
+            contains: None,
+        })
+        .collect();
+    RunResult {
+        exit_code: Some(code),
+        duration_ms: ms,
+        outcome: Some(outcome),
+        from_generation: Some(0),
+        generation: Some(1),
+        checkpoint: None,
+        changed: Changed::Measured(Changes {
+            paths,
+            more: 0,
+            boot_only: 4,
+        }),
+        agent_says: AgentSays::new(Some(says.to_string())),
+    }
+}
+
+const FIXED: &str = "Fixed the flaky test.\nIt waited on the clock; now it doesn't.";
+
+// dev's batch of three as best::start and `runner drive` leave it: dev-1.1
+// exited 0 and committed two paths, dev-2.1 exited 1 and rolled back one, and
+// dev-3.1, started two hours ago, goes on while the lock this returns is held.
+fn three_tries(h: &Host) -> fs::File {
+    for vm in ["dev-1", "dev-2", "dev-3"] {
+        h.store.fork("dev", vm).unwrap();
+    }
+    let batch = best::Batch {
+        prompt: "fix the tests".to_string(),
+        dir: "/home/agent/work".to_string(),
+        resume: None,
+        started: "2026-11-06T09:00:00Z".parse().unwrap(),
+        generation: 0,
+        checkpoint: None,
+        tries: (1..=3)
+            .map(|i| best::Try {
+                vm: format!("dev-{i}"),
+                run: Some(format!("dev-{i}.1")),
+            })
+            .collect(),
+    };
+    let record = serde_json::to_string(&batch).unwrap();
+    fs::write(h.store.tries("dev").unwrap(), record).unwrap();
+    let paths = ["/home/agent/work/main.rs", "/home/agent/work/clock.rs"];
+    let committed = result(0, 134_000, Outcome::Committed, &paths, FIXED);
+    let said = "I couldn't make it pass: the fixture is missing.\nSorry.";
+    let rolled_back = result(1, 63_000, Outcome::RolledBack, &paths[..1], said);
+    let t0 = "2026-11-06T09:00:00Z";
+    let committed_end = end("2026-11-06T09:02:14Z", 0, "committed");
+    record_run(h, "dev-1", t0, Some((committed_end, &committed)));
+    let rolled_back_end = end("2026-11-06T09:01:03Z", 1, "rolled_back");
+    record_run(h, "dev-2", t0, Some((rolled_back_end, &rolled_back)));
+    let ago = chrono::Utc::now() - chrono::Duration::seconds(2 * 3600 + 30);
+    let ago = ago.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    record_run(h, "dev-3", &ago, None);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(h.store.runs("dev-3").unwrap().join("lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+// dev-3.1 exits 0 and commits, as `runner drive` ends it.
+fn finish_third(h: &Host, lock: fs::File) {
+    let done = result(0, 7_300_000, Outcome::Committed, &[], "Done.");
+    let run = h.store.runs("dev-3").unwrap().join("1");
+    let result = serde_json::to_string(&done).unwrap();
+    fs::write(run.join("result.json"), result).unwrap();
+    let ended = end("2026-11-06T11:01:40Z", 0, "committed");
+    fs::write(run.join("end.json"), ended.to_string()).unwrap();
+    drop(lock);
+}
+
+// The row a table has for `id`.
+fn row<'a>(table: &'a str, id: &str) -> &'a str {
+    let row = table.lines().find(|l| l.starts_with(&format!("{id} ")));
+    row.unwrap_or_else(|| panic!("no {id} in\n{table}"))
+}
+
+#[test]
+fn tries_shows_a_row_per_try_side_by_side() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    let table = h.ok(&["tries", "dev"]);
+    let want = [
+        "RUN      STATE                  EXIT  TOOK   CHANGED  AGENT SAYS (UNTRUSTED)",
+        "dev-1.1  exited 0, committed    0     2m14s  2        \"Fixed the flaky test.\"",
+        "dev-2.1  exited 1, rolled back  1     1m03s  1        \"I couldn't make it pass: the fixture is missing.\"",
+        "dev-3.1  running                -     2h00m  -        -",
+    ];
+    assert_eq!(table, want.join("\n") + "\n");
+}
+
+#[test]
+fn tries_json_has_each_try_s_run_and_full_result() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    let out: Value = serde_json::from_str(&h.ok(&["tries", "dev", "--json"])).unwrap();
+    assert_eq!(out["vm"], json!("dev"));
+    assert_eq!(out["prompt"], json!("fix the tests"));
+    assert_eq!(out["generation"], json!(0));
+    let tries = out["tries"].as_array().unwrap();
+    let ids: Vec<&str> = tries.iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["dev-1.1", "dev-2.1", "dev-3.1"]);
+    let one = &tries[0];
+    assert_eq!(one["vm"], json!("dev-1"));
+    assert_eq!(one["gone"], json!(false));
+    assert_eq!(one["run"]["state"], json!("exited"));
+    assert_eq!(one["run"]["outcome"], json!("committed"));
+    assert_eq!(one["result"]["exit_code"], json!(0));
+    let paths = &one["result"]["changed"]["paths"];
+    let paths: Vec<&str> = (paths.as_array().unwrap().iter())
+        .map(|p| p["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        ["/home/agent/work/main.rs", "/home/agent/work/clock.rs"]
+    );
+    // The whole of what the agent says, kept apart.
+    let says = &one["result"]["agent_says"];
+    assert_eq!(says["untrusted"], json!(true));
+    assert_eq!(says["text"], json!(FIXED));
+    assert_eq!(tries[1]["result"]["outcome"], json!("rolled_back"));
+    // Still going, so no result yet.
+    assert_eq!(tries[2]["run"]["state"], json!("running"));
+    assert!(tries[2].get("result").is_none(), "{}", tries[2]);
+}
+
+#[test]
+fn tries_wait_returns_once_every_try_has_ended() {
+    let h = host(false);
+    let lock = three_tries(&h);
+    let mut waiting = h
+        .runner(&["tries", "dev", "--wait"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        waiting.try_wait().unwrap().is_none(),
+        "returned with dev-3.1 running"
+    );
+    finish_third(&h, lock);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || tx.send(waiting.wait_with_output().unwrap()));
+    let out = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("--wait returned once dev-3.1 ended");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let table = text(&out.stdout);
+    let third = row(&table, "dev-3.1");
+    assert!(third.contains("  exited 0, committed  "), "{table}");
+    assert!(third.ends_with("  \"Done.\""), "{table}");
+    // With nothing going, it returns at once.
+    let out = returns_at_once(h.runner(&["tries", "dev", "--wait", "--json"]));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_try_deleted_by_hand_shows_as_gone() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    h.ok(&["delete", "dev-2"]);
+    let table = h.ok(&["tries", "dev"]);
+    assert!(row(&table, "dev-2.1").contains("  gone  "), "{table}");
+    assert!(
+        row(&table, "dev-1.1").contains("  exited 0, committed  "),
+        "{table}"
+    );
+    assert!(row(&table, "dev-3.1").contains("  running  "), "{table}");
+    let out: Value = serde_json::from_str(&h.ok(&["tries", "dev", "--json"])).unwrap();
+    let gone = &out["tries"][1];
+    assert_eq!(gone["id"], json!("dev-2.1"));
+    assert_eq!(gone["gone"], json!(true));
+    assert!(gone.get("run").is_none(), "{gone}");
+    assert_eq!(out["tries"][0]["gone"], json!(false));
+}
+
+#[test]
+fn tries_on_a_vm_with_none_says_so() {
+    let h = host(false);
+    assert_eq!(h.ok(&["tries", "dev"]), "no tries yet\n");
+    let out: Value = serde_json::from_str(&h.ok(&["tries", "dev", "--json"])).unwrap();
+    assert_eq!(out, json!({"vm": "dev", "tries": []}));
+    let err = h.refused(&["tries", "nope"]);
+    assert!(err.contains("no VM named nope"), "{err}");
+}
+
+#[test]
+fn mcp_lists_tries() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    let mut s = mcp(&h);
+    let got = s.call(2, "list_tries", json!({"name": "dev"}));
+    let tries = got["structuredContent"]["tries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let ids: Vec<&str> = tries.iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["dev-1.1", "dev-2.1", "dev-3.1"], "{got}");
+    let states: Vec<&str> = (tries.iter())
+        .map(|t| t["run"]["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["exited", "exited", "running"]);
+    let codes: Vec<Value> = (tries.iter())
+        .map(|t| t["result"]["exit_code"].clone())
+        .collect();
+    assert_eq!(codes, [json!(0), json!(1), Value::Null]);
+    let paths = tries[0]["result"]["changed"]["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(tries[0]["result"]["agent_says"]["untrusted"], json!(true));
+    // A VM with no batch has no tries.
+    let none = s.call(3, "list_tries", json!({"name": "dev-1"}));
+    assert_eq!(none["structuredContent"]["tries"], json!([]), "{none}");
+    let bad = s.call(4, "list_tries", json!({"name": "nope"}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
 }
 
 #[test]

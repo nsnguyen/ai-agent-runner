@@ -421,6 +421,7 @@ fn a_command_naming_a_vm_reaches_only_its_host() {
         (&["output", "web.1", "--follow"], "output web.1 --follow"),
         (&["result", "web.12"], "result web.12"),
         (&["cancel", "web.3"], "cancel web.3"),
+        (&["tries", "web", "--wait"], "tries web --wait"),
         (
             &["service", "logs", "-n", "50", "web", "srv"],
             "service logs -n 50 web srv",
