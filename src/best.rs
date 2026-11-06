@@ -45,8 +45,8 @@ pub const MAX: u32 = 4;
 pub const SPARE_MIB: u64 = 1024;
 /// How many characters of what an agent says a row of `table` shows.
 pub const SAYS_WIDTH: usize = 60;
-// How often `wait` looks again.
-const POLL: Duration = Duration::from_millis(100);
+// How often `wait` looks again: each look reads every try's result.
+const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -263,8 +263,8 @@ pub struct Tried {
     pub vm: String,
     /// Its run's id, like dev-1.1; null if its run never started.
     pub id: Option<String>,
-    /// The fork, or its run, has been deleted since, so there's no run or
-    /// result to show.
+    /// The fork, or its run, isn't on this host any more: deleted, or moved
+    /// to another host, since. Then there's no run or result to show.
     pub gone: bool,
     /// Its run, as list_runs gives it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,7 +395,9 @@ fn first_line(text: &str) -> Option<String> {
     Some(format!("{cut:?}"))
 }
 
-// A try as it stands: gone if its fork or run has been deleted.
+// A try as it stands: gone if its fork or run has been deleted, even while
+// it's read. One the record has no run for may have one all the same, if
+// `run --n` died before it noted it: a fork's first run is <vm>.1.
 fn tried(store: &Store, t: &Try) -> Result<Tried> {
     let mut tried = Tried {
         vm: t.vm.clone(),
@@ -404,24 +406,27 @@ fn tried(store: &Store, t: &Try) -> Result<Tried> {
         run: None,
         result: None,
     };
-    let Some(id) = &t.run else {
-        match store.get(&t.vm) {
-            Err(store::Error::NoVm(_)) => tried.gone = true,
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
-        }
-        return Ok(tried);
-    };
-    let run = match runs::get(store, id) {
-        Err(runs::Error::Store(store::Error::NoVm(_)) | runs::Error::NoRun(_)) => {
+    let id = t.run.clone().unwrap_or_else(|| runs::id(&t.vm, 1));
+    let run = match runs::get(store, &id) {
+        Err(runs::Error::Store(store::Error::NoVm(_))) => {
             tried.gone = true;
+            return Ok(tried);
+        }
+        // Its run was deleted, or it never had one.
+        Err(runs::Error::NoRun(_)) => {
+            tried.gone = t.run.is_some();
             return Ok(tried);
         }
         r => r?,
     };
+    tried.id = Some(id.clone());
     if run.state != runs::State::Running {
-        tried.result = match runs::result(store, id) {
+        tried.result = match runs::result(store, &id) {
             Err(runs::Error::NoResult { .. } | runs::Error::StillRunning(_)) => None,
+            Err(runs::Error::Store(store::Error::NoVm(_)) | runs::Error::NoRun(_)) => {
+                tried.gone = true;
+                return Ok(tried);
+            }
             r => Some(r?),
         };
     }

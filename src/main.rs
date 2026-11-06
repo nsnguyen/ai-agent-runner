@@ -351,7 +351,7 @@ enum Cmd {
     /// Show the tries of a VM's latest best of N side by side, a row per
     /// try: its run, how it stands, its exit code, how long it took, how many
     /// paths it changed, and the first line of what its agent says, which is
-    /// untrusted. A try deleted since shows as gone.
+    /// untrusted. A try deleted or moved since shows as gone.
     Tries {
         name: String,
         /// Print each try's run and its whole result as JSON instead, the

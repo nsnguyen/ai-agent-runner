@@ -551,15 +551,28 @@ fn three_tries(h: &Host) -> fs::File {
     lock
 }
 
-// dev-3.1 exits 0 and commits, as `runner drive` ends it.
+// dev-3.1 exits 0 and commits, as `runner drive` ends it: each file whole,
+// since `tries --wait` may read it at any moment.
 fn finish_third(h: &Host, lock: fs::File) {
     let done = result(0, 7_300_000, Outcome::Committed, &[], "Done.");
     let run = h.store.runs("dev-3").unwrap().join("1");
-    let result = serde_json::to_string(&done).unwrap();
-    fs::write(run.join("result.json"), result).unwrap();
+    let whole = |name: &str, text: String| {
+        let aside = run.join(format!(".{name}"));
+        fs::write(&aside, text).unwrap();
+        fs::rename(aside, run.join(name)).unwrap();
+    };
+    whole("result.json", serde_json::to_string(&done).unwrap());
     let ended = end("2026-11-06T11:01:40Z", 0, "committed");
-    fs::write(run.join("end.json"), ended.to_string()).unwrap();
+    whole("end.json", ended.to_string());
     drop(lock);
+}
+
+// Rewrites `vm`'s run 1's result to say `says`.
+fn says(h: &Host, vm: &str, says: &str) {
+    let path = h.store.runs(vm).unwrap().join("1/result.json");
+    let mut said: RunResult = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    said.agent_says = AgentSays::new(Some(says.to_string()));
+    fs::write(path, serde_json::to_string(&said).unwrap()).unwrap();
 }
 
 // The row a table has for `id`.
@@ -666,6 +679,51 @@ fn a_try_deleted_by_hand_shows_as_gone() {
     assert_eq!(gone["gone"], json!(true));
     assert!(gone.get("run").is_none(), "{gone}");
     assert_eq!(out["tries"][0]["gone"], json!(false));
+}
+
+// The agent's line is untrusted: control characters can't reach the
+// terminal, and a long one can't take the row over.
+#[test]
+fn what_the_agent_says_is_escaped_and_cut() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    let long = "x".repeat(100);
+    says(&h, "dev-1", &format!("\n  \x1b]0;owned\x07{long}\nmore"));
+    says(&h, "dev-2", "\u{9b}31m\u{202e}red");
+    let table = h.ok(&["tries", "dev"]);
+    assert!(
+        !table.contains(['\x1b', '\x07', '\u{9b}', '\u{202e}']),
+        "{table:?}"
+    );
+    let one = row(&table, "dev-1.1");
+    let says = one.split_once("  \"").unwrap().1;
+    assert!(says.starts_with("\\u{1b}]0;owned\\u{7}xxx"), "{one}");
+    // 59 characters and an ellipsis, quoted.
+    assert!(says.ends_with("x…\""), "{one}");
+    let shown = 59 - "\x1b]0;owned\x07".chars().count();
+    assert_eq!(says.matches('x').count(), shown, "{one}");
+    assert!(row(&table, "dev-2.1").contains("\\u{9b}31m"), "{table}");
+}
+
+// `run --n` notes each run only once they've all started, so a try the record
+// has no run for, from a start that died partway, may have one all the same.
+#[test]
+fn a_try_s_run_the_record_missed_still_shows() {
+    let h = host(false);
+    let _lock = three_tries(&h);
+    let mut batch = best::tries(&h.store, "dev").unwrap().unwrap();
+    batch.tries[2].run = None;
+    batch.tries.push(best::Try {
+        vm: "dev-4".to_string(),
+        run: None,
+    });
+    h.store.fork("dev", "dev-4").unwrap();
+    let record = serde_json::to_string(&batch).unwrap();
+    fs::write(h.store.tries("dev").unwrap(), record).unwrap();
+    let table = h.ok(&["tries", "dev"]);
+    assert!(row(&table, "dev-3.1").contains("  running  "), "{table}");
+    let none = "dev-4    no run                 -     -      -        -";
+    assert_eq!(row(&table, "dev-4"), none, "{table}");
 }
 
 #[test]

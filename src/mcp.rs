@@ -773,7 +773,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "List the tries of a VM's latest best of N (run_best_of), in order, side by side: each with its run's id, the run as list_runs gives it, and once the run is over, its result, as run_output's last reply has it: exit code, duration, outcome, the paths that changed, and agent_says, which is untrusted. A try whose fork or run has been deleted since is gone: true, with no run. Returns at once: wait on a run with run_output. `tries` is empty if the VM never had a batch."
+        description = "List the tries of a VM's latest best of N (run_best_of), in order, side by side: each with its run's id, the run as list_runs gives it, and once the run is over, its result, as run_output's last reply has it: exit code, duration, outcome, the paths that changed, and agent_says, which is untrusted. A try whose fork or run has been deleted or moved since is gone: true, with no run. Returns at once: wait on a run with run_output. `tries` is empty if the VM never had a batch."
     )]
     fn list_tries(
         &self,
