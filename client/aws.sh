@@ -33,8 +33,9 @@
 #
 # stop and start act on every host in the laptop's ~/.config/runner/hosts
 # (`runner hosts add`), by its ssh target's host part: runner@kvm-host-2 is
-# kvm-host-2, the name up gives its instance. A listed host with no such
-# instance, one aws.sh didn't make, is left alone. With RUNNER_AWS_NAME set,
+# kvm-host-2, the name up gives its instance and its key pair. A listed host
+# with no instance of that name and key pair, one aws.sh didn't make, is
+# named and left alone. With RUNNER_AWS_NAME set,
 # or no hosts file, they act on that one host, as every other command does.
 #
 # RUNNER_AWS_NAME names the instance, its key pair and its security group
@@ -88,9 +89,12 @@ tailnet_name() {
 }
 
 # The instance named $name that isn't terminated, as "id state address".
+# With $keyed set, only one launched with the key pair of that name, as up
+# launches them, so another instance that just shares the name isn't taken.
 instance() {
   aws ec2 describe-instances \
     --filters "Name=tag:Name,Values=$name" \
+    ${keyed:+"Name=key-name,Values=$name"} \
     "Name=instance-state-name,Values=pending,running,stopping,stopped" \
     --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]' \
     --output text
@@ -139,9 +143,9 @@ gather() {
       continue
     fi
     name=$h
-    found=$(instance)
+    found=$(keyed=1 instance)
     if [ -z "$found" ]; then
-      printf "aws.sh: no instance is named %s, so it's left alone\n" "$h" >&2
+      printf "aws.sh: no instance aws.sh up made is named %s, so it's left alone\n" "$h" >&2
       continue
     fi
     parse
@@ -589,7 +593,7 @@ stop)
   gather
   # shellcheck disable=SC2086 # $ids: one word an id.
   aws ec2 stop-instances --instance-ids $ids >/dev/null
-  printf 'Stopping %s...\n' "$(printf '%s\n' "$list" | awk '{printf "%s%s (%s)", NR > 1 ? ", " : "", $1, $2}')"
+  printf 'Stopping %s...\n' "$(printf '%s\n' "$list" | awk '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')"
   # Stopped, not stopping: a start in between gets IncorrectInstanceState.
   # shellcheck disable=SC2086
   aws ec2 wait instance-stopped --instance-ids $ids
@@ -606,9 +610,12 @@ start)
   # shellcheck disable=SC2086
   aws ec2 start-instances --instance-ids $ids >/dev/null
   # Each one's status checks, which pass once it has booted, so the first
-  # ssh gets in.
-  # shellcheck disable=SC2086
-  aws ec2 wait instance-status-ok --instance-ids $ids
+  # ssh gets in. One wait each, though they boot side by side: the wait asks
+  # for running instances' statuses only, so one wait for all would pass as
+  # soon as those already running were ok.
+  for id in $ids; do
+    booted
+  done
   for n in $(printf '%s\n' "$list" | awk '{print $1}'); do
     name=$n
     address

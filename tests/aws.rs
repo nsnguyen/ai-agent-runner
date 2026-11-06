@@ -28,10 +28,12 @@ const LOG: &str = r#"log() { { printf '%s\037' "${WHO:-laptop}" "$@"; printf '\0
 
 // Each aws call's argv on a line, its args split by US, in $FAKE/calls. A file
 // in $FAKE says what AWS has: has-key, has-sg, instances (describe-instances'
-// text; instances.<name> answers for the instance named <name> instead),
+// text; instances.<name> answers for the instance named <name> instead, and
+// key-of.<name> is the key pair it was launched with, when not <name>),
 // perms (the group's IpPermissions, which authorize and revoke set);
 // key-fails and signed-out make those calls fail as AWS does. stop-instances
-// and start-instances set each instance they name stopped or running.
+// and start-instances set each instance they name stopped or running, start
+// at the address in ip.<id>, else HOST_IP.
 const FAKE_AWS: &str = r#"{ for arg; do printf '%s\037' "$arg"; done; printf '\n'; } >>"$FAKE/calls"
 log aws "$@"
 fail() { echo "An error occurred ($1)" >&2; exit 254; }
@@ -39,7 +41,9 @@ case "$1 $2" in
 "sts get-caller-identity") [ ! -e "$FAKE/signed-out" ] || fail ExpiredToken ;;
 "ec2 describe-instances")
   n=$(printf '%s\n' "$@" | sed -n 's/^Name=tag:Name,Values=//p')
-  if [ -n "$n" ] && [ -e "$FAKE/instances.$n" ]; then cat "$FAKE/instances.$n"
+  k=$(printf '%s\n' "$@" | sed -n 's/^Name=key-name,Values=//p')
+  if [ -n "$k" ] && [ -e "$FAKE/key-of.$n" ] && [ "$(cat "$FAKE/key-of.$n")" != "$k" ]; then :
+  elif [ -n "$n" ] && [ -e "$FAKE/instances.$n" ]; then cat "$FAKE/instances.$n"
   else cat "$FAKE/instances" 2>/dev/null || true; fi ;;
 "ec2 describe-key-pairs") [ -e "$FAKE/has-key" ] || fail InvalidKeyPair.NotFound ;;
 "ec2 create-key-pair")
@@ -68,7 +72,9 @@ case "$1 $2" in
   for f in "$FAKE"/instances "$FAKE"/instances.*; do
     [ -e "$f" ] || continue
     for id in $ids; do
-      sed "s/^$id	.*/$id	$to/" "$f" >"$f.new" && mv "$f.new" "$f"
+      t=$to
+      [ "$t" = "stopped	None" ] || [ ! -e "$FAKE/ip.$id" ] || t="running	$(cat "$FAKE/ip.$id")"
+      sed "s/^$id	.*/$id	$t/" "$f" >"$f.new" && mv "$f.new" "$f"
     done
   done ;;
 "ec2 wait") ;;
@@ -441,6 +447,20 @@ impl Aws {
             .collect()
     }
 
+    /// The ids each `aws ec2 wait <what>` waited on, a list per call.
+    fn waited(&self, what: &str) -> Vec<Vec<String>> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.len() > 2 && c[0] == "ec2" && c[1] == "wait" && c[2] == what)
+            .map(|c| {
+                values(&c, "--instance-ids")
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
     fn ssh_argv(&self) -> Vec<String> {
         let bytes = fs::read(self.dir.path().join("fake/ssh")).unwrap();
         text(&bytes)
@@ -510,7 +530,6 @@ fn says(r: &[String], part: &str) -> bool {
     r.iter().skip(1).any(|a| a.contains(part))
 }
 
-/// The value after `flag` in `args`.
 /// Every value after `flag`, up to the next flag: --instance-ids takes several.
 fn values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
     let at = args.iter().position(|a| a == flag).expect("no flag") + 1;
@@ -521,6 +540,7 @@ fn values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The value after `flag` in `args`.
 fn after<'a>(args: &'a [String], flag: &str) -> &'a str {
     let at = args
         .iter()
@@ -856,7 +876,8 @@ fn stop_and_start() {
     for shell in SHELLS {
         let aws = Aws::new();
         aws.has("instances", &format!("i-0old\trunning\t{HOST_IP}\n"));
-        ok(&aws.run(shell, &["stop"]));
+        let out = ok(&aws.run(shell, &["stop"]));
+        assert!(out.contains("Stopping kvm-host (i-0old)...\n"), "{out}");
         let stop = aws.call("stop-instances").expect("no stop-instances");
         assert_eq!(after(&stop, "--instance-ids"), "i-0old");
         // Stopped, not stopping, so a start straight after doesn't get
@@ -878,11 +899,18 @@ fn stop_and_start_act_on_every_listed_host() {
         aws.hosts("runner@kvm-host\nrunner@kvm-host-2\n");
         aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
         aws.has("instances.kvm-host-2", "i-0b\trunning\t192.0.2.8\n");
-        let out = ok(&aws.run(shell, &["stop"]));
+        aws.has("ip.i-0b", "192.0.2.8");
+        let run = aws.run(shell, &["stop"]);
+        let out = ok(&run);
+        assert_eq!(text(&run.stderr), "", "nothing on stderr");
+        assert!(
+            out.contains("Stopping kvm-host (i-0a), kvm-host-2 (i-0b)...\n"),
+            "{out}"
+        );
         let stop = aws.call("stop-instances").expect("no stop-instances");
         assert_eq!(values(&stop, "--instance-ids"), ["i-0a", "i-0b"]);
         // One wait for both, so they stop side by side.
-        assert_eq!(aws.waits(), ["instance-stopped"]);
+        assert_eq!(aws.waited("instance-stopped"), [["i-0a", "i-0b"]]);
         assert!(
             out.contains("kvm-host is stopped") && out.contains("kvm-host-2 is stopped"),
             "{out}"
@@ -891,9 +919,12 @@ fn stop_and_start_act_on_every_listed_host() {
         let out = ok(&aws.run(shell, &["start"]));
         let start = aws.call("start-instances").expect("no start-instances");
         assert_eq!(values(&start, "--instance-ids"), ["i-0a", "i-0b"]);
-        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        // One wait each: AWS's status wait sees only running instances, so a
+        // wait for both would pass once one had booted.
+        assert_eq!(aws.waited("instance-status-ok"), [["i-0a"], ["i-0b"]]);
         assert!(
-            out.contains("kvm-host is up at") && out.contains("kvm-host-2 is up at"),
+            out.contains(&format!("kvm-host is up at {HOST_IP}."))
+                && out.contains("kvm-host-2 is up at 192.0.2.8."),
             "{out}"
         );
     }
@@ -939,6 +970,25 @@ fn a_listed_host_aws_sh_didnt_make_is_left_alone() {
 }
 
 #[test]
+fn a_listed_host_named_like_an_instance_aws_sh_didnt_make_is_left_alone() {
+    // up launches with the key pair of the host's name; another instance
+    // that only shares the name isn't one of these.
+    for shell in SHELLS {
+        let aws = Aws::new();
+        aws.hosts("runner@kvm-host\nrunner@web\n");
+        aws.has("instances.kvm-host", &format!("i-0a\trunning\t{HOST_IP}\n"));
+        aws.has("instances.web", &format!("i-0w\trunning\t{HOST_IP}\n"));
+        aws.has("key-of.web", "deploy");
+        let out = aws.run(shell, &["stop"]);
+        let err = text(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        let stop = aws.call("stop-instances").expect("no stop-instances");
+        assert_eq!(values(&stop, "--instance-ids"), ["i-0a"]);
+        assert!(err.contains("web"), "{err}");
+    }
+}
+
+#[test]
 fn no_listed_host_with_an_instance_is_an_error() {
     for shell in SHELLS {
         let aws = Aws::new();
@@ -970,7 +1020,14 @@ fn start_waits_only_for_the_stopping_hosts() {
         assert_eq!(values(wait, "--instance-ids"), ["i-0a"]);
         let start = aws.call("start-instances").expect("no start-instances");
         assert_eq!(values(&start, "--instance-ids"), ["i-0a", "i-0b"]);
-        assert_eq!(aws.waits(), ["instance-stopped", "instance-status-ok"]);
+        assert_eq!(
+            aws.waits(),
+            [
+                "instance-stopped",
+                "instance-status-ok",
+                "instance-status-ok"
+            ]
+        );
         assert!(out.contains("kvm-host-2 is up at"), "{out}");
     }
 }

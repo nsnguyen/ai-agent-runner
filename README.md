@@ -164,7 +164,7 @@ Each step checks first, so after a failure, fix what it says and rerun `client/a
 
 Once closed, `client/aws.sh ssh` goes over the tailnet, as `kvm-host`, and `client/check.sh` upgrades and checks the host (After merging a change). After the laptop's address changes, `client/aws.sh open` lets in the new one and no other, until the next `close`. `client/aws.sh stop` stops the host, after which only its disks cost, `start` brings it back at a new public address, and `ip` prints it.
 
-With several hosts, `stop` and `start` take every host in the laptop's `~/.config/runner/hosts` (Several hosts), by its name: `runner@kvm-host-2` is the instance `kvm-host-2`. They ask AWS for all of them in one call and wait for them side by side. A listed host with no instance of that name, one aws.sh didn't make, is named and left alone. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` stops that one alone, and every other command (`up`, `setup`, `ip`, `ssh`, `open`, `close`) acts on one host, `RUNNER_AWS_NAME`'s or `kvm-host`.
+With several hosts, `stop` and `start` take every host in the laptop's `~/.config/runner/hosts` (Several hosts), by its name: `runner@kvm-host-2` is the instance `kvm-host-2`. They ask AWS for all of them in one call and wait for them side by side. A listed host with no instance of that name launched with the key pair of that name, as `up` launches them, is one aws.sh didn't make: it's named and left alone. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` stops that one alone, and every other command (`up`, `setup`, `ip`, `ssh`, `open`, `close`) acts on one host, `RUNNER_AWS_NAME`'s or `kvm-host`.
 
 ## Build the base image
 
