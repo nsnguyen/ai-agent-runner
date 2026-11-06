@@ -164,6 +164,8 @@ install -m 0644 "$tmp/50-runner.rules" /etc/polkit-1/rules.d/50-runner.rules
 
 say "firecracker@.service"
 install -m 0644 "$here/firecracker@.service" /etc/systemd/system/firecracker@.service
+# At a host shutdown, it parks each sleeping VM before the VMs' units stop.
+install -m 0644 "$here/runner-park.service" /etc/systemd/system/runner-park.service
 
 say "NAT for $net"
 cat >"$tmp/90-runner.conf" <<'EOF'
@@ -184,6 +186,9 @@ install -m 0644 "$here/runner-nat.service" /etc/systemd/system/runner-nat.servic
 systemctl daemon-reload
 systemctl enable runner-nat.service
 systemctl restart runner-nat.service
+# Started, never restarted: its stop parks every sleeping VM.
+systemctl enable runner-park.service
+systemctl start runner-park.service
 
 say "host idle: $idle"
 echo "$idle" >"$tmp/host-idle"

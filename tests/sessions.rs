@@ -417,7 +417,12 @@ fn asleep(store: &Store) {
     snap.make_room().unwrap();
     let generation = store.booted("dev").unwrap().unwrap().generation;
     let at = chrono::Utc::now();
-    snap.note(&Slept { generation, at }).unwrap();
+    snap.note(&Slept {
+        generation,
+        at,
+        parked: false,
+    })
+    .unwrap();
 }
 
 // A sleeping VM's sessions are there in its memory, so looking at one wakes

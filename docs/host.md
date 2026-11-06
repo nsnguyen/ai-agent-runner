@@ -15,7 +15,7 @@ How `start` and `stop` work, and how to set a host up by hand until the host ins
 - `delete` and `undo` refuse a running VM, because boot holds its lock. `checkpoint` pauses one for its copy, and `restore` stops and starts it, or waits out a stop under way.
 - The agent's own calls, `runner-guest checkpoint`, `checkpoints` and `restore`, go to the host on vsock port 10024, which Firecracker passes to `vsock.sock_10024`, where boot serves them for that VM alone (`src/calls.rs`). Its checkpoint is made as `runner checkpoint` makes one, up to 10 an hour. Its restore is copied while the VM runs; then boot sends Ctrl-Alt-Del, commits the disk at the clean shutdown, puts the copy on top, and exits 75, which the unit's `RestartForceExitStatus` boots again. A unit installed before this boots nothing then, and the VM stays stopped on the restored disk: rerun `host/install.sh`.
 - A headless run (`runner run`) on a stopped VM starts it with `systemctl start`, but shuts it down with Ctrl-Alt-Del straight to Firecracker, as halt does, so a clean exit commits. Once the guest is up, the run leaves a `rollback` note in the VM's directory, naming itself, and takes it back only when Claude Code exits 0; boot keeps the old generation current on seeing it, so a VM shut down under a run, by a reboot or `runner stop`, rolls back. Each run is driven by `runner drive`, in a session of its own, so it outlives the SSH connection that started it. A host whose logind kills a user's processes at logout (`KillUserProcesses=yes` in `/etc/systemd/logind.conf`; Debian and Ubuntu leave it off) kills runs too: add `runner` to `KillExcludeUsers` there.
-- At a host shutdown, systemd stops every VM's unit, so a running VM shuts down cleanly and a sleeping one is woken to shut down, its disk kept and its memory lost.
+- At a host shutdown, `runner-park.service` parks each sleeping VM first, so it sleeps on through it (README.md, Sleep and wake); then systemd stops every VM's unit, so a running one shuts down cleanly.
 - VMs get 2 vCPUs and 2 GiB unless `runner create --cpus --mem` says otherwise, and the host's kernel at `<root>/kernel/vmlinux` unless `--kernel` names one. A fork keeps its parent's.
 
 ## Idle power-off
@@ -62,10 +62,12 @@ A host can power itself off once nothing has used it for its idle time, which on
    sudo install release-$v-$a/firecracker-$v-$a /usr/local/bin/firecracker
    ```
 2. A guest kernel at `/var/lib/runner/kernel/vmlinux`. It needs `CONFIG_SERIO_I8042` and `CONFIG_KEYBOARD_ATKBD`, or Ctrl-Alt-Del never reaches the guest and every stop ends in a kill. Firecracker's CI kernels have both; its [getting started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) fetches one, and an Ubuntu rootfs.
-3. The unit, as the user that owns `/var/lib/runner`:
+3. The units, as the user that owns `/var/lib/runner`. The second parks each sleeping VM at a host shutdown, so it sleeps on through it:
    ```
    runner unit --user runner | sudo tee /etc/systemd/system/firecracker@.service
+   runner unit --park --user runner | sudo tee /etc/systemd/system/runner-park.service
    sudo systemctl daemon-reload
+   sudo systemctl enable --now runner-park.service
    ```
 4. That user in the `kvm` and `systemd-journal` groups, and allowed to start and stop `firecracker@*` units: a polkit rule, which #14 adds.
 5. NAT for the VMs' range, with a filter that drops what they open to the host itself (`host/nat.nft`), and `iproute2`. `host/install.sh` does both.

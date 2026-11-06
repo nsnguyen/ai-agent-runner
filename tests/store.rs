@@ -1459,6 +1459,7 @@ fn a_vm_sleeps_once_its_snapshot_is_noted_and_not_once_it_s_cleared() {
     let slept = Slept {
         generation: 1,
         at: chrono::Utc::now().trunc_subsecs(0),
+        parked: false,
     };
     snap.note(&slept).unwrap();
     assert_eq!(store.sleeping("dev").unwrap(), Some(slept));
@@ -1487,4 +1488,137 @@ fn making_room_for_a_snapshot_unlinks_the_last_one() {
     // The open file is still what it was.
     assert_eq!(mapped.metadata().unwrap().len(), 6);
     assert_eq!(mapped.metadata().unwrap().nlink(), 0);
+}
+
+// dev's boot, run 1, with dev asleep: its snapshot written, as a sleep
+// leaves it (src/boot.rs).
+fn asleep(store: &Store) -> runner::store::Run {
+    let run = store.begin_run("dev").unwrap();
+    let snap = run.snapshot();
+    snap.make_room().unwrap();
+    let at = chrono::Utc::now().trunc_subsecs(0);
+    snap.note(&Slept {
+        generation: run.generation,
+        at,
+        parked: false,
+    })
+    .unwrap();
+    fs::write(snap.vmstate(), b"state").unwrap();
+    fs::write(snap.mem(), b"memory").unwrap();
+    run
+}
+
+// A host shutdown parks a sleeping VM: its boot ends without committing, and
+// the next boot gets the same run back, on the same disk, to resume it.
+#[test]
+fn a_parked_vm_s_next_boot_gets_its_run_back() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    let run = asleep(&store);
+    assert_eq!(run.parked(), None);
+    run.park().unwrap();
+    let slept = store.sleeping("dev").unwrap().unwrap();
+    assert!(slept.parked);
+    assert_eq!(slept.generation, 1);
+    drop(run);
+    assert_eq!(store.get("dev").unwrap().generation, 0);
+
+    let again = store.begin_run("dev").unwrap();
+    assert_eq!((again.from, again.generation), (0, 1));
+    assert_eq!(again.disk, store.disk("dev", 1).unwrap());
+    assert_eq!(again.parked(), Some(slept));
+    // Nothing new was cloned, and what it booted is as it was.
+    assert!(!store.disk("dev", 2).unwrap().exists());
+    let booted = store.booted("dev").unwrap().unwrap();
+    assert_eq!(
+        booted,
+        Booted {
+            from: 0,
+            generation: 1
+        }
+    );
+    // Its disk is the guest's, even if this boot never got going.
+    again.discard();
+    assert!(store.disk("dev", 1).unwrap().exists());
+    assert!(store.sleeping("dev").unwrap().unwrap().parked);
+
+    // Resumed and shut down cleanly, it commits that disk.
+    let again = store.begin_run("dev").unwrap();
+    again.snapshot().clear().unwrap();
+    assert_eq!(again.commit().unwrap().generation, 1);
+}
+
+// One that can't resume boots its last committed disk instead, under the
+// same lock, and the disk it was parked on stays for a look.
+#[test]
+fn a_parked_run_that_can_t_resume_gives_way_to_a_fresh_one() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    let run = asleep(&store);
+    run.park().unwrap();
+    drop(run);
+    let mut fresh = store.begin_run("dev").unwrap();
+    fresh.unpark().unwrap();
+    assert_eq!((fresh.from, fresh.generation), (0, 2));
+    assert_eq!(fresh.parked(), None);
+    assert_eq!(store.sleeping("dev").unwrap(), None);
+    assert!(!store.snapshot("dev").unwrap().mem().exists());
+    assert_eq!(fs::read(&fresh.disk).unwrap(), b"rootfs");
+    assert!(store.disk("dev", 1).unwrap().exists());
+    assert!(matches!(store.undo("dev"), Err(Error::Busy(_))));
+    let booted = store.booted("dev").unwrap().unwrap();
+    assert_eq!(booted.generation, 2);
+    assert_eq!(fresh.commit().unwrap().generation, 2);
+}
+
+// With no boot up, nothing holds a parked VM's lock, so the store refuses
+// it as busy itself: undo, gc and the rest would take its disk from under
+// its snapshot.
+#[test]
+fn a_parked_vm_is_busy_with_no_boot_up() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    store.checkpoint("dev", None).unwrap();
+    let run = asleep(&store);
+    run.park().unwrap();
+    drop(run);
+    let busy = |r: Result<(), Error>| assert!(matches!(r, Err(Error::Busy(_))), "{r:?}");
+    busy(store.undo("dev").map(drop));
+    busy(store.gc("dev", false).map(drop));
+    busy(store.checkpoint("dev", None).map(drop));
+    busy(store.restore("dev", 1).map(drop));
+    busy(store.open_disks("dev", true).map(drop));
+    busy(store.lock("dev").map(drop));
+    busy(store.delete("dev").map(drop));
+    assert!(store.disk("dev", 2).unwrap().exists());
+    // An old runner's note says nothing of parking: it's not parked.
+    let snap = store.snapshot("dev").unwrap();
+    let note = snap.mem().with_file_name("slept.json");
+    fs::write(&note, r#"{"generation":2,"at":"2026-11-06T00:00:00Z"}"#).unwrap();
+    assert!(!store.sleeping("dev").unwrap().unwrap().parked);
+    let undone = store.undo("dev");
+    assert!(matches!(undone, Err(Error::NothingToUndo(_))), "{undone:?}");
+}
+
+// A note that won't read isn't parked, so it can't hold the VM busy for good:
+// its next boot clears it, and a delete takes it.
+#[test]
+fn an_unreadable_note_is_not_parked() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    let run = asleep(&store);
+    run.park().unwrap();
+    drop(run);
+    let note = store
+        .snapshot("dev")
+        .unwrap()
+        .mem()
+        .with_file_name("slept.json");
+    fs::write(&note, b"{torn").unwrap();
+    let undone = store.undo("dev");
+    assert!(matches!(undone, Err(Error::NothingToUndo(_))), "{undone:?}");
+    let run = store.begin_run("dev").unwrap();
+    assert_eq!((run.generation, run.parked()), (2, None));
+    drop(run);
+    store.delete("dev").unwrap();
 }

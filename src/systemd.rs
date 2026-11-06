@@ -3,7 +3,8 @@
 // systemctl on it, logs is journalctl. systemctl's output is captured, never
 // inherited: under `runner mcp`, stdout is protocol. A VM that sleeps keeps
 // its unit active, since its boot stays up (src/sleep.rs): status tells it
-// apart by its snapshot.
+// apart by its snapshot. One parked at a host shutdown sleeps with its unit
+// stopped, until a start or wake starts it, and its boot resumes it.
 use crate::boot::RESTART;
 use crate::creds::Cred;
 use crate::store::{Store, Vm};
@@ -124,9 +125,12 @@ pub fn start(store: &Store, name: &str) -> Result<VmStatus> {
 }
 
 /// Returns once the VM is down, cleanly or, past the timeout, killed. A
-/// sleeping VM is woken to shut down (boot::halt).
+/// sleeping VM is woken to shut down (boot::halt), and a parked one resumed.
 pub fn stop(store: &Store, name: &str) -> Result<VmStatus> {
     store.get(name)?;
+    if parked(store, name)? {
+        systemctl(name, &["start", &unit_name(name)])?;
+    }
     systemctl(name, &["stop", &unit_name(name)])?;
     status(store, name)
 }
@@ -145,8 +149,12 @@ pub fn sleep(store: &Store, name: &str) -> Result<VmStatus> {
     status(store, name)
 }
 
-/// Wakes a sleeping VM. One awake already stays so.
+/// Wakes a sleeping VM, or starts a parked one, which resumes it. One awake
+/// already stays so.
 pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
+    if parked(store, name)? {
+        return start(store, name);
+    }
     match status(store, name)?.state {
         state @ (State::Sleeping | State::Running) => {
             awake(store, name, state)?;
@@ -176,6 +184,33 @@ fn awake(store: &Store, name: &str, state: State) -> Result<bool> {
     }
 }
 
+// Parked at a host shutdown (src/sleep.rs): asleep, with its unit stopped.
+fn parked(store: &Store, name: &str) -> Result<bool> {
+    Ok(store.parked(name)? && unit_state(name)? == State::Stopped)
+}
+
+// What systemd says of the VM's unit.
+fn unit_state(name: &str) -> Result<State> {
+    let unit = unit_name(name);
+    let active = systemctl(name, &["show", "--property=ActiveState", "--value", &unit])?;
+    let active = active.trim();
+    State::from_active_state(active).ok_or_else(|| Error::UnknownState {
+        unit,
+        state: active.to_string(),
+    })
+}
+
+/// Only the VM's state, of all `status` says: its unit's, or sleeping.
+pub fn state(store: &Store, name: &str) -> Result<State> {
+    // Only while its boot is up: one killed asleep leaves its snapshot. One
+    // parked has no boot up, and sleeps on.
+    Ok(match unit_state(name)? {
+        State::Running if store.sleeping(name)?.is_some() => State::Sleeping,
+        State::Stopped if store.parked(name)? => State::Sleeping,
+        state => state,
+    })
+}
+
 pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
     let vm = store.get(name)?;
     let state = state(store, name)?;
@@ -194,22 +229,6 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
         creds,
         url,
     })
-}
-
-/// Only the VM's state, of all `status` says: its unit's, or sleeping.
-pub fn state(store: &Store, name: &str) -> Result<State> {
-    let unit = unit_name(name);
-    let active = systemctl(name, &["show", "--property=ActiveState", "--value", &unit])?;
-    let active = active.trim();
-    let state = State::from_active_state(active).ok_or_else(|| Error::UnknownState {
-        unit,
-        state: active.to_string(),
-    })?;
-    // Only while its boot is up: one killed asleep leaves its snapshot.
-    if state == State::Running && store.sleeping(name)?.is_some() {
-        return Ok(State::Sleeping);
-    }
-    Ok(state)
 }
 
 /// The VM's journal: its serial console and the runner's own lines, on this
@@ -274,6 +293,8 @@ Description=Firecracker microVM %i
 After=network.target runner-nat.service
 # Stopped before its disks' filesystem is unmounted, at host shutdown too.
 RequiresMountsFor={root}
+# And after runner-park.service, which parks it first if it's asleep.
+Before=runner-park.service
 
 [Service]
 # Ready once the guest is started; until then the VM is booting. Booting
@@ -306,6 +327,40 @@ StandardError=journal
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
+"
+    ))
+}
+
+/// The unit that parks each sleeping VM at a host shutdown, before the VMs'
+/// units stop, for `runner unit --park` to print: as render_unit's.
+pub fn render_park_unit(runner: &Path, root: &Path, user: &str) -> Result<String> {
+    let runner = plain_path(runner)?;
+    let root = plain_path(root)?;
+    check_user(user)?;
+    Ok(format!(
+        "\
+# runner-park.service, as `runner unit --park` writes it and host/install.sh
+# installs it. At a host shutdown, it parks each sleeping VM before the VMs'
+# units stop (src/sleep.rs): the VM's boot ends, leaving its snapshot and
+# disk, and its next start resumes it. Write it again after moving the
+# runner binary or its root.
+[Unit]
+Description=runner: sleeping VMs sleep on through a host shutdown
+RequiresMountsFor={root}
+
+[Service]
+# Up from the host's start, with nothing to run: its stop is what it's for.
+# Each firecracker@ unit is ordered Before= this one, so this one stops first.
+Type=oneshot
+RemainAfterExit=yes
+User={user}
+Environment=RUNNER_ROOT={root}
+ExecStop={runner} park --all
+# Each park syncs its VM's memory file, which takes a while for a big VM.
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
 "
     ))
 }

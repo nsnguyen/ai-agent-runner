@@ -273,12 +273,21 @@ impl Host {
         self.sd.calls().iter().any(|c| c == "systemctl poweroff")
     }
 
-    fn asleep(&self, vm: &str) {
-        self.sd.set_vm_state(vm, "active");
+    // Asleep with its boot up, or parked at the last host shutdown, its
+    // unit stopped.
+    fn asleep(&self, vm: &str, parked: bool) {
+        self.sd
+            .set_vm_state(vm, if parked { "inactive" } else { "active" });
         let snap = self.store.snapshot(vm).unwrap();
         snap.make_room().unwrap();
         let at = chrono::Utc::now();
-        snap.note(&Slept { generation: 1, at }).unwrap();
+        let generation = self.store.get(vm).unwrap().generation;
+        snap.note(&Slept {
+            generation,
+            at,
+            parked,
+        })
+        .unwrap();
     }
 }
 
@@ -286,7 +295,8 @@ impl Host {
 fn the_look_powers_off_a_host_idle_for_its_idle_time_and_says_why() {
     let h = host("1h", 3 * HOUR);
     h.used_ago(2 * HOUR);
-    h.asleep("dev");
+    h.asleep("dev", false);
+    h.asleep("base", true);
     // The look's own user's sessions, as runner's are on the host.
     h.sd.set_logins(&[&me(), &me()]);
     let said = h.ok();

@@ -2,8 +2,9 @@
 // hour on a host client/aws.sh set up and never on one it didn't
 // (host/install.sh keeps it in /etc/runner/host-idle). On EC2 an OS
 // power-off stops the instance, so only its disks cost until
-// `client/aws.sh start`. A sleeping VM's unit stops with the rest, which
-// wakes it to shut down cleanly (boot::halt): its disk is kept.
+// `client/aws.sh start`. It's any host shutdown: a sleeping VM is parked
+// and sleeps on through it (src/sleep.rs), and a running one shuts down
+// cleanly.
 //
 // Use is what keeps the host up: a VM running, booting or stopping (one
 // stopped or asleep isn't); a login by any user but the one the look runs
