@@ -1557,8 +1557,8 @@ fn a_parked_run_that_can_t_resume_gives_way_to_a_fresh_one() {
     let run = asleep(&store);
     run.park().unwrap();
     drop(run);
-    let parked = store.begin_run("dev").unwrap();
-    let fresh = parked.unpark().unwrap();
+    let mut fresh = store.begin_run("dev").unwrap();
+    fresh.unpark().unwrap();
     assert_eq!((fresh.from, fresh.generation), (0, 2));
     assert_eq!(fresh.parked(), None);
     assert_eq!(store.sleeping("dev").unwrap(), None);
@@ -1598,4 +1598,27 @@ fn a_parked_vm_is_busy_with_no_boot_up() {
     assert!(!store.sleeping("dev").unwrap().unwrap().parked);
     let undone = store.undo("dev");
     assert!(matches!(undone, Err(Error::NothingToUndo(_))), "{undone:?}");
+}
+
+// A note that won't read isn't parked, so it can't hold the VM busy for good:
+// its next boot clears it, and a delete takes it.
+#[test]
+fn an_unreadable_note_is_not_parked() {
+    let (dir, store) = store();
+    store.import("dev", &disk(dir.path(), b"rootfs")).unwrap();
+    let run = asleep(&store);
+    run.park().unwrap();
+    drop(run);
+    let note = store
+        .snapshot("dev")
+        .unwrap()
+        .mem()
+        .with_file_name("slept.json");
+    fs::write(&note, b"{torn").unwrap();
+    let undone = store.undo("dev");
+    assert!(matches!(undone, Err(Error::NothingToUndo(_))), "{undone:?}");
+    let run = store.begin_run("dev").unwrap();
+    assert_eq!((run.generation, run.parked()), (2, None));
+    drop(run);
+    store.delete("dev").unwrap();
 }

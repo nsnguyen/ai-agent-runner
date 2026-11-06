@@ -399,8 +399,8 @@ enum Cmd {
     Park {
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         names: Vec<String>,
-        /// Every VM with a boot up. One awake isn't parked, and sleeps no
-        /// more, so its unit's stop shuts it down cleanly.
+        /// Every VM with a boot up, at once. One awake isn't parked: its
+        /// unit's stop shuts it down cleanly.
         #[arg(long)]
         all: bool,
     },
@@ -910,16 +910,26 @@ fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
 }
 
-// At a host shutdown, as fast as it can: each VM whose boot is up is asked,
+// At a host shutdown, all at once, since each park syncs its VM's memory
+// file and the unit's stop has a deadline: each VM whose boot is up is asked,
 // and one that isn't parked is shut down cleanly by its unit's stop, as ever.
 // The VMs' units stop next whatever this says, so it fails only if it can't
 // list them.
 fn park_all(store: &Store) -> Result<(), Box<dyn Error>> {
-    for vm in store.list()? {
-        match runner::sleep::park(store, &vm.name) {
-            Ok(()) => println!("{}  parked", vm.name),
-            Err(runner::sleep::Error::NoBoot(_)) => {}
-            Err(e) => println!("{}  not parked: {e}", vm.name),
+    let vms = store.list()?;
+    let parks: Vec<_> = std::thread::scope(|s| {
+        let parks: Vec<_> = vms
+            .iter()
+            .map(|vm| s.spawn(|| runner::sleep::park(store, &vm.name)))
+            .collect();
+        parks.into_iter().map(|p| p.join()).collect()
+    });
+    for (vm, park) in vms.iter().zip(parks) {
+        match park {
+            Ok(Ok(())) => println!("{}  parked", vm.name),
+            Ok(Err(runner::sleep::Error::NoBoot(_))) => {}
+            Ok(Err(e)) => println!("{}  not parked: {e}", vm.name),
+            Err(_) => println!("{}  not parked: its park panicked", vm.name),
         }
     }
     Ok(())

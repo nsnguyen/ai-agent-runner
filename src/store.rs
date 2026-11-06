@@ -11,7 +11,7 @@
 //   <root>/vms/<name>/api.sock       Firecracker's API, while the VM runs
 //   <root>/vms/<name>/vsock.sock     the guest's vsock, while the VM runs
 //   <root>/vms/<name>/vsock.sock_*   where its guest takes its credentials (creds::PORT) and makes its calls (calls::PORT), while it runs
-//   <root>/vms/<name>/boot.sock      where its boot takes sleep, wake and halt (sleep.rs), while it's up
+//   <root>/vms/<name>/boot.sock      where its boot takes sleep, wake, halt and park (sleep.rs), while it's up
 //   <root>/vms/<name>/snapshot/      while it sleeps: Firecracker's vmstate and mem, then slept.json, the generation they run on and whether a host shutdown parked it
 //   <root>/vms/<name>/creds          the credentials it gets at boot, by name; never a value
 //   <root>/vms/<name>/handed         the ones its guest took this boot, by name; never a value
@@ -623,7 +623,7 @@ impl Store {
         Ok(vsock(&self.existing(name)?))
     }
 
-    /// Where the VM's boot takes sleep, wake and halt (src/sleep.rs).
+    /// Where the VM's boot takes sleep, wake, halt and park (src/sleep.rs).
     pub fn boot_socket(&self, name: &str) -> Result<PathBuf> {
         Ok(boot_socket(&self.existing(name)?))
     }
@@ -638,6 +638,11 @@ impl Store {
     /// that was killed asleep leaves one until the next boot clears it.
     pub fn sleeping(&self, name: &str) -> Result<Option<Slept>> {
         self.snapshot(name)?.slept()
+    }
+
+    /// Whether the VM is parked (Run::park), as Snapshot::parked says.
+    pub fn parked(&self, name: &str) -> Result<bool> {
+        Ok(self.snapshot(name)?.parked())
     }
 
     /// Blocks until nothing holds the VM: what a stop waits on.
@@ -723,7 +728,9 @@ impl Store {
     pub fn begin_run(&self, name: &str) -> Result<Run> {
         let dir = self.existing(name)?;
         let lock = take_any_lock(&dir, name)?;
-        let Some(slept) = snapshot(&dir).slept()?.filter(|s| s.parked) else {
+        // A note that won't read isn't parked (Snapshot::parked).
+        let parked = snapshot(&dir).slept().ok().flatten();
+        let Some(slept) = parked.filter(|s| s.parked) else {
             return fresh_run(name, dir, self.keep, lock);
         };
         // Noted by the boot that parked it; the current disk, if that's gone.
@@ -1041,18 +1048,8 @@ pub struct Run {
 // A fresh copy of the current disk for a run, under the VM's lock, as
 // begin_run makes it.
 fn fresh_run(name: &str, dir: PathBuf, keep: usize, lock: File) -> Result<Run> {
-    // An ask for an earlier boot that never took it isn't this run's.
-    remove_if_there(&dir.join(ROLLBACK))?;
-    let from = current(&dir)?;
-    let generation = next_generation(&dir)?;
+    let Booted { from, generation } = fresh_disk(&dir)?;
     let disk = disk_of(&dir, generation);
-    clone(&disk_of(&dir, from), &disk)?;
-    let booted = Booted { from, generation };
-    let text = serde_json::to_string(&booted).map_err(|e| at(&dir.join(BOOTED))(e.into()))?;
-    if let Err(e) = write_aside(&dir, BOOTED, &text) {
-        remove_if_there(&disk)?;
-        return Err(e);
-    }
     Ok(Run {
         from,
         generation,
@@ -1063,6 +1060,23 @@ fn fresh_run(name: &str, dir: PathBuf, keep: usize, lock: File) -> Result<Run> {
         keep,
         _lock: lock,
     })
+}
+
+// The disk of a fresh run: the current one cloned, and both noted.
+fn fresh_disk(dir: &Path) -> Result<Booted> {
+    // An ask for an earlier boot that never took it isn't this run's.
+    remove_if_there(&dir.join(ROLLBACK))?;
+    let from = current(dir)?;
+    let generation = next_generation(dir)?;
+    let disk = disk_of(dir, generation);
+    clone(&disk_of(dir, from), &disk)?;
+    let booted = Booted { from, generation };
+    let text = serde_json::to_string(&booted).map_err(|e| at(&dir.join(BOOTED))(e.into()))?;
+    if let Err(e) = write_aside(dir, BOOTED, &text) {
+        remove_if_there(&disk)?;
+        return Err(e);
+    }
+    Ok(booted)
 }
 
 impl Run {
@@ -1099,7 +1113,8 @@ impl Run {
 
     /// Ends a run that never got going, with its disk: nothing wrote to it,
     /// so there's nothing to look at. A parked VM's run keeps its disk, which
-    /// its guest wrote before it was parked, and stays parked.
+    /// its guest wrote before it was parked; the VM stays parked unless its
+    /// boot got as far as the load (Run::resuming).
     pub fn discard(self) {
         if self.parked.is_some() {
             return;
@@ -1146,7 +1161,7 @@ impl Run {
         port_socket(&self.dir, calls::PORT)
     }
 
-    /// Where this boot takes sleep, wake and halt.
+    /// Where this boot takes sleep, wake, halt and park.
     pub fn boot_socket(&self) -> PathBuf {
         boot_socket(&self.dir)
     }
@@ -1188,12 +1203,25 @@ impl Run {
         snap.note(&slept)
     }
 
+    /// Unparks this parked VM's run just before its snapshot loads, note
+    /// first: once loaded, the guest runs and writes to its disk, so a boot
+    /// that dies after this mustn't resume the snapshot again. The files
+    /// stay for the load.
+    pub fn resuming(&self) -> Result<()> {
+        remove_if_there(&self.snapshot().dir.join(SLEPT))
+    }
+
     /// Gives up on resuming this parked VM's run: its snapshot goes, its disk
-    /// stays in gens/ for a look, and a fresh run of the current disk takes
-    /// its place, under the same lock, as begin_run makes one.
-    pub fn unpark(self) -> Result<Run> {
+    /// stays in gens/ for a look, and this becomes a fresh run of the current
+    /// disk, under the same lock, as begin_run makes one.
+    pub fn unpark(&mut self) -> Result<()> {
         self.snapshot().clear()?;
-        fresh_run(&self.name, self.dir, self.keep, self._lock)
+        let Booted { from, generation } = fresh_disk(&self.dir)?;
+        self.from = from;
+        self.generation = generation;
+        self.disk = disk_of(&self.dir, generation);
+        self.parked = None;
+        Ok(())
     }
 }
 
@@ -1410,6 +1438,13 @@ impl Snapshot {
         };
         let slept = serde_json::from_slice(&text).map_err(|e| at(&path)(e.into()))?;
         Ok(Some(slept))
+    }
+
+    /// Whether a host shutdown parked it (Run::park). A note that won't read
+    /// isn't parked, so it can't hold the VM busy for good: its next boot
+    /// clears it.
+    pub fn parked(&self) -> bool {
+        self.slept().ok().flatten().is_some_and(|s| s.parked)
     }
 
     /// Deletes it, note first, so a snapshot cleared partway isn't asleep.
@@ -1636,7 +1671,7 @@ fn run_going(dir: &Path) -> Result<bool> {
 // would take from under it. Only its next boot takes it (begin_run).
 fn take_lock(dir: &Path, name: &str) -> Result<File> {
     let lock = take_any_lock(dir, name)?;
-    if snapshot(dir).slept()?.is_some_and(|s| s.parked) {
+    if snapshot(dir).parked() {
         return Err(Error::Busy(name.to_string()));
     }
     Ok(lock)

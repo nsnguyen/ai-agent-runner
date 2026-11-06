@@ -7,7 +7,7 @@
 // up while the VM sleeps, holding the VM's lock, its tap and the sockets its
 // guest takes credentials and makes calls on, so a wake only starts
 // Firecracker and loads. It takes asks on `<vm>/boot.sock`, one at a time,
-// from `runner sleep`, `wake`, `start` and `halt`. Only the runner user can
+// from `runner sleep`, `wake`, `start`, `halt` and `park`. Only the runner user can
 // connect. A connection makes one ask, framed as src/proto.rs frames, with a
 // hello of its own:
 //
@@ -31,8 +31,9 @@
 // without committing. Its unit stops with it, and its next boot, at a
 // `start` or `wake`, gets that run back and loads the snapshot onto that disk,
 // with its tap and sockets where they were, and sets the guest's clock, as a
-// wake does. One that can't load boots the last committed disk instead, and
-// the parked disk stays for a look (src/boot.rs). Until then the store holds
+// wake does. One whose load fails boots the last committed disk instead, and
+// the parked disk stays for a look; one whose Firecracker never came up
+// stays parked (src/boot.rs). Until then the store holds
 // a parked VM busy itself, as a sleeping VM's boot does, and status says
 // sleeping. Only a host shutdown parks: `stop`, `restore` and the rest wake a
 // sleeping VM, and resume a parked one, to shut it down cleanly.
@@ -71,8 +72,7 @@ pub enum Ask {
     /// `runner halt` does. Sleeps are refused from then on.
     Halt,
     /// The host is shutting down: if it's asleep, park it, and end the boot.
-    /// One awake is refused, and sleeps are refused from then on, so its
-    /// unit's stop shuts it down cleanly.
+    /// One awake is refused, and its unit's stop shuts it down cleanly.
     Park,
 }
 

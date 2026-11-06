@@ -25,7 +25,8 @@
 // At a host shutdown, a sleeping VM's boot parks it and ends without
 // committing (src/sleep.rs). The next boot of a parked VM boots no fresh copy:
 // it loads the snapshot onto the disk it was parked on, and sets the guest's
-// clock, as a wake does. One that can't boots its last committed disk.
+// clock, as a wake does. One whose load fails boots its last committed disk;
+// one whose Firecracker doesn't come up fails, still parked.
 //
 // It serves the VM's URL on the tailnet, too (src/url.rs), for as long as it's
 // up: a connection to a sleeping VM has the loop wake it, as a `runner wake`
@@ -221,22 +222,28 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     let mut resumed = None;
     if run.parked().is_some() {
         let began = Instant::now();
-        match load(bin, &api, &api_sock, &vsock, name, &run) {
+        match load(bin, &api, &api_sock, &vsock, name, &run, || run.resuming()) {
             Ok(child) => resumed = Some((child, began)),
             Err(Unwoken::Asleep(why) | Unwoken::Lost(why)) => {
                 let kept = run.generation;
-                run = match run.unpark() {
-                    Ok(fresh) => fresh,
-                    Err(e) => {
-                        drop(url);
-                        drop(asks);
-                        drop(calls);
-                        drop(offer);
-                        let _ = remove_sockets(&sockets);
-                        drop(tap);
-                        return Err(e.into());
-                    }
+                // Still noted, so Firecracker never came up to load it: it
+                // can resume once it does.
+                let unparked = if run.snapshot().parked() {
+                    let why = format!("{name} didn't resume, and stays parked: {why}");
+                    Err(io_err("resuming")(io::Error::other(why)))
+                } else {
+                    run.unpark().map_err(Error::from)
                 };
+                if let Err(e) = unparked {
+                    drop(url);
+                    drop(asks);
+                    drop(calls);
+                    drop(offer);
+                    let _ = remove_sockets(&sockets);
+                    drop(tap);
+                    run.discard();
+                    return Err(e);
+                }
                 // A cold boot, whose guest asks for its credentials again.
                 if let Err(e) = handed.clear() {
                     note(format_args!("{e}"));
@@ -283,13 +290,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         timer: Timer::new(Instant::now()),
     };
     let started = match resumed {
-        // The snapshot goes first, credentials and all: the guest runs now,
-        // and writes to its disk, so it can't be resumed again.
-        Some(_) => run
-            .snapshot()
-            .clear()
-            .map_err(Error::from)
-            .and_then(|()| up.watch(&child)),
+        Some(_) => up.watch(&child),
         None => wait_for_api(&mut child, &api_sock)
             .and_then(|()| Ok(up.api.configure(&guest)?))
             .and_then(|()| Ok(up.api.start()?))
@@ -311,6 +312,11 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     up.fc = Some(child);
     match resumed {
         Some(began) => {
+            // Credentials and all. Unnoted since the load, it's no longer
+            // asleep, so what's left goes at the next boot if not now.
+            if let Err(e) = run.snapshot().clear() {
+                note(format_args!("{name} resumed, but its snapshot stays: {e}"));
+            }
             let took = began.elapsed();
             if let Err(e) = set_clock(&vsock) {
                 note(format_args!(
@@ -775,6 +781,7 @@ impl Up<'_> {
             self.vsock,
             name,
             self.run,
+            || Ok(()),
         )?;
         self.epoch += 1;
         if let Err(e) = self.watch(&child) {
@@ -800,12 +807,11 @@ impl Up<'_> {
     }
 
     // At a host shutdown: a sleeping VM is parked, which ends the boot. An
-    // awake one isn't, and sleeps no more, so its unit's stop, which comes
-    // next, shuts it down cleanly.
+    // awake one isn't: its unit's stop, which comes next, shuts it down
+    // cleanly, waking it first if it has gone to sleep since.
     fn park(&mut self) -> std::result::Result<(), String> {
         let name = self.name;
         if self.fc.is_some() {
-            self.halting = true;
             return Err(format!(
                 "{name} is awake: it isn't parked, and shuts down cleanly as its unit stops"
             ));
@@ -864,8 +870,9 @@ impl Up<'_> {
 }
 
 // A fresh Firecracker on the boot's sockets, with the VM's snapshot loaded
-// into it and running: what a wake starts, and a parked VM's boot. On a
-// failure it's gone, and so are its sockets.
+// into it and running: what a wake starts, and a parked VM's boot. `first`
+// runs once Firecracker is up, just before the load. On a failure it's gone,
+// and so are its sockets.
 fn load(
     bin: &Path,
     api: &Api,
@@ -873,24 +880,17 @@ fn load(
     vsock: &Path,
     name: &str,
     run: &Run,
+    first: impl FnOnce() -> store::Result<()>,
 ) -> std::result::Result<Child, Unwoken> {
     let asleep = |e: &dyn std::fmt::Display| Unwoken::Asleep(e.to_string());
     let snap = run.snapshot();
     remove_sockets(&[api_sock, vsock]).map_err(|e| asleep(&e))?;
     let lock = run.hold().map_err(|e| asleep(&e))?;
     let mut child = firecracker(bin, api_sock, name, lock).map_err(|e| asleep(&e))?;
-    let loaded = match wait_for_api(&mut child, api_sock) {
-        Err(e) => Err(asleep(&e)),
-        Ok(()) => match api.load(&snap.vmstate(), &snap.mem()) {
-            Ok(()) => Ok(()),
-            // Refused, so Firecracker never ran the guest.
-            Err(e @ (firecracker::Error::Api { .. } | firecracker::Error::NotListening(_))) => {
-                Err(asleep(&e))
-            }
-            // No answer: it may have.
-            Err(e) => Err(Unwoken::Lost(e.to_string())),
-        },
-    };
+    let loaded = wait_for_api(&mut child, api_sock)
+        .map_err(|e| asleep(&e))
+        .and_then(|()| first().map_err(|e| asleep(&e)))
+        .and_then(|()| load_into(api, &snap));
     if let Err(e) = loaded {
         let _ = child.kill();
         let _ = child.wait();
@@ -898,6 +898,18 @@ fn load(
         return Err(e);
     }
     Ok(child)
+}
+
+// A refused load means Firecracker never ran the guest; no answer, that it
+// may have.
+fn load_into(api: &Api, snap: &store::Snapshot) -> std::result::Result<(), Unwoken> {
+    match api.load(&snap.vmstate(), &snap.mem()) {
+        Ok(()) => Ok(()),
+        Err(e @ (firecracker::Error::Api { .. } | firecracker::Error::NotListening(_))) => {
+            Err(Unwoken::Asleep(e.to_string()))
+        }
+        Err(e) => Err(Unwoken::Lost(e.to_string())),
+    }
 }
 
 // What a look asks about this boot's VM (src/idle.rs).

@@ -1356,8 +1356,20 @@ fn the_next_boot_loads_a_parked_snapshot_onto_its_disk() {
     let dev = h.vm_dir("dev");
     let snap = dev.join("snapshot");
     let boot = h.boot("dev");
-    let up = next_firecracker(&h, firecracker_that_sleeps(&h.fc));
+    // Unparked before the load, which runs the guest: a boot that died then
+    // mustn't resume this snapshot onto a disk the guest has written since.
+    let store = h.store.clone();
+    let at_load = Arc::new(Mutex::new(None));
+    let seen = at_load.clone();
+    let writes = firecracker_that_sleeps(&h.fc);
+    let up = next_firecracker(&h, move |req| {
+        if req.path == "/snapshot/load" {
+            *seen.lock().unwrap() = Some(store.sleeping("dev").unwrap());
+        }
+        writes(req)
+    });
     assert_eq!(h.ready(), "READY=1");
+    assert_eq!(*at_load.lock().unwrap(), Some(None));
     let resumed = chrono::Utc::now();
     // No boot of its own: the snapshot, with the disk, tap and sockets it
     // slept with.
@@ -1454,8 +1466,29 @@ fn a_parked_vm_that_can_t_resume_boots_its_last_committed_disk() {
     assert_eq!(h.store.get("dev").unwrap().generation, 2);
 }
 
-// Only a sleeping VM is parked. An awake one sleeps no more, and its unit's
-// stop shuts it down cleanly, as ever.
+// A Firecracker that never comes up loaded nothing: the boot fails, and the
+// VM stays parked for the next start.
+#[test]
+fn a_parked_vm_stays_parked_if_firecracker_doesn_t_come_up() {
+    let h = Host::new();
+    parked(&h);
+    let boot = h.boot("dev");
+    h.fc.next();
+    h.fc.exit_with(1);
+    let out = finish(boot);
+    let notes = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{notes}");
+    assert!(notes.contains("stays parked"), "{notes}");
+    let slept = h.store.sleeping("dev").unwrap().expect("no snapshot");
+    assert!(slept.parked);
+    assert!(h.vm_dir("dev").join("snapshot/mem").exists());
+    assert!(h.vm_dir("dev").join("gens/1.ext4").exists());
+    assert!(!h.vm_dir("dev").join("gens/2.ext4").exists());
+    assert!(h.store.handed("dev").unwrap().is_some());
+}
+
+// Only a sleeping VM is parked. An awake one is left as it was, and its
+// unit's stop shuts it down cleanly, as ever.
 #[test]
 fn an_awake_vm_isn_t_parked_and_shuts_down_as_ever() {
     let h = Host::new();
@@ -1464,8 +1497,9 @@ fn an_awake_vm_isn_t_parked_and_shuts_down_as_ever() {
     assert!(!park.status.success());
     let err = text(&park.stderr);
     assert!(err.contains("dev is awake"), "{err}");
-    let err = sleep::sleep(&h.store, "dev").unwrap_err();
-    assert!(err.to_string().contains("dev is shutting down"), "{err}");
+    let all = h.runner(&["park", "--all"]).output().unwrap();
+    assert!(all.status.success(), "{}", text(&all.stderr));
+    assert!(text(&all.stdout).starts_with("dev  not parked: dev is awake"));
     let halt = h.runner(&["halt", "dev"]).output().unwrap();
     assert!(halt.status.success(), "{}", text(&halt.stderr));
     assert!(finish(boot).status.success());

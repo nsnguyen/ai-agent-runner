@@ -186,8 +186,7 @@ fn awake(store: &Store, name: &str, state: State) -> Result<bool> {
 
 // Parked at a host shutdown (src/sleep.rs): asleep, with its unit stopped.
 fn parked(store: &Store, name: &str) -> Result<bool> {
-    let parked = store.sleeping(name)?.is_some_and(|s| s.parked);
-    Ok(parked && unit_state(name)? == State::Stopped)
+    Ok(store.parked(name)? && unit_state(name)? == State::Stopped)
 }
 
 // What systemd says of the VM's unit.
@@ -206,9 +205,9 @@ pub fn status(store: &Store, name: &str) -> Result<VmStatus> {
     let mut state = unit_state(name)?;
     // Only while its boot is up: one killed asleep leaves its snapshot. One
     // parked has no boot up, and sleeps on.
-    match (state, store.sleeping(name)?) {
-        (State::Running, Some(_)) => state = State::Sleeping,
-        (State::Stopped, Some(slept)) if slept.parked => state = State::Sleeping,
+    match state {
+        State::Running if store.sleeping(name)?.is_some() => state = State::Sleeping,
+        State::Stopped if store.parked(name)? => state = State::Sleeping,
         _ => {}
     }
     // A start or stop that worked shouldn't be reported as failed for want
