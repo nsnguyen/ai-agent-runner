@@ -31,10 +31,17 @@
 // It serves the VM's URL on the tailnet, too (src/url.rs), for as long as it's
 // up: a connection to a sleeping VM has the loop wake it, as a `runner wake`
 // does. And the VM's DNS, on its gateway (src/dns.rs), for as long too.
+//
+// A VM with a list of names is held to it in the host's rules (src/fence.rs):
+// its tap goes in them before the tap is made, and comes out after it's gone.
+// Its DNS hands each listed name's addresses on to them, and they follow its
+// list as the DNS reads it. Boot's looks put the tap back if a firewall
+// reload took it out.
 use crate::calls::{Calls, Restore};
 use crate::creds::{Cred, Keyring, Source};
 use crate::dns;
 use crate::exec;
+use crate::fence::Fence;
 use crate::firecracker::{self, Api, Guest};
 use crate::idle::{self, Idle, Look, Quiet, Timer, Uses};
 use crate::net::{self, HOST_RESOLV_CONFS, Net, Tap};
@@ -92,6 +99,16 @@ pub enum Error {
          can't serve its DNS: {why}"
     )]
     NoDns { name: String, why: String },
+    #[error(
+        "{name} has a list of names, but the host's rules can't hold it to them: {why}. \
+         `runner doctor` says whether they're from an install.sh before lists"
+    )]
+    Unfenced { name: String, why: String },
+    #[error(
+        "{name}'s tap was left in the host's rules for VMs with a list of names, by a boot \
+         that was killed, and taking it out failed: {why}"
+    )]
+    Fenced { name: String, why: String },
     #[error("firecracker's API didn't come up within {}s", API_WAIT.as_secs())]
     NoApi,
     #[error(
@@ -140,8 +157,9 @@ fn io_err(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 }
 
 /// Boots the VM and returns when Firecracker exits. Its console goes to
-/// stdout, which the unit sends to journald. `ip` is iproute2's, for the tap.
-pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
+/// stdout, which the unit sends to journald. `ip` is iproute2's, for the tap,
+/// and `nft` nftables', for a listed VM's place in the host's rules.
+pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path, nft: &Path) -> Result<Ended> {
     let machine = store.machine(name)?;
     if !machine.kernel.is_file() {
         return Err(Error::NoKernel(machine.kernel));
@@ -160,6 +178,16 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         run.discard();
         return Err(e.into());
     }
+    // In the host's rules before the tap is made, so nothing goes out of
+    // it unheld, and out after it's gone. Like the tap, it's dropped by hand
+    // before commit and discard let go of the lock.
+    let fence = match fence(store, name, &net, nft) {
+        Ok(fence) => fence,
+        Err(e) => {
+            run.discard();
+            return Err(e);
+        }
+    };
     // Made under the VM's lock, and dropped, which removes it, before the
     // lock goes: halt returns once the lock is free, and systemd may kill
     // this process right after. commit and discard let go of the lock, so
@@ -167,15 +195,17 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     let tap = match Tap::add_with(ip, &net) {
         Ok(tap) => tap,
         Err(e) => {
+            drop(fence);
             run.discard();
             return Err(e.into());
         }
     };
     // On the tap's address, so after it, and dropped just before it.
-    let (relay, ip_arg) = match serve_dns(store, name, &net, run.parked().is_some()) {
+    let (relay, ip_arg) = match serve_dns(store, name, &net, run.parked().is_some(), &fence.0) {
         Ok(served) => served,
         Err(e) => {
             drop(tap);
+            drop(fence);
             run.discard();
             return Err(e);
         }
@@ -202,6 +232,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         Err(e) => {
             drop(relay);
             drop(tap);
+            drop(fence);
             run.discard();
             return Err(e.into());
         }
@@ -221,6 +252,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
             let _ = remove_sockets(&sockets);
             drop(relay);
             drop(tap);
+            drop(fence);
             run.discard();
             return Err(e);
         }
@@ -251,6 +283,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
                     let _ = remove_sockets(&sockets);
                     drop(relay);
                     drop(tap);
+                    drop(fence);
                     run.discard();
                     return Err(e);
                 }
@@ -298,6 +331,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         parked: false,
         uses,
         timer: Timer::new(Instant::now()),
+        fence: &fence.0,
     };
     let started = match resumed {
         Some(_) => up.watch(&child),
@@ -317,6 +351,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
         let _ = remove_sockets(&sockets);
         drop(relay);
         drop(tap);
+        drop(fence);
         run.discard();
         return Err(e);
     }
@@ -368,6 +403,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     }
     drop(relay);
     drop(tap);
+    drop(fence);
     let status = match over {
         Over::Exited(Ok(status)) => status,
         Over::Exited(Err(e)) => {
@@ -438,6 +474,30 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path) -> Result<Ended> {
     })
 }
 
+// The VM's tap in the host's rules, held to its list if it has one, and
+// taken out when dropped (Fenced).
+fn fence(store: &Store, name: &str, net: &Net, nft: &Path) -> Result<Fenced> {
+    let list = store.allowed(name)?;
+    let why = |e: store::Error| e.to_string();
+    let name = name.to_string();
+    match Fence::start(nft, &name, &net.tap, list.as_ref()) {
+        Ok(fence) => Ok(Fenced(Arc::new(fence))),
+        Err(e) if list.is_some() => Err(Error::Unfenced { name, why: why(e) }),
+        Err(e) => Err(Error::Fenced { name, why: why(e) }),
+    }
+}
+
+// The VM's place in the host's rules, ended when dropped, wherever boot
+// returns. Its DNS's threads hold the fence too, and a query under way can
+// outlast boot, so it's ended here, not when the last of them lets go.
+struct Fenced(Arc<Fence>);
+
+impl Drop for Fenced {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 // The VM's DNS, served on its gateway, and the boot argument that points
 // the guest there. A boot that can't serve it, with a resolver already on
 // port 53 of every address, say, gives the guest the host's resolvers, which
@@ -449,6 +509,7 @@ fn serve_dns(
     name: &str,
     net: &Net,
     parked: bool,
+    fence: &Arc<Fence>,
 ) -> Result<(Option<dns::Relay>, String)> {
     let listed = store.allowed(name)?.is_some();
     let no_dns = |why: String| {
@@ -466,7 +527,7 @@ fn serve_dns(
         note(format_args!("{name} boots without DNS: {why}"));
         return Ok((None, net.boot_arg_with(name, &[])));
     }
-    match dns::Relay::bind(net, &resolvers, dns_policy(store, name)) {
+    match dns::Relay::bind(net, &resolvers, dns_policy(store, name, fence)) {
         Ok(relay) => Ok((Some(relay), net.boot_arg(name))),
         Err(e) if listed => no_dns(e.to_string()),
         Err(e) if parked => {
@@ -486,18 +547,23 @@ fn serve_dns(
     }
 }
 
-// The VM's list, as the store has it each time the relay looks, and where
-// its allowed answers' addresses go. Nothing takes them yet: until the
-// host's rules hold a listed VM to them, it reaches any address it has.
-fn dns_policy(store: &Store, name: &str) -> dns::Policy {
+// The VM's list, as the store has it each time the relay looks, which the
+// host's rules follow, and its allowed answers' addresses, which go in them
+// before the guest gets the answer. Only while the relay serves: a boot that
+// can't gives the guest other resolvers, and a list made then counts from the
+// next boot.
+fn dns_policy(store: &Store, name: &str, fence: &Arc<Fence>) -> dns::Policy {
     let (store, name) = (store.clone(), name.to_string());
+    let (follows, hands) = (fence.clone(), fence.clone());
     dns::Policy {
         list: Box::new(move || {
-            store
+            let list = store
                 .allowed(&name)
-                .map_err(|e| format!("{name}'s list of names: {e}"))
+                .map_err(|e| format!("{name}'s list of names: {e}"))?;
+            follows.track(list.as_ref());
+            Ok(list)
         }),
-        hand_on: Arc::new(|_| {}),
+        hand_on: Arc::new(move |addresses| hands.hand_on(addresses)),
     }
 }
 
@@ -618,6 +684,8 @@ struct Up<'a> {
     uses: Uses,
     /// Since the VM was last seen in use, or last woke.
     timer: Timer,
+    /// The VM's place in the host's rules, which each look checks.
+    fence: &'a Fence,
 }
 
 impl Up<'_> {
@@ -701,6 +769,8 @@ impl Up<'_> {
     // the next look.
     fn look(&mut self) -> Duration {
         let name = self.name;
+        // Asleep too: a reload empties the sets whether the VM is up or not.
+        self.fence.look();
         let idle = match self.store.idle(name) {
             Ok(idle) => idle,
             Err(e) => {

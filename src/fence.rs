@@ -179,11 +179,12 @@ impl Fence {
         state.pairs.retain(|_, until| *until > now);
         let mut script = format!("add element {} {LISTED} {{ \"{}\" }}", table(), self.tap);
         if !state.pairs.is_empty() {
-            let left = state
-                .pairs
-                .iter()
-                .map(|(ip, until)| (*ip, *until - now));
-            script += &format!("; add element {} {REACH} {{ {} }}", table(), self.timed(left));
+            let left = state.pairs.iter().map(|(ip, until)| (*ip, *until - now));
+            script += &format!(
+                "; add element {} {REACH} {{ {} }}",
+                table(),
+                self.timed(left)
+            );
         }
         let pairs = state.pairs.len();
         drop(state);
@@ -332,7 +333,9 @@ impl Fence {
         }
         let said = String::from_utf8_lossy(&out.stderr);
         let first = said.lines().map(str::trim).find(|l| !l.is_empty());
-        Err(failed(first.map_or_else(|| out.status.to_string(), String::from)))
+        Err(failed(
+            first.map_or_else(|| out.status.to_string(), String::from),
+        ))
     }
 
     // Notes `msg`, unless it's what was noted last.

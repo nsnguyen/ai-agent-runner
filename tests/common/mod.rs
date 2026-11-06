@@ -248,9 +248,9 @@ exit "$code"
 /// An `nft` that logs each call's arguments, a line each, and runs `hook`
 /// with them if a test put one there. It answers a listing of the set
 /// `reach` with the pairs `pairs` gave, and a `get` of a tap in `listed`
-/// with a failure while `missing` is there, which an add to `listed` takes
-/// away, as a real one would put it back. Any call holding the text `fail`
-/// gave fails, as nft does when a set isn't there.
+/// with whether a tap went in and didn't come out since: one test's VM's.
+/// Any call holding the text `fail` gave fails, as nft does when a set
+/// isn't there.
 pub struct FakeNft {
     pub dir: PathBuf,
     pub bin: PathBuf,
@@ -275,10 +275,11 @@ case "$*" in
   '-j list set ip runner reach')
     if [ -f "$d/pairs" ]; then cat "$d/pairs"; else echo '{{"nftables": []}}'; fi;;
   'get element ip runner listed '*)
-    if [ -f "$d/missing" ]; then
+    if [ ! -f "$d/listed" ]; then
       echo 'Error: Could not process rule: No such file or directory' >&2; exit 1
     fi;;
-  *'add element ip runner listed '*) rm -f "$d/missing";;
+  *'delete element ip runner listed '*) rm -f "$d/listed";;
+  *'add element ip runner listed '*) touch "$d/listed";;
 esac
 exit 0
 "#,
@@ -330,12 +331,17 @@ exit 0
 
     /// The set `listed` has lost its taps, as after a firewall reload.
     pub fn lose_taps(&self) {
-        fs::write(self.dir.join("missing"), "").unwrap();
+        let _ = fs::remove_file(self.dir.join("listed"));
     }
 
-    /// Whether `listed` is still missing its taps.
-    pub fn taps_lost(&self) -> bool {
-        self.dir.join("missing").exists()
+    /// A tap is in `listed`, as a boot that was killed leaves its own.
+    pub fn leave_tap(&self) {
+        fs::write(self.dir.join("listed"), "").unwrap();
+    }
+
+    /// Whether a tap is in `listed`.
+    pub fn has_tap(&self) -> bool {
+        self.dir.join("listed").exists()
     }
 }
 

@@ -96,7 +96,10 @@ fn a_listed_vm_s_tap_goes_in_with_none_of_the_pairs_a_killed_boot_left() {
     fake.pairs(&[(TAP, "203.0.113.9"), (OTHER, "203.0.113.10")]);
     let fence = listed(fake, &["github.com"]);
     let gone = take_out(&["203.0.113.9"]);
-    assert_eq!(fake.calls(), [LIST.to_string(), format!("{gone}; {ADD_TAP}")]);
+    assert_eq!(
+        fake.calls(),
+        [LIST.to_string(), format!("{gone}; {ADD_TAP}")]
+    );
     // The same list, read again each second, changes nothing.
     fence.follow(Some(&list(&["github.com"]))).unwrap();
     assert_eq!(fake.calls().len(), 2);
@@ -113,7 +116,6 @@ fn a_listed_vm_with_no_pairs_left_only_puts_its_tap_in() {
 fn an_unlisted_vm_s_tap_is_taken_out_only_if_a_killed_boot_left_it_in() {
     let nft = nft();
     let fake = &nft.fake;
-    fake.lose_taps();
     let fence = Fence::start(&fake.bin, "dev", TAP, None).unwrap();
     assert_eq!(fake.calls(), [GET]);
     // Nothing to hand on to, or put back.
@@ -124,14 +126,19 @@ fn an_unlisted_vm_s_tap_is_taken_out_only_if_a_killed_boot_left_it_in() {
 
     // Left in, with a pair.
     fake.forget();
-    let _ = std::fs::remove_file(fake.dir.join("missing"));
+    fake.leave_tap();
     fake.pairs(&[(TAP, "203.0.113.9")]);
     Fence::start(&fake.bin, "dev", TAP, None).unwrap();
     let gone = take_out(&["203.0.113.9"]);
     assert_eq!(
         fake.calls(),
-        [GET.to_string(), LIST.to_string(), format!("{gone}; {TAKE_TAP}")]
+        [
+            GET.to_string(),
+            LIST.to_string(),
+            format!("{gone}; {TAKE_TAP}")
+        ]
     );
+    assert!(!fake.has_tap());
 }
 
 #[test]
@@ -261,7 +268,7 @@ fn a_tap_the_rules_lost_is_put_back_with_its_pairs_at_the_next_look() {
     assert!((3590..=3600).contains(&pairs[0].1), "{pairs:?}");
     assert_eq!(pairs[1].0, format!(r#""{TAP}" . 203.0.113.2"#));
     assert!((590..=600).contains(&pairs[1].1), "{pairs:?}");
-    assert!(!fake.taps_lost());
+    assert!(fake.has_tap());
 }
 
 #[test]

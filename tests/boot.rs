@@ -2,7 +2,9 @@
 // Firecracker whose API socket this test serves. No KVM needed.
 mod common;
 
-use common::{FakeApi, FakeFirecracker, FakeVsock, Reply, Request, script, text, wait_for};
+use common::{
+    FakeApi, FakeFirecracker, FakeNft, FakeVsock, Reply, Request, script, text, wait_for,
+};
 use runner::boot;
 use runner::calls::{self, Answer, Call};
 use runner::creds::{self, Cred, Keyring};
@@ -26,6 +28,7 @@ struct Host {
     dir: TempDir,
     store: Store,
     fc: FakeFirecracker,
+    nft: FakeNft,
     notify: UnixDatagram,
 }
 
@@ -59,6 +62,26 @@ impl Host {
                 fail.display()
             ),
         );
+        // An `nft` that notes, as the tap goes in the rules, whether
+        // Firecracker had started, and as it comes out, whether dev was still
+        // held and what `ip` did last.
+        let nft = FakeNft::new(&dir.path().join("nft"));
+        script(
+            &nft.dir.join("hook"),
+            &format!(
+                "case \"$1\" in\n\
+                 *'delete element ip runner listed '*)\n\
+                 {{ flock -n '{lock}' true && echo free || echo held; tail -n 1 '{log}'; }} > '{out}';;\n\
+                 *'add element ip runner listed '*)\n\
+                 {{ [ -f '{argv}' ] && echo after || echo before; }} > '{at}';;\n\
+                 esac\n",
+                lock = lock.display(),
+                log = log.display(),
+                out = nft.dir.join("out").display(),
+                argv = fc.dir.join("argv").display(),
+                at = nft.dir.join("in").display(),
+            ),
+        );
         let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
         notify
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -67,6 +90,7 @@ impl Host {
             dir,
             store,
             fc,
+            nft,
             notify,
         }
     }
@@ -88,6 +112,7 @@ impl Host {
     fn env<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
         cmd.env("RUNNER_ROOT", self.root())
             .env("RUNNER_IP", self.dir.path().join("ip"))
+            .env("RUNNER_NFT", &self.nft.bin)
             .env("RUNNER_FIRECRACKER", &self.fc.bin)
             .env("FAKE_FC", &self.fc.dir)
             .env("FAKE_FC_VERSION", firecracker::VERSION)
@@ -103,6 +128,48 @@ impl Host {
     fn held_at_tap_removal(&self) -> String {
         let held = fs::read_to_string(self.dir.path().join("held"));
         held.expect("the tap wasn't removed").trim().to_string()
+    }
+
+    /// Whether Firecracker had started when the tap last went in the rules.
+    fn fc_when_tap_went_in(&self) -> String {
+        let at = fs::read_to_string(self.nft.dir.join("in"));
+        at.expect("the tap didn't go in the rules")
+            .trim()
+            .to_string()
+    }
+
+    /// Whether dev was still held when its tap came out of the rules, and
+    /// what `ip` had done last.
+    fn when_tap_came_out(&self) -> (String, String) {
+        let out = fs::read_to_string(self.nft.dir.join("out"));
+        let out = out.expect("the tap didn't come out of the rules");
+        let (held, ip) = out.split_once('\n').unwrap();
+        (held.to_string(), ip.trim().to_string())
+    }
+
+    /// Boots `name` in a network namespace of its own, with the real `ip`,
+    /// so its tap is real and its DNS serves: what a listed VM needs.
+    fn boot_apart(&self, name: &str) -> Child {
+        let real = Command::new("sh")
+            .args(["-c", "command -v ip"])
+            .output()
+            .unwrap();
+        let real = text(&real.stdout).trim().to_string();
+        assert!(!real.is_empty(), "no ip on PATH");
+        let log = self.dir.path().join("ip.log");
+        script(
+            &self.dir.path().join("ip"),
+            &format!("echo \"$*\" >> '{}'\nexec '{real}' \"$@\"\n", log.display()),
+        );
+        let mut cmd = Command::new("unshare");
+        cmd.arg("-n")
+            .arg(env!("CARGO_BIN_EXE_runner"))
+            .args(["boot", name]);
+        self.env(&mut cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
     }
 
     /// What `ip` was asked to do, one line per call.
@@ -211,6 +278,10 @@ fn the_tap_is_up_while_the_vm_runs_and_goes_before_the_vm_is_let_go() {
     assert_eq!(h.ip_calls().last().unwrap(), &format!("link del dev {tap}"));
     assert_eq!(h.ip_calls().len(), 5);
     assert_eq!(h.held_at_tap_removal(), "held");
+    // A VM with no list is left be in the rules: its boot only looks that
+    // a boot that was killed didn't leave its tap there.
+    let get = format!(r#"get element ip runner listed {{ "{tap}" }}"#);
+    assert_eq!(h.nft.calls(), [get]);
 }
 
 #[test]
@@ -246,11 +317,156 @@ fn a_listed_vm_whose_boot_can_t_serve_its_dns_doesn_t_boot() {
     assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
     assert_eq!(h.store.get("dev").unwrap().generation, 0);
     // Its tap went, and with it dev.
+    let tap = h.store.net("dev").unwrap().tap;
+    assert_eq!(h.ip_calls().last().unwrap(), &format!("link del dev {tap}"));
+    // Out of the rules too, last.
     assert_eq!(
-        h.ip_calls().last().unwrap(),
-        &format!("link del dev {}", h.store.net("dev").unwrap().tap)
+        h.when_tap_came_out(),
+        ("held".into(), format!("link del dev {tap}"))
     );
     h.store.delete("dev").unwrap();
+}
+
+// A VM with a list of names whose tap can't go in the host's rules, as on a
+// host whose rules are from before the sets (`runner doctor` warns), doesn't
+// boot: nothing would hold it to its names. It says why before it makes its
+// tap.
+#[test]
+fn a_listed_vm_whose_tap_can_t_go_in_the_rules_doesn_t_boot() {
+    let h = Host::new();
+    h.store
+        .allow("dev", &["github.com".parse().unwrap()])
+        .unwrap();
+    h.nft.fail("add element ip runner listed");
+    let out = finish(h.boot("dev"));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("dev has a list of names"), "{err}");
+    assert!(err.contains("the host's rules can't hold it"), "{err}");
+    assert!(err.contains("No such file or directory"), "{err}");
+    assert!(err.contains("runner doctor"), "{err}");
+    assert!(!h.fc.started());
+    assert_eq!(h.ip_calls(), Vec::<String>::new());
+    assert!(!h.vm_dir("dev").join("gens/1.ext4").exists());
+    assert_eq!(h.store.get("dev").unwrap().generation, 0);
+    h.store.delete("dev").unwrap();
+}
+
+// Booted apart, a listed VM's tap is real and its DNS serves, so it boots:
+// its tap goes in the rules before Firecracker starts, and comes out with
+// its pairs last, after the tap is gone, while dev is still held. Run as
+// root: cargo test --test boot -- --ignored
+#[test]
+#[ignore = "needs root, to make a tap in a network namespace of its own"]
+fn a_listed_vm_s_tap_goes_in_the_rules_before_firecracker_and_out_last() {
+    let h = Host::new();
+    let tap = h.store.net("dev").unwrap().tap;
+    h.store
+        .allow("dev", &["github.com".parse().unwrap()])
+        .unwrap();
+    // A boot of dev that was killed left a pair.
+    h.nft.pairs(&[(tap.as_str(), "203.0.113.9")]);
+    let boot = h.boot_apart("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    assert_eq!(h.fc_when_tap_went_in(), "before");
+    let pair = format!(r#""{tap}" . 203.0.113.9"#);
+    let went_in = h.nft.calls();
+    assert!(
+        went_in.iter().any(
+            |c| c.contains(&format!("delete element ip runner reach {{ {pair} }}"))
+                && c.ends_with(&format!(r#"add element ip runner listed {{ "{tap}" }}"#))
+        ),
+        "{went_in:?}"
+    );
+    h.fc.exit_with(0);
+    let out = finish(boot);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        h.when_tap_came_out(),
+        ("held".into(), format!("link del dev {tap}"))
+    );
+    let last = h.nft.calls().pop().unwrap();
+    assert!(
+        last.contains(&format!("delete element ip runner reach {{ {pair} }}")),
+        "{last}"
+    );
+    assert!(
+        last.ends_with(&format!(r#"delete element ip runner listed {{ "{tap}" }}"#)),
+        "{last}"
+    );
+}
+
+// A running VM's rules follow its list within a second: a name taken off
+// takes its pairs out, so its names are looked up again; a list dropped
+// takes its tap out, and one made puts it back. Run as root:
+//   cargo test --test boot -- --ignored
+#[test]
+#[ignore = "needs root, to make a tap in a network namespace of its own"]
+fn a_running_vm_s_rules_follow_its_list() {
+    let h = Host::new();
+    let tap = h.store.net("dev").unwrap().tap;
+    let names = ["github.com", "example.com"].map(|n| n.parse().unwrap());
+    h.store.allow("dev", &names).unwrap();
+    let boot = h.boot_apart("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    // What the DNS put in, as the rules list it.
+    h.nft.pairs(&[(tap.as_str(), "203.0.113.9")]);
+    h.nft.forget();
+    let pair = format!(r#""{tap}" . 203.0.113.9"#);
+    h.store.deny("dev", &[names[1].clone()]).unwrap();
+    wait_for("the pairs to come out", || {
+        h.nft
+            .calls()
+            .iter()
+            .any(|c| c.ends_with(&format!("delete element ip runner reach {{ {pair} }}")))
+    });
+    h.store.allow_all("dev").unwrap();
+    let out = format!(r#"delete element ip runner listed {{ "{tap}" }}"#);
+    wait_for("the tap to come out", || {
+        h.nft.calls().iter().any(|c| c.ends_with(&out))
+    });
+    h.nft.forget();
+    h.store.allow("dev", &[names[0].clone()]).unwrap();
+    let back_in = format!(r#"add element ip runner listed {{ "{tap}" }}"#);
+    wait_for("the tap to go back in", || {
+        h.nft.calls().iter().any(|c| c.ends_with(&back_in))
+    });
+    h.fc.exit_with(0);
+    assert!(finish(boot).status.success());
+}
+
+// A firewall reload empties the sets: a listed VM's boot puts its tap back
+// at its next look, within 10 seconds. Run as root:
+//   cargo test --test boot -- --ignored
+#[test]
+#[ignore = "needs root, to make a tap in a network namespace of its own"]
+fn a_tap_the_rules_lost_is_put_back_at_the_next_look() {
+    let h = Host::new();
+    h.store
+        .allow("dev", &["github.com".parse().unwrap()])
+        .unwrap();
+    let boot = h.boot_apart("dev");
+    let _api = h.serve("dev", guest_that_shuts_down(&h.fc));
+    assert_eq!(h.ready(), "READY=1");
+    h.nft.lose_taps();
+    let lost = Instant::now();
+    while !h.nft.has_tap() {
+        assert!(
+            lost.elapsed() < Duration::from_secs(12),
+            "the tap wasn't put back"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    h.fc.exit_with(0);
+    let out = finish(boot);
+    assert!(out.status.success());
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("dev's tap was out of the host's rules"),
+        "{err}"
+    );
 }
 
 // The unit gives boot CAP_NET_ADMIN for the tap and CAP_NET_BIND_SERVICE
