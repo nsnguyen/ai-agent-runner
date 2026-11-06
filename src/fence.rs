@@ -359,9 +359,9 @@ fn table() -> String {
     host::NAT_TABLE.join(" ")
 }
 
-/// The addresses a set listed by `nft -j list set` pairs with `tap`, or None
-/// if it isn't such a listing.
-pub fn paired(json: &str, tap: &str) -> Option<BTreeSet<Ipv4Addr>> {
+// The addresses a set listed by `nft -j list set` pairs with `tap`, or None
+// if it isn't such a listing.
+fn paired(json: &str, tap: &str) -> Option<BTreeSet<Ipv4Addr>> {
     let listed: serde_json::Value = serde_json::from_str(json).ok()?;
     let mut found = BTreeSet::new();
     for item in listed.get("nftables")?.as_array()? {
