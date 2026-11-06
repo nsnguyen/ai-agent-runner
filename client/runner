@@ -25,7 +25,7 @@ ask="-n -o BatchMode=yes -o ConnectTimeout=$wait -o ServerAliveInterval=$wait -o
 
 # Options of the host's runner that take a value, so the scan below knows the
 # next argument is that value and not the VM. tests/hosts.rs checks that
-# every one clap has is here. --run is for #160; --host is the laptop's own.
+# every one clap has is here. --run is claude's; --host is the laptop's own.
 valued=" --root --keep --creds --from --cpus --mem --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --peer --name --host "
 
 hosts_usage="usage: runner hosts [add <host> | rm <host>]
