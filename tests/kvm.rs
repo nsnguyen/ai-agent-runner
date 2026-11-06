@@ -28,13 +28,15 @@
 // `an_old_vm_rebased_onto_base_gets_its_guest_and_keeps_its_home`,
 // `a_service_answers_through_its_url_after_the_vm_slept`,
 // `a_vm_reaches_the_internet_but_not_the_host`,
+// `a_listed_vm_reaches_only_its_names`,
+// `a_headless_run_on_a_listed_vm_reaches_claude_code_s_api`,
 // `claude_keeps_running_after_a_detach`,
 // `claude_code_in_a_vm_has_its_updater_off` and
 // `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
 // unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
 // root's owner. The unit boots them with the installed runner, so rerun
-// host/install.sh after a build. The headless run needs the host's Claude
+// host/install.sh after a build. The headless runs need the host's Claude
 // Code token in /etc/credstore (docs/host.md, step 6). The agent's own
 // checkpoints need a base built with this runner-guest, and the updater test
 // needs a base built from this images/base (images/base/build.sh).
@@ -824,6 +826,114 @@ except OSError as e:
     let mut exec = vec!["exec", &name, "--"];
     exec.extend(web);
     ok(runner(&root, &exec));
+}
+
+// A list made on a running VM holds it to its names within a second: other
+// names aren't answered, an address it didn't look up is dropped, and so is
+// another resolver. Dropping the list opens it again, with no reboot.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
+fn a_listed_vm_reaches_only_its_names() {
+    use std::net::ToSocketAddrs;
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("net-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let in_vm = |argv: &[&str]| {
+        let exec = ["exec", name.as_str(), "--"];
+        let all: Vec<&str> = exec.iter().chain(argv).copied().collect();
+        runner(&root, &all)
+    };
+    // curl exits 6 when it can't resolve the host.
+    let curl = |url: &str| in_vm(&["curl", "-fsS", "-m", "20", "-o", "/dev/null", url]);
+    // Dropped, so it times out; refused or answered would be at once.
+    let connect = "import socket, sys
+try:
+    socket.create_connection((sys.argv[1], 443), 5)
+    print('connected')
+except TimeoutError:
+    print('timed out')
+except OSError as e:
+    print(e)
+";
+    // One plain question for example.com's A record, straight to a resolver.
+    let ask = "import socket, sys
+q = bytes.fromhex('123401000001000000000000076578616d706c6503636f6d0000010001')
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(5)
+s.sendto(q, (sys.argv[1], 53))
+try:
+    s.recvfrom(512)
+    print('answered')
+except TimeoutError:
+    print('no answer')
+";
+    let boot_id = ["cat", "/proc/sys/kernel/random/boot_id"];
+    let booted = ok(in_vm(&boot_id));
+    // Open, it reaches all of it: so what fails below, the list does.
+    ok(curl("https://example.com"));
+    assert_eq!(ok(in_vm(&["python3", "-c", ask, "1.1.1.1"])), "answered\n");
+    // Looked up here, on the host, so never by the VM's own DNS.
+    let example = ("example.com", 443)
+        .to_socket_addrs()
+        .unwrap()
+        .find(std::net::SocketAddr::is_ipv4)
+        .expect("example.com has an IPv4 address")
+        .ip()
+        .to_string();
+
+    let set = ok(runner(&root, &["net", &name, "allow", "github.com"]));
+    assert_eq!(
+        set,
+        format!("{name}  allows github.com, and always api.anthropic.com\n")
+    );
+    eventually("example.com to stop resolving", || {
+        curl("https://example.com").status.code() == Some(6)
+    });
+    ok(curl("https://github.com"));
+    let reached = ok(in_vm(&["python3", "-c", connect, &example]));
+    assert_eq!(reached, "timed out\n", "{example}:443");
+    assert_eq!(ok(in_vm(&["python3", "-c", ask, "1.1.1.1"])), "no answer\n");
+
+    let open = ok(runner(&root, &["net", &name, "open"]));
+    assert_eq!(open, format!("{name}  open: the whole internet\n"));
+    eventually("example.com to answer again", || {
+        curl("https://example.com").status.success()
+    });
+    assert_eq!(ok(in_vm(&boot_id)), booted, "it rebooted");
+}
+
+// Claude Code works on a VM whose list has nothing on it but what every
+// list has: a real `claude -p` edits a file and exits 0.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and its token"]
+fn a_headless_run_on_a_listed_vm_reaches_claude_code_s_api() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("net-run-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    ok(runner(&root, &["net", &name, "allow", "github.com"]));
+    let only = ok(runner(&root, &["net", &name, "deny", "github.com"]));
+    assert_eq!(only, format!("{name}  allows only api.anthropic.com\n"));
+
+    let prompt = "Create a file named hello.txt in the current directory holding \
+                  exactly the text hi, then stop.";
+    let id = ok(runner(&root, &["run", &name, prompt]));
+    // Returns once the run is over, its VM shut down and all.
+    let stream = ok(runner(&root, &["output", id.trim(), "--follow"]));
+    let rows = ok(runner(&root, &["runs", &name]));
+    assert!(rows.contains("  exited 0, committed  "), "{rows}{stream}");
+    let hello = ok(runner(
+        &root,
+        &["exec", &name, "--", "cat", "/home/agent/work/hello.txt"],
+    ));
+    assert_eq!(hello.trim(), "hi");
 }
 
 // No token needed: a logged-out claude waits at its login screen.
