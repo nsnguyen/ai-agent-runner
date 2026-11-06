@@ -15,6 +15,15 @@ use tempfile::TempDir;
 
 // What `nft list table ip runner` prints for the rules install.sh writes.
 const NAT: &str = "table ip runner {
+\tset listed {
+\t\ttype ifname
+\t}
+
+\tset reach {
+\t\ttype ifname . ipv4_addr
+\t\tflags timeout
+\t}
+
 \tchain postrouting {
 \t\ttype nat hook postrouting priority srcnat; policy accept;
 \t\tip saddr 172.16.0.0/16 ip daddr != 172.16.0.0/16 masquerade
@@ -23,8 +32,15 @@ const NAT: &str = "table ip runner {
 \tchain forward {
 \t\ttype filter hook forward priority filter; policy accept;
 \t\tiifname \"fc*\" ip saddr != 172.16.0.0/16 drop
-\t\tiifname \"fc*\" ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
+\t\tiifname != @listed ip daddr != 172.16.0.0/16 meta l4proto { tcp, udp } th dport 53 accept
 \t\tiifname \"fc*\" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+\t\tiifname @listed jump listed
+\t}
+
+\tchain listed {
+\t\tct state established,related accept
+\t\tiifname . ip daddr @reach accept
+\t\tdrop
 \t}
 
 \tchain input {
@@ -70,6 +86,27 @@ fn without_input(rules: &str) -> String {
     let start = rules.find("\tchain input {").unwrap();
     let end = start + rules[start..].find("\t}\n").unwrap() + "\t}\n".len();
     format!("{}{}", &rules[..start], &rules[end..])
+}
+
+// Rules as an install.sh from before lists of names wrote them, loaded or
+// in the file: no sets for boot to put a listed VM's tap and addresses in,
+// and nothing that sends a listed tap's packets to be held to them.
+fn without_lists(rules: &str) -> String {
+    let mut kept = String::new();
+    let mut skipping = false;
+    for line in rules.split_inclusive('\n') {
+        let words = line.trim();
+        if words.starts_with("set ") || words == "chain listed {" {
+            skipping = true;
+        }
+        if !skipping && words != "iifname @listed jump listed" {
+            kept += &line.replace("iifname != @listed", "iifname \"fc*\"");
+        }
+        if skipping && words == "}" {
+            skipping = false;
+        }
+    }
+    kept
 }
 
 // The file install.sh writes, without its ip6 table: VMs reach the host over
@@ -491,6 +528,78 @@ fn nat_warns_when_nothing_keeps_vms_off_the_host() {
         .cmd(docker, ran(true, "active\n", ""));
     let report = assert_verdict(both, &store, "nat", Status::Warn, "off the host");
     assert!(verdict(&report, "nat").1.contains("docker.service"));
+}
+
+// Rules from before lists of names have no sets for boot to fill, so a VM
+// with a list doesn't boot there. The rest still run, so it only warns, read
+// from the loaded rules as root and from the file the unit loads as the
+// runner user.
+#[test]
+fn nat_warns_when_the_rules_can_t_hold_a_vm_to_its_list() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let list = &list_nat();
+    let old = without_lists(NAT);
+    assert!(!old.contains("@listed") && !old.contains("set "), "{old}");
+    assert!(
+        old.contains("iifname \"fc*\" ip daddr != 172.16.0.0/16 meta"),
+        "{old}"
+    );
+    let report = assert_verdict(
+        fake().cmd(list, ran(true, &old, "")),
+        &store,
+        "nat",
+        Status::Warn,
+        "list of names",
+    );
+    let nat = verdict(&report, "nat").1;
+    assert!(nat.contains("rerun host/install.sh"), "{nat}");
+    assert!(nat.contains("VMs kept off the host"), "{nat}");
+
+    let why = "Operation not permitted (you must be root)";
+    let unprivileged = || fake().cmd(list, ran(false, "", why));
+    let file = without_lists(&host::nat_rules(&DEFAULT_SUBNET));
+    // Its comments still speak of them.
+    let rules: Vec<&str> = file.lines().filter(|l| !l.starts_with('#')).collect();
+    assert!(
+        !rules
+            .iter()
+            .any(|l| l.contains("@listed") || l.contains("set ")),
+        "{file}"
+    );
+    let old = unprivileged().file(host::NAT_RULES, Ok(&file));
+    let report = assert_verdict(old, &store, "nat", Status::Warn, "list of names");
+    assert!(verdict(&report, "nat").1.contains(host::NAT_RULES));
+
+    // The sets, but nothing sending a listed tap's packets to be held.
+    let unsent = NAT.replace("\t\tiifname @listed jump listed\n", "");
+    assert_ne!(unsent, NAT);
+    assert_verdict(
+        fake().cmd(list, ran(true, &unsent, "")),
+        &store,
+        "nat",
+        Status::Warn,
+        "list of names",
+    );
+    let one_set = NAT.replace("set reach {", "set reached {");
+    assert_verdict(
+        fake().cmd(list, ran(true, &one_set, "")),
+        &store,
+        "nat",
+        Status::Warn,
+        "list of names",
+    );
+
+    // Both warnings at once.
+    let both = without_input(&without_lists(NAT));
+    let report = assert_verdict(
+        fake().cmd(list, ran(true, &both, "")),
+        &store,
+        "nat",
+        Status::Warn,
+        "list of names",
+    );
+    assert!(verdict(&report, "nat").1.contains("off the host"));
 }
 
 // Both set forwarding to drop by default, so the VMs lose the internet while
