@@ -21,8 +21,11 @@
 // alone, through directories the copy made, so nothing lands anywhere else.
 //
 // Files go through the host a batch at a time, never the whole tree: a
-// batch's files are staged sparse next to the target, written in by one
-// debugfs, then deleted.
+// batch's files are staged sparse next to the target (`staging`), written in
+// by one debugfs, then deleted. debugfs finds a path by reading each
+// directory on it from the start, so a command per file in a directory of N
+// takes time in N squared. A file's mode, owner and times go in by the inode
+// number its write gave, in a second debugfs, with no path to look up.
 //
 // Each entry keeps its type, contents, permission bits, owner and group, and
 // its access and modification times to the nanosecond. A hard link comes out
@@ -30,7 +33,9 @@
 // among them, aren't copied: ext4-view gives neither. Nor are inode flags, or
 // the change and creation times, which are the copy's. Sockets, devices and
 // fifos are skipped and named: ext4-view doesn't read a device's numbers,
-// and debugfs's mknod takes a name in its working directory, not a path.
+// and debugfs's mknod takes a name in its working directory, not a path. So
+// is an entry whose inode ext4-view refuses as corrupt, which includes, in
+// ext4-view 1.0, any time before 1970 or past 2038 (`touch -d 2040-01-01`).
 use crate::changes::{self, Budget, Disk, Limits, fill, read, shown};
 use crate::host;
 use ext4_view::{Ext4Error, Metadata, PathBuf as InPathBuf};
@@ -98,6 +103,9 @@ pub enum Why {
     Long,
     /// It's a socket, a device or a fifo.
     Special,
+    /// Its inode, or its link's target, is one ext4-view refuses, like one
+    /// with a time before 1970 or past 2038.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -124,6 +132,9 @@ pub struct Copied {
 ///
 /// debugfs reads `to`, so it must be a disk no guest has written, like a
 /// fresh copy of base's. On an error `to` may be half written: delete it.
+/// The copy stages files in `staging(to)` and deletes it, whether it fails
+/// or not; one that was killed leaves it, for the next copy into `to`, or
+/// whoever deletes `to`, to delete.
 pub fn copy(from: &Path, to: &Path, paths: &[&str], limits: Limits) -> Result<Copied> {
     let paths = checked(paths)?;
     let (a, b) = (stat(from)?, stat(to)?);
@@ -162,6 +173,13 @@ pub fn copy(from: &Path, to: &Path, paths: &[&str], limits: Limits) -> Result<Co
     }
     copy.batch.flush(&copy.budget)?;
     Ok(copy.out)
+}
+
+/// Where a copy into `to` stages the source's files: a directory beside it.
+pub fn staging(to: &Path) -> PathBuf {
+    let mut name = to.file_name().unwrap_or_default().to_os_string();
+    name.push(".graft");
+    to.with_file_name(name)
 }
 
 fn stat(disk: &Path) -> Result<fs::Metadata> {
@@ -307,6 +325,10 @@ impl Copier<'_> {
             Ok(m) => m,
             // Nothing there, so nothing there in the target either.
             Err(Ext4Error::NotFound | Ext4Error::NotADirectory) => return Ok(()),
+            Err(Ext4Error::Corrupt(_)) => {
+                self.skip(path, Why::Unreadable);
+                return Ok(());
+            }
             Err(e) => return Err(read(self.src.path)(e).into()),
         };
         let mut made = Vec::new();
@@ -355,14 +377,14 @@ impl Copier<'_> {
             let deep = self.budget.deep(depth);
             deep.map_err(|why| self.src.unbounded(why))?;
             self.batch.push(line);
-            for (name, kid) in self.src.entries(at, &mut self.budget)? {
+            for (name, kid) in self.src.entries_as_read(at, &mut self.budget)? {
                 let kid_path = [path, b"/", &name].concat();
-                if !plain(&name) {
-                    self.skip(&kid_path, Why::Name);
-                } else if kid_path.len() > MAX_LINE {
-                    self.skip(&kid_path, Why::Long);
-                } else {
-                    self.entry(&at.join(&name), &kid_path, &kid, depth + 1)?;
+                match kid {
+                    _ if !plain(&name) => self.skip(&kid_path, Why::Name),
+                    _ if kid_path.len() > MAX_LINE => self.skip(&kid_path, Why::Long),
+                    Err(Ext4Error::Corrupt(_)) => self.skip(&kid_path, Why::Unreadable),
+                    Err(e) => return Err(read(self.src.path)(e).into()),
+                    Ok(kid) => self.entry(&at.join(&name), &kid_path, &kid, depth + 1)?,
                 }
             }
         } else if kind.is_symlink() {
@@ -371,7 +393,12 @@ impl Copier<'_> {
             if m.len() > changes::MAX_LINK {
                 return Ok(Some(Why::Long));
             }
-            let to = self.src.link(at)?;
+            let to = match self.src.fs.read_link(at) {
+                Ok(to) => to,
+                // A target with a name longer than 255 bytes, say.
+                Err(Ext4Error::Corrupt(_)) => return Ok(Some(Why::Unreadable)),
+                Err(e) => return Err(read(self.src.path)(e).into()),
+            };
             let to = to.as_ref();
             if !plain(to) {
                 return Ok(Some(Why::Name));
@@ -431,6 +458,9 @@ struct Batch {
     dir: PathBuf,
     script: Vec<u8>,
     lines: usize,
+    // Each file written in this batch's attributes, in the order written,
+    // for the second debugfs to set by inode number.
+    later: Vec<Vec<(&'static str, String)>>,
     staged: Vec<PathBuf>,
     bytes: u64,
     files: u64,
@@ -438,9 +468,7 @@ struct Batch {
 
 impl Batch {
     fn new(src: &Path, disk: &Path) -> Result<Batch> {
-        let mut name = disk.file_name().unwrap_or_default().to_os_string();
-        name.push(".graft");
-        let dir = disk.with_file_name(name);
+        let dir = staging(disk);
         if !plain(dir.as_os_str().as_encoded_bytes()) {
             let path = dir.display().to_string();
             return Err(Error::Path {
@@ -458,6 +486,7 @@ impl Batch {
             dir,
             script: Vec::new(),
             lines: 0,
+            later: Vec::new(),
             staged: Vec::new(),
             bytes: 0,
             files: 0,
@@ -470,7 +499,8 @@ impl Batch {
         self.lines += 1;
     }
 
-    // An entry's mode, owner and times, set as the source has them.
+    // An entry's mode, owner and times, set as the source has them: a
+    // file's by its inode number, once its batch is written.
     fn attrs(&mut self, path: &[u8], m: &Metadata) {
         let kind: u32 = if m.is_dir() {
             0o040000
@@ -496,6 +526,11 @@ impl Batch {
                 extra(mtime.seconds(), mtime.nanoseconds()).to_string(),
             ),
         ];
+        if m.file_type().is_regular_file() {
+            self.lines += fields.len();
+            self.later.push(fields.into());
+            return;
+        }
         for (field, value) in fields {
             let mut line = cmd("sif", &[path]);
             line.extend(format!(" {field} {value}").as_bytes());
@@ -553,18 +588,59 @@ impl Batch {
         if self.lines == 0 {
             return Ok(());
         }
-        let script = self.dir.join("script");
-        fs::write(&script, &self.script).map_err(at(&script))?;
-        // A file, not a pipe, so debugfs never waits on it.
-        let errs = self.dir.join("stderr");
+        let said = self.debugfs(&self.script, budget)?;
+        // Each write says the inode it made on a line of its own, which no
+        // name can start, since none holds a newline or a carriage return.
+        let made: Vec<&[u8]> = (said.split(|&b| b == b'\n'))
+            .filter_map(|l| l.strip_prefix(b"Allocated inode: "))
+            .collect();
+        if made.len() != self.later.len() {
+            let (n, m) = (self.later.len(), made.len());
+            let why = format!("wrote {n} files but made {m} inodes");
+            let disk = self.disk.clone();
+            return Err(Error::Debugfs { disk, why });
+        }
+        let mut sifs = Vec::new();
+        for (ino, fields) in made.iter().zip(&self.later) {
+            let ino = std::str::from_utf8(ino).ok();
+            let Some(ino) = ino.and_then(|n| n.trim().parse::<u32>().ok()) else {
+                let why = "made an inode it didn't number".to_string();
+                let disk = self.disk.clone();
+                return Err(Error::Debugfs { disk, why });
+            };
+            for (field, value) in fields {
+                sifs.extend(format!("sif <{ino}> {field} {value}\n").as_bytes());
+            }
+        }
+        if !sifs.is_empty() {
+            self.debugfs(&sifs, budget)?;
+        }
+        for file in self.staged.drain(..) {
+            fs::remove_file(&file).map_err(at(&file))?;
+        }
+        self.script.clear();
+        self.later.clear();
+        self.lines = 0;
+        self.bytes = 0;
+        Ok(())
+    }
+
+    // Runs `script` through debugfs on the target, and what it printed, or
+    // an error if it said one.
+    fn debugfs(&self, script: &[u8], budget: &Budget) -> Result<Vec<u8>> {
+        let path = self.dir.join("script");
+        fs::write(&path, script).map_err(at(&path))?;
+        // Files, not pipes, so debugfs never waits on them.
+        let (outs, errs) = (self.dir.join("stdout"), self.dir.join("stderr"));
+        let out = File::create(&outs).map_err(at(&outs))?;
         let err = File::create(&errs).map_err(at(&errs))?;
         let mut debugfs = Command::new(host::DEBUGFS)
             .arg("-w")
             .arg("-f")
-            .arg(&script)
+            .arg(&path)
             .arg(&self.disk)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(out)
             .stderr(err)
             .spawn()
             .map_err(at(Path::new(host::DEBUGFS)))?;
@@ -603,13 +679,7 @@ impl Batch {
             };
             return Err(Error::Debugfs { disk, why });
         }
-        for file in self.staged.drain(..) {
-            fs::remove_file(&file).map_err(at(&file))?;
-        }
-        self.script.clear();
-        self.lines = 0;
-        self.bytes = 0;
-        Ok(())
+        fs::read(&outs).map_err(at(&outs))
     }
 }
 

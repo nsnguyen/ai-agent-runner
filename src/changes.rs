@@ -221,13 +221,26 @@ impl<'a> Disk<'a> {
         dir: &InPathBuf,
         budget: &mut Budget,
     ) -> Result<BTreeMap<Vec<u8>, Metadata>> {
+        let entries = self.entries_as_read(dir, budget)?.into_iter();
+        let read = read(self.path);
+        entries
+            .map(|(name, m)| Ok((name, m.map_err(&read)?)))
+            .collect()
+    }
+
+    // As `entries`, with each inode ext4-view couldn't read as its error.
+    pub(crate) fn entries_as_read(
+        &self,
+        dir: &InPathBuf,
+        budget: &mut Budget,
+    ) -> Result<BTreeMap<Vec<u8>, std::result::Result<Metadata, Ext4Error>>> {
         let mut out = BTreeMap::new();
         for entry in self.fs.read_dir(dir).map_err(read(self.path))? {
             let entry = entry.map_err(read(self.path))?;
             let name = entry.file_name().as_ref().to_vec();
             if name != b"." && name != b".." {
                 budget.entry().map_err(|why| self.unbounded(why))?;
-                out.insert(name, entry.metadata().map_err(read(self.path))?);
+                out.insert(name, entry.metadata());
             }
         }
         Ok(out)

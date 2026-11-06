@@ -105,7 +105,9 @@ fn skip(path: &str, why: Why) -> Skip {
 fn staged(disk: &Path) -> Vec<String> {
     let dir = fs::read_dir(disk.parent().unwrap()).unwrap();
     let names = dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
-    names.filter(|n| n.contains("graft")).collect()
+    let staging = graft::staging(disk);
+    let staging = staging.file_name().unwrap().to_string_lossy();
+    names.filter(|n| *n == staging).collect()
 }
 
 // Bytes no run of zeros hides, so the disk holds every block.
@@ -323,18 +325,21 @@ fn names_debugfs_cant_take_are_skipped_named_and_change_nothing_else() {
             ("home/agent/sp ace and 'single'\\back", "fine too"),
         ],
     );
-    // Were a newline to reach debugfs, each would be a command of its own.
-    let shell = "x\n!touch graft-pwned";
+    // Were a newline to reach debugfs, each would end in a command of its
+    // own, the shell's `#` or a newline cutting off the quote after it.
+    let shell = "x\n!touch graft-pwned #";
     fs::write(t.join("home/agent").join(shell), "x").unwrap();
-    fs::write(t.join("home/agent/y\nmkdir evil"), "x").unwrap();
+    fs::write(t.join("home/agent/y\nmkdir evil\n"), "x").unwrap();
     symlink("to\"where", t.join("home/agent/link")).unwrap();
     symlink("to\nmkdir /evil2", t.join("home/agent/link2")).unwrap();
     let a = image(&t);
     let b = image(&tree(&dir.path().join("b"), &[("etc/os-release", "x")]));
     let before = rest(&b, &["/home"]);
 
-    let got = copy(&a, &b, &["/home"]);
+    let got = graft::copy(&a, &b, &["/home"], changes::LIMITS);
 
+    assert!(!pwned.exists());
+    let got = got.unwrap();
     let want = [
         "/home/agent/bad\"dir",
         "/home/agent/cr\rx",
@@ -343,7 +348,7 @@ fn names_debugfs_cant_take_are_skipped_named_and_change_nothing_else() {
         "/home/agent/new\nline",
         "/home/agent/q\"uote",
         &format!("/home/agent/{shell}"),
-        "/home/agent/y\nmkdir evil",
+        "/home/agent/y\nmkdir evil\n",
     ];
     let want: Vec<_> = want.iter().map(|p| skip(p, Why::Name)).collect();
     assert_eq!(
@@ -368,7 +373,105 @@ fn names_debugfs_cant_take_are_skipped_named_and_change_nothing_else() {
     theirs.retain(|k, _| home.contains_key(k));
     assert_eq!(home, theirs);
     assert_eq!(rest(&b, &["/home"]), before);
-    assert!(!pwned.exists());
+}
+
+#[test]
+fn past_the_first_200_skipped_are_only_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = tree(&dir.path().join("a"), &[("home/ok", "fine")]);
+    for i in 0..205 {
+        fs::write(t.join(format!("home/bad\n{i:03}")), "x").unwrap();
+    }
+    let a = image_of(&t, "32M");
+    let b = image(&tree(&dir.path().join("b"), &[("etc/os-release", "x")]));
+
+    let got = copy(&a, &b, &["/home"]);
+
+    let want = (0..200).map(|i| skip(&format!("/home/bad\n{i:03}"), Why::Name));
+    let want = Copied {
+        skipped: want.collect(),
+        more: 5,
+    };
+    assert_eq!(got, want);
+    assert_eq!(listing(&b, "/home").len(), 2);
+}
+
+#[test]
+fn a_path_too_long_for_a_debugfs_line_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = tree(&dir.path().join("a"), &[("home/ok", "fine")]);
+    // A link target near the most a link holds, on a short path.
+    symlink("ttt/".repeat(1022), t.join("home/link")).unwrap();
+    let a = image(&t);
+    // Directories 250 bytes a name, 16 deep: /home/a…, 4021 bytes of path,
+    // then a directory past 4096 bytes and two files, one whose write fits
+    // and one whose doesn't. Made with debugfs, since the host's own calls
+    // take no path past 4096.
+    let name = "a".repeat(250);
+    let mut path = "/home".to_string();
+    let mut made = String::new();
+    for _ in 0..17 {
+        path = format!("{path}/{name}");
+        made.push_str(&format!("mkdir {path}\n"));
+    }
+    let deep = path[..path.len() - 251].to_string();
+    let data = dir.path().join("data");
+    fs::write(&data, "deep").unwrap();
+    let long = format!("{deep}/{}", "g".repeat(60));
+    made.push_str(&format!("write {} {deep}/f\n", data.display()));
+    made.push_str(&format!("write {} {long}\n", data.display()));
+    debugfs(&a, &made);
+    let b = image(&tree(&dir.path().join("b"), &[("etc/os-release", "x")]));
+
+    let got = copy(&a, &b, &["/home"]);
+
+    let skipped = vec![
+        skip(&path, Why::Long),
+        skip(&long, Why::Long),
+        skip("/home/link", Why::Long),
+    ];
+    assert_eq!(got, Copied { skipped, more: 0 });
+    let home = listing(&b, "/home");
+    let f = format!("{}/f", &deep["/home".len()..]);
+    assert_eq!(home[f.as_bytes()].data, b"deep");
+    assert_eq!(home[b"/ok".as_slice()].data, b"fine");
+    assert_eq!(home.len(), 2 + 16 + 1);
+}
+
+#[test]
+fn an_inode_ext4_view_refuses_is_skipped_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = tree(
+        &dir.path().join("a"),
+        &[
+            ("home/agent/ok", "fine"),
+            ("home/agent/future", "x"),
+            ("home/agent/past", "x"),
+            ("home/agent/later/inside", "x"),
+        ],
+    );
+    // A target whose one name is longer than a name can be.
+    symlink("n".repeat(300), t.join("home/agent/link")).unwrap();
+    let a = image(&t);
+    // Times anyone can give a file: ext4-view 1.0 reads neither.
+    debugfs(
+        &a,
+        "sif /home/agent/future mtime @2208988800\n\
+         sif /home/agent/past mtime @-100\n\
+         sif /home/agent/later atime @2208988800\n",
+    );
+    let b = image(&tree(&dir.path().join("b"), &[("etc/os-release", "x")]));
+
+    let got = copy(&a, &b, &["/home"]);
+
+    let skipped = ["future", "later", "link", "past"];
+    let skipped = (skipped.iter())
+        .map(|n| skip(&format!("/home/agent/{n}"), Why::Unreadable))
+        .collect();
+    assert_eq!(got, Copied { skipped, more: 0 });
+    let home = listing(&b, "/home");
+    let names: Vec<_> = home.keys().map(|k| String::from_utf8_lossy(k)).collect();
+    assert_eq!(names, ["", "/agent", "/agent/ok"]);
 }
 
 #[test]
