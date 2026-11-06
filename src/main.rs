@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use runner::best;
 use runner::checkpoint;
 use runner::claude::{self, Claude};
@@ -14,10 +14,13 @@ use runner::peers;
 use runner::power;
 use runner::proto::{Exit, Request};
 use runner::rebase;
+use runner::resize;
 use runner::runs::{self, AgentRun};
 use runner::services::{self, InVm};
 use runner::sessions::{self, Session};
-use runner::store::{self, BASE, Config, KEEP, Source, Store, Vm, parse_mem};
+use runner::store::{
+    self, BASE, Config, KEEP, Sizes, Source, Store, Vm, parse_disk, parse_mem, size_text,
+};
 use runner::systemd::{self, State, VmStatus};
 use runner::url;
 use std::error::Error;
@@ -118,6 +121,10 @@ enum Cmd {
         /// Memory, like 4G or 4096 (MiB). Defaults to that VM's, else 2G.
         #[arg(long)]
         mem: Option<String>,
+        /// Its disk's size, like 40G, if bigger than that VM's: grown as
+        /// `runner resize` grows one. Defaults to that VM's.
+        #[arg(long)]
+        disk: Option<String>,
         /// A kernel for this VM, in place of the host's <root>/kernel/vmlinux.
         #[arg(long)]
         kernel: Option<PathBuf>,
@@ -126,7 +133,8 @@ enum Cmd {
         #[arg(long)]
         idle: Option<Idle>,
     },
-    /// List VMs, their current disk generation and the space their disks use.
+    /// List VMs: each one's current disk generation and its size, its vCPUs
+    /// and memory, and the space its disks use.
     List,
     /// Boot a VM under systemd, or wake it if it's sleeping. Returns once its
     /// guest has started.
@@ -189,6 +197,24 @@ enum Cmd {
     },
     /// Roll a VM back to its previous committed disk generation.
     Undo { name: String },
+    /// Change a stopped VM's sizes: any of its disk, memory and vCPUs. The
+    /// bigger disk is a new generation, so `runner undo` takes it back, with
+    /// its files as they were, and the guest's / is that big at its next
+    /// boot. A disk only grows. Memory and vCPUs count from its next boot.
+    /// Refused while it's up or asleep: `runner stop` it first.
+    #[command(group(ArgGroup::new("sizes").required(true).multiple(true)))]
+    Resize {
+        name: String,
+        /// The disk's new size, bigger than it is, like 40G or 40960 (MiB).
+        #[arg(long, group = "sizes")]
+        disk: Option<String>,
+        /// Memory, like 4G or 4096 (MiB).
+        #[arg(long, group = "sizes")]
+        mem: Option<String>,
+        /// vCPUs: 1 or an even number up to 32.
+        #[arg(long, group = "sizes")]
+        cpus: Option<u32>,
+    },
     /// Give a stopped VM the current base's system, runner-guest and Claude
     /// Code included, as a new disk generation that keeps its /home, /root,
     /// /etc/machine-id and services. Anything else it installed, like apt
@@ -639,6 +665,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             from,
             cpus,
             mem,
+            disk,
             kernel,
             idle,
         } => {
@@ -650,7 +677,8 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 url: None,
                 allow: None,
             };
-            show(&store.fork_with(&from, &name, &config)?);
+            let disk = disk.as_deref().map(parse_disk).transpose()?;
+            show(&store.fork_sized(&from, &name, &config, disk)?);
         }
         Cmd::List => {
             let vms = store.list()?;
@@ -658,7 +686,7 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 println!("no VMs yet");
             }
             vms.iter()
-                .for_each(|vm| println!("{}  {} bytes used", line(vm), vm.used));
+                .for_each(|vm| println!("{}  {} bytes used", sized(vm), vm.used));
         }
         Cmd::Gc { name, dry_run } => return Ok(gc(&store, name, dry_run)),
         Cmd::Start { name } => show_status(&systemd::start(&store, &name)?),
@@ -712,6 +740,19 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             });
         }
         Cmd::Undo { name } => show(&store.undo(&name)?),
+        Cmd::Resize {
+            name,
+            disk,
+            mem,
+            cpus,
+        } => {
+            let sizes = Sizes {
+                disk: disk.as_deref().map(parse_disk).transpose()?,
+                mem_mib: mem.as_deref().map(parse_mem).transpose()?,
+                cpus,
+            };
+            println!("{}", sized(&resize::resize(&store, &name, &sizes)?));
+        }
         Cmd::Rebase { name } => print!("{}", rebase::said(&rebase::rebase(&store, &name)?)),
         Cmd::Delete { name } => println!("deleted {}", line(&store.delete(&name)?)),
         Cmd::Ip { name } => println!("{}", store.net(&name)?.address),
@@ -1104,6 +1145,13 @@ fn line(vm: &Vm) -> String {
     format!("{}  gen {}  {} bytes", vm.name, vm.generation, vm.bytes)
 }
 
+// `line`, and the vCPUs and memory its next boot gets: what `list`,
+// `status` and `resize` show.
+fn sized(vm: &Vm) -> String {
+    let mem = size_text(u64::from(vm.mem_mib) << 20);
+    format!("{}  cpus {}  mem {mem}", line(vm), vm.cpus)
+}
+
 // At a host shutdown, all at once, since each park syncs its VM's memory
 // file and the unit's stop has a deadline: each VM whose boot is up is asked,
 // and one that isn't parked is shut down cleanly by its unit's stop, as ever.
@@ -1345,7 +1393,7 @@ fn show_status(status: &VmStatus) {
         .as_deref()
         .map(|c| format!("  creds {}", names(c)));
     let creds = creds.unwrap_or_default();
-    println!("{}  {}{creds}", line(&status.vm), status.state);
+    println!("{}  {}{creds}", sized(&status.vm), status.state);
 }
 
 fn names(creds: &[Cred]) -> String {

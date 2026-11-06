@@ -49,6 +49,8 @@ pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
 pub const NFT: &str = "/usr/sbin/nft";
 pub const IP: &str = "/usr/sbin/ip";
 pub const DEBUGFS: &str = "/usr/sbin/debugfs";
+pub const E2FSCK: &str = "/usr/sbin/e2fsck";
+pub const RESIZE2FS: &str = "/usr/sbin/resize2fs";
 
 const PIN: &str = include_str!("../host/firecracker.pin");
 
