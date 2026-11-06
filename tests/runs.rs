@@ -26,7 +26,7 @@ use tempfile::TempDir;
 // prints an init event (`ctl/init` in its place if there is one), waits for
 // `ctl/go`, then prints `ctl/events` more (3 unless set), a result event
 // saying `ctl/says` if there is one, and exits with `ctl/exit` (0 unless
-// set).
+// set). A SIGTERM it notes in `ctl/signal` before it dies of it.
 struct Vm {
     dir: TempDir,
     store: Store,
@@ -62,6 +62,7 @@ fn vm(running: bool) -> Vm {
         &ctl.join("claude"),
         &format!(
             r#"c='{}'
+trap 'echo TERM > "$c/signal"; trap - TERM; kill -TERM $$' TERM
 printf '%s\n' "$@" > "$c/argv"
 pwd > "$c/pwd"
 cat > "$c/prompt"
@@ -212,17 +213,21 @@ fn returns_at_once(mut cmd: Command) -> Output {
 // asked to roll back, as boot does, and the unit goes inactive.
 struct Boot {
     asked: Arc<Mutex<Option<String>>>,
+    halted: Arc<Mutex<bool>>,
     _api: FakeApi,
 }
 
 fn boot(vm: &Vm) -> Boot {
     let run = Arc::new(Mutex::new(Some(vm.store.begin_run("dev").unwrap())));
     let asked = Arc::new(Mutex::new(None));
+    let halted = Arc::new(Mutex::new(false));
     let (seen, state) = (asked.clone(), vm.sd.bin.join("state"));
+    let halts = halted.clone();
     let api = FakeApi::serve(&vm.dir.path().join("vms/dev/api.sock"), move |req| {
         if req.body == json!({"action_type": "SendCtrlAltDel"})
             && let Some(run) = run.lock().unwrap().take()
         {
+            *halts.lock().unwrap() = true;
             match run.take_rollback().unwrap() {
                 Some(by) => *seen.lock().unwrap() = Some(by),
                 None => {
@@ -233,12 +238,21 @@ fn boot(vm: &Vm) -> Boot {
         }
         (204, None)
     });
-    Boot { asked, _api: api }
+    Boot {
+        asked,
+        halted,
+        _api: api,
+    }
 }
 
 impl Boot {
     fn asked(&self) -> Option<String> {
         self.asked.lock().unwrap().clone()
+    }
+
+    /// Whether it took a Ctrl-Alt-Del.
+    fn halted(&self) -> bool {
+        *self.halted.lock().unwrap()
     }
 }
 
@@ -1206,4 +1220,144 @@ proptest! {
         let within = ends <= runs::SESSION_WITHIN as usize;
         prop_assert_eq!(found, within.then_some(uuid));
     }
+}
+
+// The run as `runner runs dev` lists it is still going: nothing stopped
+// Claude Code, and nothing asked it to stop. Then it's let finish, so its
+// fake claude doesn't outlive the test.
+fn still_going(vm: &Vm, id: &str) {
+    std::thread::sleep(Duration::from_millis(300));
+    let row = vm.row(id);
+    assert!(row.contains("Z  running  "), "{row}");
+    assert!(!vm.ctl.join("signal").exists());
+    assert!(!vm.dir.path().join("vms/dev/runs/1/takeover").exists());
+    let _ = fs::remove_file(vm.ctl.join("hold"));
+    vm.go(0, 0);
+    vm.wait_until_ended(id);
+}
+
+// `runner claude --run` takes a run over: Claude Code gets SIGTERM, as a
+// cancel's does, but the VM the run booted stays up on the run's disk, with
+// no ask to roll back. So its next clean shutdown commits what the run wrote
+// and what the session goes on to write, together, as any boot does.
+#[test]
+fn a_run_taken_over_leaves_the_vm_it_booted_up_to_commit_later() {
+    let vm = vm(false);
+    let boot = boot(&vm);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("carry on");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+
+    let run = runs::take_over(&vm.store, &id).unwrap();
+    assert_eq!(run.state, runs::State::TakenOver);
+    assert_eq!(serde_json::to_value(&run).unwrap()["state"], "taken_over");
+    assert_eq!(fs::read_to_string(vm.ctl.join("signal")).unwrap(), "TERM\n");
+    assert!(!boot.halted(), "the run shut its VM down");
+    assert!(!vm.dir.path().join("vms/dev/rollback").exists());
+    assert!(!vm.dir.path().join("vms/dev/runs/1/takeover").exists());
+    let row = vm.row(&id);
+    assert!(row.contains(&format!("Z  taken over  {UUID}  ")), "{row}");
+    let result = vm.result(&id);
+    assert_eq!(result["exit_code"], json!(null), "{result}");
+    assert_eq!(result["outcome"], json!(null));
+    assert_eq!(result["generation"], json!(1));
+    assert_eq!(
+        result["changed"]["error"],
+        "taken over: dev runs on, on the run's disk, so what the run changed isn't measured"
+    );
+    assert_eq!(vm.generation(), 0);
+
+    // Later, as `runner stop` would.
+    let api = runner::firecracker::Api::new(vm.dir.path().join("vms/dev/api.sock"));
+    api.ctrl_alt_del().unwrap();
+    assert!(boot.halted());
+    assert_eq!(boot.asked(), None);
+    assert_eq!(vm.generation(), 1);
+}
+
+// One that joined dev running keeps the checkpoint it took first, in `runs`
+// and its result, for a restore by hand; dev runs on as it was.
+#[test]
+fn a_joined_run_taken_over_keeps_its_checkpoint() {
+    let vm = vm(true);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("look around");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+
+    let run = runs::take_over(&vm.store, &id).unwrap();
+    assert_eq!(run.state, runs::State::TakenOver);
+    assert_eq!(run.checkpoint, Some(2));
+    assert_eq!(run.outcome, None);
+    assert_eq!(fs::read_to_string(vm.ctl.join("signal")).unwrap(), "TERM\n");
+    let row = vm.row(&id);
+    assert!(
+        row.contains(&format!("Z  taken over, checkpoint 2 undoes it  {UUID}  ")),
+        "{row}"
+    );
+    let result = vm.result(&id);
+    assert_eq!(result["checkpoint"], json!(2), "{result}");
+    assert_eq!(result["outcome"], json!(null));
+    assert_eq!(stops_and_starts(&vm), Vec::<String>::new());
+    let listed = vm.ok(&["checkpoints", "dev"]);
+    let first = listed.lines().next().unwrap();
+    assert!(first.ends_with("  \"before run dev.1\""), "{listed}");
+}
+
+// A cancel asked for as well wins: the run rolls back as it says.
+#[test]
+fn a_cancel_asked_for_too_wins_over_a_takeover() {
+    let vm = vm(false);
+    let boot = boot(&vm);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("carry on");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+    fs::write(vm.dir.path().join("vms/dev/runs/1/cancel"), "").unwrap();
+    let run = runs::take_over(&vm.store, &id).unwrap();
+    assert_eq!(run.state, runs::State::Cancelled);
+    assert!(vm.row(&id).contains("Z  cancelled, rolled back  "));
+    assert!(boot.halted());
+    assert_eq!(boot.asked().as_deref(), Some("run dev.1"));
+    assert_eq!(vm.generation(), 0);
+}
+
+#[test]
+fn a_run_that_has_ended_can_t_be_taken_over() {
+    let vm = vm(true);
+    let id = vm.start("quick");
+    vm.go(0, 0);
+    vm.wait_until_ended(&id);
+    let err = runs::take_over(&vm.store, &id).unwrap_err().to_string();
+    assert_eq!(err, "dev.1 has already ended: exited 0, joined");
+}
+
+// Without a terminal there's nothing to carry the session on in.
+#[test]
+fn a_takeover_without_a_terminal_leaves_the_run_going() {
+    let vm = vm(true);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("carry on");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+    let out = vm
+        .runner(&["claude", "--run", &id])
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(255));
+    let err = text(&out.stderr);
+    assert!(err.contains("needs a terminal"), "{err}");
+    still_going(&vm, &id);
+}
+
+// Nor before Claude Code has named its session: there's none to resume.
+#[test]
+fn a_run_without_a_session_yet_isn_t_taken_over() {
+    let vm = vm(true);
+    fs::write(vm.ctl.join("hold"), "").unwrap();
+    let id = vm.start("hi");
+    wait_for("claude to start", || vm.started());
+    let t = common::pty(24, 80);
+    let mut taking = t.spawn(vm.runner(&["claude", "--run", &id]));
+    assert_eq!(taking.wait().unwrap().code(), Some(255), "{}", t.seen());
+    t.wait_for("dev.1 has no Claude Code session yet");
+    still_going(&vm, &id);
 }

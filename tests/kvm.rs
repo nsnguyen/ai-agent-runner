@@ -31,8 +31,9 @@
 // `a_listed_vm_reaches_only_its_names`,
 // `a_headless_run_on_a_listed_vm_reaches_claude_code_s_api`,
 // `claude_keeps_running_after_a_detach`,
-// `claude_code_in_a_vm_has_its_updater_off` and
-// `a_headless_run_edits_a_file_and_commits_it`) need a host set up as
+// `claude_code_in_a_vm_has_its_updater_off`,
+// `a_headless_run_edits_a_file_and_commits_it` and
+// `a_run_taken_over_carries_on_in_claude_s_session`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
 // unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
 // root's owner. The unit boots them with the installed runner, so rerun
@@ -1133,6 +1134,111 @@ fn a_headless_run_edits_a_file_and_commits_it() {
         &["exec", &name, "--", "cat", "/home/agent/work/hello.txt"],
     ));
     assert_eq!(hello.trim(), "hi");
+}
+
+// A run that's going, taken over on a terminal: its claude -p stops, and its
+// session goes on in the VM's claude session, the prompt it was given and
+// all. The VM the run booted stays up, and its next clean shutdown commits
+// the generation the run booted.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and its token"]
+fn a_run_taken_over_carries_on_in_claude_s_session() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("takeover-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let prompt =
+        "Run the shell command sleep 300 in the foreground and wait for it, then say done.";
+    let id = ok(runner(&root, &["run", &name, prompt]));
+    let id = id.trim().to_string();
+    let row = || {
+        let rows = ok(runner(&root, &["runs", &name]));
+        let row = rows.lines().find(|r| r.starts_with(&format!("{id}  ")));
+        row.unwrap_or_else(|| panic!("{rows}")).to_string()
+    };
+    // The column before the prompt, once it's a UUID.
+    let session = |row: &str| {
+        let (before, _) = row.split_once("  \"")?;
+        let s = before.rsplit("  ").next()?;
+        let uuid = s.len() == 36 && s.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit());
+        uuid.then(|| s.to_string())
+    };
+    eventually("the run's session in runs", || session(&row()).is_some());
+    let uuid = session(&row()).unwrap();
+    let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    // Claude Code has written the prompt to its session by the time it runs
+    // the tool.
+    eventually("claude -p to run sleep 300", || {
+        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+        done; true"#;
+        in_vm(sleeping).contains("found")
+    });
+
+    let t = common::pty(50, 160);
+    let mut cmd = cli(&root);
+    cmd.env_remove("TERM").args(["claude", "--run", &id]);
+    let mut taking = t.spawn(cmd);
+    eventually("the takeover", || {
+        t.seen().contains(&format!("{id} is taken over"))
+    });
+    let capture = [
+        "exec",
+        &name,
+        "--",
+        "tmux",
+        "capture-pane",
+        "-p",
+        "-S",
+        "-",
+        "-t",
+        "=claude:",
+    ];
+    let screen = || String::from_utf8_lossy(&runner(&root, &capture).stdout).into_owned();
+    // A fork of base has no ~/.claude.json, so an interactive claude shows
+    // its first-run screens, and then may ask to trust the directory: Enter
+    // takes each one's default. At the prompt, an empty Enter does nothing.
+    eventually("the run's prompt in claude's pane", || {
+        let shown = screen();
+        let there = shown.contains("sleep 300 in the foreground");
+        if !there {
+            t.send("\r");
+        }
+        there
+    });
+    let shown = screen();
+    assert!(!shown.contains("No conversation found"), "{shown}");
+    // As tmux started it, whatever claude makes of its own argv.
+    let pane = [
+        "exec",
+        &name,
+        "--",
+        "tmux",
+        "display",
+        "-p",
+        "-t",
+        "=claude:",
+        "#{pane_start_command}|#{pane_current_path}",
+    ];
+    let ran = ok(runner(&root, &pane));
+    assert!(ran.contains("--resume"), "{ran}");
+    assert!(ran.contains(&uuid), "{ran}");
+    assert!(ran.ends_with("|/home/agent/work\n"), "{ran}");
+    let taken = row();
+    assert!(taken.contains("Z  taken over  "), "{taken}");
+    let result = ok(runner(&root, &["result", &id]));
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let booted = result["generation"].as_u64().expect("the run's generation");
+
+    in_vm("tmux detach-client -s =claude");
+    assert_eq!(taking.wait().unwrap().code(), Some(0), "{}", t.seen());
+    ok(runner(&root, &["stop", &name]));
+    let status = ok(runner(&root, &["status", &name]));
+    assert!(status.ends_with("  stopped\n"), "{status}");
+    assert!(status.contains(&format!("  gen {booted}  ")), "{status}");
 }
 
 #[test]

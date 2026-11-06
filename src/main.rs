@@ -293,18 +293,28 @@ enum Cmd {
     /// new and starts it if it's stopped, then attaches to its tmux session
     /// named claude, starting claude there if it isn't running. Detach with
     /// tmux's prefix key and d; a dropped connection detaches too.
+    /// With --run in place of a VM, takes a headless run that's going over.
     Claude {
-        name: String,
+        #[arg(required_unless_present = "run", conflicts_with = "run")]
+        name: Option<String>,
         /// The VM a new one forks.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "run")]
         from: Option<String>,
         /// Where a new session starts claude.
-        #[arg(short, long, default_value = claude::DIR)]
+        #[arg(short, long, default_value = claude::DIR, conflicts_with = "run")]
         dir: String,
-        /// The user claude runs as.
+        /// The user claude runs as; with --run, the run's.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
-        /// Arguments for claude, after `--`, like --continue.
+        /// Take over this run that's going, like dev.1: stop its claude -p,
+        /// leave its VM up with nothing rolled back, and resume its session
+        /// in the VM's claude session, in the run's directory, as its user.
+        /// Refused, before anything stops, until the run has a session, and
+        /// while the VM has a claude session.
+        #[arg(long, value_name = "RUN")]
+        run: Option<String>,
+        /// Arguments for claude, after `--`, like --continue. With --run,
+        /// after --resume and its session.
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -733,12 +743,30 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
         }
         Cmd::Service { cmd } => return service(&store, cmd),
         Cmd::Claude {
+            run: Some(run),
+            args,
+            ..
+        } => {
+            let t = claude::TakeOver {
+                run,
+                args,
+                env: term(),
+                size: exec::terminal_size(),
+            };
+            return Ok(exit_code(take_over(&store, &t)));
+        }
+        Cmd::Claude {
             name,
             from,
             dir,
             user,
             args,
+            run: None,
         } => {
+            // clap has it unless there's a run.
+            let Some(name) = name else {
+                return Err("claude needs a VM, or --run and a run".into());
+            };
             let c = Claude {
                 vm: name,
                 from,
@@ -1018,6 +1046,18 @@ fn open_claude(store: &Store, c: &Claude) -> Result<Exit, Box<dyn Error>> {
     Ok(claude::open(
         &claude::Host(store),
         c,
+        &mut std::io::stderr(),
+    )?)
+}
+
+// Checked first too, so a run isn't stopped for tmux to fail on.
+fn take_over(store: &Store, t: &claude::TakeOver) -> Result<Exit, Box<dyn Error>> {
+    if !std::io::stdin().is_terminal() {
+        return Err("claude needs a terminal: run this from one, or over ssh -t".into());
+    }
+    Ok(claude::take_over(
+        &claude::Host(store),
+        t,
         &mut std::io::stderr(),
     )?)
 }
