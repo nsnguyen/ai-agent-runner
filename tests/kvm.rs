@@ -1198,23 +1198,35 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
         "=claude:",
     ];
     let screen = || String::from_utf8_lossy(&runner(&root, &capture).stdout).into_owned();
-    // A directory claude -p ran in may not be trusted yet: Enter trusts it.
-    let mut trusted = false;
+    // A fork of base has no ~/.claude.json, so an interactive claude shows
+    // its first-run screens, and then may ask to trust the directory: Enter
+    // takes each one's default. At the prompt, an empty Enter does nothing.
     eventually("the run's prompt in claude's pane", || {
         let shown = screen();
-        if !trusted && shown.contains("trust") {
+        let there = shown.contains("sleep 300 in the foreground");
+        if !there {
             t.send("\r");
-            trusted = true;
         }
-        shown.contains("sleep 300 in the foreground")
+        there
     });
     let shown = screen();
     assert!(!shown.contains("No conversation found"), "{shown}");
-    let pane = r#"pid=$(tmux list-panes -t =claude: -F '#{pane_pid}') &&
-        tr '\0' ' ' </proc/$pid/cmdline && echo && readlink /proc/$pid/cwd"#;
-    let ran = in_vm(pane);
-    assert!(ran.contains(&format!("--resume {uuid}")), "{ran}");
-    assert!(ran.ends_with("/home/agent/work\n"), "{ran}");
+    // As tmux started it, whatever claude makes of its own argv.
+    let pane = [
+        "exec",
+        &name,
+        "--",
+        "tmux",
+        "display",
+        "-p",
+        "-t",
+        "=claude:",
+        "#{pane_start_command}|#{pane_current_path}",
+    ];
+    let ran = ok(runner(&root, &pane));
+    assert!(ran.contains("--resume"), "{ran}");
+    assert!(ran.contains(&uuid), "{ran}");
+    assert!(ran.ends_with("|/home/agent/work\n"), "{ran}");
     let taken = row();
     assert!(taken.contains("Z  taken over  "), "{taken}");
     let result = ok(runner(&root, &["result", &id]));

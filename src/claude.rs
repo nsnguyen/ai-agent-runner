@@ -47,24 +47,36 @@ pub enum Error {
     SessionThere { vm: String },
     #[error("{id} has already ended: {how}")]
     Ended { id: String, how: String },
-    #[error(
-        "{id}'s Claude Code ended on its own before the takeover stopped it, so nothing was \
-         opened: {how}"
-    )]
+    #[error("{id} ended before the takeover stopped it, so nothing was opened: {how}")]
     EndedFirst { id: String, how: String },
+    /// `resume` is the command that carries the session on by hand.
     #[error(
-        "{id} is still stopping: once `runner runs {vm}` says it's taken over, `runner claude \
-         {vm} --dir {dir} -- --resume {session}` carries its session on"
+        "{id} is still stopping: once `runner runs {vm}` says it's taken over, {resume} \
+         carries its session on"
     )]
     StillStopping {
         id: String,
         vm: String,
-        dir: String,
-        session: String,
+        resume: String,
+    },
+    #[error(
+        "{id} is taken over, but {vm} got a claude session while it stopped: `runner kill {vm} \
+         claude` ends that, then {resume} carries the run's session on"
+    )]
+    SessionOpened {
+        id: String,
+        vm: String,
+        resume: String,
     },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// What carries a run's session on by hand.
+fn resume(run: &Run, session: &str) -> String {
+    let (vm, dir, user) = (&run.vm, &run.dir, &run.user);
+    format!("`runner claude {vm} --dir {dir} --user {user} -- --resume {session}`")
+}
 
 /// What `runner claude` does to VMs. `Host` is the real one; tests fake it.
 pub trait Vms {
@@ -208,10 +220,9 @@ pub fn take_over(vms: &impl Vms, t: &TakeOver, notes: &mut impl Write) -> Result
         runs::State::TakenOver => {}
         runs::State::Running => {
             return Err(Error::StillStopping {
+                resume: resume(&run, &session),
                 id: run.id,
                 vm: run.vm,
-                dir: run.dir,
-                session,
             });
         }
         _ => {
@@ -220,6 +231,15 @@ pub fn take_over(vms: &impl Vms, t: &TakeOver, notes: &mut impl Write) -> Result
                 how: ended.how,
             });
         }
+    }
+    // Stopping can take a while, and tmux would attach to a session opened
+    // meanwhile as if it were the run's.
+    if vms.has_session(&run.vm, &run.user, SESSION)? {
+        return Err(Error::SessionOpened {
+            resume: resume(&run, &session),
+            id: run.id,
+            vm: run.vm,
+        });
     }
     let vm = &run.vm;
     note(

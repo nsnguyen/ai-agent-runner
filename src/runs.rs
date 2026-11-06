@@ -493,7 +493,6 @@ pub fn drive(store: &Store, vm: &str, n: u64, program: &str) -> Result<()> {
         // The VM runs on for the session, and commits at its next clean
         // shutdown, as any boot does, unless the run's ask to roll back
         // stays.
-        down = false;
         if ask.boots
             && let Err(e) = store.withdraw_rollback(vm)
         {

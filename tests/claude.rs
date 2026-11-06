@@ -15,11 +15,12 @@ use std::process::{Command, Stdio};
 // VMs by name, each running or not, and whether a running one has a claude
 // session. Each call is logged; a call named in `fail` fails. `run` is the
 // headless run there is, and `ends` how a takeover leaves it: taken over
-// unless set.
+// unless set. With `opens`, a claude session opens while the run stops.
 #[derive(Default)]
 struct Fake {
     vms: RefCell<Vec<(String, bool)>>,
     session: bool,
+    opens: RefCell<bool>,
     run: Option<Run>,
     ends: Option<Run>,
     fail: Option<&'static str>,
@@ -84,7 +85,18 @@ impl Vms for Fake {
     fn has_session(&self, vm: &str, user: &str, session: &str) -> claude::Result<bool> {
         self.call("has_session", format!("has_session {vm} {user} {session}"))?;
         assert!(self.running(vm).unwrap(), "looked in stopped {vm}");
-        Ok(self.session)
+        Ok(self.session
+            || *self.opens.borrow() && self.calls().iter().any(|c| c.starts_with("take_over")))
+    }
+
+    fn take_over(&self, id: &str) -> claude::Result<Run> {
+        self.call("take_over", format!("take_over {id}"))?;
+        let taken = Run {
+            state: State::TakenOver,
+            how: "taken over".to_string(),
+            ..self.run.clone().expect("no run")
+        };
+        Ok(self.ends.clone().unwrap_or(taken))
     }
 
     fn attach(&self, vm: &str, req: &Request) -> claude::Result<Exit> {
@@ -97,16 +109,6 @@ impl Vms for Fake {
     fn run(&self, id: &str) -> claude::Result<Run> {
         self.call("run", format!("run {id}"))?;
         Ok(self.run.clone().expect("no run"))
-    }
-
-    fn take_over(&self, id: &str) -> claude::Result<Run> {
-        self.call("take_over", format!("take_over {id}"))?;
-        let taken = Run {
-            state: State::TakenOver,
-            how: "taken over".to_string(),
-            ..self.run.clone().expect("no run")
-        };
-        Ok(self.ends.clone().unwrap_or(taken))
     }
 }
 
@@ -384,6 +386,7 @@ fn a_run_taken_over_resumes_its_session_where_it_ran() {
             "run dev.1",
             "has_session dev me claude",
             "take_over dev.1",
+            "has_session dev me claude",
             "attach dev"
         ]
     );
@@ -460,8 +463,8 @@ fn a_run_whose_claude_code_ends_first_isn_t_resumed() {
     let (notes, got) = take_over(&fake, &take(&[]));
     assert_eq!(
         got.unwrap_err().to_string(),
-        "dev.1's Claude Code ended on its own before the takeover stopped it, \
-         so nothing was opened: exited 0, committed"
+        "dev.1 ended before the takeover stopped it, so nothing was opened: \
+         exited 0, committed"
     );
     assert_eq!(
         fake.calls(),
@@ -477,10 +480,38 @@ fn a_run_whose_claude_code_ends_first_isn_t_resumed() {
         got.unwrap_err().to_string(),
         format!(
             "dev.1 is still stopping: once `runner runs dev` says it's taken over, \
-             `runner claude dev --dir /home/agent/src -- --resume {UUID}` carries its session on"
+             `runner claude dev --dir /home/agent/src --user me -- --resume {UUID}` carries \
+             its session on"
         )
     );
     assert!(!fake.calls().contains(&"attach dev".to_string()));
+}
+
+// Stopping the run can take a while: a claude session opened meanwhile isn't
+// attached to as if it were the run's.
+#[test]
+fn a_claude_session_opened_while_the_run_stops_isn_t_taken_for_the_run_s() {
+    let mut fake = Fake::with("dev", true);
+    fake.run = Some(going());
+    *fake.opens.borrow_mut() = true;
+    let (_, got) = take_over(&fake, &take(&[]));
+    assert_eq!(
+        got.unwrap_err().to_string(),
+        format!(
+            "dev.1 is taken over, but dev got a claude session while it stopped: \
+             `runner kill dev claude` ends that, then `runner claude dev --dir /home/agent/src \
+             --user me -- --resume {UUID}` carries the run's session on"
+        )
+    );
+    assert_eq!(
+        fake.calls(),
+        [
+            "run dev.1",
+            "has_session dev me claude",
+            "take_over dev.1",
+            "has_session dev me claude"
+        ]
+    );
 }
 
 // A takeover names no VM, nor where or what a new one forks: the run says.

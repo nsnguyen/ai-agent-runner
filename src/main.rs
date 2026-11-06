@@ -303,16 +303,14 @@ enum Cmd {
         /// Where a new session starts claude.
         #[arg(short, long, default_value = claude::DIR, conflicts_with = "run")]
         dir: String,
-        /// The user claude runs as.
+        /// The user claude runs as; with --run, the run's.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
-        /// Take over this run that's going, like dev.1: its claude -p is
-        /// stopped, as a cancel does, but its VM stays up and nothing is
-        /// rolled back, and its session goes on as `claude --resume` in the
-        /// VM's claude session, in the run's directory, as its user. A VM
-        /// the run booted commits at its next clean shutdown, run and session
-        /// together. Refused before anything stops if Claude Code hasn't
-        /// named its session yet, or if the VM has a claude session already.
+        /// Take over this run that's going, like dev.1: stop its claude -p,
+        /// leave its VM up with nothing rolled back, and resume its session
+        /// in the VM's claude session, in the run's directory, as its user.
+        /// Refused, before anything stops, until the run has a session, and
+        /// while the VM has a claude session.
         #[arg(long, value_name = "RUN")]
         run: Option<String>,
         /// Arguments for claude, after `--`, like --continue. With --run,

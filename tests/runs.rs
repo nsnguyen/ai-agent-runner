@@ -1223,13 +1223,17 @@ proptest! {
 }
 
 // The run as `runner runs dev` lists it is still going: nothing stopped
-// Claude Code, and nothing asked it to stop.
+// Claude Code, and nothing asked it to stop. Then it's let finish, so its
+// fake claude doesn't outlive the test.
 fn still_going(vm: &Vm, id: &str) {
     std::thread::sleep(Duration::from_millis(300));
     let row = vm.row(id);
     assert!(row.contains("Z  running  "), "{row}");
     assert!(!vm.ctl.join("signal").exists());
     assert!(!vm.dir.path().join("vms/dev/runs/1/takeover").exists());
+    let _ = fs::remove_file(vm.ctl.join("hold"));
+    vm.go(0, 0);
+    vm.wait_until_ended(id);
 }
 
 // `runner claude --run` takes a run over: Claude Code gets SIGTERM, as a
@@ -1297,6 +1301,23 @@ fn a_joined_run_taken_over_keeps_its_checkpoint() {
     let listed = vm.ok(&["checkpoints", "dev"]);
     let first = listed.lines().next().unwrap();
     assert!(first.ends_with("  \"before run dev.1\""), "{listed}");
+}
+
+// A cancel asked for as well wins: the run rolls back as it says.
+#[test]
+fn a_cancel_asked_for_too_wins_over_a_takeover() {
+    let vm = vm(false);
+    let boot = boot(&vm);
+    fs::write(vm.ctl.join("init"), init(UUID)).unwrap();
+    let id = vm.start("carry on");
+    wait_for("the session to show", || vm.row(&id).contains(UUID));
+    fs::write(vm.dir.path().join("vms/dev/runs/1/cancel"), "").unwrap();
+    let run = runs::take_over(&vm.store, &id).unwrap();
+    assert_eq!(run.state, runs::State::Cancelled);
+    assert!(vm.row(&id).contains("Z  cancelled, rolled back  "));
+    assert!(boot.halted());
+    assert_eq!(boot.asked().as_deref(), Some("run dev.1"));
+    assert_eq!(vm.generation(), 0);
 }
 
 #[test]
