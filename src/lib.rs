@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod exec;
 pub mod export;
 pub mod firecracker;
+pub mod graft;
 pub mod guest;
 pub mod host;
 pub mod hosts;

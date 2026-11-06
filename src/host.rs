@@ -48,6 +48,7 @@ pub const UPTIME: &str = "/proc/uptime";
 pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
 pub const NFT: &str = "/usr/sbin/nft";
 pub const IP: &str = "/usr/sbin/ip";
+pub const DEBUGFS: &str = "/usr/sbin/debugfs";
 
 const PIN: &str = include_str!("../host/firecracker.pin");
 
