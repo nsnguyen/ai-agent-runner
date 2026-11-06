@@ -11,6 +11,11 @@ const WANTS: &str = "etc/systemd/system/multi-user.target.wants/runner-guest.ser
 const LLM_TXT: &str = ".runner/llm.txt";
 const SETTINGS: &str = "etc/claude-code/managed-settings.json";
 const BUILD: &str = ".runner/build";
+const DOCKER_UNIT: &str = "usr/lib/systemd/system/docker.service";
+const DOCKER_WANTS: &str = "etc/systemd/system/multi-user.target.wants/docker.service";
+const GROUP: &str = "etc/group";
+const GROUPS: &str = "root:x:0:\nsudo:x:27:\ndocker:x:101:agent\nagent:x:1000:\n";
+const NO_RAW: &str = "etc/systemd/system/docker.service.d/no-raw-table.conf";
 const RECORD: &str = "# What this image was built from: images/base/build.sh wrote it.
 fingerprint=3f2a4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819
 commit=42f0b7d1e2a3
@@ -53,6 +58,23 @@ fn clean_tree() -> TempDir {
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::copy(script("managed-settings.json"), &settings).unwrap();
     fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).unwrap();
+    // Docker, enabled as systemctl enables it, for agent, on iptables-legacy
+    // with the image's own drop-in.
+    fs::create_dir_all(root.join(DOCKER_UNIT).parent().unwrap()).unwrap();
+    fs::write(root.join(DOCKER_UNIT), b"[Service]\n").unwrap();
+    symlink(
+        "/usr/lib/systemd/system/docker.service",
+        root.join(DOCKER_WANTS),
+    )
+    .unwrap();
+    fs::write(root.join(GROUP), GROUPS).unwrap();
+    fs::create_dir_all(root.join("etc/alternatives")).unwrap();
+    for cmd in ["iptables", "ip6tables"] {
+        let link = root.join("etc/alternatives").join(cmd);
+        symlink(format!("/usr/sbin/{cmd}-legacy"), link).unwrap();
+    }
+    fs::create_dir_all(root.join(NO_RAW).parent().unwrap()).unwrap();
+    fs::copy(script("docker-no-raw-table.conf"), root.join(NO_RAW)).unwrap();
     tree
 }
 
@@ -213,6 +235,139 @@ fn check_fails_when_the_agent_can_t_read_the_settings() {
     );
 }
 
+#[test]
+fn check_fails_when_docker_is_not_enabled() {
+    let tree = clean_tree();
+    fs::remove_file(tree.path().join(DOCKER_WANTS)).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  docker.service is not enabled");
+}
+
+// A link left behind by a unit that's gone starts nothing.
+#[test]
+fn check_fails_when_docker_s_link_leads_nowhere() {
+    let tree = clean_tree();
+    fs::remove_file(tree.path().join(DOCKER_UNIT)).unwrap();
+    fails_mentioning(&check(tree.path()), "FAIL  docker.service is not enabled");
+}
+
+#[test]
+fn check_fails_when_agent_is_not_in_the_docker_group() {
+    let tree = clean_tree();
+    let groups = GROUPS.replace("docker:x:101:agent", "docker:x:101:");
+    fs::write(tree.path().join(GROUP), groups).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  agent is not in the docker group",
+    );
+}
+
+// Only the docker group counts, and only agent by its whole name.
+#[test]
+fn check_fails_on_agent_in_another_group_or_a_name_like_it() {
+    for line in [
+        "docker:x:101:agents",
+        "docker:x:101:root,myagent",
+        "dockers:x:102:agent",
+    ] {
+        let tree = clean_tree();
+        let groups = GROUPS.replace("docker:x:101:agent", line);
+        fs::write(tree.path().join(GROUP), groups).unwrap();
+        fails_mentioning(
+            &check(tree.path()),
+            "FAIL  agent is not in the docker group",
+        );
+    }
+}
+
+#[test]
+fn check_passes_agent_among_the_docker_group_s_members() {
+    let tree = clean_tree();
+    let groups = GROUPS.replace("docker:x:101:agent", "docker:x:101:root,agent,ci");
+    fs::write(tree.path().join(GROUP), groups).unwrap();
+    passes(&check(tree.path()));
+}
+
+#[test]
+fn check_fails_when_iptables_is_the_nft_variant() {
+    for cmd in ["iptables", "ip6tables"] {
+        let tree = clean_tree();
+        let link = tree.path().join("etc/alternatives").join(cmd);
+        fs::remove_file(&link).unwrap();
+        symlink(format!("/usr/sbin/{cmd}-nft"), &link).unwrap();
+        fails_mentioning(
+            &check(tree.path()),
+            &format!("FAIL  {cmd} is /usr/sbin/{cmd}-nft, not {cmd}-legacy"),
+        );
+    }
+}
+
+#[test]
+fn check_fails_when_docker_s_raw_table_variable_is_not_set() {
+    let tree = clean_tree();
+    let conf = tree.path().join(NO_RAW);
+    let unset = fs::read_to_string(&conf).unwrap().replace(
+        "DOCKER_INSECURE_NO_IPTABLES_RAW=1",
+        "DOCKER_INSECURE_NO_IPTABLES_RAW=0",
+    );
+    fs::write(&conf, unset).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  dockerd writes to the iptables raw table",
+    );
+    fs::remove_file(&conf).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  dockerd writes to the iptables raw table",
+    );
+}
+
+// A commented-out line, or one outside [Service], sets nothing.
+#[test]
+fn check_fails_when_the_raw_table_variable_is_commented_out() {
+    let tree = clean_tree();
+    let conf = "# Environment=DOCKER_INSECURE_NO_IPTABLES_RAW=1\n\
+                [Service]\nEnvironment=FOO=1\n";
+    fs::write(tree.path().join(NO_RAW), conf).unwrap();
+    fails_mentioning(
+        &check(tree.path()),
+        "FAIL  dockerd writes to the iptables raw table",
+    );
+}
+
+// What the image installs for Docker: Ubuntu's packages, dockerd and
+// containerd started at boot, logs that rotate, and the drop-in check.sh
+// reads, all of which build.sh copies in.
+#[test]
+fn the_image_installs_docker_for_agent() {
+    let dockerfile = fs::read_to_string(script("Dockerfile")).unwrap();
+    for said in [
+        "docker.io",
+        "docker-compose-v2",
+        "docker-buildx",
+        "usermod -aG docker agent",
+        "update-alternatives --set iptables /usr/sbin/iptables-legacy",
+        "update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy",
+        "systemctl enable containerd.service docker.service",
+        "COPY docker-daemon.json /etc/docker/daemon.json",
+        "COPY docker-no-raw-table.conf /etc/systemd/system/docker.service.d/no-raw-table.conf",
+    ] {
+        assert!(
+            dockerfile.contains(said),
+            "the Dockerfile doesn't say {said:?}"
+        );
+    }
+    let json = fs::read_to_string(script("docker-daemon.json")).unwrap();
+    let daemon: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(daemon["log-driver"], "local", "{json}");
+    let build = fs::read_to_string(script("build.sh")).unwrap();
+    for file in ["docker-daemon.json", "docker-no-raw-table.conf"] {
+        assert!(
+            build.contains(&format!("\"$here/{file}\"")),
+            "build.sh doesn't copy {file}"
+        );
+    }
+}
+
 // Every claude in a VM reads its managed settings, however it starts, and
 // these turn its updater off: a new version comes only from rebuilding base.
 #[test]
@@ -246,6 +401,29 @@ fn llm_txt_says_a_refused_name_is_off_the_owner_s_list() {
         "don't work around it",
         "runner net",
         runner::dns::ALWAYS[0],
+    ] {
+        assert!(llm.contains(said), "llm.txt doesn't say {said:?}");
+    }
+}
+
+// Docker fills a disk fast: llm.txt says what limits it, that the owner can
+// give it more, that images aren't shared between VMs, which names a listed
+// VM needs for Docker Hub, and what a rebase drops.
+#[test]
+fn llm_txt_says_what_docker_here_can_and_can_t_do() {
+    let llm = fs::read_to_string(script("llm.txt")).unwrap();
+    for said in [
+        "## Docker",
+        "docker compose up -d",
+        "without sudo",
+        "df -h /",
+        "free -h",
+        "the owner can give",
+        "aren't in another VM",
+        "registry-1.docker.io",
+        "auth.docker.io",
+        "production.cloudflare.docker.com",
+        "/var/lib/docker",
     ] {
         assert!(llm.contains(said), "llm.txt doesn't say {said:?}");
     }
