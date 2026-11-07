@@ -505,7 +505,10 @@ check_url() {
 check_compose() {
   step "A compose stack through runner proxy, and after a sleep and a wake"
   # This check sleeps the VM itself, so no idle sleep races it.
-  r idle "$vm" never >/dev/null
+  if ! said=$(r idle "$vm" never 2>&1 >/dev/null); then
+    fail "compose: idle never: ${said:-it failed}"
+    return
+  fi
   # check_proxy's service has the VM's port 8080; none there is as good.
   got=$(r service rm "$vm" web 2>&1)
   code=$?

@@ -605,13 +605,15 @@ fn docker_s_and_containerd_s_changes_are_one_entry_each_with_a_count() {
 }
 
 // Summed, the paths under Docker's state take one place in the list however
-// many there are; once the list is full, they're counted in `more` as any
-// path is.
+// many there are; once the list is full, they're one more in `more`, as a
+// directory added whole is.
 #[test]
 fn a_summed_entry_takes_one_place_in_the_list() {
     let dir = tempfile::tempdir().unwrap();
     let was = [("home/agent/keep", "k"), ("var/lib/docker/engine-id", "id")];
-    let before = image(&tree(&dir.path().join("before"), &was));
+    let before = tree(&dir.path().join("before"), &was);
+    fs::create_dir(before.join("var/lib/docker/overlay2")).unwrap();
+    let before = image(&before);
     let after = image(&tree(
         &dir.path().join("after"),
         &[
@@ -625,10 +627,10 @@ fn a_summed_entry_takes_one_place_in_the_list() {
     let got = changes::between(&before, &after, 2, changes::TIME).unwrap();
     let want = vec![
         change("/home/agent/a.txt", Kind::Added),
-        summed("/var/lib/docker", Kind::Modified, 9),
+        summed("/var/lib/docker", Kind::Modified, 8),
     ];
     assert_eq!(got, listed(want, 0, 0));
-    // With room for one path, overlay2, one directory added whole, is the
+    // With room for one path, x and y, each added whole under it, are the
     // one more.
     let got = changes::between(&before, &after, 1, changes::TIME).unwrap();
     let want = vec![change("/home/agent/a.txt", Kind::Added)];
@@ -636,7 +638,8 @@ fn a_summed_entry_takes_one_place_in_the_list() {
 }
 
 // Only under the directories themselves: their own mode is listed, and so
-// is a name that only starts the same.
+// is a name that only starts the same. With changes under it too, the
+// directory is still one entry.
 #[test]
 fn only_what_is_under_docker_s_state_is_summed() {
     let dir = tempfile::tempdir().unwrap();
@@ -660,6 +663,20 @@ fn only_what_is_under_docker_s_state_is_summed() {
         whole_dir("/var/lib/docker2", Kind::Added, 1),
         change("/var/lib/dockerfile", Kind::Added),
     ];
+    assert_eq!(got, listed(want, 0, 0));
+
+    let files = [
+        ("var/lib/docker/engine-id", "1"),
+        ("var/lib/docker/new", "x"),
+    ];
+    let more = tree(&dir.path().join("more"), &files);
+    fs::set_permissions(
+        more.join("var/lib/docker"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let got = between(&before, &more);
+    let want = vec![summed("/var/lib/docker", Kind::Modified, 1)];
     assert_eq!(got, listed(want, 0, 0));
 }
 

@@ -102,7 +102,7 @@ http://localhost:18080/*)
   elif [ -e "$FAKE/holding" ] && [ "$(cat "$FAKE/tunnel")" = localhost:18080:172.16.0.6:8080 ] && ! wrong proxy-dead && ! { wrong proxy-drops && grep -qx 150 "$FAKE/sleeps" && [ "$(grep -cx holding "$FAKE/held")" = 1 ]; }; then
     if [ -e "$FAKE/vm/stack" ]; then
       code=200
-      page=$(cat "$FAKE/vm/stack")
+      wrong stack-blank || page=$(cat "$FAKE/vm/stack")
     elif [ -e "$FAKE/vm/web" ]; then
       code=200
       page='<title>Directory listing for /</title>'
@@ -164,7 +164,13 @@ delete)
   [ "$(state)" = stopped ] || { echo "runner: $name is up: runner stop $name first" >&2; exit 1; }
   echo "deleted $(line)"
   rm -rf "$vm" ;;
-idle) there; echo "$3" >"$vm/idle"; echo "$name  idle $3" ;;
+idle)
+  there
+  # Only the compose check's, after the proxy check's 90s.
+  [ "$3" != never ] || [ "$(cat "$vm/idle" 2>/dev/null)" != 90s ] || ! wrong idle-never-fails || { echo "runner: couldn't write $name's config" >&2; exit 1; }
+  echo "$3" >"$vm/idle"
+  echo "$name  idle $3"
+  ;;
 ip) here; echo 172.16.0.6 ;;
 list) if [ -d "$vm" ] && [ "$(cat "$vm/on")" = "$FAKE_DEST" ]; then echo "$(line)  4096 bytes used"; else echo "no VMs yet"; fi ;;
 move)
@@ -1460,6 +1466,14 @@ const WRONG: &[(&str, &[&str])] = &[
         &["url on: http://100.64.0.1:10001 gives HTTP 000"],
     ),
     // A compose stack through the proxy, and after a sleep and a wake
+    (
+        "idle-never-fails",
+        &["compose: idle never: runner: couldn't write client-check's config"],
+    ),
+    (
+        "stack-blank",
+        &["compose: localhost:18080 doesn't answer from the stack: HTTP 200, ''"],
+    ),
     (
         "service-rm-fails",
         &["compose: service rm web, which has port 8080: exit 1"],

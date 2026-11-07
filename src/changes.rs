@@ -204,8 +204,8 @@ pub struct Change {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contains: Option<u64>,
     /// For a directory on SUMMED, where containers keep their images, layers
-    /// and volumes: how many paths changed under it, counted here and not
-    /// listed, each under a directory added or deleted whole among them.
+    /// and volumes: how many paths changed under it, none of them listed. A
+    /// directory added or deleted whole there counts with all that's in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_under: Option<u64>,
 }
@@ -395,8 +395,8 @@ struct Walk<'a> {
     // The bytes of the paths listed so far.
     listed: usize,
     // The directory on SUMMED whose entry the paths under it go in, and where
-    // that entry is in the list.
-    summing: Option<(&'static str, usize)>,
+    // that entry is in the list: None once it's counted in `more` instead.
+    summing: Option<(&'static str, Option<usize>)>,
     out: Changes,
 }
 
@@ -542,25 +542,33 @@ impl Walk<'_> {
         } else if let Some(root) = summed_under(path.as_ref()) {
             self.sum(root, Kind::Modified, 1 + contains.unwrap_or(0));
         } else {
+            let root = SUMMED.iter().find(|at| at.as_bytes() == path.as_ref());
             let path = shown(path.as_ref());
-            self.list(Change {
+            let listed = self.list(Change {
                 path,
                 change,
                 contains,
                 changed_under: None,
             });
+            // Its own change, a new mode say: what changed under it joins it.
+            if let Some(root) = root {
+                self.summing = Some((root, listed.then(|| self.out.paths.len() - 1)));
+            }
         }
     }
 
     // `paths` more under `root`, in its entry: the walk comes to everything
     // under a directory together, so the entry is where the first of them
-    // would be listed.
+    // would be listed. If it didn't fit, it's one path in `more`, however
+    // many are under it.
     fn sum(&mut self, root: &'static str, change: Kind, paths: u64) {
-        if let Some((at, i)) = self.summing
+        if let Some((at, entry)) = self.summing
             && at == root
         {
-            let n = self.out.paths[i].changed_under.get_or_insert(0);
-            *n = n.saturating_add(paths);
+            if let Some(i) = entry {
+                let n = self.out.paths[i].changed_under.get_or_insert(0);
+                *n = n.saturating_add(paths);
+            }
             return;
         }
         let entry = Change {
@@ -569,9 +577,8 @@ impl Walk<'_> {
             contains: None,
             changed_under: Some(paths),
         };
-        if self.list(entry) {
-            self.summing = Some((root, self.out.paths.len() - 1));
-        }
+        let listed = self.list(entry);
+        self.summing = Some((root, listed.then(|| self.out.paths.len() - 1)));
     }
 
     // Lists a change, if it fits. Once one doesn't, the rest are only
