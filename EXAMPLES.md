@@ -258,7 +258,41 @@ runner net demo open                                   # the whole internet agai
 
 It works at once, on a running VM too, with no restart. A name covers the names under it: github.com lets in api.github.com. Any other site doesn't resolve inside demo, and Claude there knows to ask you rather than work around it. Claude on your laptop can read the list (`vm_allowlist`) but not change it.
 
-## 11. When you're done
+## 11. A database next to the code: Docker Compose
+
+Every VM made from a current base has Docker and Compose, and Claude in it can use them without sudo. Say the project in demo has this `compose.yaml`:
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+volumes:
+  pgdata:
+```
+
+```sh
+runner exec demo -d /home/agent/work/app -- docker compose up -d   # Postgres, inside demo
+runner proxy demo 5432                         # in another terminal: demo's Postgres at localhost:5432
+psql -h localhost -U postgres                  # from the laptop, password dev
+runner exec demo -- docker system df           # what images and volumes take of demo's disk
+```
+
+Or ask Claude in `runner claude demo` to bring it up. `restart: unless-stopped` brings it back each time demo starts. `runner stop` gives demo 30 seconds to shut down cleanly before it kills it and loses what that boot wrote, so keep a service's `stop_grace_period` at Compose's 10 seconds or so. Images, containers and volumes are on demo's disk, so checkpoints, sleep, export and forks keep them. A rebase doesn't: it keeps `/home`, not `/var/lib/docker`, so after one, `docker compose up -d` pulls again and a named volume starts empty. Images pulled in demo aren't in your other VMs.
+
+On a VM kept to a few sites (section 10), let Docker Hub in first:
+
+```sh
+runner net demo allow registry-1.docker.io auth.docker.io production.cloudfront.docker.com
+```
+
+## 12. When you're done
 
 ```sh
 runner stop demo       # saves its disk

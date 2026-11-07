@@ -436,6 +436,70 @@ fn tmp_emptied_by_the_boot_and_the_empty_directories_it_makes_are_left_out() {
     assert_eq!(got, listed(want, 0, 5));
 }
 
+// #170: dockerd and containerd make their state directories at a VM's first
+// boot, and every start rewrites four bolt databases there. Those are left
+// out, but not what an agent's containers, volumes and images add once the
+// directories are there, nor a name that only starts the same.
+#[test]
+fn docker_s_own_state_from_a_boot_is_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = ("home/agent/work/keep.txt", "keep");
+    let kv = "var/lib/docker/network/files/local-kv.db";
+    let volumes = "var/lib/docker/volumes/metadata.db";
+    let cache = "var/lib/docker/buildkit/cache.db";
+    let meta = "var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db";
+    // A fork's first boot: neither directory was there.
+    let before = tree(&dir.path().join("before"), &[keep]);
+    fs::create_dir_all(before.join("var/lib")).unwrap();
+    let after = tree(
+        &dir.path().join("after"),
+        &[
+            keep,
+            ("var/lib/docker/engine-id", "id"),
+            (kv, "kv 1"),
+            (volumes, "volumes 1"),
+            (cache, "cache 1"),
+            (meta, "meta 1"),
+        ],
+    );
+    fs::create_dir_all(after.join("var/lib/docker/containers")).unwrap();
+    assert_eq!(between(&before, &after), listed(vec![], 0, 2));
+
+    // A later boot: the databases rewritten, and what the agent ran.
+    let later = tree(
+        &dir.path().join("later"),
+        &[
+            keep,
+            ("var/lib/docker/engine-id", "id"),
+            (kv, "kv 2"),
+            (volumes, "volumes 2"),
+            ("var/lib/docker/volumes/pgdata/_data/PG_VERSION", "17"),
+            (cache, "cache 2"),
+            ("var/lib/docker/containers/c0ffee/config.v2.json", "{}"),
+            (meta, "meta 2"),
+            ("var/lib/docker.bak/engine-id", "id"),
+        ],
+    );
+    let got = between(&after, &later);
+    let want = vec![
+        whole_dir("/var/lib/docker/containers/c0ffee", Kind::Added, 1),
+        whole_dir("/var/lib/docker/volumes/pgdata", Kind::Added, 2),
+        whole_dir("/var/lib/docker.bak", Kind::Added, 1),
+    ];
+    assert_eq!(got, listed(want, 0, 4));
+
+    // Gone, Docker's state is listed: no boot deletes it.
+    let gone = tree(&dir.path().join("gone"), &[keep]);
+    fs::create_dir_all(gone.join("var/lib")).unwrap();
+    let got = between(&later, &gone);
+    let want = vec![
+        whole_dir("/var/lib/containerd", Kind::Deleted, 2),
+        whole_dir("/var/lib/docker", Kind::Deleted, 14),
+        whole_dir("/var/lib/docker.bak", Kind::Deleted, 1),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+}
+
 // The list never reaches into /home, where the agent works.
 #[test]
 fn nothing_under_home_is_ever_left_out() {

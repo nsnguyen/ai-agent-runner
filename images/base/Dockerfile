@@ -10,10 +10,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # systemd is init. No sshd: the host reaches the VM through runner-guest.
+# Docker Engine, Compose v2 and buildx are Ubuntu's, so they update with the
+# image; installed here, while the image's policy-rc.d still keeps their
+# postinst from starting dockerd in the build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       systemd systemd-sysv udev dbus libnss-myhostname iproute2 iputils-ping \
       ca-certificates curl git openssh-client sudo less xz-utils unzip \
       build-essential pkg-config tmux python3 python3-pip python3-venv \
+      docker.io docker-compose-v2 docker-buildx \
  && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/nodesource.sh \
  && bash /tmp/nodesource.sh && rm /tmp/nodesource.sh \
  && apt-get install -y --no-install-recommends nodejs \
@@ -53,6 +57,20 @@ RUN rm -rf /home/agent/.claude /home/agent/.claude.json /root/.claude /root/.cla
 # serial console for a locale or a root password.
 RUN : > /etc/machine-id && rm -f /var/lib/dbus/machine-id \
  && ln -s /dev/null /etc/systemd/system/systemd-firstboot.service
+
+# Docker for agent, without sudo, started at boot so a container with a
+# restart policy comes back after a reboot. Firecracker's CI kernel has no
+# nf_tables, so iptables is the legacy variant, and no raw table, which the
+# drop-in tells dockerd to leave alone. Container logs rotate rather than
+# fill the disk.
+COPY docker-daemon.json /etc/docker/daemon.json
+COPY docker-no-raw-table.conf /etc/systemd/system/docker.service.d/no-raw-table.conf
+RUN usermod -aG docker agent \
+ && update-alternatives --set iptables /usr/sbin/iptables-legacy \
+ && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+ && systemctl enable containerd.service docker.service \
+ && chmod 0755 /etc/docker /etc/systemd/system/docker.service.d \
+ && chmod 0644 /etc/docker/daemon.json /etc/systemd/system/docker.service.d/no-raw-table.conf
 
 COPY runner-guest /usr/local/bin/runner-guest
 COPY runner-guest.service /etc/systemd/system/runner-guest.service
