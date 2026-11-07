@@ -96,6 +96,14 @@ runner claude --run demo.1   # stops the run's agent, then opens its conversatio
 
 The run's changes stay, and demo stays on: from there it's the same as `runner claude demo`, and **Ctrl-b**, then **d**, leaves it running. It works once `runner runs demo` shows the run's session, and not while `runner claude demo` is already open (Ctrl-b, then d, doesn't close it: `runner kill demo claude` does).
 
+The same command picks up a run that's over, one that failed or that you cancelled, from where it stopped:
+
+```sh
+runner claude --run demo.1   # starts demo if it's stopped, then opens the run's conversation
+```
+
+If the run's changes were thrown away, the takeover brings them back first. demo has to be stopped for that (`runner stop demo`), and the takeover prints the `runner restore` that gets back the disk from before. Once a later run has kept its changes, the thrown-away ones may be cleaned up, and then the takeover says they're gone. Taking the same run over again later carries on where you left it, and never brings the old changes back a second time.
+
 To have several agents try the same thing at once and keep the best, give `--n`:
 
 ```sh
