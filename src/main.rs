@@ -293,7 +293,7 @@ enum Cmd {
     /// new and starts it if it's stopped, then attaches to its tmux session
     /// named claude, starting claude there if it isn't running. Detach with
     /// tmux's prefix key and d; a dropped connection detaches too.
-    /// With --run in place of a VM, takes a headless run that's going over.
+    /// With --run in place of a VM, takes a headless run over, going or not.
     Claude {
         #[arg(required_unless_present = "run", conflicts_with = "run")]
         name: Option<String>,
@@ -306,11 +306,14 @@ enum Cmd {
         /// The user claude runs as; with --run, the run's.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
         user: String,
-        /// Take over this run that's going, like dev.1: stop its claude -p,
-        /// leave its VM up with nothing rolled back, and resume its session
-        /// in the VM's claude session, in the run's directory, as its user.
-        /// Refused, before anything stops, until the run has a session, and
-        /// while the VM has a claude session.
+        /// Take over this run, like dev.1. One that's going: stop its claude
+        /// -p, leave its VM up with nothing rolled back, and resume its
+        /// session in the VM's claude session, in the run's directory, as its
+        /// user. Refused, before anything stops, until the run has a session,
+        /// and while the VM has a claude session. One that's over resumes
+        /// from the disk it ended on: the VM's own if it committed or joined,
+        /// started if it's stopped; if it rolled back, a copy of the run's
+        /// disk put on top of the stopped VM's history, as a restore's is.
         #[arg(long, value_name = "RUN")]
         run: Option<String>,
         /// Arguments for claude, after `--`, like --continue. With --run,

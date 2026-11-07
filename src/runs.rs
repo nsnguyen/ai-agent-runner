@@ -20,6 +20,9 @@
 //   <vm>/runs/<n>/takeover  there once `runner claude --run` has asked to
 //                           take the run over, until Claude Code is done
 //   <vm>/runs/<n>/result.json  what the runner measured once it was over
+//   <vm>/runs/<n>/taken     there once `runner claude --run` has taken the
+//                           run over after it ended (claude.rs), with the
+//                           generation it put the run's disk back as, if it did
 //   <vm>/runs/<n>/end.json  how it ended, written last
 //
 // A run on a stopped VM boots it, which runs a new disk generation as every
@@ -51,7 +54,9 @@
 // VM's next clean shutdown commits the run's writes and the session's
 // together, as any boot does. One that joined it keeps its checkpoint. The
 // run ends taken over, with no outcome and nothing measured: the disk is
-// still in use.
+// still in use. A run that's over is taken over from the disk it ended on,
+// which claude.rs works out from its outcome and its result's generation.
+// How it ended stays as it was; only the taken mark says it was taken over.
 use crate::changes;
 use crate::checkpoint;
 use crate::exec::{self, Streamed};
@@ -112,6 +117,7 @@ const CANCEL: &str = "cancel";
 const TAKEOVER: &str = "takeover";
 const RESULT: &str = "result.json";
 const END: &str = "end.json";
+const TAKEN: &str = "taken";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1034,6 +1040,12 @@ pub struct Placed {
     pub run: AgentRun,
     pub dir: String,
     pub user: String,
+    /// Once it's over, the disk generation it booted, as its result has it:
+    /// where a run that rolled back left its session.
+    pub generation: Option<u64>,
+    /// Taken over after it ended (mark_taken): its session goes on from the
+    /// VM's own disk since.
+    pub taken: bool,
 }
 
 /// The run with this id, and where its Claude Code runs.
@@ -1041,11 +1053,58 @@ pub fn placed(store: &Store, id: &str) -> Result<Placed> {
     let (vm, n) = parse_id(id)?;
     let path = store.runs(&vm)?.join(n.to_string()).join(ASK);
     let ask: Ask = read_json(&path)?.ok_or_else(|| Error::NoRun(id.to_string()))?;
+    let run = load(store, &vm, n)?;
     Ok(Placed {
-        run: load(store, &vm, n)?,
+        generation: read_result(store, &vm, n)?.and_then(|r| r.generation),
+        taken: taken(store, id)?,
+        run,
         dir: ask.dir,
         user: ask.user,
     })
+}
+
+/// Whether the run was taken over after it ended (mark_taken), so its
+/// session goes on on the VM's own disk, whatever its outcome says.
+pub fn taken(store: &Store, id: &str) -> Result<bool> {
+    let (vm, n) = parse_id(id)?;
+    Ok(store.runs(&vm)?.join(n.to_string()).join(TAKEN).exists())
+}
+
+/// Marks a run that's over as taken over by `runner claude --run`, so the
+/// next takeover goes on from the VM's own disk, where the session is now.
+/// `onto` is the generation the takeover put the run's disk back as, if it
+/// did: the session reached the VM's disk there, after every run before.
+pub fn mark_taken(store: &Store, id: &str, onto: Option<u64>) -> Result<()> {
+    let (vm, n) = parse_id(id)?;
+    let path = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
+    let text = onto.map(|g| g.to_string()).unwrap_or_default();
+    fs::write(&path, text).map_err(io_err(format!("writing {}", path.display())))
+}
+
+/// The generation a takeover put the run's disk back as (mark_taken), if
+/// one did. A mark with none, or one an older runner left empty, has none.
+pub fn taken_onto(store: &Store, id: &str) -> Result<Option<u64>> {
+    let (vm, n) = parse_id(id)?;
+    let path = store.runs(&vm)?.join(n.to_string()).join(TAKEN);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).trim().parse().ok()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(format!("reading {}", path.display()))(e)),
+    }
+}
+
+/// The generation the run's session reached its VM's disk at, if it's
+/// known: the one a takeover put its disk back as, else the one it booted,
+/// or the checkpoint of the VM it joined, as its result has them.
+/// Generations are numbered in the order they're made, so a session that
+/// reached a lower one got there first.
+pub fn reached(store: &Store, id: &str) -> Result<Option<u64>> {
+    if let Some(onto) = taken_onto(store, id)? {
+        return Ok(Some(onto));
+    }
+    let (vm, n) = parse_id(id)?;
+    let result = read_result(store, &vm, n)?;
+    Ok(result.and_then(|r| r.generation.or(r.checkpoint)))
 }
 
 // Leaves `mark` for the process driving the run, which stops Claude Code on

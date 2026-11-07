@@ -33,8 +33,9 @@
 // `a_headless_run_on_a_listed_vm_reaches_claude_code_s_api`,
 // `claude_keeps_running_after_a_detach`,
 // `claude_code_in_a_vm_has_its_updater_off`,
-// `a_headless_run_edits_a_file_and_commits_it` and
-// `a_run_taken_over_carries_on_in_claude_s_session`) need a host set up as
+// `a_headless_run_edits_a_file_and_commits_it`,
+// `a_run_taken_over_carries_on_in_claude_s_session` and
+// `a_cancelled_run_taken_over_gets_its_disk_and_session_back`) need a host set up as
 // docs/host.md says, with `runner doctor` all ok: they fork its base, in the
 // unit's root (RUNNER_ROOT or /var/lib/runner), and run `runner` as that
 // root's owner. The unit boots them with the installed runner, so rerun
@@ -1240,6 +1241,103 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     let status = ok(runner(&root, &["status", &name]));
     assert!(status.ends_with("  stopped\n"), "{status}");
     assert!(status.contains(&format!("  gen {booted}  ")), "{status}");
+}
+
+// A run that's over, taken over: one cancelled once it has written
+// work/started.txt rolls back, so the takeover puts a copy of its disk on
+// top of the VM's history and boots onto it, and the session goes on there,
+// the prompt it was given and all.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and its token"]
+fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("pickup-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let prompt = "Create a file named started.txt in the current directory holding exactly \
+                  the text started. Then run the shell command sleep 300 in the foreground \
+                  and wait for it, then say done.";
+    let id = ok(runner(&root, &["run", &name, prompt]));
+    let id = id.trim().to_string();
+    let row = || {
+        let rows = ok(runner(&root, &["runs", &name]));
+        let row = rows.lines().find(|r| r.starts_with(&format!("{id}  ")));
+        row.unwrap_or_else(|| panic!("{rows}")).to_string()
+    };
+    let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    // A wait each for the boot and Claude Code's start, then its two turns.
+    eventually("the run's session in runs", || {
+        !row().contains("Z  running  -  ")
+    });
+    // The file is there, and Claude Code has written the prompt to its
+    // session, by the time it runs the sleep.
+    eventually("claude -p to write started.txt", || {
+        in_vm("[ -f /home/agent/work/started.txt ] && echo found || true").contains("found")
+    });
+    eventually("claude -p to run sleep 300", || {
+        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+        done; true"#;
+        in_vm(sleeping).contains("found")
+    });
+    // It can still be measuring the run's disk when cancel gives up waiting.
+    runner(&root, &["cancel", &id]);
+    eventually("the run to end rolled back", || {
+        row().contains("Z  cancelled, rolled back  ")
+    });
+    let result = ok(runner(&root, &["result", &id]));
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let booted = result["generation"].as_u64().expect("the run's generation");
+
+    let t = common::pty(50, 160);
+    let mut cmd = cli(&root);
+    cmd.env_remove("TERM").args(["claude", "--run", &id]);
+    let mut taking = t.spawn(cmd);
+    eventually("the takeover", || {
+        t.seen().contains(&format!("{id}'s session goes on"))
+    });
+    let seen = t.seen();
+    let put = format!("put {id}'s disk, generation {booted}, back on {name} as generation ");
+    assert!(seen.contains(&put), "{seen}");
+    let capture = [
+        "exec",
+        &name,
+        "--",
+        "tmux",
+        "capture-pane",
+        "-p",
+        "-S",
+        "-",
+        "-t",
+        "=claude:",
+    ];
+    let screen = || String::from_utf8_lossy(&runner(&root, &capture).stdout).into_owned();
+    // Enter through an interactive claude's first-run screens, as in
+    // a_run_taken_over_carries_on_in_claude_s_session.
+    eventually("the run's prompt in claude's pane", || {
+        let shown = screen();
+        let there = shown.contains("sleep 300 in the foreground");
+        if !there {
+            t.send("\r");
+        }
+        there
+    });
+    let shown = screen();
+    assert!(!shown.contains("No conversation found"), "{shown}");
+    // The run's disk, put back: dev's own from before the run never had it.
+    let started = in_vm("cat /home/agent/work/started.txt");
+    assert_eq!(started.trim(), "started");
+    let listed = ok(runner(&root, &["checkpoints", &name]));
+    assert!(
+        listed.contains(&format!("  \"takeover of {id}\"")),
+        "{listed}"
+    );
+
+    in_vm("tmux detach-client -s =claude");
+    assert_eq!(taking.wait().unwrap().code(), Some(0), "{}", t.seen());
 }
 
 #[test]
