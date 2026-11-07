@@ -117,6 +117,22 @@ pub struct Vm {
     /// Space all its generations take on the host: allocated blocks, not
     /// apparent size. A block reflinked into several disks counts in each.
     pub used: u64,
+    /// vCPUs its next boot gets. Absent from a host's runner from before
+    /// sizes were listed, which reads as 0.
+    #[serde(default)]
+    pub cpus: u32,
+    /// Memory its next boot gets, in MiB; 0 as cpus is.
+    #[serde(default)]
+    pub mem_mib: u32,
+}
+
+/// What `Store::resize` changes, each left out kept as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sizes {
+    /// The disk's new size in bytes, more than it is now: a disk only grows.
+    pub disk: Option<u64>,
+    pub cpus: Option<u32>,
+    pub mem_mib: Option<u32>,
 }
 
 /// What gc deleted from one VM, or would on a dry run.
@@ -288,9 +304,31 @@ pub struct Machine {
 /// A memory size in MiB: a plain number is MiB, or it ends in M, G or T
 /// (MiB, GiB and TiB too, in any case).
 pub fn parse_mem(text: &str) -> Result<u32> {
+    parse_mib(text, "memory", "4G")
+}
+
+/// A disk size in bytes, written as parse_mem takes a memory size, like 40G.
+pub fn parse_disk(text: &str) -> Result<u64> {
+    Ok(u64::from(parse_mib(text, "disk", "40G")?) << 20)
+}
+
+/// A size as parse_disk and parse_mem take it back: whole T, G or M, else
+/// in bytes.
+pub fn size_text(bytes: u64) -> String {
+    let unit = [(40, 'T'), (30, 'G'), (20, 'M')]
+        .into_iter()
+        .find(|&(shift, _)| bytes > 0 && bytes.trailing_zeros() >= shift);
+    match unit {
+        Some((shift, c)) => format!("{}{c}", bytes >> shift),
+        None => format!("{bytes} bytes"),
+    }
+}
+
+// A size in MiB, as parse_mem takes it, for `what`.
+fn parse_mib(text: &str, what: &str, like: &str) -> Result<u32> {
     let bad = || {
         Error::BadConfig(format!(
-            "{text:?} isn't a memory size: use MiB, or a whole number with M, G or T, like 4G"
+            "{text:?} isn't a {what} size: use MiB, or a whole number with M, G or T, like {like}"
         ))
     };
     let lower = text.to_ascii_lowercase();
@@ -377,7 +415,7 @@ impl Store {
     /// `import`, from a file or a stream.
     pub fn import_from(&self, name: &str, disk: Source) -> Result<Vm> {
         let note = |disk: &Path| Note::auto("import").built(image::read(disk));
-        self.make(name, disk, &Config::default(), note)
+        self.make(name, disk, &Config::default(), None, note)
     }
 
     /// A new VM whose disk is a copy-on-write fork of `from`'s current disk,
@@ -388,11 +426,39 @@ impl Store {
 
     /// A fork, with whatever `over` sets in place of `from`'s sizes and kernel.
     pub fn fork_with(&self, from: &str, name: &str, over: &Config) -> Result<Vm> {
+        self.fork_sized(from, name, over, None)
+    }
+
+    /// `fork_with`, its disk grown to `disk` bytes as `resize` grows one, in
+    /// the same step: its only generation. `from`'s own size makes a plain
+    /// fork, and a smaller one is refused, before anything is copied.
+    pub fn fork_sized(
+        &self,
+        from: &str,
+        name: &str,
+        over: &Config,
+        disk: Option<u64>,
+    ) -> Result<Vm> {
         let src = self.existing(from)?;
         let config = read_config(&src)?.with(over);
-        let why = format!("fork of {from}");
-        let disk = disk_of(&src, current(&src)?);
-        self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
+        let src_disk = disk_of(&src, current(&src)?);
+        let mut why = format!("fork of {from}");
+        let grow = match disk {
+            Some(bytes) => {
+                let now = fs::metadata(&src_disk).map_err(at(&src_disk))?.len();
+                if bytes < now {
+                    return Err(smaller(from, now));
+                }
+                (bytes > now).then_some(bytes)
+            }
+            None => None,
+        };
+        if let Some(bytes) = grow {
+            why += &format!(", resized to {}", size_text(bytes));
+        }
+        self.make(name, Source::File(&src_disk), &config, grow, |_| {
+            Note::auto(&why)
+        })
     }
 
     /// A fork of generation `generation` of `from`, which has to be on hand,
@@ -406,16 +472,19 @@ impl Store {
             return Err(Error::NoCheckpoint(from.to_string(), generation));
         }
         let why = format!("fork of {from}'s generation {generation}");
-        self.make(name, Source::File(&disk), &config, |_| Note::auto(&why))
+        self.make(name, Source::File(&disk), &config, None, |_| {
+            Note::auto(&why)
+        })
     }
 
-    // A new VM with `disk` as its only generation, noted as `note` says,
-    // given it.
+    // A new VM with `disk` as its only generation, grown to `grow` bytes if
+    // given, noted as `note` says, given it.
     fn make(
         &self,
         name: &str,
         disk: Source,
         config: &Config,
+        grow: Option<u64>,
         note: impl FnOnce(&Path) -> Note,
     ) -> Result<Vm> {
         check_name(name)?;
@@ -423,6 +492,9 @@ impl Store {
         self.make_from(name, config, None, |vm: &NewVm| {
             let at = vm.disk(0);
             bring(disk, &at)?;
+            if let Some(bytes) = grow {
+                grow_disk(&at, bytes)?;
+            }
             vm.commit(0, &note(&at))
         })
     }
@@ -1031,7 +1103,9 @@ impl Store {
     /// A new disk for the VM `name`, made from a copy of base's current disk,
     /// which `fill` writes into from the VM's own, and put on top of its
     /// history, as a restore's copy is: `undo` goes back to the disk from
-    /// before it. Its settings stay as they are. `fill` gets the VM's
+    /// before it. Its settings stay as they are, and so does its disk's size
+    /// when it's bigger than base's, a resize's say: the copy is grown to it
+    /// before `fill`, as Store::resize grows one. `fill` gets the VM's
     /// current disk, base's, and the new one, and what it returns comes back
     /// with the VM and base's generation.
     ///
@@ -1063,6 +1137,7 @@ impl Store {
             return Err(Error::NotImported { onto, made_by }.into());
         }
         let (from, base_disk) = (disk_of(&dir, current(&dir)?), disk_of(&base, onto));
+        let own = fs::metadata(&from).map_err(at(&from))?.len();
         freezer.clear_parts()?;
         clear_staged(&dir)?;
         let why = format!("rebase onto base gen {onto}");
@@ -1080,6 +1155,11 @@ impl Store {
                 let made_by = again.and_then(|n| n.comment);
                 let made_by = made_by.unwrap_or_else(|| "nothing it noted".to_string());
                 return Err(Error::NotImported { onto, made_by }.into());
+            }
+            // The VM's size stays its own, a resize's too, when it's
+            // bigger than base's: a disk only grows.
+            if own > fs::metadata(&part).map_err(at(&part))?.len() {
+                grow_disk(&part, own)?;
             }
             let filled = fill(&from, &base_disk, &part)?;
             File::open(&part)
@@ -1107,6 +1187,91 @@ impl Store {
             }
         };
         Ok((read_vm(name, &dir)?, onto, filled))
+    }
+
+    /// Changes a stopped VM's sizes, each that `sizes` gives. A disk only
+    /// grows: a copy of the current one, made bigger, its ext4 checked and
+    /// grown to fill it, goes on top of history noted "resize to <size>", so
+    /// `undo` takes it back, with its files as they were. Memory and vCPUs
+    /// go in its config, as `create`'s do, for its next boot.
+    ///
+    /// Every size is checked before anything changes, and the disk, which
+    /// can fail, changes before the config. Under the VM's lock all the
+    /// while, which its boot holds while it's up, so that's `Busy`, and so is
+    /// a VM parked at a host shutdown, whose snapshot runs on its disk. A
+    /// disk that fails to grow goes, and history stays as it was; one killed
+    /// partway leaves a part, which the VM's next copy clears.
+    pub fn resize(&self, name: &str, sizes: &Sizes) -> Result<Vm> {
+        let dir = self.existing(name)?;
+        if *sizes == Sizes::default() {
+            let why = "nothing to resize: give a disk size, memory or vCPUs";
+            return Err(Error::BadConfig(why.to_string()));
+        }
+        let over = Config {
+            cpus: sizes.cpus,
+            mem_mib: sizes.mem_mib,
+            ..Config::default()
+        };
+        let sets_config = sizes.cpus.is_some() || sizes.mem_mib.is_some();
+        over.check_values()?;
+        // Parked is Busy here too.
+        let _lock = take_lock(&dir, name)?;
+        // The config as set_config will read it, so one that won't read, or
+        // won't take these, fails before the disk grows. A disk alone
+        // needs none.
+        if sets_config {
+            read_config(&dir)?.with(&over).check_values()?;
+        }
+        if let Some(bytes) = sizes.disk {
+            self.grow_current(name, &dir, bytes)?;
+        }
+        if sets_config {
+            self.set_config(name, |config| {
+                *config = config.clone().with(&over);
+                Ok(())
+            })?;
+        }
+        read_vm(name, &dir)
+    }
+
+    // Resize's disk, under the VM's lock: a new generation, made as a
+    // rebase's is, aside under a part, the owner's until it's in history.
+    fn grow_current(&self, name: &str, dir: &Path, bytes: u64) -> Result<()> {
+        let from = disk_of(dir, current(dir)?);
+        let now = fs::metadata(&from).map_err(at(&from))?.len();
+        if bytes <= now {
+            return Err(Error::BadConfig(format!(
+                "{name}'s disk is {} already: a disk only grows, so give a bigger size",
+                size_text(now)
+            )));
+        }
+        // A stage_disk's copy, which needs no lock, takes its number first.
+        let freezer = self.hold_checkpoints(name)?;
+        freezer.clear_parts()?;
+        let why = format!("resize to {}", size_text(bytes));
+        let id = next_generation(dir)?;
+        write_note(dir, id, &Note::frozen(Some(&why), Maker::Owner))?;
+        let (part, disk) = (part_of(dir, id), disk_of(dir, id));
+        let made = (|| -> Result<()> {
+            clone(&from, &part)?;
+            grow_disk(&part, bytes)?;
+            fs::rename(&part, &disk).map_err(at(&disk))?;
+            sync_dir(&dir.join("gens"))?;
+            write_note(dir, id, &Note::auto(&why).built(image::read(&disk)))?;
+            let mut gens = history(dir)?;
+            gens.push(id);
+            write_history(dir, &gens)
+        })();
+        if let Err(e) = made {
+            let _ = fs::remove_file(&part);
+            // One that failed after it went into history is current: it stays.
+            if !history(dir).is_ok_and(|gens| gens.contains(&id)) {
+                let _ = fs::remove_file(&disk);
+                let _ = fs::remove_file(note_of(dir, id));
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// What the VM's current disk says it was built from, as noted when it
@@ -2003,12 +2168,17 @@ fn read_vm(name: &str, dir: &Path) -> Result<Vm> {
             Err(e) => return Err(at(&gens)(e)),
         }
     }
+    // A config that won't read is the boot's to refuse (Store::machine): a
+    // list, or a delete, shouldn't fail on it, so it shows the defaults.
+    let config = read_config(dir).unwrap_or_default();
     let name = name.to_string();
     Ok(Vm {
         name,
         generation,
         bytes,
         used,
+        cpus: config.cpus.unwrap_or(DEFAULT_CPUS),
+        mem_mib: config.mem_mib.unwrap_or(DEFAULT_MEM_MIB),
     })
 }
 
@@ -2377,6 +2547,70 @@ fn settle(disk: &Path) -> Result<()> {
     fs::set_permissions(disk, fs::Permissions::from_mode(0o644))
         .and_then(|()| File::open(disk)?.sync_all())
         .map_err(at(disk))
+}
+
+// A fork's disk smaller than its source's, which it can't be.
+fn smaller(from: &str, now: u64) -> Error {
+    let size = size_text(now);
+    Error::BadConfig(format!(
+        "{from}'s disk is {size}: a fork's disk only grows, so give {size} or more"
+    ))
+}
+
+// Grows the ext4 disk at `disk`, which nothing else has open, to `bytes`:
+// the file first, which adds a hole, so it stays sparse; then a forced
+// e2fsck, which resize2fs asks for; then the filesystem, to fill the file.
+// A size no bigger than the file's is refused, so it never shrinks one.
+fn grow_disk(disk: &Path, bytes: u64) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(disk)
+        .map_err(at(disk))?;
+    let now = file.metadata().map_err(at(disk))?.len();
+    if bytes <= now {
+        return Err(Error::BadConfig(format!(
+            "the disk is {} already: a disk only grows, so give a bigger size",
+            size_text(now)
+        )));
+    }
+    file.set_len(bytes).map_err(at(disk))?;
+    drop(file);
+    // -p fixes only what's safe to fix unasked, and exits 1 if it did.
+    disk_tool(crate::host::E2FSCK, &["-f", "-p"], disk, 1)?;
+    disk_tool(crate::host::RESIZE2FS, &[], disk, 0)?;
+    File::open(disk)
+        .and_then(|f| f.sync_all())
+        .map_err(at(disk))
+}
+
+// One of e2fsprogs' tools on `disk`, which fails past exit code `worst`,
+// saying the last of what it printed.
+fn disk_tool(prog: &str, args: &[&str], disk: &Path, worst: i32) -> Result<()> {
+    let out = Command::new(prog)
+        .args(args)
+        .arg(disk)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(at(Path::new(prog)))?;
+    if out.status.code().is_some_and(|code| code <= worst) {
+        return Ok(());
+    }
+    let said = [&out.stderr[..], &out.stdout[..]].concat();
+    let said = String::from_utf8_lossy(&said);
+    let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+    let last = lines[lines.len().saturating_sub(8)..].join("; ");
+    let cmd = [prog].into_iter().chain(args.iter().copied());
+    let cmd = format!("{} {}", cmd.collect::<Vec<_>>().join(" "), disk.display());
+    let why = match out.status.code() {
+        Some(code) => format!("exited {code}"),
+        None => out.status.to_string(),
+    };
+    let why = if last.is_empty() {
+        why
+    } else {
+        format!("{why}: {last}")
+    };
+    Err(Error::Command { cmd, why })
 }
 
 // GNU cp does the copying: a reflink on XFS or btrfs, which takes constant

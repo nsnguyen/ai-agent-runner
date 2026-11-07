@@ -27,6 +27,7 @@ pub mod peers;
 pub mod power;
 pub mod proto;
 pub mod rebase;
+pub mod resize;
 pub mod result;
 pub mod runs;
 pub mod services;

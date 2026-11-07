@@ -151,6 +151,7 @@ pub fn check(host: &impl Host, store: &Store) -> Report {
     let checks = vec![
         named("kvm", kvm(host)),
         named("firecracker", firecracker(host)),
+        named("e2fsprogs", e2fsprogs(host)),
         named("reflink", reflink(host, store.root())),
         named("kernel", kernel(host, store.root())),
         named("base", base(store)),
@@ -219,6 +220,34 @@ fn firecracker(host: &impl Host) -> Verdict {
         }
         Err(e) => fail(format!("firecracker: {e}")),
     }
+}
+
+// What `runner resize` and `create --disk` grow a disk with. VMs run
+// without them, so a missing one only warns. resize2fs has no version flag:
+// with no disk it prints its version and usage, and exits 1.
+fn e2fsprogs(host: &impl Host) -> Verdict {
+    let tools = [(host::E2FSCK, &["-V"][..]), (host::RESIZE2FS, &[][..])];
+    let mut version = String::new();
+    for (path, args) in tools {
+        match host.run(path, args) {
+            Ok(r) if version.is_empty() => {
+                version = r.stderr.lines().next().unwrap_or("").trim().to_string();
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return warn(format!(
+                    "{path} is missing, so runner resize can't grow a disk: rerun {INSTALL}, which installs e2fsprogs"
+                ));
+            }
+            Err(e) => return warn(format!("{path}: {e}, so runner resize can't grow a disk")),
+        }
+    }
+    let version = if version.is_empty() {
+        "e2fsck".to_string()
+    } else {
+        version
+    };
+    ok(format!("{version} and resize2fs, for runner resize"))
 }
 
 fn reflink(host: &impl Host, root: &Path) -> Verdict {

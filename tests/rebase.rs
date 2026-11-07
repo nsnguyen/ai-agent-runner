@@ -7,10 +7,11 @@ use common::{debugfs, image_of, tree};
 use ext4_view::{Ext4, PathBuf as InPathBuf};
 use runner::graft::{Skip, Why};
 use runner::rebase::{self, Error, KEPT};
-use runner::store::{Source, Store};
+use runner::store::{Sizes, Source, Store};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::TempDir;
 
 const WANTS: &str = "etc/systemd/system/multi-user.target.wants";
@@ -134,9 +135,18 @@ fn setup(dev: impl FnOnce(&Path) -> PathBuf) -> Setup {
 
 // `setup`, with dev's disk `size` big, as mkfs.ext4 reads a size.
 fn setup_sized(dev: impl FnOnce(&Path) -> PathBuf, size: &str) -> Setup {
+    setup_with(base_tree, dev, size)
+}
+
+// `setup_sized`, with base's 32M disk made from `base`.
+fn setup_with(
+    base: impl FnOnce(&Path) -> PathBuf,
+    dev: impl FnOnce(&Path) -> PathBuf,
+    size: &str,
+) -> Setup {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path().join("root")).with_net_file(dir.path().join("net"));
-    let base = image_of(&base_tree(&dir.path().join("base")), "32M");
+    let base = image_of(&base(&dir.path().join("base")), "32M");
     store.import("base", &base).unwrap();
     let old = image_of(&dev(&dir.path().join("dev")), size);
     debugfs(
@@ -323,31 +333,109 @@ fn base_and_a_vm_that_isn_t_there_are_refused() {
     assert_eq!(s.store.get("base").unwrap().generation, 0);
 }
 
-// A home too big for base's disk fails the copy: the new disk goes, staged
-// files too, and history stays as it was.
+// The new disk passes a forced check that changes nothing.
+#[track_caller]
+fn assert_clean(disk: &Path) {
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(disk)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&[&out.stdout[..], &out.stderr[..]].concat()).into_owned();
+    assert!(out.status.success(), "{said}");
+}
+
+// A tree of `files` with a file of noise `mib` MiB big at `big`.
+fn with_big(at: &Path, files: impl FnOnce(&Path) -> PathBuf, big: &str, mib: usize) -> PathBuf {
+    let t = files(at);
+    let big = t.join(big);
+    fs::create_dir_all(big.parent().unwrap()).unwrap();
+    fs::write(big, noise(mib << 20)).unwrap();
+    t
+}
+
+// A resize's bigger disk stays dev's through a rebase: the new one is a copy
+// of base's, grown to dev's size, not base's size.
 #[test]
-fn a_failed_copy_leaves_the_vm_as_it_was() {
-    // dev's disk is bigger than base's, to hold it.
+fn a_resized_vm_keeps_its_disk_size_through_a_rebase() {
+    let s = setup(dev_tree);
+    let grown = Sizes {
+        disk: Some(64 << 20),
+        ..Sizes::default()
+    };
+    assert_eq!(s.store.resize("dev", &grown).unwrap().bytes, 64 << 20);
+
+    let done = rebase::rebase(&s.store, "dev").unwrap();
+
+    assert_eq!((done.vm.generation, done.vm.bytes), (2, 64 << 20));
+    let disk = s.current("dev");
+    assert_eq!(runner::image::ext4_size(&disk), Some(64 << 20));
+    assert_clean(&disk);
+    let fs = fs_of(&disk);
+    assert_eq!(read(&fs, "/etc/os-release"), "base 2\n");
+    assert_eq!(read(&fs, "/home/agent/work/main.rs"), "fn main() {}\n");
+    // base's own disk is as it was.
+    assert_eq!(s.store.get("base").unwrap().bytes, 32 << 20);
+    assert_eq!(s.gens("base"), ["0.ext4", "0.json"]);
+}
+
+// A /home bigger than base's whole disk fits dev's own, which the new disk
+// takes the size of.
+#[test]
+fn a_home_bigger_than_base_s_disk_comes_on_dev_s_bigger_one() {
     let s = setup_sized(
-        |at| {
-            let t = tree(at, &[]);
-            let big = t.join("home/agent/big");
-            fs::create_dir_all(big.parent().unwrap()).unwrap();
-            fs::write(big, noise(40 << 20)).unwrap();
-            t
-        },
+        |at| with_big(at, |at| tree(at, &[]), "home/agent/big", 40),
         "64M",
     );
-    let before = s.gens("dev");
 
-    let failed = rebase::rebase(&s.store, "dev").unwrap_err();
-    assert!(
-        failed.to_string().contains("no room for the copy"),
-        "{failed}"
-    );
-    assert_eq!(s.gens("dev"), before);
-    assert_eq!(s.store.get("dev").unwrap().generation, 0);
-    assert_eq!(s.store.checkpoints("dev").unwrap().len(), 1);
+    let done = rebase::rebase(&s.store, "dev").unwrap();
+
+    assert_eq!(done.vm.bytes, 64 << 20);
+    let disk = s.current("dev");
+    assert_clean(&disk);
+    let fs = fs_of(&disk);
+    let big = fs.read(&InPathBuf::try_from("/home/agent/big").unwrap());
+    assert!(big.unwrap() == noise(40 << 20), "/home/agent/big differs");
+    assert_eq!(read(&fs, "/etc/os-release"), "base 2\n");
+}
+
+// A home that won't fit beside base's system fails the copy: the new disk
+// goes, staged files too, and history stays as it was.
+#[test]
+fn a_failed_copy_leaves_the_vm_as_it_was() {
+    // base's system takes 20M of its 32M. dev's disk is base's size, then
+    // bigger, so its copy is grown before it fills.
+    for (size, home) in [("32M", 20), ("48M", 30)] {
+        let s = setup_with(
+            |at| with_big(at, base_tree, "usr/lib/big", 20),
+            |at| with_big(at, |at| tree(at, &[]), "home/agent/big", home),
+            size,
+        );
+        let before = s.gens("dev");
+
+        let failed = rebase::rebase(&s.store, "dev").unwrap_err();
+        assert!(
+            failed.to_string().contains("no room for the copy"),
+            "{size}: {failed}"
+        );
+        assert_eq!(s.gens("dev"), before, "{size}");
+        assert_eq!(s.store.get("dev").unwrap().generation, 0);
+        assert_eq!(s.store.checkpoints("dev").unwrap().len(), 1);
+    }
+}
+
+// A dev smaller than base comes out base's size: a disk only grows.
+#[test]
+fn a_vm_smaller_than_base_gets_base_s_size() {
+    let s = setup_sized(dev_tree, "16M");
+    assert_eq!(s.store.get("dev").unwrap().bytes, 16 << 20);
+
+    let done = rebase::rebase(&s.store, "dev").unwrap();
+
+    assert_eq!(done.vm.bytes, 32 << 20);
+    assert_clean(&s.current("dev"));
+    let fs = fs_of(&s.current("dev"));
+    assert_eq!(read(&fs, "/home/agent/work/main.rs"), "fn main() {}\n");
 }
 
 // What the copy can't take is named, and the rest comes.

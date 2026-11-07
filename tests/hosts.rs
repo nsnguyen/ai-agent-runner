@@ -473,6 +473,10 @@ fn a_command_naming_a_vm_reaches_only_its_host() {
         ),
         (&["logs", "-fn", "5", "web"], "logs -fn 5 web"),
         (&["checkpoint", "-m", "dev", "web"], "checkpoint -m dev web"),
+        (
+            &["resize", "--disk", "40G", "--mem", "4G", "web"],
+            "resize --disk 40G --mem 4G web",
+        ),
         (&["claude", "--run", "web.1"], "claude --run web.1"),
         (&["--keep", "3", "gc", "web"], "--keep 3 gc web"),
     ];
@@ -1293,8 +1297,8 @@ fn the_client_knows_every_option_that_takes_a_value() {
         missing.is_empty(),
         "client/runner's valued line lacks {missing:?}"
     );
-    // Seeded for tasks that merge in any order: #147's and #160's.
-    for opt in ["--n", "--run", "--host"] {
+    // Seeded for tasks that merge in any order: #147's, #160's and #169's.
+    for opt in ["--n", "--run", "--host", "--disk"] {
         assert!(known.contains(&opt), "{opt}");
     }
 }

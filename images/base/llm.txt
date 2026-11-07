@@ -30,7 +30,9 @@ you can go back.
 
 - The disk, from boot to boot: everything you write anywhere on it, but only
   once the VM shuts down cleanly. A crash or a kill throws away what this
-  boot wrote, back to how the disk was when this boot started.
+  boot wrote, back to how the disk was when this boot started. `df -h /`
+  says how big it is; if it's filling up, ask the owner: they can grow it
+  with `runner resize`, which takes effect at the next boot.
 - Not memory: processes and tmux sessions end when the VM shuts down.
   The VM sleeps instead when nobody on the host has used it for a while
   (10 minutes unless the owner set otherwise), and the owner can put it to

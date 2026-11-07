@@ -13,9 +13,10 @@
 // What's lost: apt packages and anything else outside what's kept, users
 // added with useradd (their files keep their numeric owners), crontabs and
 // /var, and what graft.rs skips, which is named. The new disk is a new
-// generation, so `runner undo` brings the old one back. The store does the
-// rest (Store::rebase): the VM's lock, which refuses one that's up, and
-// base's current disk, which must be one an import made.
+// generation, so `runner undo` brings the old one back. It's the VM's size,
+// if that's bigger than base's, as a resize leaves it, else base's. The
+// store does the rest (Store::rebase): the VM's lock, which refuses one
+// that's up, and base's current disk, which must be one an import made.
 use crate::changes::{self, Budget, Disk, Limits};
 use crate::graft::{self, Skip, Why};
 use crate::services::{self, UNIT_DIR};

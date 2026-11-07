@@ -14,6 +14,7 @@
 // The tests under the unit (`start_logs_and_stop_under_systemd`,
 // `exec_starts_the_vm_and_runs_in_the_guest`,
 // `a_running_vm_s_checkpoint_brings_a_deleted_file_back`,
+// `a_resized_disk_is_that_big_in_the_guest`,
 // `a_running_vm_s_export_boots_elsewhere_and_it_carries_on`,
 // `an_agent_s_checkpoint_from_inside_its_vm_shows_up_in_runner_checkpoints`,
 // `an_agent_s_restore_reboots_its_vm_onto_its_checkpoint`,
@@ -1371,6 +1372,41 @@ fn a_running_vm_s_checkpoint_brings_a_deleted_file_back() {
     // Says how long the whole checkpoint took, pause and all: on XFS, well
     // under a second of it is the pause.
     eprintln!("checkpoint of a running VM took {took:?}");
+}
+
+// A disk grown while the VM is stopped is that big in the guest at its next
+// boot, with what it held: 10 GiB past base's, which is 30 GiB for a base
+// built as it comes, whatever size base was built at.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm and a host set up with its base"]
+fn a_resized_disk_is_that_big_in_the_guest() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("resize-test-{}", std::process::id());
+    // "<name>  gen 0  <bytes> bytes"
+    let made = ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let sh = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
+    let bytes: u64 = made.split_whitespace().nth(3).unwrap().parse().unwrap();
+    let gib = bytes.div_ceil(1 << 30) + 10;
+
+    sh("echo kept > ~/before-resize");
+    ok(runner(&root, &["stop", &name]));
+    let disk = format!("{gib}G");
+    let said = ok(runner(&root, &["resize", &name, "--disk", &disk]));
+    assert!(said.contains(&format!("  {} bytes  ", gib << 30)), "{said}");
+    let size = sh("df -B1 --output=size / | tail -n 1");
+    let size: u64 = size
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("df said {size:?}"));
+    assert!(
+        size > (gib - 1) << 30,
+        "/ is {size} bytes, want about {gib} GiB"
+    );
+    assert_eq!(sh("cat ~/before-resize"), "kept\n");
 }
 
 // A running VM's export, through `tar -xO` into an import under another

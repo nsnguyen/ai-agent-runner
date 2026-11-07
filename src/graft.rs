@@ -5,8 +5,9 @@
 // The source, a disk a guest with root wrote, is only read, by ext4-view, as
 // src/changes.rs reads a run's disks and within its limits. The target is
 // always a fresh copy of base's disk, which no guest has written, and only
-// e2fsprogs' debugfs writes it, so debugfs, which parses a whole filesystem
-// in C, never opens a disk a guest made.
+// e2fsprogs writes it: resize2fs first when the VM's disk is bigger than
+// base's (Store::rebase), then debugfs. So they, which parse a whole
+// filesystem in C, never open a disk a guest made.
 //
 // From the source, debugfs gets file contents, names and link targets.
 // Contents go through files staged on the host. Names and targets go into
