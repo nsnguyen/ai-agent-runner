@@ -2,7 +2,7 @@
 // mkfs.ext4 -d and edit with debugfs: no root, no mounts, no KVM.
 mod common;
 
-use common::{debugfs, image, tree};
+use common::{debugfs, image, image_of, tree};
 use runner::changes::{self, Change, Changes, Error, Kind};
 use runner::store::Store;
 use std::ffi::OsStr;
@@ -14,11 +14,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 fn change(path: &str, change: Kind) -> Change {
     let path = path.to_string();
-    let contains = None;
     Change {
         path,
         change,
-        contains,
+        contains: None,
+        changed_under: None,
     }
 }
 
@@ -26,6 +26,14 @@ fn whole_dir(path: &str, change: Kind, entries: u64) -> Change {
     let contains = Some(entries);
     Change {
         contains,
+        ..self::change(path, change)
+    }
+}
+
+fn summed(path: &str, change: Kind, paths: u64) -> Change {
+    let changed_under = Some(paths);
+    Change {
+        changed_under,
         ..self::change(path, change)
     }
 }
@@ -436,54 +444,86 @@ fn tmp_emptied_by_the_boot_and_the_empty_directories_it_makes_are_left_out() {
     assert_eq!(got, listed(want, 0, 5));
 }
 
+// What dockerd's and containerd's first start makes, as Docker 29 with
+// containerd 2 made it, started on empty state directories: empty
+// directories and a few small files, all on BOOT_ONLY.
+const DOCKER_S_FILES: &[&str] = &[
+    "var/lib/containerd/io.containerd.grpc.v1.introspection/uuid",
+    "var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db",
+    "var/lib/docker/buildkit/cache.db",
+    "var/lib/docker/buildkit/containerd-overlayfs/metadata_v2.db",
+    "var/lib/docker/buildkit/containerd-overlayfs/workerid",
+    "var/lib/docker/buildkit/history_c8d.db",
+    "var/lib/docker/engine-id",
+    "var/lib/docker/image/identity-cache.db",
+    "var/lib/docker/network/files/local-kv.db",
+    // A block device, there; a file stands in for it.
+    "var/lib/docker/volumes/backingFsBlockDev",
+    "var/lib/docker/volumes/metadata.db",
+];
+const DOCKER_S_DIRS: &[&str] = &[
+    "var/lib/containerd/io.containerd.content.v1.content",
+    "var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots",
+    "var/lib/containerd/tmpmounts",
+    "var/lib/docker/buildkit/containerd-overlayfs/cachemounts",
+    "var/lib/docker/buildkit/executor",
+    "var/lib/docker/containers",
+    "var/lib/docker/plugins/storage",
+    "var/lib/docker/plugins/tmp",
+    "var/lib/docker/runtimes",
+    "var/lib/docker/swarm",
+    "var/lib/docker/tmp",
+];
+
+// A tree as a VM's first boot leaves it: Docker's first start, with each
+// file reading `boot`, beside `files`.
+fn first_boot(dir: &Path, boot: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let mut all: Vec<(&str, &str)> = DOCKER_S_FILES.iter().map(|f| (*f, boot)).collect();
+    all.extend(files);
+    let tree = tree(dir, &all);
+    for d in DOCKER_S_DIRS {
+        fs::create_dir_all(tree.join(d)).unwrap();
+    }
+    tree
+}
+
 // #170: dockerd and containerd make their state directories at a VM's first
 // boot, and every start rewrites four bolt databases there. Those are left
-// out, but not what an agent's containers, volumes and images add once the
-// directories are there, nor a name that only starts the same.
+// out; what an agent's containers, volumes and images add is summed (#171),
+// and a name that only starts the same is listed.
 #[test]
 fn docker_s_own_state_from_a_boot_is_left_out() {
     let dir = tempfile::tempdir().unwrap();
     let keep = ("home/agent/work/keep.txt", "keep");
-    let kv = "var/lib/docker/network/files/local-kv.db";
-    let volumes = "var/lib/docker/volumes/metadata.db";
-    let cache = "var/lib/docker/buildkit/cache.db";
-    let meta = "var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db";
     // A fork's first boot: neither directory was there.
     let before = tree(&dir.path().join("before"), &[keep]);
     fs::create_dir_all(before.join("var/lib")).unwrap();
-    let after = tree(
-        &dir.path().join("after"),
-        &[
-            keep,
-            ("var/lib/docker/engine-id", "id"),
-            (kv, "kv 1"),
-            (volumes, "volumes 1"),
-            (cache, "cache 1"),
-            (meta, "meta 1"),
-        ],
-    );
-    fs::create_dir_all(after.join("var/lib/docker/containers")).unwrap();
+    let after = first_boot(&dir.path().join("after"), "1", &[keep]);
+    // Each directory, added whole and all Docker's own, is one.
     assert_eq!(between(&before, &after), listed(vec![], 0, 2));
 
-    // A later boot: the databases rewritten, and what the agent ran.
-    let later = tree(
+    // A later boot: the four databases rewritten, and what the agent ran.
+    let later = first_boot(
         &dir.path().join("later"),
+        "1",
         &[
             keep,
-            ("var/lib/docker/engine-id", "id"),
-            (kv, "kv 2"),
-            (volumes, "volumes 2"),
+            ("var/lib/docker/network/files/local-kv.db", "2"),
+            ("var/lib/docker/volumes/metadata.db", "2"),
             ("var/lib/docker/volumes/pgdata/_data/PG_VERSION", "17"),
-            (cache, "cache 2"),
+            ("var/lib/docker/buildkit/cache.db", "2"),
             ("var/lib/docker/containers/c0ffee/config.v2.json", "{}"),
-            (meta, "meta 2"),
+            (
+                "var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db",
+                "2",
+            ),
             ("var/lib/docker.bak/engine-id", "id"),
         ],
     );
     let got = between(&after, &later);
     let want = vec![
-        whole_dir("/var/lib/docker/containers/c0ffee", Kind::Added, 1),
-        whole_dir("/var/lib/docker/volumes/pgdata", Kind::Added, 2),
+        // c0ffee and what's in it, and pgdata and the two under it.
+        summed("/var/lib/docker", Kind::Modified, 5),
         whole_dir("/var/lib/docker.bak", Kind::Added, 1),
     ];
     assert_eq!(got, listed(want, 0, 4));
@@ -493,17 +533,159 @@ fn docker_s_own_state_from_a_boot_is_left_out() {
     fs::create_dir_all(gone.join("var/lib")).unwrap();
     let got = between(&later, &gone);
     let want = vec![
-        whole_dir("/var/lib/containerd", Kind::Deleted, 2),
-        whole_dir("/var/lib/docker", Kind::Deleted, 14),
+        whole_dir("/var/lib/containerd", Kind::Deleted, 8),
+        whole_dir("/var/lib/docker", Kind::Deleted, 29),
         whole_dir("/var/lib/docker.bak", Kind::Deleted, 1),
     ];
     assert_eq!(got, listed(want, 0, 0));
 }
 
-// The list never reaches into /home, where the agent works.
+// #171: on a VM's first boot, Docker's state is new whole, and what the
+// agent's first run pulled and ran is in it beside Docker's own. That much
+// is summed; Docker's own is left out.
+#[test]
+fn what_an_agent_runs_at_a_vm_s_first_boot_is_summed() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = tree(&dir.path().join("before"), &[]);
+    fs::create_dir_all(before.join("var/lib")).unwrap();
+    let blob = "var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/aa";
+    let config = "var/lib/docker/containers/c0ffee/config.v2.json";
+    let after = first_boot(
+        &dir.path().join("after"),
+        "1",
+        &[(blob, "layer"), (config, "{}")],
+    );
+    let got = between(&before, &after);
+    let want = vec![
+        // The blob and the three directories it's in.
+        summed("/var/lib/containerd", Kind::Added, 4),
+        // The config, c0ffee and containers.
+        summed("/var/lib/docker", Kind::Added, 3),
+    ];
+    // Docker's own: 7 of containerd's and 23 of Docker's.
+    assert_eq!(got, listed(want, 0, 30));
+}
+
+// #171, Done when: a run whose disk gained 5,000 files under
+// /var/lib/docker and 3 elsewhere lists one entry counting the 5,000, beside
+// the 3 paths, and containerd's are one entry of their own.
+#[test]
+fn docker_s_and_containerd_s_changes_are_one_entry_each_with_a_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = "var/lib/docker/volumes/pgdata/_data";
+    let blobs = "var/lib/containerd/io.containerd.content.v1.content/blobs/sha256";
+    let was = [
+        ("home/agent/work/keep.txt", "keep"),
+        ("var/lib/docker/engine-id", "id"),
+        (&format!("{blobs}/aa") as &str, "layer 1"),
+        (&format!("{data}/PG_VERSION"), "17"),
+    ];
+    let before = image(&tree(&dir.path().join("before"), &was));
+    let pg: Vec<String> = (0..5000).map(|i| format!("{data}/{i:04}")).collect();
+    let mut now: Vec<(&str, &str)> = was.to_vec();
+    now[2].1 = "layer 2";
+    let bb = format!("{blobs}/bb");
+    now.push((&bb, "layer 3"));
+    for f in ["a", "b", "c"] {
+        now.push((f, f));
+    }
+    now.extend(pg.iter().map(|f| (f.as_str(), "")));
+    // 5,000 inodes, more than a 16M disk has.
+    let after = image_of(&tree(&dir.path().join("after"), &now), "64M");
+    let got = changes::between(&before, &after, changes::CAP, changes::TIME).unwrap();
+    let want = vec![
+        change("/a", Kind::Added),
+        change("/b", Kind::Added),
+        change("/c", Kind::Added),
+        // aa rewritten and bb added.
+        summed("/var/lib/containerd", Kind::Modified, 2),
+        summed("/var/lib/docker", Kind::Modified, 5000),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+}
+
+// Summed, the paths under Docker's state take one place in the list however
+// many there are; once the list is full, they're one more in `more`, as a
+// directory added whole is.
+#[test]
+fn a_summed_entry_takes_one_place_in_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let was = [("home/agent/keep", "k"), ("var/lib/docker/engine-id", "id")];
+    let before = tree(&dir.path().join("before"), &was);
+    fs::create_dir(before.join("var/lib/docker/overlay2")).unwrap();
+    let before = image(&before);
+    let after = image(&tree(
+        &dir.path().join("after"),
+        &[
+            ("home/agent/keep", "k"),
+            ("home/agent/a.txt", "a"),
+            ("var/lib/docker/engine-id", "id"),
+            ("var/lib/docker/overlay2/x/diff/etc/hosts", "h"),
+            ("var/lib/docker/overlay2/y/diff/etc/hosts", "h"),
+        ],
+    ));
+    let got = changes::between(&before, &after, 2, changes::TIME).unwrap();
+    let want = vec![
+        change("/home/agent/a.txt", Kind::Added),
+        summed("/var/lib/docker", Kind::Modified, 8),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+    // With room for one path, x and y, each added whole under it, are the
+    // one more.
+    let got = changes::between(&before, &after, 1, changes::TIME).unwrap();
+    let want = vec![change("/home/agent/a.txt", Kind::Added)];
+    assert_eq!(got, listed(want, 1, 0));
+}
+
+// Only under the directories themselves: their own mode is listed, and so
+// is a name that only starts the same. With changes under it too, the
+// directory is still one entry.
+#[test]
+fn only_what_is_under_docker_s_state_is_summed() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = tree(
+        &dir.path().join("before"),
+        &[("var/lib/docker/engine-id", "1")],
+    );
+    let after = tree(
+        &dir.path().join("after"),
+        &[
+            ("var/lib/docker/engine-id", "1"),
+            ("var/lib/docker2/f", "x"),
+            ("var/lib/dockerfile", "x"),
+        ],
+    );
+    let mode = fs::Permissions::from_mode(0o700);
+    fs::set_permissions(after.join("var/lib/docker"), mode).unwrap();
+    let got = between(&before, &after);
+    let want = vec![
+        change("/var/lib/docker", Kind::Modified),
+        whole_dir("/var/lib/docker2", Kind::Added, 1),
+        change("/var/lib/dockerfile", Kind::Added),
+    ];
+    assert_eq!(got, listed(want, 0, 0));
+
+    let files = [
+        ("var/lib/docker/engine-id", "1"),
+        ("var/lib/docker/new", "x"),
+    ];
+    let more = tree(&dir.path().join("more"), &files);
+    fs::set_permissions(
+        more.join("var/lib/docker"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let got = between(&before, &more);
+    let want = vec![summed("/var/lib/docker", Kind::Modified, 1)];
+    assert_eq!(got, listed(want, 0, 0));
+}
+
+// The list never reaches into /home, where the agent works, and nor does a
+// summed entry.
 #[test]
 fn nothing_under_home_is_ever_left_out() {
-    for (path, _) in changes::BOOT_ONLY {
+    let summed = changes::SUMMED.iter();
+    for path in changes::BOOT_ONLY.iter().map(|(p, _)| p).chain(summed) {
         assert!(path.starts_with('/') && !path.ends_with('/'), "{path}");
         assert!(*path != "/home" && !path.starts_with("/home/"), "{path}");
         assert!(*path != "/", "{path}");

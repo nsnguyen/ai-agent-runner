@@ -225,6 +225,25 @@ wait_state() {
 }
 # http URL [SECONDS]: the HTTP status URL answers with, or 000.
 http() { curl -s -o /dev/null -w '%{http_code}' -m "${2:-10}" "$1"; }
+# page URL: what URL serves, or nothing.
+page() { curl -s -m 10 "$1"; }
+# open_proxy: runner proxy from localhost:$port to the VM's port 8080, in the
+# background as $proxy, given a minute to answer 200.
+open_proxy() {
+  "$runner" proxy "$vm" "$port:8080" </dev/null 2>/dev/null &
+  proxy=$!
+  waited=0
+  until [ "$(http "http://localhost:$port/" 5)" = 200 ] || [ "$waited" -ge 60 ]; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+# close_proxy: ends it, and with it the host's hold on the VM.
+close_proxy() {
+  kill "$proxy" 2>/dev/null
+  wait "$proxy" 2>/dev/null
+  proxy=
+}
 # run_row RUN: RUN's line in `runner runs`.
 run_row() { r runs "$vm" | awk -v id="$1" '$1 == id'; }
 
@@ -442,22 +461,14 @@ check_proxy() {
     fail "localhost:$port answers before the proxy opens: stop what's on it"
     return
   fi
-  "$runner" proxy "$vm" "$port:8080" </dev/null 2>/dev/null &
-  proxy=$!
-  waited=0
-  until [ "$(http "http://localhost:$port/" 5)" = 200 ] || [ "$waited" -ge 60 ]; do
-    sleep 2
-    waited=$((waited + 2))
-  done
+  open_proxy
   [ "$(http "http://localhost:$port/")" = 200 ] && pass "localhost:$port answers from the VM's port 8080" || fail "localhost:$port doesn't answer"
   echo "holding the proxy open for 2.5 minutes, past the 90s idle time"
   sleep 150
   got=$(state)
   [ "$got" = running ] && pass "with the proxy open past its idle time, $vm is running" || fail "with the proxy open, $vm is $got"
   [ "$(http "http://localhost:$port/")" = 200 ] && pass "localhost:$port still answers" || fail "localhost:$port stopped answering"
-  kill "$proxy" 2>/dev/null
-  wait "$proxy" 2>/dev/null
-  proxy=
+  close_proxy
   echo "proxy closed; waiting up to 3 minutes for $vm to sleep"
   wait_state sleeping 180 && pass "$vm sleeps once the proxy ends" || fail "$vm is $(state) 3 minutes after the proxy ended"
 }
@@ -485,6 +496,81 @@ check_url() {
   sleep 3
   got=$(http "$url/" 45)
   [ "$got" = 200 ] && pass "url on: $url answers again" || fail "url on: $url gives HTTP $got"
+}
+
+# A compose stack in the VM (#171): the port it publishes answers through
+# runner proxy as any port in the VM does, and after a sleep and a wake the
+# same container still answers, never restarted. Its page is a uuid written
+# as it starts, so another container, or this one restarted, serves another.
+check_compose() {
+  step "A compose stack through runner proxy, and after a sleep and a wake"
+  # This check sleeps the VM itself, so no idle sleep races it.
+  if ! said=$(r idle "$vm" never 2>&1 >/dev/null); then
+    fail "compose: idle never: ${said:-it failed}"
+    return
+  fi
+  # check_proxy's service has the VM's port 8080; none there is as good.
+  got=$(r service rm "$vm" web 2>&1)
+  code=$?
+  case $code:$got in
+  0:* | *"no service web in $vm"*) ;;
+  *)
+    fail "compose: service rm web, which has port 8080: exit $code, '$got'"
+    return
+    ;;
+  esac
+  echo "docker compose up -d in $vm; pulling busybox can take a minute"
+  # compose.yaml's lines are the arguments after sh's $0, one each.
+  got=$(r exec "$vm" -d /home/agent/work -- sh -c 'mkdir -p compose-check && cd compose-check && printf "%s\n" "$@" >compose.yaml && docker compose up -d' sh \
+    'services:' \
+    '  web:' \
+    '    image: busybox:1.37' \
+    '    command: [sh, -c, "cat /proc/sys/kernel/random/uuid >/tmp/index.html && exec httpd -f -p 8080 -h /tmp"]' \
+    '    ports: ["8080:8080"]' \
+    '    restart: unless-stopped' 2>&1)
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    fail "compose up: exit $code, $(printf '%s' "$got" | tail -n 1)"
+    return
+  fi
+  pass "compose up: busybox's httpd on $vm's port 8080"
+  if [ "$(http "http://localhost:$port/" 5)" != 000 ]; then
+    fail "compose: localhost:$port answers before the proxy opens: stop what's on it"
+    return
+  fi
+  open_proxy
+  got=$(http "http://localhost:$port/")
+  before=$(page "http://localhost:$port/")
+  close_proxy
+  if [ "$got" != 200 ] || [ -z "$before" ]; then
+    fail "compose: localhost:$port doesn't answer from the stack: HTTP $got, '$before'"
+    return
+  fi
+  pass "compose: localhost:$port answers from the stack, page $before"
+  said=$(r sleep "$vm" 2>&1 >/dev/null)
+  if ! wait_state sleeping 60; then
+    fail "compose: after runner sleep, $vm is $(state)${said:+: $said}"
+    return
+  fi
+  pass "compose: $vm sleeps"
+  said=$(r wake "$vm" 2>&1 >/dev/null)
+  got=$(state)
+  if [ "$got" != running ]; then
+    fail "compose: after runner wake, $vm is $got${said:+: $said}"
+    return
+  fi
+  pass "compose: $vm wakes"
+  open_proxy
+  got=$(http "http://localhost:$port/")
+  after=$(page "http://localhost:$port/")
+  close_proxy
+  if [ "$got" != 200 ]; then
+    fail "compose: after the wake, localhost:$port gives HTTP $got"
+    return
+  fi
+  pass "compose: localhost:$port still answers after the wake"
+  [ "$after" = "$before" ] && pass "compose: the same container answers, not restarted" ||
+    fail "compose: after the wake, the page is '$after', not '$before': another container, or a restart"
 }
 
 # A real move between hosts, when ~/.config/runner/hosts lists the host
@@ -543,10 +629,10 @@ check_move() {
     fail "move: $vm is left on $other: RUNNER_HOST='' client/runner move $vm $here"
 }
 
-# The checks in order: each leaves the VM as the next expects. About 15
-# minutes, most of it waiting out idle times, with two short headless runs;
-# with two hosts or more, one more minute for MCP across them and a few for
-# the move there and back.
+# The checks in order: each leaves the VM as the next expects. About 17
+# minutes, most of it waiting out idle times, with two short headless runs
+# and a compose stack's pull; with two hosts or more, one more minute for MCP
+# across them and a few for the move there and back.
 laptop_checks() {
   check_exec
   check_mcp
@@ -556,6 +642,7 @@ laptop_checks() {
   check_result
   check_proxy
   check_url
+  check_compose
 }
 
 laptop_part() {

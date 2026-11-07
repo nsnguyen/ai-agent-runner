@@ -87,16 +87,26 @@ if [ "$1" = "$(cat "$FAKE/block-at" 2>/dev/null)" ]; then
 fi
 "#;
 
-// localhost:18080 answers while the host's hold is up, as the proxy's
-// tunnel to the VM's port 8080 would; the VM's URL answers while it's on, and wakes the VM.
+// localhost:18080 is the VM's port 8080 while the host's hold is up, as the
+// proxy's tunnel there would be: the compose stack's page once it's up, else
+// the web service's, else nothing. proxy-drops drops the first hold once it's
+// held through check_proxy's 150 seconds. The VM's URL answers while it's on,
+// and wakes the VM. With -w, the status; without, the page.
 const FAKE_CURL: &str = r#"for url; do :; done
 code=000
+page=
 case $url in
 http://localhost:18080/*)
   if wrong port-taken; then
     code=200
-  elif [ -e "$FAKE/holding" ] && [ "$(cat "$FAKE/tunnel")" = localhost:18080:172.16.0.6:8080 ] && ! wrong proxy-dead && ! { wrong proxy-drops && grep -qx 150 "$FAKE/sleeps"; }; then
-    code=200
+  elif [ -e "$FAKE/holding" ] && [ "$(cat "$FAKE/tunnel")" = localhost:18080:172.16.0.6:8080 ] && ! wrong proxy-dead && ! { wrong proxy-drops && grep -qx 150 "$FAKE/sleeps" && [ "$(grep -cx holding "$FAKE/held")" = 1 ]; }; then
+    if [ -e "$FAKE/vm/stack" ]; then
+      code=200
+      wrong stack-blank || page=$(cat "$FAKE/vm/stack")
+    elif [ -e "$FAKE/vm/web" ]; then
+      code=200
+      page='<title>Directory listing for /</title>'
+    fi
   fi
   ;;
 http://100.64.0.1:10001/*)
@@ -106,7 +116,10 @@ http://100.64.0.1:10001/*)
   fi
   ;;
 esac
-printf '%s' "$code"
+case " $* " in
+*" -w "*) printf '%s' "$code" ;;
+*) [ -z "$page" ] || printf '%s\n' "$page" ;;
+esac
 [ "$code" != 000 ] || exit 7
 "#;
 
@@ -151,7 +164,13 @@ delete)
   [ "$(state)" = stopped ] || { echo "runner: $name is up: runner stop $name first" >&2; exit 1; }
   echo "deleted $(line)"
   rm -rf "$vm" ;;
-idle) there; echo "$3" >"$vm/idle"; echo "$name  idle $3" ;;
+idle)
+  there
+  # Only the compose check's, after the proxy check's 90s.
+  [ "$3" != never ] || [ "$(cat "$vm/idle" 2>/dev/null)" != 90s ] || ! wrong idle-never-fails || { echo "runner: couldn't write $name's config" >&2; exit 1; }
+  echo "$3" >"$vm/idle"
+  echo "$name  idle $3"
+  ;;
 ip) here; echo 172.16.0.6 ;;
 list) if [ -d "$vm" ] && [ "$(cat "$vm/on")" = "$FAKE_DEST" ]; then echo "$(line)  4096 bytes used"; else echo "no VMs yet"; fi ;;
 move)
@@ -201,6 +220,13 @@ exec)
   "timeout 300 sh -c "*/home/agent/work/joined.txt*) [ -e "$vm/joined" ] ;;
   "test -f /home/agent/work/joined.txt") [ -e "$vm/joined" ] ;;
   "test ! -e /home/agent/work/joined.txt") [ ! -e "$vm/joined" ] ;;
+  # The stack, up in compose-check with the compose.yaml it's given: it
+  # publishes 8080, so not while the web service has it. Its page is a uuid.
+  "sh -c mkdir -p compose-check && cd compose-check && "*" && docker compose up -d sh services:"*)
+    ! wrong compose-up-fails || { echo 'Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io: no such host' >&2; exit 1; }
+    [ ! -e "$vm/web" ] || { echo "Error response from daemon: driver failed programming external connectivity on endpoint compose-check-web-1: failed to bind port 0.0.0.0:8080/tcp: Error starting userland proxy: listen tcp4 0.0.0.0:8080: bind: address already in use" >&2; exit 1; }
+    wrong compose-dead || echo 6f1c2b9e-4d3a-4e0b-9a51-2c7d8e0f1a23 >"$vm/stack"
+    echo " Container compose-check-web-1  Started" >&2 ;;
   *) echo "fake runner: unexpected exec $*" >&2; exit 99 ;;
   esac ;;
 sessions)
@@ -319,12 +345,42 @@ restore)
   echo stopped >"$vm/state"
   up
   line; echo ;;
+# The web service on the VM's port 8080 is $vm/web while it's there.
 service)
   name=$3
   there
-  ! wrong service-fails || { echo "runner: web didn't start" >&2; exit 1; }
-  up
-  echo "web  active  /home/agent/work  python3 -m http.server 8080" ;;
+  case $2 in
+  rm)
+    ! wrong service-rm-fails || { echo "runner: services in $name: removing it exited 1" >&2; exit 1; }
+    [ -e "$vm/web" ] || { echo "runner: no service $4 in $name" >&2; exit 1; }
+    up
+    rm "$vm/web"
+    echo "removed $4" ;;
+  *)
+    ! wrong service-fails || { echo "runner: web didn't start" >&2; exit 1; }
+    up
+    touch "$vm/web"
+    echo "web  active/running  /home/agent/work  python3 -m http.server 8080" ;;
+  esac ;;
+# Sleep and wake keep the compose stack, $vm/stack, unless told otherwise.
+sleep)
+  there
+  ! wrong sleep-fails || { echo "runner: $name has no boot to ask: it's stopped, or it booted under a runner from before sleep and wake, which a stop and start brings up to date" >&2; exit 1; }
+  case $(state) in
+  running | sleeping) echo sleeping >"$vm/state" ;;
+  *) echo "runner: $name is $(state): only a running VM sleeps" >&2; exit 1 ;;
+  esac
+  echo "$(line)  sleeping  creds claude" ;;
+wake)
+  there
+  ! wrong wake-fails || { echo "runner: $name couldn't wake, and sleeps on: snapshot load failed. \`runner stop $name\` drops its snapshot and rolls its disk back" >&2; exit 1; }
+  case $(state) in
+  running | sleeping) echo running >"$vm/state" ;;
+  *) echo "runner: $name is $(state), not sleeping" >&2; exit 1 ;;
+  esac
+  ! wrong stack-dies || rm -f "$vm/stack"
+  ! wrong stack-restarts || [ ! -e "$vm/stack" ] || echo 0b7e4c1d-9f2a-4c3e-8d6b-5a1f2e3d4c5b >"$vm/stack"
+  echo "$(line)  running  creds claude" ;;
 url)
   there
   case ${3-} in
@@ -1357,14 +1413,29 @@ const WRONG: &[(&str, &[&str])] = &[
         "boot-noise",
         &["changed lists, outside /home and /tmp: /var/log/journal/system.journal"],
     ),
-    // The proxy
-    ("service-fails", &["service add web"]),
-    ("port-taken", &["localhost:18080 answers before the proxy"]),
+    // The proxy. Nothing on the VM's port 8080 answers it, and the compose
+    // check takes a missing service as a free port.
+    (
+        "service-fails",
+        &[
+            "service add web",
+            "localhost:18080 doesn't answer",
+            "localhost:18080 stopped answering",
+        ],
+    ),
+    (
+        "port-taken",
+        &[
+            "localhost:18080 answers before the proxy",
+            "compose: localhost:18080 answers before the proxy",
+        ],
+    ),
     (
         "proxy-dead",
         &[
             "localhost:18080 doesn't answer",
             "localhost:18080 stopped answering",
+            "compose: localhost:18080 doesn't answer from the stack: HTTP 000",
         ],
     ),
     ("proxy-drops", &["localhost:18080 stopped answering"]),
@@ -1393,6 +1464,47 @@ const WRONG: &[(&str, &[&str])] = &[
     (
         "url-stays-off",
         &["url on: http://100.64.0.1:10001 gives HTTP 000"],
+    ),
+    // A compose stack through the proxy, and after a sleep and a wake
+    (
+        "idle-never-fails",
+        &["compose: idle never: runner: couldn't write client-check's config"],
+    ),
+    (
+        "stack-blank",
+        &["compose: localhost:18080 doesn't answer from the stack: HTTP 200, ''"],
+    ),
+    (
+        "service-rm-fails",
+        &["compose: service rm web, which has port 8080: exit 1"],
+    ),
+    (
+        "compose-up-fails",
+        &["compose up: exit 1, Error response from daemon: Get"],
+    ),
+    (
+        "compose-dead",
+        &["compose: localhost:18080 doesn't answer from the stack: HTTP 000"],
+    ),
+    (
+        "sleep-fails",
+        &["compose: after runner sleep, client-check is running: runner: client-check has no boot"],
+    ),
+    (
+        "wake-fails",
+        &[
+            "compose: after runner wake, client-check is sleeping: runner: client-check couldn't wake",
+        ],
+    ),
+    (
+        "stack-dies",
+        &["compose: after the wake, localhost:18080 gives HTTP 000"],
+    ),
+    (
+        "stack-restarts",
+        &[
+            "compose: after the wake, the page is '0b7e4c1d-9f2a-4c3e-8d6b-5a1f2e3d4c5b', not '6f1c2b9e-4d3a-4e0b-9a51-2c7d8e0f1a23'",
+        ],
     ),
 ];
 
@@ -1465,10 +1577,38 @@ fn every_check_ran_against_the_fake() {
         ssh.iter().any(|c| c.last().unwrap() == "runner mcp"),
         "{ssh:?}"
     );
+    // check_proxy's proxy, then the compose check's, before and after the
+    // sleep: each let go.
     assert!(
-        laptop.held() == ["holding", "let go"],
+        laptop.held() == ["holding", "let go"].repeat(3),
         "{:?}",
         laptop.held()
+    );
+    // The compose check frees port 8080 and stops idle sleeps first, then
+    // brings the stack up, and sleeps and wakes the VM itself.
+    let calls = laptop.host_calls();
+    let at = |c: &str| {
+        (calls.iter().rposition(|x| x.starts_with(c)))
+            .unwrap_or_else(|| panic!("no {c:?} in {calls:?}"))
+    };
+    let up = format!("exec {VM} -d /home/agent/work -- sh -c mkdir -p compose-check");
+    assert!(at(&format!("idle {VM} 90s")) < at(&format!("idle {VM} never")));
+    assert!(at(&format!("idle {VM} never")) < at(&format!("service rm {VM} web")));
+    assert!(at(&format!("service rm {VM} web")) < at(&up));
+    assert!(at(&up) < at(&format!("sleep {VM}")));
+    assert!(at(&format!("sleep {VM}")) < at(&format!("wake {VM}")));
+    let up = &calls[at(&up)];
+    for want in [
+        "image: busybox:1.37",
+        r#"ports: ["8080:8080"]"#,
+        "restart: unless-stopped",
+    ] {
+        assert!(up.contains(want), "{want}: {up}");
+    }
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("PASS  compose: the same container answers, not restarted"),
+        "{stdout}"
     );
 }
 

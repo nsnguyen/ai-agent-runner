@@ -35,6 +35,7 @@
 // `claude_keeps_running_after_a_detach`,
 // `claude_code_in_a_vm_has_its_updater_off`,
 // `agent_runs_docker_in_a_vm_without_sudo`,
+// `a_compose_stack_lives_through_sleep_and_comes_back_at_boot`,
 // `a_headless_run_edits_a_file_and_commits_it`,
 // `a_run_taken_over_carries_on_in_claude_s_session` and
 // `a_cancelled_run_taken_over_gets_its_disk_and_session_back`) need a host set up as
@@ -196,8 +197,13 @@ fn a_halt_that_fails_says_why() {
 }
 
 /// Polls `check` for up to a minute.
-fn eventually(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+fn eventually(what: &str, check: impl FnMut() -> bool) {
+    eventually_within(what, Duration::from_secs(60), check);
+}
+
+/// `eventually`, polling for up to `wait`.
+fn eventually_within(what: &str, wait: Duration, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + wait;
     while !check() {
         assert!(Instant::now() < deadline, "gave up waiting for {what}");
         std::thread::sleep(Duration::from_millis(500));
@@ -548,6 +554,20 @@ fn http_status_within(address: &str, port: u16, wait: Duration) -> Option<String
     let mut line = String::new();
     std::io::BufReader::new(conn).read_line(&mut line).ok()?;
     Some(line.trim_end().to_string())
+}
+
+// What a GET of / at the address gets back in full: its status line and its
+// body.
+fn http_get(address: &str, port: u16) -> Option<(String, String)> {
+    use std::io::{Read, Write};
+    let to = std::net::SocketAddr::new(address.parse().ok()?, port);
+    let mut conn = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(2)).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    conn.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
+    let mut response = String::new();
+    conn.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    Some((head.lines().next()?.to_string(), body.to_string()))
 }
 
 #[test]
@@ -1090,6 +1110,97 @@ fn agent_runs_docker_in_a_vm_without_sudo() {
     let compose = in_vm(&["docker", "compose", "version", "--short"]);
     let version = compose.trim().trim_start_matches('v');
     assert!(version.starts_with("2."), "{compose}");
+}
+
+// A compose stack in a fork of base behaves like the VM's own services: its
+// web container, brought up by agent with no sudo, answers on the VM's
+// address. Asleep and woken, the same container answers, in the same
+// process. Stopped and started, its restart policy brings it back once
+// dockerd is up, which is after runner-guest.
+#[test]
+#[ignore = "boots a VM: needs /dev/kvm, a host set up with its base, and the internet"]
+fn a_compose_stack_lives_through_sleep_and_comes_back_at_boot() {
+    let root = std::env::var_os("RUNNER_ROOT").map_or("/var/lib/runner".into(), PathBuf::from);
+    let name = format!("compose-test-{}", std::process::id());
+    ok(runner(&root, &["create", &name]));
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        name: name.clone(),
+    };
+    let dir = "/home/agent/work/web";
+    let docker = |args: &[&str]| {
+        let exec = ["exec", name.as_str(), "-d", dir, "--", "docker"];
+        let all: Vec<&str> = exec.iter().chain(args).copied().collect();
+        ok(runner(&root, &all))
+    };
+    // Whether it runs, its process, and when that started, as dockerd has it.
+    let state = |id: &str| {
+        let format = "{{.State.Status}} {{.State.Pid}} {{.State.StartedAt}}";
+        docker(&["inspect", "-f", format, id]).trim().to_string()
+    };
+    let address = ok(runner(&root, &["ip", &name])).trim().to_string();
+    // httpd serves the container's hostname, its id's first 12 characters, so
+    // a GET says which container answered.
+    let answers = |id: &str| {
+        http_get(&address, 8080)
+            .is_some_and(|(status, body)| status.ends_with(" 200 OK") && body.trim() == &id[..12])
+    };
+
+    // A container's PID 1 ignores a SIGTERM it has no handler for, so sh
+    // traps it: the stop at shutdown ends it at once, not 10 seconds on.
+    let serve = "mkdir -p /www; hostname >/www/index.html; \
+                 trap 'exit 0' TERM; httpd -f -p 8080 -h /www & wait";
+    let command = format!("    command: [sh, -c, \"{serve}\"]");
+    let compose = [
+        "services:",
+        "  web:",
+        "    image: busybox:1.37",
+        "    restart: unless-stopped",
+        "    ports: [\"8080:8080\"]",
+        &command,
+        "",
+    ]
+    .join("\n");
+    // Boots it.
+    let put = "mkdir -p \"$1\" && printf %s \"$2\" > \"$1/compose.yaml\"";
+    ok(runner(
+        &root,
+        &["exec", &name, "--", "sh", "-c", put, "sh", dir, &compose],
+    ));
+    docker(&["compose", "up", "-d"]);
+    let id = docker(&["compose", "ps", "-q", "web"]).trim().to_string();
+    assert_eq!(id.len(), 64, "not one container's id: {id:?}");
+    eventually("the container to answer", || answers(&id));
+    let before = state(&id);
+    assert!(before.starts_with("running "), "{before}");
+
+    let slept = ok(runner(&root, &["sleep", &name]));
+    assert!(slept.contains("  sleeping"), "{slept}");
+    let woke = ok(runner(&root, &["wake", &name]));
+    assert!(woke.contains("  running"), "{woke}");
+    eventually("the container to answer after the wake", || answers(&id));
+    assert_eq!(state(&id), before);
+
+    ok(runner(&root, &["stop", &name]));
+    assert!(!answers(&id));
+    let began = Instant::now();
+    ok(runner(&root, &["start", &name]));
+    let wait = Duration::from_secs(120);
+    eventually_within(
+        "the container to answer after a stop and start",
+        wait,
+        || answers(&id),
+    );
+    let took = began.elapsed();
+    // The same container, started again: a new start time.
+    let after = state(&id);
+    assert!(after.starts_with("running "), "{after}");
+    assert_ne!(
+        after.rsplit(' ').next(),
+        before.rsplit(' ').next(),
+        "{after}"
+    );
+    eprintln!("runner start to the container's answer took {took:?}");
 }
 
 // A real `claude -p` under the unit: the run boots the VM, Claude Code edits

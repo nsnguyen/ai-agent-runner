@@ -509,6 +509,7 @@ fn result(code: i32, ms: u64, outcome: Outcome, paths: &[&str], says: &str) -> R
             path: p.to_string(),
             change: Kind::Modified,
             contains: None,
+            changed_under: None,
         })
         .collect();
     RunResult {

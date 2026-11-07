@@ -28,11 +28,19 @@ fn the_json_shape_is_pinned() {
                 path: "/home/agent/work/main.rs".to_string(),
                 change: Kind::Modified,
                 contains: None,
+                changed_under: None,
             },
             Change {
                 path: "/home/agent/work/target".to_string(),
                 change: Kind::Added,
                 contains: Some(812),
+                changed_under: None,
+            },
+            Change {
+                path: "/var/lib/docker".to_string(),
+                change: Kind::Modified,
+                contains: None,
+                changed_under: Some(5000),
             },
         ],
         more: 4,
@@ -49,7 +57,8 @@ fn the_json_shape_is_pinned() {
         "changed": {
             "paths": [
                 {"path": "/home/agent/work/main.rs", "change": "modified"},
-                {"path": "/home/agent/work/target", "change": "added", "contains": 812}
+                {"path": "/home/agent/work/target", "change": "added", "contains": 812},
+                {"path": "/var/lib/docker", "change": "modified", "changed_under": 5000}
             ],
             "more": 4,
             "boot_only": 12
