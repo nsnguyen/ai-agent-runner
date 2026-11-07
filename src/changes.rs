@@ -13,7 +13,9 @@
 // hash index, as mkfs.ext4 -d leaves them.
 //
 // What the VM's boot writes on its own, like its journal, is left out of the
-// list and only counted (BOOT_ONLY), so the agent's changes stand out.
+// list and only counted (BOOT_ONLY), so the agent's changes stand out. What
+// the agent's containers write is its own, but thousands of paths of it, so
+// each directory on SUMMED is one entry with a count.
 use ext4_view::{Ext4, Ext4Error, File, Metadata, Path as InPath, PathBuf as InPathBuf};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -88,22 +90,36 @@ pub const BOOT_ONLY: &[(&str, Part)] = &[
     ("/var/lib/apt/daily_lock", Part::File),
     // ldconfig.service's cache, at the first boot.
     ("/var/cache/ldconfig/aux-cache", Part::File),
-    // containerd's and dockerd's state, which they make at their first
-    // start, at a VM's first boot (#170). Once it's there, what the agent's
-    // images, containers and volumes add under it is listed, but each start
-    // rewrites these bolt databases. Measured on base's own Docker, started
-    // twice on a copy of its disk.
-    ("/var/lib/containerd", Part::New),
+    // containerd's and dockerd's state (SUMMED). Each start rewrites these
+    // bolt databases (#170), measured on base's own Docker started twice on a
+    // copy of its disk. The rest of these files their first start writes, at
+    // a VM's first boot, beside empty directories (`made`), measured on
+    // Docker 29.9 and containerd 2.4 started on empty directories.
+    (
+        "/var/lib/containerd/io.containerd.grpc.v1.introspection/uuid",
+        Part::File,
+    ),
     (
         "/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db",
         Part::File,
     ),
     // The first boot's tmpfiles links it to /etc/machine-id (dbus.conf).
     ("/var/lib/dbus/machine-id", Part::File),
-    // As /var/lib/containerd.
-    ("/var/lib/docker", Part::New),
+    // As containerd's.
     ("/var/lib/docker/buildkit/cache.db", Part::File),
+    (
+        "/var/lib/docker/buildkit/containerd-overlayfs/metadata_v2.db",
+        Part::File,
+    ),
+    (
+        "/var/lib/docker/buildkit/containerd-overlayfs/workerid",
+        Part::File,
+    ),
+    ("/var/lib/docker/buildkit/history_c8d.db", Part::File),
+    ("/var/lib/docker/engine-id", Part::File),
+    ("/var/lib/docker/image/identity-cache.db", Part::File),
     ("/var/lib/docker/network/files/local-kv.db", Part::File),
+    ("/var/lib/docker/volumes/backingFsBlockDev", Part::File),
     ("/var/lib/docker/volumes/metadata.db", Part::File),
     // The first boot's tmpfiles makes it. A user who lingers is listed.
     ("/var/lib/systemd/linger", Part::Empty),
@@ -117,6 +133,19 @@ pub const BOOT_ONLY: &[(&str, Part)] = &[
     ("/var/log/wtmp", Part::File),
 ];
 
+/// Where Docker and containerd keep what the agent's images, containers and
+/// volumes write: a run that pulls one image changes thousands of paths
+/// there. The agent's work, so not left out as the boot's is, but each of
+/// these is one entry in a result, counting what changed under it (#171).
+pub const SUMMED: &[&str] = &["/var/lib/containerd", "/var/lib/docker"];
+
+// The directory on SUMMED that a path is under, if any.
+fn summed_under(path: &[u8]) -> Option<&'static str> {
+    let under =
+        |at: &str| (path.strip_prefix(at.as_bytes())).is_some_and(|rest| rest.starts_with(b"/"));
+    SUMMED.iter().copied().find(|at| under(at))
+}
+
 /// Which changes to a path on BOOT_ONLY are the boot's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Part {
@@ -126,9 +155,6 @@ pub enum Part {
     File,
     /// It added as an empty directory.
     Empty,
-    /// It added as a directory, whatever is under it: a daemon's state, made
-    /// whole at its first start.
-    New,
     /// Deletions under it.
     Deleted,
 }
@@ -144,7 +170,6 @@ fn boot_only(path: &[u8], change: Kind, contains: Option<u64>) -> bool {
             Part::All => path == at || under,
             Part::File => path == at && contains.is_none(),
             Part::Empty => path == at && change == Kind::Added && contains == Some(0),
-            Part::New => path == at && change == Kind::Added && contains.is_some(),
             Part::Deleted => under && change == Kind::Deleted,
         }
     })
@@ -178,6 +203,11 @@ pub struct Change {
     /// or gave its place to one: how many entries are under it, unlisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contains: Option<u64>,
+    /// For a directory on SUMMED, where containers keep their images, layers
+    /// and volumes: how many paths changed under it, counted here and not
+    /// listed, each under a directory added or deleted whole among them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_under: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -185,7 +215,8 @@ pub struct Changes {
     /// Each directory's entries in name order, a directory's changes right
     /// after it. Modified means a different type, mode, owner, file contents
     /// or link target. Extended attributes, file capabilities included, aren't
-    /// read.
+    /// read. A directory on SUMMED, Docker's and containerd's state, is one
+    /// entry for everything that changed under it, with `changed_under`.
     pub paths: Vec<Change>,
     /// How many more paths changed than are listed, besides those counted
     /// in `boot_only`.
@@ -217,6 +248,7 @@ pub fn between_until(
         cap,
         budget: Budget::new(limits, "measuring", stop),
         listed: 0,
+        summing: None,
         out: Changes::default(),
     };
     walk.dir(&InPath::ROOT.into(), 0)?;
@@ -362,6 +394,9 @@ struct Walk<'a> {
     budget: Budget<'a>,
     // The bytes of the paths listed so far.
     listed: usize,
+    // The directory on SUMMED whose entry the paths under it go in, and where
+    // that entry is in the list.
+    summing: Option<(&'static str, usize)>,
     out: Changes,
 }
 
@@ -377,6 +412,14 @@ impl Walk<'_> {
         for name in names {
             let path = dir.join(name);
             let (o, n) = (old.get(name), new.get(name));
+            let made = o.is_none() && n.is_some_and(Metadata::is_dir);
+            if let Some(root) = SUMMED
+                .iter()
+                .find(|at| made && at.as_bytes() == path.as_ref())
+            {
+                self.made(root, &path, depth + 1)?;
+                continue;
+            }
             // A directory on one side only is counted, not walked into.
             let lone = |m: Option<&Metadata>, other: Option<&Metadata>| {
                 m.is_some_and(Metadata::is_dir) && !other.is_some_and(Metadata::is_dir)
@@ -448,27 +491,100 @@ impl Walk<'_> {
         }
     }
 
+    // A directory on SUMMED that the run made whole, as dockerd and
+    // containerd do at their first start, at a VM's first boot. What the
+    // agent's first run put in it beside theirs is summed; if nothing, the
+    // directory is the boot's, one path added whole.
+    fn made(&mut self, root: &'static str, path: &InPathBuf, depth: usize) -> Result<()> {
+        let (boot, agent) = self.split(path, depth)?;
+        if agent == 0 {
+            self.out.boot_only += 1;
+        } else {
+            self.out.boot_only += boot;
+            self.sum(root, Kind::Added, agent);
+        }
+        Ok(())
+    }
+
+    // How many paths under a directory `made` walks are the boot's, and how
+    // many the agent's. An empty directory, or a file on BOOT_ONLY, is the
+    // boot's. Any other file is the agent's, and so is a directory with any
+    // of the agent's under it.
+    fn split(&mut self, dir: &InPathBuf, depth: usize) -> Result<(u64, u64)> {
+        let deep = self.budget.deep(depth);
+        deep.map_err(|why| self.after.unbounded(why))?;
+        let (mut boot, mut agent) = (0, 0);
+        for (name, m) in self.after.entries(dir, &mut self.budget)? {
+            let path = dir.join(name);
+            if m.is_dir() {
+                let (b, a) = self.split(&path, depth + 1)?;
+                boot += b;
+                agent += a;
+                if a == 0 {
+                    boot += 1;
+                } else {
+                    agent += 1;
+                }
+            } else if boot_only(path.as_ref(), Kind::Added, None) {
+                boot += 1;
+            } else {
+                agent += 1;
+            }
+        }
+        Ok((boot, agent))
+    }
+
     // The boot's own changes are only counted, and take no room in the list.
-    // Once a path doesn't fit, the rest are only counted, so the list stays
-    // in order.
+    // Those under a directory on SUMMED are counted in its one entry.
     fn note(&mut self, path: &InPathBuf, change: Kind, contains: Option<u64>) {
         if boot_only(path.as_ref(), change, contains) {
             self.out.boot_only += 1;
+        } else if let Some(root) = summed_under(path.as_ref()) {
+            self.sum(root, Kind::Modified, 1 + contains.unwrap_or(0));
+        } else {
+            let path = shown(path.as_ref());
+            self.list(Change {
+                path,
+                change,
+                contains,
+                changed_under: None,
+            });
+        }
+    }
+
+    // `paths` more under `root`, in its entry: the walk comes to everything
+    // under a directory together, so the entry is where the first of them
+    // would be listed.
+    fn sum(&mut self, root: &'static str, change: Kind, paths: u64) {
+        if let Some((at, i)) = self.summing
+            && at == root
+        {
+            let n = self.out.paths[i].changed_under.get_or_insert(0);
+            *n = n.saturating_add(paths);
             return;
         }
-        if self.out.more == 0 && self.out.paths.len() < self.cap {
-            let path = shown(path.as_ref());
-            if self.listed + path.len() <= PATH_BYTES {
-                self.listed += path.len();
-                self.out.paths.push(Change {
-                    path,
-                    change,
-                    contains,
-                });
-                return;
-            }
+        let entry = Change {
+            path: root.to_string(),
+            change,
+            contains: None,
+            changed_under: Some(paths),
+        };
+        if self.list(entry) {
+            self.summing = Some((root, self.out.paths.len() - 1));
+        }
+    }
+
+    // Lists a change, if it fits. Once one doesn't, the rest are only
+    // counted, so the list stays in order.
+    fn list(&mut self, change: Change) -> bool {
+        let fits = self.out.paths.len() < self.cap && self.listed + change.path.len() <= PATH_BYTES;
+        if self.out.more == 0 && fits {
+            self.listed += change.path.len();
+            self.out.paths.push(change);
+            return true;
         }
         self.out.more += 1;
+        false
     }
 }
 
