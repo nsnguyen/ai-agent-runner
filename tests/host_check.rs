@@ -809,3 +809,90 @@ fn a_failed_import_is_a_fail_and_no_test_runs() {
     assert!(line(&stdout, "FAIL", "base").contains("import"), "{stdout}");
     assert_eq!(host.called(&["cargo", "test"]), None);
 }
+
+// cargo rebuilds by file times, and a copy can bring sources older than the
+// host's last build (rsync -a keeps the laptop's times), so cargo tested the
+// old build in 2026-11-08's check. A checkout that changed since the last
+// check has its sources touched before anything builds; one that didn't is
+// left as it is, so a rerun builds nothing again. A change of the same size
+// at an older time is still a change: git would miss it.
+#[test]
+fn a_changed_checkout_s_sources_are_touched_before_the_build() {
+    let host = Host::new();
+    let repo = host.repo();
+    let lib = repo.join("src/lib.rs");
+    let test = repo.join("tests/kvm.rs");
+    fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    fs::create_dir_all(test.parent().unwrap()).unwrap();
+    fs::write(&lib, "// one\n").unwrap();
+    fs::write(&test, "// one\n").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    let age = |files: &[&Path]| {
+        for f in files {
+            fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    };
+    let touched = |f: &Path| fs::metadata(f).unwrap().modified().unwrap() > old;
+
+    // The first check here: nothing says what was built.
+    age(&[&lib, &test]);
+    passes(&host.run());
+    assert!(touched(&lib) && touched(&test));
+
+    // The same checkout again.
+    age(&[&lib, &test]);
+    passes(&host.run());
+    assert!(!touched(&lib) && !touched(&test));
+
+    // A change of the same size that keeps an older time, as a copy brings
+    // it.
+    fs::write(&lib, "// two\n").unwrap();
+    age(&[&lib, &test]);
+    passes(&host.run());
+    assert!(touched(&lib) && touched(&test));
+}
+
+// A check that stops before its builds are all done, at the install or with
+// a test file that doesn't build, hasn't built this checkout: the next one
+// touches its sources again, though a copy brought back older times.
+#[test]
+fn a_check_that_didn_t_build_touches_again_next_time() {
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    for stop in ["build-fails", "doesn't build"] {
+        let host = Host::new();
+        let lib = host.repo().join("src/lib.rs");
+        fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        fs::write(&lib, "// one\n").unwrap();
+        if stop == "build-fails" {
+            host.has("build-fails", "");
+        } else {
+            host.has("test-output", DOESNT_BUILD);
+            host.has("test-exit", "101");
+        }
+        let failed = host.run();
+        assert_eq!(
+            failed.status.code(),
+            Some(1),
+            "{stop}: {}",
+            text(&failed.stdout)
+        );
+
+        fs::remove_file(host.path("fake/build-fails")).ok();
+        host.has("test-output", PASSING);
+        host.has("test-exit", "0");
+        fs::File::options()
+            .write(true)
+            .open(&lib)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        passes(&host.run());
+        let touched = fs::metadata(&lib).unwrap().modified().unwrap() > old;
+        assert!(touched, "{stop}: the second check left the old time");
+    }
+}

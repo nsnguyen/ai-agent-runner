@@ -16,7 +16,10 @@
 # 4. tests    Every #[ignore]d test in every test file, one at a time, as root,
 #             or only those matching the filter. About 12 minutes.
 #
-# A PASS or FAIL line for each, then a count. Exits 1 on any FAIL; a failed
+# First, when the checkout's files changed since the last check that built
+# them all, it touches src and tests, since cargo goes by file times and a
+# copy keeps the laptop's; the log says when. Then a PASS or FAIL line for
+# each step, then a count. Exits 1 on any FAIL; a failed
 # install or base stops it there. Each step's full output goes to a log under
 # target/check, which the count names. FORCE_BASE=1 rebuilds base anyway, and
 # ENGINE picks docker over podman.
@@ -47,6 +50,27 @@ fi
 mkdir -p target/check || exit 2
 log=$(mktemp "$repo/target/check/$(date -u +%Y%m%dT%H%M%SZ)-XXXX.log") || exit 2
 echo "check: log at $log"
+
+# cargo rebuilds what's older than its sources, by file times, and a copy can
+# bring sources older than the last build here: rsync -a keeps the laptop's
+# times (2026-11-08's check tested the old build). So unless the last check
+# built these very files, every one of its builds through the tests', src
+# and tests are touched, and every build below is of what's here. Files, not
+# git, say what changed: git trusts the times.
+checkout_id() {
+  find . \( -path ./.git -o -path ./target -o -path ./images/base/out \) -prune -o \
+    -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum -- | sha256sum | cut -c1-64
+}
+stamp=target/check/built-from
+id=$(checkout_id) || id=
+if [[ -z $id || $(cat "$stamp" 2>/dev/null) != "$id" ]]; then
+  # Gone until this check has built them all.
+  rm -f "$stamp"
+  printf '\n== the checkout changed since the last check: touching src and tests\n' >>"$log"
+  for d in src tests; do
+    [[ ! -d $d ]] || find "$d" -type f -exec touch {} + >>"$log" 2>&1
+  done
+fi
 
 passed=0
 failed=0
@@ -193,6 +217,7 @@ stopped() { # cargo says the binary failed
     fail "$bin: the test binary failed: see the log"
   fi
 }
+unbuilt=
 start ""
 printf '\n== tests\n' >>"$log"
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$disk \
@@ -225,9 +250,15 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' RUNNER_TEST_DISK=$disk \
       what=${BASH_REMATCH[1]}
       [[ ! $what =~ ^test\ \"(.+)\"( |$) ]] || what=${BASH_REMATCH[1]}
       fail "$what: doesn't build"
+      unbuilt=1
     fi
   done
 status=${PIPESTATUS[0]}
+# Every build went, the tests' too, since tests ran or all passed: the next
+# check of these files needn't touch them.
+if [[ -n $id && -z $unbuilt ]] && ((status == 0 || ran > 0)); then
+  printf '%s\n' "$id" >"$stamp"
+fi
 settle
 if ((failed == was)); then
   if ((status != 0)); then
