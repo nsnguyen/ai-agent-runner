@@ -196,29 +196,148 @@ fn a_halt_that_fails_says_why() {
     assert!(started.elapsed() < Duration::from_secs(10), "{why}");
 }
 
+/// What the take-over tests ask a run to do, so it's still going when they
+/// take it over. Not `sleep 300`: Claude Code blocks a standalone sleep and
+/// has the model run it in the background, and the run ends at once
+/// (2026-11-08's check). A command past the Bash tool's timeout, two minutes
+/// by default, goes to the background too, so the run lasts about that long.
+const LONG_PROMPT: &str = "the shell command timeout 300 tail -f /dev/null in the foreground";
+
 /// Presses Enter through an interactive claude's first-run screens until
-/// the take-over tests' prompt shows in claude's pane, for up to a minute.
-/// Giving up, it says what the pane shows, how its capture ended, and what
-/// the taking-over terminal drew.
+/// the take-over tests' prompt shows in claude's pane, for up to a minute,
+/// and Down where Enter would end claude. Giving up, it says what the pane
+/// shows, how its capture ended, and the end of what the taking-over
+/// terminal drew, without its escapes.
 fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let out = runner(root, capture);
         let shown = String::from_utf8_lossy(&out.stdout);
-        if shown.contains("sleep 300 in the foreground") {
+        // Claude Code wraps the prompt to the pane: matched as one line.
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.contains(LONG_PROMPT) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
-             The capture: {}, {}\nThe terminal:\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-            t.seen()
-        );
-        t.send("\r");
-        std::thread::sleep(Duration::from_millis(500));
+        if Instant::now() >= deadline {
+            let drawn = plain(&t.seen());
+            let end = drawn.len() - drawn.len().min(4000);
+            let end = (end..drawn.len())
+                .find(|&i| drawn.is_char_boundary(i))
+                .unwrap_or(end);
+            panic!(
+                "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
+                 The capture: {}, {}\nThe terminal drew, at the end:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+                &drawn[end..]
+            );
+        }
+        let key = key_for(&shown);
+        t.send(key);
+        if key == DOWN {
+            // Down wraps from Yes back to No, so no key goes until the pane
+            // shows this one has moved off No.
+            let moved = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < moved {
+                let out = runner(root, capture);
+                if key_for(&String::from_utf8_lossy(&out.stdout)) != DOWN {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
+}
+
+const DOWN: &str = "\x1b[B";
+
+/// The key for a first-run screen: Enter takes its default, but on Claude
+/// Code's trust screen the default is "No, exit", so Down moves to "Yes, I
+/// trust this folder" first.
+fn key_for(shown: &str) -> &'static str {
+    // The capture holds the scrollback: only the newest trust screen counts.
+    let newest = shown.lines().rfind(|l| l.contains("No, exit"));
+    if newest.is_some_and(|l| l.contains('\u{276f}')) {
+        DOWN
+    } else {
+        "\r"
+    }
+}
+
+/// What a terminal drew, as text: its escape sequences and control
+/// characters dropped, but for newlines and tabs.
+fn plain(drawn: &str) -> String {
+    let mut out = String::new();
+    let mut chars = drawn.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then a final byte from @ to ~. A cursor
+                // move starts a row, so the screen's rows don't run together.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            if matches!(c, 'H' | 'f') && !out.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL, or ESC and a backslash.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                // A character set, like ESC ( B.
+                Some('(' | ')') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// Claude Code 2.1's trust screen, as tmux captured it on 2026-11-08.
+const TRUST: &str = " Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ \u{276f} No, exit
+   Yes, I trust this folder
+ Enter to confirm \u{b7} Esc to cancel
+";
+
+#[test]
+fn the_trust_screen_gets_down_until_yes_is_picked() {
+    assert_eq!(key_for(TRUST), "\x1b[B");
+    let yes = TRUST
+        .replace(" \u{276f} No, exit", "   No, exit")
+        .replace("   Yes, I trust", " \u{276f} Yes, I trust");
+    assert_eq!(key_for(&yes), "\r");
+    assert_eq!(key_for(" Press Enter to continue\n"), "\r");
+    // An old frame in the scrollback, above the newest one on Yes.
+    assert_eq!(key_for(&format!("{TRUST}{yes}")), "\r");
+}
+
+#[test]
+fn plain_drops_a_terminal_s_escapes() {
+    let drawn = "\x1b[2J\x1b[1;1HTrust?\x1b]10;?\x1b\\ \x1b]11;rgb:1e/1e/2e\x07No,\x1b(B exit\r\n";
+    assert_eq!(plain(drawn), "\nTrust? No, exit\n");
+    assert_eq!(plain("a\x1b[2;1Hb\x1b[3;1H"), "a\nb\n");
 }
 
 /// The state in a `runner status` line: its last word before any creds.
@@ -1338,9 +1457,8 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
         root: root.clone(),
         name: name.clone(),
     };
-    let prompt =
-        "Run the shell command sleep 300 in the foreground and wait for it, then say done.";
-    let id = ok(runner(&root, &["run", &name, prompt]));
+    let prompt = format!("Run {LONG_PROMPT} and wait for it, then say done.");
+    let id = ok(runner(&root, &["run", &name, &prompt]));
     let id = id.trim().to_string();
     let row = || {
         let rows = ok(runner(&root, &["runs", &name]));
@@ -1359,11 +1477,11 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
     // Claude Code has written the prompt to its session by the time it runs
     // the tool.
-    eventually("claude -p to run sleep 300", || {
-        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
-            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+    eventually("claude -p to run tail", || {
+        let tailing = r#"for c in /proc/[0-9]*/cmdline; do
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
-        in_vm(sleeping).contains("found")
+        in_vm(tailing).contains("found")
     });
 
     let t = common::pty(50, 160);
@@ -1436,10 +1554,11 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         root: root.clone(),
         name: name.clone(),
     };
-    let prompt = "Create a file named started.txt in the current directory holding exactly \
-                  the text started. Then run the shell command sleep 300 in the foreground \
-                  and wait for it, then say done.";
-    let id = ok(runner(&root, &["run", &name, prompt]));
+    let prompt = format!(
+        "Create a file named started.txt in the current directory holding exactly the \
+         text started. Then run {LONG_PROMPT} and wait for it, then say done."
+    );
+    let id = ok(runner(&root, &["run", &name, &prompt]));
     let id = id.trim().to_string();
     let row = || {
         let rows = ok(runner(&root, &["runs", &name]));
@@ -1452,15 +1571,15 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         !row().contains("Z  running  -  ")
     });
     // The file is there, and Claude Code has written the prompt to its
-    // session, by the time it runs the sleep.
+    // session, by the time it runs tail.
     eventually("claude -p to write started.txt", || {
         in_vm("[ -f /home/agent/work/started.txt ] && echo found || true").contains("found")
     });
-    eventually("claude -p to run sleep 300", || {
-        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
-            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+    eventually("claude -p to run tail", || {
+        let tailing = r#"for c in /proc/[0-9]*/cmdline; do
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
-        in_vm(sleeping).contains("found")
+        in_vm(tailing).contains("found")
     });
     // It can still be measuring the run's disk when cancel gives up waiting.
     runner(&root, &["cancel", &id]);
