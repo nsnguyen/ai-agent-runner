@@ -438,8 +438,15 @@ impl Walk<'_> {
                 self.made(root, &path, depth + 1)?;
                 continue;
             }
-            if made && only_dirs(path.as_ref()) && self.empty_tree(&path, depth + 1)? {
-                self.out.boot_only += 1;
+            // One walk tells the boot's from a directory listed whole, and
+            // counts what that holds.
+            if made && only_dirs(path.as_ref()) {
+                let (contains, dirs) = self.dirs_only(&path, depth + 1)?;
+                if dirs {
+                    self.out.boot_only += 1;
+                } else {
+                    self.note(&path, Kind::Added, Some(contains));
+                }
                 continue;
             }
             // A directory on one side only is counted, not walked into.
@@ -528,16 +535,23 @@ impl Walk<'_> {
         Ok(())
     }
 
-    // Whether a directory holds nothing but directories, all the way down.
-    fn empty_tree(&mut self, dir: &InPathBuf, depth: usize) -> Result<bool> {
+    // How many entries a directory holds, as Disk::count, and whether
+    // they're all directories.
+    fn dirs_only(&mut self, dir: &InPathBuf, depth: usize) -> Result<(u64, bool)> {
         let deep = self.budget.deep(depth);
         deep.map_err(|why| self.after.unbounded(why))?;
+        let (mut n, mut dirs) = (0, true);
         for (name, m) in self.after.entries(dir, &mut self.budget)? {
-            if !m.is_dir() || !self.empty_tree(&dir.join(name), depth + 1)? {
-                return Ok(false);
+            n += 1;
+            if m.is_dir() {
+                let (under, all) = self.dirs_only(&dir.join(name), depth + 1)?;
+                n += under;
+                dirs &= all;
+            } else {
+                dirs = false;
             }
         }
-        Ok(true)
+        Ok((n, dirs))
     }
 
     // How many paths under a directory `made` walks are the boot's, and how

@@ -565,6 +565,16 @@ fn containerd_s_empty_directories_from_a_first_boot_are_left_out() {
     made(&agent);
     let want = vec![whole_dir("/etc/cni", Kind::Added, 2)];
     assert_eq!(between(&before, &agent), listed(want, 0, 1));
+
+    // Once they're on the disk, what changes under them is listed, as
+    // anywhere else, and so is their going.
+    let want = vec![change("/etc/cni/net.d/10-bridge.conflist", Kind::Added)];
+    assert_eq!(between(&after, &agent), listed(want, 0, 0));
+    let want = vec![
+        whole_dir("/etc/cni", Kind::Deleted, 1),
+        whole_dir("/opt/containerd", Kind::Deleted, 2),
+    ];
+    assert_eq!(between(&after, &before), listed(want, 0, 0));
 }
 
 // #171: on a VM's first boot, Docker's state is new whole, and what the

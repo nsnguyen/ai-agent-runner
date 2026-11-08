@@ -197,18 +197,24 @@ fn a_halt_that_fails_says_why() {
 }
 
 /// Presses Enter through an interactive claude's first-run screens until
-/// the take-over tests' prompt shows in its pane, for up to a minute. Giving
-/// up, it says what the pane shows.
-fn enter_to_the_prompt(t: &common::Pty, screen: impl Fn() -> String) {
+/// the take-over tests' prompt shows in claude's pane, for up to a minute.
+/// Giving up, it says what the pane shows, how its capture ended, and what
+/// the taking-over terminal drew.
+fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let shown = screen();
+        let out = runner(root, capture);
+        let shown = String::from_utf8_lossy(&out.stdout);
         if shown.contains("sleep 300 in the foreground") {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}"
+            "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
+             The capture: {}, {}\nThe terminal:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+            t.seen()
         );
         t.send("\r");
         std::thread::sleep(Duration::from_millis(500));
@@ -1383,7 +1389,7 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     // A fork of base has no ~/.claude.json, so an interactive claude shows
     // its first-run screens, and then may ask to trust the directory: Enter
     // takes each one's default. At the prompt, an empty Enter does nothing.
-    enter_to_the_prompt(&t, screen);
+    enter_to_the_prompt(&t, &root, &capture);
     let shown = screen();
     assert!(!shown.contains("No conversation found"), "{shown}");
     // As tmux started it, whatever claude makes of its own argv.
@@ -1490,7 +1496,7 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
     let screen = || String::from_utf8_lossy(&runner(&root, &capture).stdout).into_owned();
     // Enter through an interactive claude's first-run screens, as in
     // a_run_taken_over_carries_on_in_claude_s_session.
-    enter_to_the_prompt(&t, screen);
+    enter_to_the_prompt(&t, &root, &capture);
     let shown = screen();
     assert!(!shown.contains("No conversation found"), "{shown}");
     // The run's disk, put back: dev's own from before the run never had it.
