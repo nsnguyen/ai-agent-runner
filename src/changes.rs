@@ -67,10 +67,16 @@ const ASK_EVERY: u32 = 1024;
 pub const BOOT_ONLY: &[(&str, Part)] = &[
     // systemd-update-done's stamp, at the first boot: the image has none.
     ("/etc/.updated", Part::File),
+    // containerd's first start, at a VM's first boot, makes these empty:
+    // /etc/cni/net.d, and /opt/containerd's bin and lib. Seen on base's own
+    // containerd in 2026-11-08's milestone check.
+    ("/etc/cni", Part::Dirs),
     // The VM's own id, written at its first boot: base ships it empty.
     ("/etc/machine-id", Part::File),
     // The first boot's systemd-tmpfiles links it to ../proc/self/mounts.
     ("/etc/mtab", Part::File),
+    // As /etc/cni.
+    ("/opt/containerd", Part::Dirs),
     // Every boot empties /tmp (tmpfiles' tmp.conf), so what the last run left
     // there shows as deleted. What this run adds is listed.
     ("/tmp", Part::Deleted),
@@ -155,8 +161,18 @@ pub enum Part {
     File,
     /// It added as an empty directory.
     Empty,
+    /// It added with only empty directories under it, or none.
+    Dirs,
     /// Deletions under it.
     Deleted,
+}
+
+// Whether BOOT_ONLY leaves the path out when it's added holding only
+// directories.
+fn only_dirs(path: &[u8]) -> bool {
+    BOOT_ONLY
+        .iter()
+        .any(|&(at, part)| part == Part::Dirs && at.as_bytes() == path)
 }
 
 // Whether a change is one only the boot makes.
@@ -171,6 +187,8 @@ fn boot_only(path: &[u8], change: Kind, contains: Option<u64>) -> bool {
             Part::File => path == at && contains.is_none(),
             Part::Empty => path == at && change == Kind::Added && contains == Some(0),
             Part::Deleted => under && change == Kind::Deleted,
+            // Only a walk under it can tell (Walk::dir).
+            Part::Dirs => false,
         }
     })
 }
@@ -420,6 +438,17 @@ impl Walk<'_> {
                 self.made(root, &path, depth + 1)?;
                 continue;
             }
+            // One walk tells the boot's from a directory listed whole, and
+            // counts what that holds.
+            if made && only_dirs(path.as_ref()) {
+                let (contains, dirs) = self.dirs_only(&path, depth + 1)?;
+                if dirs {
+                    self.out.boot_only += 1;
+                } else {
+                    self.note(&path, Kind::Added, Some(contains));
+                }
+                continue;
+            }
             // A directory on one side only is counted, not walked into.
             let lone = |m: Option<&Metadata>, other: Option<&Metadata>| {
                 m.is_some_and(Metadata::is_dir) && !other.is_some_and(Metadata::is_dir)
@@ -504,6 +533,25 @@ impl Walk<'_> {
             self.sum(root, Kind::Added, agent);
         }
         Ok(())
+    }
+
+    // How many entries a directory holds, as Disk::count, and whether
+    // they're all directories.
+    fn dirs_only(&mut self, dir: &InPathBuf, depth: usize) -> Result<(u64, bool)> {
+        let deep = self.budget.deep(depth);
+        deep.map_err(|why| self.after.unbounded(why))?;
+        let (mut n, mut dirs) = (0, true);
+        for (name, m) in self.after.entries(dir, &mut self.budget)? {
+            n += 1;
+            if m.is_dir() {
+                let (under, all) = self.dirs_only(&dir.join(name), depth + 1)?;
+                n += under;
+                dirs &= all;
+            } else {
+                dirs = false;
+            }
+        }
+        Ok((n, dirs))
     }
 
     // How many paths under a directory `made` walks are the boot's, and how

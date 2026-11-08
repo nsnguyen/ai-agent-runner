@@ -196,6 +196,50 @@ fn a_halt_that_fails_says_why() {
     assert!(started.elapsed() < Duration::from_secs(10), "{why}");
 }
 
+/// Presses Enter through an interactive claude's first-run screens until
+/// the take-over tests' prompt shows in claude's pane, for up to a minute.
+/// Giving up, it says what the pane shows, how its capture ended, and what
+/// the taking-over terminal drew.
+fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = runner(root, capture);
+        let shown = String::from_utf8_lossy(&out.stdout);
+        if shown.contains("sleep 300 in the foreground") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
+             The capture: {}, {}\nThe terminal:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+            t.seen()
+        );
+        t.send("\r");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The state in a `runner status` line: its last word before any creds.
+fn state_in(status: &str) -> &str {
+    let line = status.trim_end();
+    let line = line
+        .split_once("  creds ")
+        .map_or(line, |(before, _)| before);
+    line.rsplit("  ").next().unwrap_or_default()
+}
+
+#[test]
+fn state_in_reads_past_the_creds() {
+    let line = "dev  gen 0  21474836480 bytes  cpus 2  mem 2G  sleeping  creds claude\n";
+    assert_eq!(state_in(line), "sleeping");
+    assert_eq!(
+        state_in("dev  gen 1  10 bytes  cpus 2  mem 2G  stopped\n"),
+        "stopped"
+    );
+}
+
 /// Polls `check` for up to a minute.
 fn eventually(what: &str, check: impl FnMut() -> bool) {
     eventually_within(what, Duration::from_secs(60), check);
@@ -1345,14 +1389,7 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     // A fork of base has no ~/.claude.json, so an interactive claude shows
     // its first-run screens, and then may ask to trust the directory: Enter
     // takes each one's default. At the prompt, an empty Enter does nothing.
-    eventually("the run's prompt in claude's pane", || {
-        let shown = screen();
-        let there = shown.contains("sleep 300 in the foreground");
-        if !there {
-            t.send("\r");
-        }
-        there
-    });
+    enter_to_the_prompt(&t, &root, &capture);
     let shown = screen();
     assert!(!shown.contains("No conversation found"), "{shown}");
     // As tmux started it, whatever claude makes of its own argv.
@@ -1459,14 +1496,7 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
     let screen = || String::from_utf8_lossy(&runner(&root, &capture).stdout).into_owned();
     // Enter through an interactive claude's first-run screens, as in
     // a_run_taken_over_carries_on_in_claude_s_session.
-    eventually("the run's prompt in claude's pane", || {
-        let shown = screen();
-        let there = shown.contains("sleep 300 in the foreground");
-        if !there {
-            t.send("\r");
-        }
-        there
-    });
+    enter_to_the_prompt(&t, &root, &capture);
     let shown = screen();
     assert!(!shown.contains("No conversation found"), "{shown}");
     // The run's disk, put back: dev's own from before the run never had it.
@@ -1712,13 +1742,14 @@ fn a_sleeping_vm_lives_through_a_host_stop() {
     let parked = ok(runner(&root, &["park", &name]));
     assert_eq!(parked, format!("{name}  parked\n"));
     eventually("its unit to stop", || active() == "inactive");
+    // A sleeping or running VM's status ends with the creds its guest took.
     let status = ok(runner(&root, &["status", &name]));
-    assert!(status.ends_with("  sleeping\n"), "{status}");
+    assert_eq!(state_in(&status), "sleeping", "{status}");
 
     let began = Instant::now();
     let started = ok(runner(&root, &["start", &name]));
     let took = began.elapsed();
-    assert!(started.ends_with("  running\n"), "{started}");
+    assert_eq!(state_in(&started), "running", "{started}");
     assert_eq!(sh(&format!("cat /proc/{pid}/comm")), "sleep\n");
     let sessions = ok(runner(&root, &["sessions", &name]));
     assert!(

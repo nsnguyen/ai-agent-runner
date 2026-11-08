@@ -540,6 +540,43 @@ fn docker_s_own_state_from_a_boot_is_left_out() {
     assert_eq!(got, listed(want, 0, 0));
 }
 
+// containerd's first start, at a VM's first boot, also makes empty
+// directories outside its state: /etc/cni/net.d and /opt/containerd's bin
+// and lib (seen on base's own containerd, 2026-11-08's milestone check).
+// They're the boot's; a file the agent put there lists the directory whole.
+#[test]
+fn containerd_s_empty_directories_from_a_first_boot_are_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = ("home/agent/work/keep.txt", "keep");
+    let made = |at: &Path| {
+        for d in ["etc/cni/net.d", "opt/containerd/bin", "opt/containerd/lib"] {
+            fs::create_dir_all(at.join(d)).unwrap();
+        }
+    };
+    let before = tree(&dir.path().join("before"), &[keep]);
+    fs::create_dir_all(before.join("etc")).unwrap();
+    fs::create_dir_all(before.join("opt")).unwrap();
+    let after = tree(&dir.path().join("after"), &[keep]);
+    made(&after);
+    assert_eq!(between(&before, &after), listed(vec![], 0, 2));
+
+    let conf = ("etc/cni/net.d/10-bridge.conflist", "{}");
+    let agent = tree(&dir.path().join("agent"), &[keep, conf]);
+    made(&agent);
+    let want = vec![whole_dir("/etc/cni", Kind::Added, 2)];
+    assert_eq!(between(&before, &agent), listed(want, 0, 1));
+
+    // Once they're on the disk, what changes under them is listed, as
+    // anywhere else, and so is their going.
+    let want = vec![change("/etc/cni/net.d/10-bridge.conflist", Kind::Added)];
+    assert_eq!(between(&after, &agent), listed(want, 0, 0));
+    let want = vec![
+        whole_dir("/etc/cni", Kind::Deleted, 1),
+        whole_dir("/opt/containerd", Kind::Deleted, 2),
+    ];
+    assert_eq!(between(&after, &before), listed(want, 0, 0));
+}
+
 // #171: on a VM's first boot, Docker's state is new whole, and what the
 // agent's first run pulled and ran is in it beside Docker's own. That much
 // is summed; Docker's own is left out.
