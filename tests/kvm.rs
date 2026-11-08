@@ -253,7 +253,7 @@ fn plain(drawn: &str) -> String {
                         }
                     }
                 }
-                // OSC: up to BEL or ESC \\.
+                // OSC: up to BEL, or ESC and a backslash.
                 Some(']') => {
                     while let Some(c) = chars.next() {
                         if c == '\x07' {
