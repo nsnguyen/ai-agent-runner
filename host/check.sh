@@ -5,6 +5,9 @@
 #
 #   host/check.sh [filter]
 #
+# 0. sources  Touches src and tests when the checkout's files changed since
+#             the last check, since cargo goes by file times and a copy keeps
+#             the laptop's.
 # 1. install  cargo build --release, then sudo host/install.sh.
 # 2. base     Builds runner-guest for musl. Rebuilds base (sudo ENGINE=podman
 #             images/base/build.sh) only when images/base/out has no disk, or
@@ -47,6 +50,31 @@ fi
 mkdir -p target/check || exit 2
 log=$(mktemp "$repo/target/check/$(date -u +%Y%m%dT%H%M%SZ)-XXXX.log") || exit 2
 echo "check: log at $log"
+
+# cargo rebuilds what's older than its sources, by file times, and a copy can
+# bring sources older than the last build here: rsync -a keeps the laptop's
+# times (2026-11-08's check tested the old build). So a checkout whose files
+# changed since the last check has its sources touched, and every build below
+# is of what's here. Files, not git, say what changed: git trusts the times.
+checkout_id() {
+  find . \( -path ./.git -o -path ./target -o -path ./images/base/out \) -prune -o \
+    -type f -print0 | sort -z | xargs -0r sha256sum -- | sha256sum | cut -c1-64
+}
+stamp=target/check/built-from
+touch_sources=
+if id=$(checkout_id); then
+  [[ $(cat "$stamp" 2>/dev/null) == "$id" ]] || touch_sources=1
+  printf '%s\n' "$id" >"$stamp"
+else
+  touch_sources=1
+  rm -f "$stamp"
+fi
+if [[ -n $touch_sources ]]; then
+  printf '\n== the checkout changed since the last check: touching src and tests\n' >>"$log"
+  for d in src tests; do
+    [[ ! -d $d ]] || find "$d" -type f -exec touch {} +
+  done
+fi
 
 passed=0
 failed=0

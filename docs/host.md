@@ -105,7 +105,7 @@ host/check.sh sleep       # only the tests whose names contain "sleep"
 FORCE_BASE=1 host/check.sh
 ```
 
-It does each step a milestone check needs, with a `PASS` or `FAIL` line for each:
+It does each step a milestone check needs, with a `PASS` or `FAIL` line for each. First, when the checkout's files changed since its last run (a hash of them all but `.git`, `target` and `images/base/out`, kept in `target/check/built-from`), it touches every file under `src` and `tests`: cargo rebuilds by file times, and a copy by `rsync -a` keeps the laptop's, which can be older than the host's last build, so cargo would test that build instead.
 
 1. `cargo build --release && sudo host/install.sh`.
 2. Builds runner-guest for musl, then holds `images/base/build.sh --fingerprint` against what `runner doctor` says base was built from and against the disk in `images/base/out`. When the disk or `images/base/out/vmlinux` is missing, or the disk differs, it rebuilds them (`sudo ENGINE=podman images/base/build.sh`; `ENGINE=docker` picks docker), and when either differs, imports it: `sudo -u runner runner import --replace base - <images/base/out/base.ext4`. It installs `images/base/out/vmlinux` as the host's kernel where it differs. `FORCE_BASE=1` rebuilds and imports anyway.
