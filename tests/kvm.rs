@@ -197,9 +197,10 @@ fn a_halt_that_fails_says_why() {
 }
 
 /// Presses Enter through an interactive claude's first-run screens until
-/// the take-over tests' prompt shows in claude's pane, for up to a minute.
-/// Giving up, it says what the pane shows, how its capture ended, and what
-/// the taking-over terminal drew.
+/// the take-over tests' prompt shows in claude's pane, for up to a minute,
+/// and Down where Enter would end claude. Giving up, it says what the pane
+/// shows, how its capture ended, and the end of what the taking-over
+/// terminal drew, without its escapes.
 fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -208,17 +209,99 @@ fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
         if shown.contains("sleep 300 in the foreground") {
             return;
         }
+        let drawn = plain(&t.seen());
+        let end = drawn.len() - drawn.len().min(4000);
+        let end = (end..drawn.len())
+            .find(|&i| drawn.is_char_boundary(i))
+            .unwrap_or(end);
         assert!(
             Instant::now() < deadline,
             "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
-             The capture: {}, {}\nThe terminal:\n{}",
+             The capture: {}, {}\nThe terminal drew, at the end:\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim(),
-            t.seen()
+            &drawn[end..]
         );
-        t.send("\r");
+        t.send(key_for(&shown));
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// The key for a first-run screen: Enter takes its default, but on Claude
+/// Code's trust screen the default is "No, exit", so Down moves to "Yes, I
+/// trust this folder" first.
+fn key_for(shown: &str) -> &'static str {
+    let on_no = shown
+        .lines()
+        .any(|l| l.contains('\u{276f}') && l.contains("No, exit"));
+    if on_no { "\x1b[B" } else { "\r" }
+}
+
+/// What a terminal drew, as text: its escape sequences and control
+/// characters dropped, but for newlines and tabs.
+fn plain(drawn: &str) -> String {
+    let mut out = String::new();
+    let mut chars = drawn.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then a final byte from @ to ~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ESC \\.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                // A character set, like ESC ( B.
+                Some('(' | ')') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// Claude Code 2.1's trust screen, as tmux captured it on 2026-11-08.
+const TRUST: &str = " Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ \u{276f} No, exit
+   Yes, I trust this folder
+ Enter to confirm \u{b7} Esc to cancel
+";
+
+#[test]
+fn the_trust_screen_gets_down_until_yes_is_picked() {
+    assert_eq!(key_for(TRUST), "\x1b[B");
+    let yes = TRUST
+        .replace(" \u{276f} No, exit", "   No, exit")
+        .replace("   Yes, I trust", " \u{276f} Yes, I trust");
+    assert_eq!(key_for(&yes), "\r");
+    assert_eq!(key_for(" Press Enter to continue\n"), "\r");
+}
+
+#[test]
+fn plain_drops_a_terminal_s_escapes() {
+    let drawn = "\x1b[2J\x1b[1;1HTrust?\x1b]10;?\x1b\\ \x1b]11;rgb:1e/1e/2e\x07No,\x1b(B exit\r\n";
+    assert_eq!(plain(drawn), "Trust? No, exit\n");
 }
 
 /// The state in a `runner status` line: its last word before any creds.
