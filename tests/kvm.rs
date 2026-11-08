@@ -196,6 +196,13 @@ fn a_halt_that_fails_says_why() {
     assert!(started.elapsed() < Duration::from_secs(10), "{why}");
 }
 
+/// What the take-over tests ask a run to do, so it's still going when they
+/// take it over. Not `sleep 300`: Claude Code blocks a standalone sleep and
+/// has the model run it in the background, and the run ends at once
+/// (2026-11-08's check). A command past the Bash tool's timeout, two minutes
+/// by default, goes to the background too, so the run lasts about that long.
+const LONG_PROMPT: &str = "the shell command timeout 300 tail -f /dev/null in the foreground";
+
 /// Presses Enter through an interactive claude's first-run screens until
 /// the take-over tests' prompt shows in claude's pane, for up to a minute,
 /// and Down where Enter would end claude. Giving up, it says what the pane
@@ -206,7 +213,9 @@ fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
     loop {
         let out = runner(root, capture);
         let shown = String::from_utf8_lossy(&out.stdout);
-        if shown.contains("sleep 300 in the foreground") {
+        // Claude Code wraps the prompt to the pane: matched as one line.
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.contains(LONG_PROMPT) {
             return;
         }
         let drawn = plain(&t.seen());
@@ -1421,9 +1430,8 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
         root: root.clone(),
         name: name.clone(),
     };
-    let prompt =
-        "Run the shell command sleep 300 in the foreground and wait for it, then say done.";
-    let id = ok(runner(&root, &["run", &name, prompt]));
+    let prompt = format!("Run {LONG_PROMPT} and wait for it, then say done.");
+    let id = ok(runner(&root, &["run", &name, &prompt]));
     let id = id.trim().to_string();
     let row = || {
         let rows = ok(runner(&root, &["runs", &name]));
@@ -1442,9 +1450,9 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     let in_vm = |script: &str| ok(runner(&root, &["exec", &name, "--", "sh", "-c", script]));
     // Claude Code has written the prompt to its session by the time it runs
     // the tool.
-    eventually("claude -p to run sleep 300", || {
+    eventually("claude -p to run tail", || {
         let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
-            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
         in_vm(sleeping).contains("found")
     });
@@ -1520,7 +1528,7 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         name: name.clone(),
     };
     let prompt = "Create a file named started.txt in the current directory holding exactly \
-                  the text started. Then run the shell command sleep 300 in the foreground \
+                  the text started. Then run the shell command timeout 300 tail -f /dev/null in the foreground \
                   and wait for it, then say done.";
     let id = ok(runner(&root, &["run", &name, prompt]));
     let id = id.trim().to_string();
@@ -1539,9 +1547,9 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
     eventually("claude -p to write started.txt", || {
         in_vm("[ -f /home/agent/work/started.txt ] && echo found || true").contains("found")
     });
-    eventually("claude -p to run sleep 300", || {
+    eventually("claude -p to run tail", || {
         let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
-            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'sleep 300 ' ] && echo found
+            [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
         in_vm(sleeping).contains("found")
     });
