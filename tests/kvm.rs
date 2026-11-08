@@ -1478,10 +1478,10 @@ fn a_run_taken_over_carries_on_in_claude_s_session() {
     // Claude Code has written the prompt to its session by the time it runs
     // the tool.
     eventually("claude -p to run tail", || {
-        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
+        let tailing = r#"for c in /proc/[0-9]*/cmdline; do
             [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
-        in_vm(sleeping).contains("found")
+        in_vm(tailing).contains("found")
     });
 
     let t = common::pty(50, 160);
@@ -1554,10 +1554,11 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         root: root.clone(),
         name: name.clone(),
     };
-    let prompt = "Create a file named started.txt in the current directory holding exactly \
-                  the text started. Then run the shell command timeout 300 tail -f /dev/null in the foreground \
-                  and wait for it, then say done.";
-    let id = ok(runner(&root, &["run", &name, prompt]));
+    let prompt = format!(
+        "Create a file named started.txt in the current directory holding exactly the \
+         text started. Then run {LONG_PROMPT} and wait for it, then say done."
+    );
+    let id = ok(runner(&root, &["run", &name, &prompt]));
     let id = id.trim().to_string();
     let row = || {
         let rows = ok(runner(&root, &["runs", &name]));
@@ -1570,15 +1571,15 @@ fn a_cancelled_run_taken_over_gets_its_disk_and_session_back() {
         !row().contains("Z  running  -  ")
     });
     // The file is there, and Claude Code has written the prompt to its
-    // session, by the time it runs the sleep.
+    // session, by the time it runs tail.
     eventually("claude -p to write started.txt", || {
         in_vm("[ -f /home/agent/work/started.txt ] && echo found || true").contains("found")
     });
     eventually("claude -p to run tail", || {
-        let sleeping = r#"for c in /proc/[0-9]*/cmdline; do
+        let tailing = r#"for c in /proc/[0-9]*/cmdline; do
             [ "$(tr '\0' ' ' <"$c" 2>/dev/null)" = 'tail -f /dev/null ' ] && echo found
         done; true"#;
-        in_vm(sleeping).contains("found")
+        in_vm(tailing).contains("found")
     });
     // It can still be measuring the run's disk when cancel gives up waiting.
     runner(&root, &["cancel", &id]);
