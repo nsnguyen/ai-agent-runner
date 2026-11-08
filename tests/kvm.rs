@@ -218,32 +218,52 @@ fn enter_to_the_prompt(t: &common::Pty, root: &Path, capture: &[&str]) {
         if flat.contains(LONG_PROMPT) {
             return;
         }
-        let drawn = plain(&t.seen());
-        let end = drawn.len() - drawn.len().min(4000);
-        let end = (end..drawn.len())
-            .find(|&i| drawn.is_char_boundary(i))
-            .unwrap_or(end);
-        assert!(
-            Instant::now() < deadline,
-            "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
-             The capture: {}, {}\nThe terminal drew, at the end:\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-            &drawn[end..]
-        );
-        t.send(key_for(&shown));
-        std::thread::sleep(Duration::from_millis(500));
+        if Instant::now() >= deadline {
+            let drawn = plain(&t.seen());
+            let end = drawn.len() - drawn.len().min(4000);
+            let end = (end..drawn.len())
+                .find(|&i| drawn.is_char_boundary(i))
+                .unwrap_or(end);
+            panic!(
+                "gave up waiting for the run's prompt in claude's pane, which shows:\n{shown}\n\
+                 The capture: {}, {}\nThe terminal drew, at the end:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+                &drawn[end..]
+            );
+        }
+        let key = key_for(&shown);
+        t.send(key);
+        if key == DOWN {
+            // Down wraps from Yes back to No, so no key goes until the pane
+            // shows this one has moved off No.
+            let moved = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < moved {
+                let out = runner(root, capture);
+                if key_for(&String::from_utf8_lossy(&out.stdout)) != DOWN {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 }
+
+const DOWN: &str = "\x1b[B";
 
 /// The key for a first-run screen: Enter takes its default, but on Claude
 /// Code's trust screen the default is "No, exit", so Down moves to "Yes, I
 /// trust this folder" first.
 fn key_for(shown: &str) -> &'static str {
-    let on_no = shown
-        .lines()
-        .any(|l| l.contains('\u{276f}') && l.contains("No, exit"));
-    if on_no { "\x1b[B" } else { "\r" }
+    // The capture holds the scrollback: only the newest trust screen counts.
+    let newest = shown.lines().rfind(|l| l.contains("No, exit"));
+    if newest.is_some_and(|l| l.contains('\u{276f}')) {
+        DOWN
+    } else {
+        "\r"
+    }
 }
 
 /// What a terminal drew, as text: its escape sequences and control
@@ -254,10 +274,14 @@ fn plain(drawn: &str) -> String {
     while let Some(c) = chars.next() {
         match c {
             '\x1b' => match chars.next() {
-                // CSI: parameters, then a final byte from @ to ~.
+                // CSI: parameters, then a final byte from @ to ~. A cursor
+                // move starts a row, so the screen's rows don't run together.
                 Some('[') => {
                     for c in chars.by_ref() {
                         if ('@'..='~').contains(&c) {
+                            if matches!(c, 'H' | 'f') && !out.ends_with('\n') {
+                                out.push('\n');
+                            }
                             break;
                         }
                     }
@@ -305,12 +329,15 @@ fn the_trust_screen_gets_down_until_yes_is_picked() {
         .replace("   Yes, I trust", " \u{276f} Yes, I trust");
     assert_eq!(key_for(&yes), "\r");
     assert_eq!(key_for(" Press Enter to continue\n"), "\r");
+    // An old frame in the scrollback, above the newest one on Yes.
+    assert_eq!(key_for(&format!("{TRUST}{yes}")), "\r");
 }
 
 #[test]
 fn plain_drops_a_terminal_s_escapes() {
     let drawn = "\x1b[2J\x1b[1;1HTrust?\x1b]10;?\x1b\\ \x1b]11;rgb:1e/1e/2e\x07No,\x1b(B exit\r\n";
-    assert_eq!(plain(drawn), "Trust? No, exit\n");
+    assert_eq!(plain(drawn), "\nTrust? No, exit\n");
+    assert_eq!(plain("a\x1b[2;1Hb\x1b[3;1H"), "a\nb\n");
 }
 
 /// The state in a `runner status` line: its last word before any creds.
