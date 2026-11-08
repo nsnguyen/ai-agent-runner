@@ -856,3 +856,43 @@ fn a_changed_checkout_s_sources_are_touched_before_the_build() {
     passes(&host.run());
     assert!(touched(&lib) && touched(&test));
 }
+
+// A check that stops before its builds are all done, at the install or with
+// a test file that doesn't build, hasn't built this checkout: the next one
+// touches its sources again, though a copy brought back older times.
+#[test]
+fn a_check_that_didn_t_build_touches_again_next_time() {
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    for stop in ["build-fails", "doesn't build"] {
+        let host = Host::new();
+        let lib = host.repo().join("src/lib.rs");
+        fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        fs::write(&lib, "// one\n").unwrap();
+        if stop == "build-fails" {
+            host.has("build-fails", "");
+        } else {
+            host.has("test-output", DOESNT_BUILD);
+            host.has("test-exit", "101");
+        }
+        let failed = host.run();
+        assert_eq!(
+            failed.status.code(),
+            Some(1),
+            "{stop}: {}",
+            text(&failed.stdout)
+        );
+
+        fs::remove_file(host.path("fake/build-fails")).ok();
+        host.has("test-output", PASSING);
+        host.has("test-exit", "0");
+        fs::File::options()
+            .write(true)
+            .open(&lib)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        passes(&host.run());
+        let touched = fs::metadata(&lib).unwrap().modified().unwrap() > old;
+        assert!(touched, "{stop}: the second check left the old time");
+    }
+}
