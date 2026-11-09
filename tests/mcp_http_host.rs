@@ -158,12 +158,17 @@ impl Fake {
         );
         let host = concat!(env!("CARGO_MANIFEST_DIR"), "/host");
         let vars = format!("here='{host}'\ntmp={d}/tmp\nhome=/home/runner\n");
-        let settings = lines(&["idle=", "mcp_http=", "mcp_url="]);
+        let settings = lines(&["idle=", "reserve=", "mcp_http=", "mcp_url="]);
         let body = format!("set -euo pipefail\n{said}{stubs}{vars}{settings}{checks}\n{rest}");
         let body = body.replace("/etc/", &format!("{d}/etc/"));
         let mut bash = Command::new("bash");
         bash.arg("-c").arg(body);
-        for var in ["RUNNER_HOST_IDLE", "RUNNER_MCP_HTTP", "RUNNER_MCP_URL"] {
+        for var in [
+            "RUNNER_HOST_IDLE",
+            "RUNNER_HOST_RESERVE",
+            "RUNNER_MCP_HTTP",
+            "RUNNER_MCP_URL",
+        ] {
             bash.env_remove(var);
         }
         bash.envs(env.iter().copied()).output().unwrap()

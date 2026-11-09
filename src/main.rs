@@ -1506,9 +1506,6 @@ fn loopback(addr: &str) -> Result<std::net::SocketAddr, String> {
     Ok(at)
 }
 
-/// Where host/install.sh keeps RUNNER_MCP_URL.
-const MCP_URL: &str = "/etc/runner/mcp-url";
-
 fn serve_http(
     store: Store,
     user: String,
@@ -1516,7 +1513,7 @@ fn serve_http(
     url: Option<String>,
 ) -> ExitCode {
     let url = url.or_else(|| {
-        let kept = std::fs::read_to_string(MCP_URL).ok()?;
+        let kept = std::fs::read_to_string(runner::host::MCP_URL).ok()?;
         let kept = kept.trim();
         (!kept.is_empty()).then(|| kept.to_string())
     });
