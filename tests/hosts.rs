@@ -3,7 +3,8 @@
 // hosts. Each host is a directory: `vms` lists its VMs, `free` its free
 // memory, `calls` what its runner got, and `down` makes ssh time out on it,
 // as `stopped` does until the fake aws.sh beside the laptop's runner, a copy,
-// starts it. No network, no host and no AWS.
+// starts it; `old` makes its runner one from before mcp-http. No network, no
+// host and no AWS.
 mod common;
 
 use runner::peers;
@@ -131,6 +132,13 @@ exec)
   ;;
 doctor) echo "ok    kvm  /dev/kvm" ;;
 gc) while read -r v; do echo "$v  nothing to free"; done <"$HOST_DIR/vms" ;;
+mcp-http)
+  # A runner from before MCP over HTTP hasn't got it, as clap says.
+  if [ -e "$HOST_DIR/old" ]; then
+    printf "error: unrecognized subcommand 'mcp-http'\n\nUsage: runner <COMMAND>\n" >&2
+    exit 2
+  fi
+  ;;
 esac
 "#;
 
@@ -247,6 +255,11 @@ impl Fleet {
 
     fn down(&self, name: &str) {
         fs::write(self.dir.path().join("fleet").join(name).join("down"), "").unwrap();
+    }
+
+    /// A runner from before MCP over HTTP, which hasn't got mcp-http.
+    fn old(&self, name: &str) {
+        fs::write(self.dir.path().join("fleet").join(name).join("old"), "").unwrap();
     }
 
     /// The AWS CLI is here, so the runner asks a host it hasn't reached
@@ -1687,10 +1700,9 @@ fn hosts_add_puts_each_host_s_key_on_every_other_once() {
         let path = fleet.dir.path().join("fleet/kvm-host/.ssh/authorized_keys");
         let mode = fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "{shell:?}: {mode:o}");
-        // No runner command ran for it.
-        for host in ["kvm-host", "kvm-host-2"] {
-            assert!(fleet.calls(host).is_empty(), "{shell:?} {host}");
-        }
+        // No runner command ran for it, but the first's list for MCP over HTTP.
+        assert_eq!(fleet.calls("kvm-host"), [listing(&HOSTS)], "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
 
         // Again changes nothing.
         ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]));
@@ -2112,4 +2124,75 @@ fn move_to_a_running_target_asks_aws_nothing() {
     ok(&fleet.run(SHELLS[0], &["list"]));
     ok(&fleet.run(SHELLS[0], &["move", "web", "kvm-host-3"]));
     assert!(fleet.aws_calls().is_empty());
+}
+
+// #176: the first host serves MCP over HTTP with no laptop to pass it --name
+// and --peer, so its runner reads the list, a host a line, the first first,
+// at each call. `hosts add` and `hosts rm` write it there.
+
+// The first host's call that writes the list, each host as listed.
+fn listing(hosts: &[&str]) -> String {
+    let mut call = "mcp-http peers".to_string();
+    for h in hosts {
+        call = format!("{call} {h}");
+    }
+    call
+}
+
+#[test]
+fn hosts_add_writes_the_list_on_the_first_host() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fs::write(fleet.hosts_file(), "runner@kvm-host\nrunner@kvm-host-2\n").unwrap();
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host-3"]);
+        ok(&out);
+        assert_eq!(fleet.calls("kvm-host"), [listing(&HOSTS)], "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+        // Only the add's check that it answers.
+        assert_eq!(fleet.calls("kvm-host-3"), ["hosts"], "{shell:?}");
+
+        // A host already listed writes it again.
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["hosts", "add", "runner@kvm-host-2"]));
+        assert_eq!(fleet.calls("kvm-host"), [listing(&HOSTS)], "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+    }
+}
+
+// One clear line, naming the first host, and a 1, as for the keys; they're
+// shared all the same.
+#[test]
+fn hosts_add_names_a_first_host_that_can_t_take_the_list() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.old("kvm-host");
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert_eq!(err.lines().count(), 1, "{shell:?}: {err}");
+        assert!(err.contains("on kvm-host"), "{err}");
+        assert!(err.contains("an older runner"), "{err}");
+        assert!(err.contains("MCP over HTTP there"), "{err}");
+        assert!(
+            err.contains("`runner hosts add runner@kvm-host` again"),
+            "{err}"
+        );
+        assert_eq!(
+            fleet.authorized_keys("kvm-host"),
+            trusting(&["kvm-host-2", "kvm-host-3"]),
+            "{shell:?}"
+        );
+
+        // Down, it's said so.
+        fs::remove_file(fleet.dir.path().join("fleet/kvm-host/old")).unwrap();
+        fleet.down("kvm-host");
+        let out = fleet.run(shell, &["hosts", "add", "runner@kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("kvm-host didn't answer, so MCP over HTTP there"),
+            "{err}"
+        );
+    }
 }
