@@ -136,6 +136,8 @@ So one host reaches another only over the tailnet, with no terminal or forwardin
 
 The host takes SSH only over the tailnet. Never forward port 22 to it from a router or expose it on a public IP. If sshd does listen elsewhere, `from=` still refuses the runner user's key from outside the tailnet.
 
+MCP over HTTP is the one exception, and it's off unless set (MCP clients, Over HTTP): the server listens on loopback only, Funnel is what puts it on the internet, and every request needs a bearer token.
+
 This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailscaled answers port 22 on the tailnet address and never reads `authorized_keys`.
 
 ### On AWS
@@ -492,6 +494,27 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
 ```
 
 Nor do they get `AWS_PROFILE`, or the AWS CLI on PATH, which starting a stopped host takes: add `"env": {"AWS_PROFILE": "runner", "PATH": "/opt/homebrew/bin:/usr/bin:/bin"}` beside `args`. Restart the app after editing its config.
+
+#### Over HTTP
+
+claude.ai, and any client that can't run a command, reaches the same server over Streamable HTTP: the same tools, reaching every listed host the same way. It's off unless set. On the first host, `sudo RUNNER_MCP_HTTP=1 RUNNER_MCP_URL=https://kvm-host.<tailnet>.ts.net host/install.sh` starts `runner-mcp-http.service`, which is `runner mcp --http 127.0.0.1:8740` as runner, and reruns remember both (`/etc/runner/mcp-http`, `/etc/runner/mcp-url`); `RUNNER_MCP_HTTP=0` stops it and takes it out. It listens on loopback only and refuses any other address: Funnel or `tailscale serve` puts it on a URL, which `RUNNER_MCP_URL` names. It also sets the host's idle time to never, since claude.ai can't start a stopped host, so the host runs around the clock, and `runner doctor` warns when it's set otherwise.
+
+Every request needs a bearer token:
+
+```sh
+runner mcp-http token     # a new one, printed once: only its SHA-256 is kept, in /var/lib/runner/mcp-http
+runner mcp-http revoke    # drops every token
+```
+
+From the laptop both go to the first host. A client sends the token as `Authorization: Bearer <token>`. With none, or a wrong or revoked one, a request gets 401, with `WWW-Authenticate: Bearer resource_metadata="<RUNNER_MCP_URL>/.well-known/oauth-protected-resource"`, and no tool runs. A browser's request from an Origin other than https://claude.ai or https://claude.com is refused, and so is a Host other than loopback's or `RUNNER_MCP_URL`'s, against DNS rebinding. There's no laptop to pass `--peer`, so the server reads the hosts from `/var/lib/runner/peers` at each call, and a host added later is reached without a restart: `runner hosts add` and `hosts rm` write it on the first host, the hosts as listed, that one first. On a host set up before this, `runner hosts add` with any listed host writes it. A long call holds its request open as long as it works: `run_output`'s 45-second wait, or an `exec` with a long `timeout_secs`.
+
+To check it on the host, with a token in `$TOKEN`:
+
+```sh
+curl -s http://127.0.0.1:8740/mcp -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 
