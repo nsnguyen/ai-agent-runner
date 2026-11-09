@@ -71,32 +71,62 @@ pub fn kernel(root: &Path) -> PathBuf {
 /// Where the host's memory figures are, unless RUNNER_MEMINFO names a fake.
 pub const MEMINFO: &str = "/proc/meminfo";
 
-/// This host's free memory in bytes: MemAvailable from /proc/meminfo, what the
-/// kernel reckons it can hand out without swapping. `runner hosts` reports it,
-/// and the laptop's `runner create` places a VM on the host with the most.
-pub fn mem_available() -> io::Result<u64> {
-    let path =
-        std::env::var_os("RUNNER_MEMINFO").map_or_else(|| PathBuf::from(MEMINFO), PathBuf::from);
-    mem_available_in(&path)
+/// What the host keeps of its memory for itself, in `runner create --mem`'s
+/// syntax, as host/install.sh keeps it from RUNNER_HOST_RESERVE: VMs boot
+/// only into the rest (src/room.rs). Missing, as before install.sh wrote it,
+/// is DEFAULT_RESERVE. RUNNER_RESERVE names another file, for tests.
+pub const RESERVE: &str = "/etc/runner/reserve";
+pub const DEFAULT_RESERVE: &str = "1G";
+
+fn from_env(var: &str, default: &str) -> PathBuf {
+    std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from)
 }
 
-/// `mem_available`, from the meminfo file at `path`.
-pub fn mem_available_in(path: &Path) -> io::Result<u64> {
+/// This host's memory in bytes: MemTotal from /proc/meminfo, which room
+/// counts down from (src/room.rs).
+pub fn mem_total() -> io::Result<u64> {
+    mem_total_in(&from_env("RUNNER_MEMINFO", MEMINFO))
+}
+
+/// `mem_total`, from the meminfo file at `path`.
+pub fn mem_total_in(path: &Path) -> io::Result<u64> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    parse_mem_available(&text).ok_or_else(|| {
+    parse_mem_total(&text).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("no MemAvailable in {}", path.display()),
+            format!("no MemTotal in {}", path.display()),
         )
     })
 }
 
-/// MemAvailable in bytes from meminfo's text, whose figures are in KiB.
-pub fn parse_mem_available(meminfo: &str) -> Option<u64> {
-    let line = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))?;
+/// MemTotal in bytes from meminfo's text, whose figures are in KiB.
+pub fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
     let kib = line.trim().strip_suffix("kB").unwrap_or(line).trim();
     kib.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+/// The host's reserve in bytes, from RESERVE.
+pub fn reserve() -> io::Result<u64> {
+    reserve_in(&from_env("RUNNER_RESERVE", RESERVE))
+}
+
+/// `reserve`, from the file at `path`.
+pub fn reserve_in(path: &Path) -> io::Result<u64> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DEFAULT_RESERVE.to_string(),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+    };
+    let mib = crate::store::parse_mem(text.trim()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: {e}. RUNNER_HOST_RESERVE=1G host/install.sh sets it again",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(u64::from(mib) << 20)
 }

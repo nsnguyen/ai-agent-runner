@@ -34,8 +34,9 @@ impl Pair {
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
         script(&bin.join("ssh"), PEER_SSH);
-        let here = PeerHost::new(dir.path().join("here"), &[], 2 << 30);
-        let there = PeerHost::new(dir.path().join("fleet/kvm-host-2"), &[], 4 << 30);
+        // Room for dev's 4 GiB on either, beside a VM up (src/room.rs).
+        let here = PeerHost::new(dir.path().join("here"), &[], 8 << 30);
+        let there = PeerHost::new(dir.path().join("fleet/kvm-host-2"), &[], 8 << 30);
         Pair { dir, here, there }
     }
 

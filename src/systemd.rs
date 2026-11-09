@@ -4,14 +4,18 @@
 // inherited: under `runner mcp`, stdout is protocol. A VM that sleeps keeps
 // its unit active, since its boot stays up (src/sleep.rs): status tells it
 // apart by its snapshot. One parked at a host shutdown sleeps with its unit
-// stopped, until a start or wake starts it, and its boot resumes it.
+// stopped, until a start or wake starts it, and its boot resumes it. A start
+// or wake is refused when the host has no room for the VM (src/room.rs); a
+// stop's wake isn't.
 use crate::boot::RESTART;
 use crate::creds::Cred;
+use crate::room::{self, NoRoom, Room};
 use crate::store::{Store, Vm};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::linux::net::SocketAddrExt;
@@ -19,9 +23,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 /// How long a VM gets to shut down after Ctrl-Alt-Del before systemd kills it.
 pub const STOP_TIMEOUT_SECS: u32 = 30;
+
+// How often a boot looks whether systemd counts its VM as up yet, holding the
+// room lock until it does.
+const BOOTING_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,6 +55,10 @@ pub enum Error {
     Sleep(#[from] crate::sleep::Error),
     #[error("{0}")]
     NotNow(String),
+    #[error(transparent)]
+    NoRoom(#[from] NoRoom),
+    #[error("reading this host's memory: {0}")]
+    Mem(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -113,10 +126,23 @@ pub fn unit_name(vm: &str) -> String {
 }
 
 /// Boots the VM, or wakes it if it's sleeping, and returns once its guest is
-/// started.
+/// started. Refused, with nothing started, if it's down or asleep and the
+/// host has no room for it.
 pub fn start(store: &Store, name: &str) -> Result<VmStatus> {
     store.get(name)?;
-    systemctl(name, &["start", &unit_name(name)])?;
+    let room = lock_room(store)?;
+    match unit_state(name)? {
+        // A parked VM too, whose boot resumes it.
+        State::Stopped | State::Stopping => {
+            fits(store, name)?;
+            boot(name, room)?;
+        }
+        // Waits for a VM booting; one up already needs no more room.
+        _ => {
+            drop(room);
+            systemctl(name, &["start", &unit_name(name)])?;
+        }
+    }
     let status = status(store, name)?;
     if !awake(store, name, status.state)? {
         return Ok(status);
@@ -150,7 +176,8 @@ pub fn sleep(store: &Store, name: &str) -> Result<VmStatus> {
 }
 
 /// Wakes a sleeping VM, or starts a parked one, which resumes it. One awake
-/// already stays so.
+/// already stays so. Refused, and it sleeps on, if the host has no room for
+/// it.
 pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
     if parked(store, name)? {
         return start(store, name);
@@ -172,16 +199,123 @@ pub fn wake(store: &Store, name: &str) -> Result<VmStatus> {
 // Asks the boot of a VM that's up to have it awake: done at once if it is,
 // and after a sleep under way if one is, so a VM that looked to be running
 // while it went to sleep is woken too. A boot from before sleep, which takes
-// no asks, can't have put it to sleep. True if the boot was asked.
+// no asks, can't have put it to sleep. True if the boot was asked. One
+// asleep is refused unless it fits.
 fn awake(store: &Store, name: &str, state: State) -> Result<bool> {
     if !matches!(state, State::Running | State::Sleeping) {
         return Ok(false);
     }
+    // Held until it's awake, and counted.
+    let _room = room_to_wake(store, name)?;
     match crate::sleep::wake(store, name) {
         Ok(()) => Ok(true),
         Err(crate::sleep::Error::NoBoot(_)) if state == State::Running => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// This host's room (src/room.rs), with each VM as `status` finds it.
+pub fn room(store: &Store) -> Result<Room> {
+    room_but(store, None)
+}
+
+// The room, not counting `but`'s own. A VM whose state systemd can't say
+// counts as up: the room can't count on its memory, and one VM's unit
+// shouldn't stop every other VM booting.
+fn room_but(store: &Store, but: Option<&str>) -> Result<Room> {
+    let total = crate::host::mem_total().map_err(Error::Mem)?;
+    let reserve = crate::host::reserve().map_err(Error::Mem)?;
+    let vms = (store.list()?.into_iter())
+        .filter(|vm| Some(vm.name.as_str()) != but)
+        .map(|vm| {
+            let state = state(store, &vm.name).unwrap_or(State::Running);
+            (state, vm.mem_mib)
+        });
+    Ok(Room::of(total, reserve, vms.collect::<Vec<_>>()))
+}
+
+fn lock_room(store: &Store) -> Result<File> {
+    room::lock(store.root()).map_err(|source| Error::Run {
+        prog: "the room lock",
+        source,
+    })
+}
+
+// Refused unless `name` fits in the room the other VMs leave.
+fn fits(store: &Store, name: &str) -> Result<()> {
+    let need = room::needs(store.get(name)?.mem_mib);
+    let free = room_but(store, Some(name))?.free();
+    if need <= free {
+        return Ok(());
+    }
+    let host = crate::hosts::hostname();
+    Err(NoRoom {
+        vm: name.to_string(),
+        need,
+        free,
+        host: if host.is_empty() {
+            "this host".into()
+        } else {
+            host
+        },
+    }
+    .into())
+}
+
+/// For a VM asleep, the room lock, for its wake to hold until it's awake,
+/// or refused if it doesn't fit; nothing for one awake. What every wake to
+/// use a VM goes through, a URL's included (src/boot.rs); a stop's doesn't.
+pub fn room_to_wake(store: &Store, name: &str) -> Result<Option<File>> {
+    // Only its boot's note tells asleep from awake.
+    if store.sleeping(name)?.is_none() {
+        return Ok(None);
+    }
+    let room = lock_room(store)?;
+    // A wake under way may have woken it meanwhile.
+    if store.sleeping(name)?.is_some() {
+        fits(store, name)?;
+    }
+    Ok(Some(room))
+}
+
+// `systemctl start`, holding the room lock until systemd counts the VM as up,
+// booting or running, or the start is over. A start stays one systemctl, so
+// a boot that fails isn't started again.
+fn boot(name: &str, room: File) -> Result<()> {
+    let unit = unit_name(name);
+    let args = ["start", unit.as_str()];
+    let run = |source| Error::Run {
+        prog: "systemctl",
+        source,
+    };
+    let mut child = Command::new("systemctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(run)?;
+    loop {
+        if child.try_wait().map_err(run)?.is_some() {
+            break;
+        }
+        match unit_state(name) {
+            Ok(State::Booting | State::Running) => break,
+            // systemd can't say: let the room go rather than hold it all boot.
+            Err(_) => break,
+            Ok(_) => std::thread::sleep(BOOTING_POLL),
+        }
+    }
+    drop(room);
+    let out = child.wait_with_output().map_err(run)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(Error::Failed {
+        command: format!("systemctl {}", args.join(" ")),
+        vm: name.to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    })
 }
 
 // Parked at a host shutdown (src/sleep.rs): asleep, with its unit stopped.

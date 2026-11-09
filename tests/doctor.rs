@@ -5,7 +5,9 @@ use runner::doctor::{self, Host, Ran, Report, Status};
 use runner::host;
 use runner::net::DEFAULT_SUBNET;
 use runner::power;
+use runner::room::Room;
 use runner::store::Store;
+use runner::systemd::State;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -117,7 +119,7 @@ fn without_ip6(rules: &str) -> String {
     format!("{}{}", &rules[..start], &rules[end..])
 }
 
-const NAMES: [&str; 10] = [
+const NAMES: [&str; 11] = [
     "kvm",
     "firecracker",
     "e2fsprogs",
@@ -128,6 +130,7 @@ const NAMES: [&str; 10] = [
     "unit",
     "key",
     "host-idle",
+    "room",
 ];
 
 // The faked user's home, where its SSH key is.
@@ -138,7 +141,10 @@ struct Fake {
     runs: HashMap<String, Result<Ran, ErrorKind>>,
     reflink: Result<bool, ErrorKind>,
     home: Result<PathBuf, ErrorKind>,
+    room: Result<Room, String>,
 }
+
+const GIB: u64 = 1 << 30;
 
 // By full path: sshd gives the runner user a PATH without /usr/sbin.
 fn version() -> String {
@@ -233,6 +239,8 @@ impl Fake {
             runs: runs.into_iter().collect(),
             reflink: Ok(true),
             home: Ok(HOME.into()),
+            // 8 GiB, a 1 GiB reserve, and a 4 GiB VM running.
+            room: Ok(Room::of(8 * GIB, GIB, [(State::Running, 4096)])),
         }
     }
 
@@ -279,6 +287,10 @@ impl Host for Fake {
 
     fn home(&self) -> io::Result<PathBuf> {
         self.home.clone().map_err(io::Error::from)
+    }
+
+    fn room(&self, _store: &Store) -> Result<Room, String> {
+        self.room.clone()
     }
 }
 
@@ -779,4 +791,30 @@ fn reflink_probe_fails_on_a_missing_directory() {
     let dir = tempfile::tempdir().unwrap();
     let err = doctor::reflinks(&dir.path().join("nope")).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+// The host's reserve and its room, which each boot and wake has to fit in. A
+// host with none still runs the VMs it has, so that only warns.
+#[test]
+fn room_shows_the_reserve_and_what_s_left_for_vms() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let report = assert_verdict(fake(), &store, "room", Status::Ok, "2.9G free for VMs");
+    let (_, detail) = verdict(&report, "room");
+    for says in [
+        "8.0G",
+        "1.0G reserve",
+        "4.1G",
+        "1 VM up",
+        "RUNNER_HOST_RESERVE",
+    ] {
+        assert!(detail.contains(says), "{detail:?} lacks {says:?}");
+    }
+    let mut full = fake();
+    full.room = Ok(Room::of(4 * GIB, GIB, [(State::Running, 4096)]));
+    let report = assert_verdict(full, &store, "room", Status::Warn, "no room");
+    assert!(verdict(&report, "room").1.contains("refused"));
+    let mut unread = fake();
+    unread.room = Err("no MemTotal in /proc/meminfo".into());
+    assert_verdict(unread, &store, "room", Status::Warn, "no MemTotal");
 }

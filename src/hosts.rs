@@ -1,7 +1,7 @@
 // This host's row in the laptop's `runner hosts`: its VMs, how many are up,
-// and its free memory. The laptop asks every host for its row at once, and
-// `runner create` there places a new VM on the host with the most free
-// memory, as MCP's create_vm does from the first host.
+// and its free memory, which is its room (src/room.rs). The laptop asks every
+// host for its row at once, and `runner create` there places a new VM on the
+// host with the most free memory, as MCP's create_vm does from the first host.
 use crate::store::{self, Store};
 use crate::systemd::{self, State};
 use rmcp::schemars;
@@ -13,8 +13,6 @@ pub enum Error {
     Store(#[from] store::Error),
     #[error(transparent)]
     Systemd(#[from] systemd::Error),
-    #[error("reading this host's free memory: {0}")]
-    Mem(std::io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -25,7 +23,8 @@ pub struct HostRow {
     pub vms: usize,
     /// How many of those are up: booting, running, sleeping or stopping.
     pub up: usize,
-    /// Its free memory in bytes: MemAvailable from /proc/meminfo.
+    /// Its free memory in bytes: its room, MemTotal less the host's reserve
+    /// and what the VMs up hold (src/room.rs).
     pub mem_available: u64,
 }
 
@@ -55,7 +54,7 @@ pub fn row(store: &Store) -> Result<HostRow, Error> {
         name: hostname(),
         vms: vms.len(),
         up,
-        mem_available: crate::host::mem_available().map_err(Error::Mem)?,
+        mem_available: systemd::room(store)?.free(),
     })
 }
 

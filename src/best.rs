@@ -36,9 +36,9 @@
 // batch. It holds dev's run lock throughout, as a batch's start does, so
 // it's refused while dev has a run going.
 use crate::checkpoint;
-use crate::host;
 use crate::idle::InUse;
 use crate::result::{Changed, Outcome, RunResult};
+use crate::room::FIRECRACKER_MIB;
 use crate::runs::{self, AgentRun, Start};
 use crate::store::{self, Config, DEFAULT_MEM_MIB, Source, Store};
 use crate::systemd::{self, State};
@@ -55,8 +55,6 @@ use std::time::Duration;
 pub const MIN: u32 = 2;
 /// The most tries a batch has.
 pub const MAX: u32 = 4;
-/// What the host keeps free past what a batch's tries take, in MiB.
-pub const SPARE_MIB: u64 = 1024;
 /// How many characters of what an agent says a row of `table` shows.
 pub const SAYS_WIDTH: usize = 60;
 // How often `wait` looks again: each look reads every try's result.
@@ -90,8 +88,8 @@ pub enum Error {
         left: String,
     },
     #[error(
-        "{n} tries of {vm} take {need} MiB, {n} times its {each}, and this host has {free} MiB free, \
-         less {SPARE_MIB} to spare: {fits}"
+        "{n} tries of {vm} take {need} MiB, {n} times its {each} and {FIRECRACKER_MIB} for its \
+         Firecracker, and this host has {free} MiB free: {fits}"
     )]
     NoRoom {
         vm: String,
@@ -101,8 +99,6 @@ pub enum Error {
         free: u64,
         fits: String,
     },
-    #[error("reading this host's free memory: {0}")]
-    Mem(io::Error),
     #[error("{name}'s run didn't start: {source}. {started}")]
     NotStarted {
         name: String,
@@ -202,7 +198,7 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
             e => e.into(),
         })?;
     }
-    room(vm, n, each)?;
+    room(store, vm, n, each)?;
     // A sleeping VM is woken for its checkpoint, and one booting or stopping
     // is refused.
     let checkpoint = match systemd::state(store, vm)? {
@@ -790,16 +786,16 @@ fn on_hand(store: &Store, vm: &str) -> Result<Option<Error>> {
     }))
 }
 
-// Refused unless the host's free memory, less SPARE_MIB, holds `n` VMs of
-// `each` MiB.
-fn room(vm: &str, n: u32, each: u64) -> Result<()> {
-    let free = host::mem_available().map_err(Error::Mem)? >> 20;
-    let need = each * u64::from(n);
-    let spare = free.saturating_sub(SPARE_MIB);
-    if need <= spare {
+// Refused unless the host's room (src/room.rs) holds `n` VMs of `each` MiB,
+// each with its Firecracker. The host's reserve is what it keeps to spare.
+fn room(store: &Store, vm: &str, n: u32, each: u64) -> Result<()> {
+    let free = systemd::room(store)?.free() >> 20;
+    let one = each + FIRECRACKER_MIB;
+    let need = one * u64::from(n);
+    if need <= free {
         return Ok(());
     }
-    let fit = spare / each.max(1);
+    let fit = free / one;
     let fits = match fit >= u64::from(MIN) {
         true => format!("--n {fit} fits"),
         false => "not even two fit".to_string(),
