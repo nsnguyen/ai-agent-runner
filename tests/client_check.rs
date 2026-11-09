@@ -23,6 +23,8 @@ const HOST: &str = "runner@kvm-host";
 const ADMIN: &str = "ubuntu@kvm-host";
 const VM: &str = "client-check";
 const LOG: &str = "/home/ubuntu/ai-agent-runner/target/check/20261103T200000Z-abcd.log";
+// RUNNER_MCP_URL on the fake host, on the port README.md funnels.
+const MCP_URL: &str = "https://kvm-host.tailnet.ts.net:8443";
 
 // Each fake starts with this: whether $FAKE/wrong names a key.
 const PRELUDE: &str = r#"wrong() { grep -qx "$1" "$FAKE/wrong" 2>/dev/null; }
@@ -51,6 +53,8 @@ done
 dest=$1
 shift
 cmd=$*
+# The host's /etc/runner, for what check.sh reads there, is $FAKE/etc-runner.
+case $cmd in "cat /etc/runner/"*) cmd=$(printf '%s' "$cmd" | sed "s|/etc/runner/|$FAKE/etc-runner/|g") ;; esac
 if [ -e "$FAKE/down" ]; then
   echo "ssh: connect to host ${dest#*@} port 22: Operation timed out" >&2
   exit 255
@@ -91,11 +95,25 @@ fi
 // proxy's tunnel there would be: the compose stack's page once it's up, else
 // the web service's, else nothing. proxy-drops drops the first hold once it's
 // held through check_proxy's 150 seconds. The VM's URL answers while it's on,
-// and wakes the VM. With -w, the status; without, the page.
-const FAKE_CURL: &str = r#"for url; do :; done
+// and wakes the VM. RUNNER_MCP_URL answers as the MCP server does with no
+// token: through Funnel only when public DNS (--doh-url) names it, since on
+// the tailnet MagicDNS takes it to the host, Funnel or not. With -w, the
+// status; without, the page. Every call goes in curl-calls, split by US.
+const FAKE_CURL: &str = r#"{ printf 'curl'; for arg; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$FAKE/curl-calls"
+for url; do :; done
 code=000
 page=
 case $url in
+https://kvm-host.tailnet.ts.net:8443/*)
+  case " $* " in *" --doh-url "*) public=1 ;; *) public= ;; esac
+  if [ -z "$public" ] || ! wrong funnel-off; then
+    case $url in
+    */mcp) code=401; ! wrong mcp-open || code=200 ;;
+    */.well-known/oauth-protected-resource) code=200; ! wrong no-metadata || code=404 ;;
+    *) code=404 ;;
+    esac
+  fi
+  ;;
 http://localhost:18080/*)
   if wrong port-taken; then
     code=200
@@ -560,7 +578,28 @@ impl Laptop {
         fs::create_dir_all(laptop.home().join(".ssh")).unwrap();
         fs::write(laptop.key(), "not a key\n").unwrap();
         laptop.host_says(&host_passing(), 0);
+        laptop.mcp_http(Some("1"), Some(MCP_URL));
         laptop
+    }
+
+    /// The host's /etc/runner/mcp-http and mcp-url, as install.sh keeps
+    /// them; None for one it hasn't written. On, with a URL, unless a test
+    /// says otherwise.
+    fn mcp_http(&self, on: Option<&str>, url: Option<&str>) -> &Laptop {
+        let etc = self.fake().join("etc-runner");
+        fs::create_dir_all(&etc).unwrap();
+        for (file, got) in [("mcp-http", on), ("mcp-url", url)] {
+            match got {
+                Some(got) => fs::write(etc.join(file), format!("{got}\n")).unwrap(),
+                None => drop(fs::remove_file(etc.join(file))),
+            }
+        }
+        self
+    }
+
+    /// Every URL curl was asked for, with --doh-url's server if it had one.
+    fn curl_calls(&self) -> Vec<Vec<String>> {
+        calls(&self.fake().join("curl-calls"))
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -1374,6 +1413,26 @@ const WRONG: &[(&str, &[&str])] = &[
     ("mcp-tail-lost", &["MCP exec: stdout doesn't end at 40000"]),
     ("mcp-no-cut", &["MCP exec: no cut marked"]),
     ("mcp-not-truncated", &["MCP exec: stdout_truncated"]),
+    // MCP over HTTP, through Funnel
+    (
+        "mcp-open",
+        &[
+            "MCP over HTTP: https://kvm-host.tailnet.ts.net:8443/mcp with no token gets HTTP 200, not 401",
+        ],
+    ),
+    (
+        "no-metadata",
+        &[
+            "MCP over HTTP: https://kvm-host.tailnet.ts.net:8443/.well-known/oauth-protected-resource gets HTTP 404, not 200",
+        ],
+    ),
+    (
+        "funnel-off",
+        &[
+            "MCP over HTTP: https://kvm-host.tailnet.ts.net:8443/mcp with no token gets HTTP 000, not 401",
+            "MCP over HTTP: https://kvm-host.tailnet.ts.net:8443/.well-known/oauth-protected-resource gets HTTP 000, not 200",
+        ],
+    ),
     // A run that joins a VM in use, and gc
     ("session-missing", &["runner sessions doesn't list"]),
     ("run-writes-nothing", &["the run never wrote joined.txt"]),
@@ -1643,5 +1702,78 @@ fn ctrl_c_ends_the_proxy_and_leaves_the_vm() {
             )),
             "{said}"
         );
+    }
+}
+
+// With MCP over HTTP on, the laptop reaches RUNNER_MCP_URL as claude.ai
+// does, through Funnel: its name looked up in public DNS, which MagicDNS
+// would otherwise answer with the host's tailnet address. /mcp wants a
+// token, and the metadata a client finds the sign-in by answers.
+#[test]
+fn mcp_over_http_is_reached_through_funnel_by_public_dns() {
+    for shell in SHELLS {
+        let laptop = Laptop::new();
+        let out = laptop.run(shell, &["laptop"]);
+        assert_eq!(out.status.code(), Some(0), "{shell:?}: {}", says(&out));
+        let stdout = text(&out.stdout);
+        for want in [
+            format!("PASS  MCP over HTTP: {MCP_URL}/mcp with no token gets 401"),
+            format!("PASS  MCP over HTTP: {MCP_URL}/.well-known/oauth-protected-resource gets 200"),
+        ] {
+            assert!(stdout.contains(&want), "{shell:?}: {want}: {stdout}");
+        }
+        let ours: Vec<_> = (laptop.curl_calls().into_iter())
+            .filter(|c| c.last().unwrap().starts_with(MCP_URL))
+            .collect();
+        assert_eq!(ours.len(), 2, "{ours:?}");
+        for call in ours {
+            let doh = call.iter().position(|a| a == "--doh-url");
+            let server = doh.map(|i| call[i + 1].as_str());
+            assert_eq!(server, Some("https://1.1.1.1/dns-query"), "{call:?}");
+        }
+        // Read on the host checked, as runner.
+        let read = laptop.ssh_calls();
+        let read = read.iter().find(|c| c.last().unwrap().starts_with("cat "));
+        let read = read.unwrap_or_else(|| panic!("{:?}", laptop.ssh_calls()));
+        assert_eq!(read[read.len() - 2], HOST, "{read:?}");
+        assert_eq!(
+            read.last().unwrap(),
+            "cat /etc/runner/mcp-http /etc/runner/mcp-url"
+        );
+    }
+}
+
+#[test]
+fn with_mcp_over_http_off_it_isn_t_checked() {
+    for off in [Some("0"), None] {
+        let laptop = Laptop::new();
+        laptop.mcp_http(off, Some(MCP_URL));
+        let out = laptop.run(SHELLS[0], &["laptop"]);
+        assert_eq!(out.status.code(), Some(0), "{off:?}: {}", says(&out));
+        let stdout = text(&out.stdout);
+        let want = format!("== MCP over HTTP: not checked, since {HOST} has it off");
+        assert!(stdout.contains(&want), "{off:?}: {stdout}");
+        let calls = laptop.curl_calls();
+        assert!(
+            !calls.iter().flatten().any(|a| a.contains("ts.net")),
+            "{calls:?}"
+        );
+    }
+}
+
+// On, with no URL, or one Funnel can't serve: nothing to reach, so a FAIL
+// saying how to set it.
+#[test]
+fn mcp_over_http_without_an_https_url_fails_saying_how_to_set_one() {
+    for url in [None, Some("http://kvm-host.tailnet.ts.net:8443")] {
+        let laptop = Laptop::new();
+        laptop.mcp_http(Some("1"), url);
+        let out = laptop.run(SHELLS[0], &["laptop"]);
+        assert_eq!(out.status.code(), Some(1), "{url:?}: {}", says(&out));
+        let fails = fails(&out);
+        assert_eq!(fails.len(), 1, "{url:?}: {fails:?}");
+        let want = format!("FAIL  laptop: MCP over HTTP: {HOST} has no https RUNNER_MCP_URL");
+        assert!(fails[0].starts_with(&want), "{url:?}: {fails:?}");
+        assert!(fails[0].contains("RUNNER_MCP_URL=https://"), "{fails:?}");
     }
 }
