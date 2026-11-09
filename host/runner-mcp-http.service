@@ -17,6 +17,10 @@ User=runner
 Environment=RUNNER_ROOT=/var/lib/runner
 ExecStart=/usr/local/bin/runner mcp --http 127.0.0.1:8740
 Restart=on-failure
+# A stop or restart, as every install.sh rerun does, ends the server alone.
+# The runs run_agent started, which setsid leaves in this cgroup, go on, as
+# they do when an SSH session's `runner mcp` ends.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

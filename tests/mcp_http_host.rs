@@ -45,6 +45,9 @@ fn the_unit_passes_systemd_analyze_verify() {
     assert!(dump.contains("User: runner"), "{dump}");
     assert!(dump.contains("RUNNER_ROOT=/var/lib/runner"), "{dump}");
     assert!(dump.contains("Restart: on-failure"), "{dump}");
+    // A stop or restart ends the server alone: the runs it started, which
+    // setsid leaves in its cgroup, go on, as they do over SSH.
+    assert!(dump.contains("KillMode: process"), "{dump}");
 }
 
 #[test]
@@ -279,6 +282,9 @@ fn turning_mcp_over_http_off_stops_and_removes_the_unit() {
     let reload = calls.iter().rposition(|c| c == "systemctl daemon-reload");
     assert!(disable.unwrap() < reload.unwrap(), "{calls:?}");
     assert!(!said.contains("mcp-http token"), "{said}");
+    // Its never stays, so the host stays up until told otherwise: it says how.
+    assert_eq!(h.kept("host-idle"), None);
+    assert!(said.contains("RUNNER_HOST_IDLE=1h"), "{said}");
     // And a rerun leaves it off, with nothing to stop.
     h.ok(&[]);
     assert_eq!(h.count(&mcp("disable --now")), 1);
@@ -345,4 +351,18 @@ fn install_sh_keeps_the_url_for_reruns_and_an_empty_one_drops_it() {
     assert_eq!(h.kept("mcp-url"), None);
     h.ok(&[]);
     assert_eq!(h.kept("mcp-url"), None);
+}
+
+// Behind Funnel or `tailscale serve`, a request's Host is the public one,
+// which the runner lets in only once RUNNER_MCP_URL names it.
+#[test]
+fn mcp_over_http_without_a_url_says_only_loopback_reaches_it() {
+    let h = Fake::new();
+    let said = h.ok(&[("RUNNER_MCP_HTTP", "1")]);
+    assert!(said.contains("no RUNNER_MCP_URL"), "{said}");
+    assert!(said.contains("403"), "{said}");
+    let h = Fake::new();
+    let url = "https://kvm-host.tailnet.ts.net";
+    let said = h.ok(&[("RUNNER_MCP_HTTP", "1"), ("RUNNER_MCP_URL", url)]);
+    assert!(!said.contains("no RUNNER_MCP_URL"), "{said}");
 }

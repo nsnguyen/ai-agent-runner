@@ -17,7 +17,7 @@ pub enum Error {
     #[error("{0}: {1}")]
     Io(String, #[source] io::Error),
     #[error(
-        "{dir} isn't this user's, so the server, which runs as runner, couldn't read a token made here: run it as runner, like `sudo -u runner runner mcp-http token`"
+        "{dir} isn't this user's, so the server, which runs as its owner, couldn't read a token made here: run it as that user, like `sudo -u runner runner mcp-http token`"
     )]
     NotMine { dir: String },
 }
@@ -54,18 +54,25 @@ fn lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
-// The directory, made 0700 if it isn't there, and this user's.
+// The directory, made 0700 if it isn't there, and this user's, as the root
+// is: the server runs as the root's owner, runner, and reads the file as it.
+// Anyone else, root above all, is refused before anything is made.
 fn ready(root: &Path) -> Result<()> {
+    mine(root)?;
     let dir = dir(root);
     match DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(io_err(format!("making {}", dir.display()))(e)),
     }
-    let meta = fs::metadata(&dir).map_err(io_err(format!("reading {}", dir.display())))?;
+    mine(&dir)
+}
+
+fn mine(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path).map_err(io_err(format!("reading {}", path.display())))?;
     if meta.uid() != nix::unistd::geteuid().as_raw() {
         return Err(Error::NotMine {
-            dir: dir.display().to_string(),
+            dir: path.display().to_string(),
         });
     }
     Ok(())
@@ -142,6 +149,7 @@ pub fn mint(root: &Path, how: &str) -> Result<String> {
 
 /// Drops every token, and says how many there were.
 pub fn revoke(root: &Path) -> Result<usize> {
+    mine(root)?;
     if !dir(root).exists() {
         return Ok(0);
     }

@@ -258,6 +258,11 @@ else
   rm -f /etc/runner/mcp-url
 fi
 if [[ $mcp_http == 1 ]]; then
+  # Behind Funnel or `tailscale serve` a request's Host is the public one,
+  # which the runner lets in only once RUNNER_MCP_URL names it.
+  if [[ -z $mcp_url ]]; then
+    say "no RUNNER_MCP_URL, so only loopback reaches it: through Funnel or tailscale serve each request gets 403 until RUNNER_MCP_URL=https://<its URL> $0"
+  fi
   install -m 0644 "$here/runner-mcp-http.service" /etc/systemd/system/runner-mcp-http.service
   systemctl daemon-reload
   systemctl enable runner-mcp-http.service
@@ -267,6 +272,10 @@ elif [[ -e /etc/systemd/system/runner-mcp-http.service ]]; then
   systemctl disable --now runner-mcp-http.service
   rm -f /etc/systemd/system/runner-mcp-http.service
   systemctl daemon-reload
+  # It set never, which stays: an idle time is only ever asked for.
+  if [[ $idle == never ]]; then
+    say "host idle stays never: RUNNER_HOST_IDLE=1h $0 sets an idle time again"
+  fi
 fi
 
 say "runner doctor"

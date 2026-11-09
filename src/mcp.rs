@@ -988,6 +988,31 @@ pub fn check_addr(addr: &SocketAddr) -> Result<(), String> {
     ))
 }
 
+/// Whether `url` will do as the public base URL: plain http(s)://host[:port]
+/// and a path, as host/install.sh takes RUNNER_MCP_URL, with nothing a
+/// header would need quoted, since a 401's challenge carries it.
+pub fn check_url(url: &str) -> Result<(), String> {
+    let refused = || {
+        format!(
+            "RUNNER_MCP_URL={url} isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net"
+        )
+    };
+    let rest = (url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(refused)?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = authority.split_once(':').unwrap_or((authority, "1"));
+    let host_ok = !host.is_empty()
+        && (host.chars()).all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    let port_ok = (1..=5).contains(&port.len()) && port.chars().all(|c| c.is_ascii_digit());
+    let path_ok = (path.chars()).all(|c| c.is_ascii_alphanumeric() || "._~/-".contains(c));
+    if host_ok && port_ok && path_ok {
+        Ok(())
+    } else {
+        Err(refused())
+    }
+}
+
 /// Serves MCP over Streamable HTTP at `addr`, on loopback, at /mcp, until
 /// it's killed. Every request needs a token from `runner mcp-http token`:
 /// one without gets 401, with a challenge naming `url`, the public base URL
@@ -1002,6 +1027,13 @@ pub async fn serve_http(
     url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     check_addr(&addr)?;
+    if let Some(url) = &url {
+        check_url(url)?;
+    } else {
+        eprintln!(
+            "runner mcp: no RUNNER_MCP_URL, so only loopback's Host is let in: through Funnel or tailscale serve each request gets 403"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let at = listener.local_addr()?;
     let base = url.map_or_else(

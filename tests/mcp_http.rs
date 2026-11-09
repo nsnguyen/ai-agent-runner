@@ -586,3 +586,48 @@ fn run_output_s_wait_holds_over_http() {
     });
     drop(lock);
 }
+
+// The server runs as the root's owner, runner, and reads the store as it: a
+// token made as anyone else, root above all, is refused before anything is
+// made, so the store can't end up one the server can't read.
+#[test]
+fn a_token_is_made_only_as_the_root_s_owner() {
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: only root can give the root to another user");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let nobody = nix::unistd::Uid::from_raw(65534);
+    nix::unistd::chown(&root, Some(nobody), None).unwrap();
+    for args in [["mcp-http", "token"], ["mcp-http", "revoke"]] {
+        let out = runner(&root, &args);
+        assert!(!out.status.success(), "{args:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("sudo -u"), "{args:?}: {err}");
+        assert!(!root.join("mcp-http").exists(), "{args:?}");
+    }
+}
+
+#[test]
+fn a_url_that_isn_t_plain_http_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for url in [
+        "kvm-host.tailnet.ts.net",
+        "ftp://kvm-host.tailnet.ts.net",
+        "https://kvm-host\".ts.net",
+        "https://kvm host.ts.net",
+        "https://",
+    ] {
+        let started = Instant::now();
+        let out = runner(dir.path(), &["mcp", "--http", "127.0.0.1:0", "--url", url]);
+        assert!(!out.status.success(), "{url}");
+        assert!(
+            text(&out.stderr).contains("RUNNER_MCP_URL"),
+            "{url}: {}",
+            text(&out.stderr)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
