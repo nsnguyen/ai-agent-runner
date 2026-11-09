@@ -2294,9 +2294,9 @@ fn hosts_rm_names_a_host_that_can_t_take_the_list() {
     }
 }
 
-// `runner mcp-http token` and `revoke` name no VM: they're for the first
-// host's MCP over HTTP, or the one --host names, never for a host with a VM
-// named token.
+// `runner mcp-http token`, `pair`, `list` and `revoke` name no VM: they're
+// for the first host's MCP over HTTP, or the one --host names, never for a
+// host with a VM named token, or web.
 #[test]
 fn mcp_http_goes_to_the_first_host_unless_host_says() {
     for shell in SHELLS {
@@ -2313,6 +2313,19 @@ fn mcp_http_goes_to_the_first_host_unless_host_says() {
         ok(&fleet.run(shell, &["mcp-http", "token", "--host", "kvm-host-2"]));
         assert!(fleet.calls("kvm-host").is_empty(), "{shell:?}");
         assert_eq!(fleet.calls("kvm-host-2"), ["mcp-http token"], "{shell:?}");
+
+        // OAuth's pair, list and revoke <client> too, a client's id that's
+        // a VM's name elsewhere included.
+        for args in [
+            &["mcp-http", "pair"][..],
+            &["mcp-http", "list"],
+            &["mcp-http", "revoke", "web"],
+        ] {
+            fleet.forget_calls();
+            ok(&fleet.run(shell, args));
+            assert_eq!(fleet.calls("kvm-host"), [args.join(" ")], "{shell:?}");
+            assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?} {args:?}");
+        }
     }
 }
 

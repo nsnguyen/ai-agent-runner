@@ -502,11 +502,11 @@ Nor do they get `AWS_PROFILE`, or the AWS CLI on PATH, which starting a stopped 
 
 claude.ai, and any client that can't run a command, reaches the same server over Streamable HTTP: the same tools, reaching the other listed hosts the same way. It's off unless set. On the first host, `sudo RUNNER_MCP_HTTP=1 RUNNER_MCP_URL=https://kvm-host.<tailnet>.ts.net host/install.sh` starts `runner-mcp-http.service`, which is `runner mcp --http 127.0.0.1:8740` as runner, and reruns remember both (`/etc/runner/mcp-http`, `/etc/runner/mcp-url`); `RUNNER_MCP_HTTP=0` stops it and takes it out. It listens on loopback only and refuses any other address: Funnel or `tailscale serve` puts it on a URL, which `RUNNER_MCP_URL` names. Without that URL only loopback's Host is let in, so a request through either gets 403, which install.sh warns of. It also sets the host's idle time to never, since claude.ai can't start a stopped host, so the host runs around the clock, and `runner doctor` warns when it's set otherwise. Turning it off leaves never as it is: `RUNNER_MCP_HTTP=0 RUNNER_HOST_IDLE=1h host/install.sh` sets an idle time again. Only this host is kept up: a peer with an idle time that has stopped doesn't answer until something starts it, like the laptop's `runner`, and a call for its VMs fails meanwhile, naming it.
 
-Every request needs a bearer token:
+Every request needs a bearer token. claude.ai gets its own by OAuth (From claude.ai and the phone); for curl, and clients that take a header:
 
 ```sh
 runner mcp-http token     # a new one, printed once: only its SHA-256 is kept, in /var/lib/runner/mcp-http
-runner mcp-http revoke    # drops every token
+runner mcp-http revoke    # drops every token, OAuth's too, and a waiting pairing code
 ```
 
 From the laptop both go to the first host. A client sends the token as `Authorization: Bearer <token>`. With none, or a wrong or revoked one, a request gets 401, with `WWW-Authenticate: Bearer resource_metadata="<RUNNER_MCP_URL>/.well-known/oauth-protected-resource"`, and no tool runs. A browser's request from an Origin other than https://claude.ai or https://claude.com is refused, and so is a Host other than loopback's or `RUNNER_MCP_URL`'s, against DNS rebinding. There's no laptop to pass `--peer`, so the server reads the hosts from `/var/lib/runner/peers` at each call, and a host added later is reached without a restart: `runner hosts add` and `hosts rm` write it on the first host, the hosts as listed, that one first. On a host set up before this, `runner hosts add` with any listed host writes it. A long call holds its request open as long as it works: `run_output`'s 45-second wait, or an `exec` with a long `timeout_secs`.
@@ -518,6 +518,20 @@ curl -s http://127.0.0.1:8740/mcp -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
+
+#### From claude.ai and the phone
+
+claude.ai signs in by OAuth, so no token is pasted anywhere. With the server on a URL (Over HTTP), add a custom connector in claude.ai's Settings, Connectors, at `RUNNER_MCP_URL/mcp`, and connect it. claude.ai registers itself and opens an approval page on the host that names it; type there the code `pair` prints:
+
+```sh
+runner mcp-http pair              # a code for the approval page: single use, 10 minutes, void after 5 wrong tries
+runner mcp-http list              # each client: its id, live tokens, when it last called, its name
+runner mcp-http revoke <client>   # drops that client's tokens; it can pair again
+```
+
+From the laptop they go to the first host, as `token` does. Allowed, the page sends you back to claude.ai with a code good for a minute, which claude.ai trades for an access token that lasts an hour and a refresh token that lasts 30 days, and it refreshes on its own from then on. Registration takes only claude.ai's and claude.com's callbacks, so a code can't be sent anywhere else, and nobody gets a token without a code from `pair`. A refresh token is replaced at each use: one used twice, or an authorization code tried twice, revokes all of that client's tokens, and claude.ai has to connect again. docs/design.md (Credentials) says what claude.ai holds. The endpoints are under `RUNNER_MCP_URL`: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize` and `/token`.
+
+#### The tools
 
 The `exec` tool runs a command in a VM, starting it first if it's stopped: `argv`, optional `stdin` text, `env` (variables as an object; `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `GH_TOKEN` are refused, since credentials reach a VM only through `runner creds`), and `timeout_secs` (120 unless given), after which the command is killed. It returns the exit code or signal, and stdout and stderr, each whole up to 32 KiB; past that, its first and last 16 KiB with a line between saying how many bytes were cut, and a truncated flag, so the error a long command prints last is kept. It runs as `agent`, or as `RUNNER_USER` if the host's environment sets one.
 

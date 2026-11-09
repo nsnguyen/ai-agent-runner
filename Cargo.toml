@@ -45,5 +45,6 @@ nix = { version = "0.31", features = ["sched"] }
 proptest = "1"
 # An MCP client over HTTP, and plain requests, for runner mcp --http.
 reqwest = { version = "0.13", default-features = false }
-rmcp = { version = "3.8", features = ["transport-streamable-http-client-reqwest"] }
+# Its OAuth client, too, against src/oauth.rs.
+rmcp = { version = "3.8", features = ["transport-streamable-http-client-reqwest", "auth"] }
 tempfile = "3"

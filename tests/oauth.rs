@@ -1128,3 +1128,43 @@ fn registration_keeps_only_a_few_clients_that_never_paired() {
     assert!(!out.contains(&ids[0]));
     assert!(host.mcp_works(&tokens.access));
 }
+
+// rmcp's own OAuth client, which follows the MCP spec's discovery: from
+// /mcp's URL it finds the metadata, registers, and sends the browser to the
+// page; the redirect the page answers with completes it, a refresh works,
+// and its token calls MCP.
+#[test]
+fn rmcp_s_oauth_client_signs_in() {
+    use rmcp::transport::auth::{AuthorizationRequest, OAuthState};
+    let host = Host::new();
+    let mut state = host.rt.block_on(async {
+        let mut state = OAuthState::new(host.mcp(), None).await.unwrap();
+        let request = AuthorizationRequest::new(CALLBACK).with_client_name("rmcp test");
+        state.start_authorization(request).await.unwrap();
+        state
+    });
+    let url = host.rt.block_on(state.get_authorization_url()).unwrap();
+    let code = host.pair();
+    let page = host.get(&url);
+    assert_eq!(page.status, StatusCode::OK, "{url}: {}", page.body);
+    assert!(page.body.contains("rmcp test"), "{}", page.body);
+    let back = host.approve(&page, &code);
+    let location = back.location.clone().unwrap_or_else(|| panic!("{back:?}"));
+    host.rt
+        .block_on(state.handle_callback_url(&location))
+        .unwrap();
+    let token = |state: &OAuthState| -> String {
+        let (_, response) = host.rt.block_on(state.get_credentials()).unwrap();
+        let response = serde_json::to_value(response.unwrap()).unwrap();
+        response["access_token"].as_str().unwrap().to_string()
+    };
+    let first = token(&state);
+    assert!(host.mcp_works(&first));
+    let OAuthState::Authorized(manager) = &state else {
+        panic!("not authorized");
+    };
+    host.rt.block_on(manager.refresh_token()).unwrap();
+    let second = token(&state);
+    assert_ne!(first, second);
+    assert!(host.mcp_works(&second));
+}
