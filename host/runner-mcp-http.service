@@ -1,0 +1,22 @@
+# runner-mcp-http.service, which host/install.sh installs only with
+# RUNNER_MCP_HTTP=1: the runner's MCP tools over HTTP, for claude.ai and
+# other clients that can't run `runner mcp` over SSH. Each request needs a
+# token from `runner mcp-http token`. It listens on loopback only, and
+# Funnel or `tailscale serve` reaches it. The runner reads its public URL
+# from /etc/runner/mcp-url, so the unit names none.
+[Unit]
+Description=runner: MCP over HTTP
+# The VMs and the tokens are there.
+RequiresMountsFor=/var/lib/runner
+# It reaches the other hosts' runners over SSH.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=runner
+Environment=RUNNER_ROOT=/var/lib/runner
+ExecStart=/usr/local/bin/runner mcp --http 127.0.0.1:8740
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

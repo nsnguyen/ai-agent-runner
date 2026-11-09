@@ -44,6 +44,21 @@ pub const IDLE_TIMER_UNIT: &str = include_str!("../host/runner-host-idle.timer")
 /// How long since the host booted, in seconds, first on its line.
 pub const UPTIME: &str = "/proc/uptime";
 
+/// Whether the host serves the runner's MCP tools over HTTP, 1 or 0, as
+/// host/install.sh keeps it from RUNNER_MCP_HTTP. Missing, as before
+/// install.sh wrote it, is 0. With 1, the host's idle time is never:
+/// claude.ai can't start a stopped host.
+pub const MCP_HTTP: &str = "/etc/runner/mcp-http";
+/// The public base URL Funnel or `tailscale serve` gives that server, like
+/// https://kvm-host.tailnet.ts.net, as host/install.sh keeps it from
+/// RUNNER_MCP_URL. RUNNER_MCP_URL itself comes first.
+pub const MCP_URL: &str = "/etc/runner/mcp-url";
+/// The unit that serves them, as host/install.sh installs it with
+/// RUNNER_MCP_HTTP=1, and where it listens: on loopback only.
+pub const MCP_HTTP_SERVICE: &str = "runner-mcp-http.service";
+pub const MCP_HTTP_UNIT: &str = include_str!("../host/runner-mcp-http.service");
+pub const MCP_HTTP_ADDR: &str = "127.0.0.1:8740";
+
 // By full path, because sshd gives the runner user a PATH without /usr/sbin.
 pub const FIRECRACKER: &str = "/usr/local/bin/firecracker";
 pub const NFT: &str = "/usr/sbin/nft";

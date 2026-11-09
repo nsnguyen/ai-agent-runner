@@ -10,8 +10,14 @@
 # 2h), or never, the default; it's kept in /etc/runner/host-idle for reruns
 # (src/power.rs). RUNNER_HOST_RESERVE sets how much memory the host keeps for
 # itself, like 2G (default 1G): VMs boot only into the rest, kept in
-# /etc/runner/reserve for reruns (src/room.rs). Safe to rerun, after an
-# upgrade too: every step overwrites or checks, never appends.
+# /etc/runner/reserve for reruns (src/room.rs). RUNNER_MCP_HTTP=1 serves the
+# runner's MCP tools over HTTP on 127.0.0.1:8740 (runner-mcp-http.service),
+# and sets the idle time to never, since claude.ai can't start a stopped
+# host; it's off unless set, and kept in /etc/runner/mcp-http for reruns.
+# RUNNER_MCP_URL is the public base URL Funnel or `tailscale serve` gives it,
+# like https://kvm-host.tailnet.ts.net, kept in /etc/runner/mcp-url; set
+# empty, it drops the one kept. Safe to rerun, after an upgrade too: every
+# step overwrites or checks, never appends.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,6 +25,9 @@ bin=${1:-$(dirname "$here")/target/release/runner}
 net=${RUNNER_NET:-$(cat /etc/runner/net 2>/dev/null || echo 172.16.0.0/16)}
 idle=${RUNNER_HOST_IDLE:-$(cat /etc/runner/host-idle 2>/dev/null || echo never)}
 reserve=${RUNNER_HOST_RESERVE:-$(cat /etc/runner/reserve 2>/dev/null || echo 1G)}
+mcp_http=${RUNNER_MCP_HTTP:-$(cat /etc/runner/mcp-http 2>/dev/null || echo 0)}
+# Set but empty, it's none.
+mcp_url=${RUNNER_MCP_URL-$(cat /etc/runner/mcp-url 2>/dev/null || true)}
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -47,6 +56,16 @@ fi
 bad_reserve="RUNNER_HOST_RESERVE=$reserve isn't a memory size: use MiB, or a whole number with M or G, like 2G"
 [[ $reserve =~ ^[0-9]{1,6}([MmGg]([Ii][Bb])?)?$ ]] || die "$bad_reserve"
 ((10#${reserve%%[!0-9]*} > 0)) || die "$bad_reserve"
+[[ $mcp_http == [01] ]] || die "RUNNER_MCP_HTTP=$mcp_http isn't 0 or 1: 1 serves the MCP tools over HTTP, 0 doesn't"
+# The runner hands it to clients as it is, so only what needs no quoting.
+url='^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+[[ -z $mcp_url || $mcp_url =~ $url ]] || die "RUNNER_MCP_URL=$mcp_url isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net"
+# claude.ai can't start a stopped host, so one that serves it stays up. Set
+# here, before the polkit rule and the timer, which both go by it.
+if [[ $mcp_http == 1 && $idle != never ]]; then
+  say "host idle never, not $idle: claude.ai can't start a stopped host, so RUNNER_MCP_HTTP=1 keeps it up"
+  idle=never
+fi
 
 missing=()
 command -v nft >/dev/null || missing+=(nftables)
@@ -227,6 +246,28 @@ else
   systemctl restart runner-host-idle.timer
 fi
 
+say "MCP over HTTP: RUNNER_MCP_HTTP=$mcp_http${mcp_url:+ RUNNER_MCP_URL=$mcp_url}"
+# Kept for reruns, as net is. The runner reads the URL there (src/host.rs).
+echo "$mcp_http" >"$tmp/mcp-http"
+install -m 0644 "$tmp/mcp-http" /etc/runner/mcp-http
+if [[ -n $mcp_url ]]; then
+  echo "$mcp_url" >"$tmp/mcp-url"
+  install -m 0644 "$tmp/mcp-url" /etc/runner/mcp-url
+else
+  rm -f /etc/runner/mcp-url
+fi
+if [[ $mcp_http == 1 ]]; then
+  install -m 0644 "$here/runner-mcp-http.service" /etc/systemd/system/runner-mcp-http.service
+  systemctl daemon-reload
+  systemctl enable runner-mcp-http.service
+  # So a rerun serves with the new binary and URL.
+  systemctl restart runner-mcp-http.service
+elif [[ -e /etc/systemd/system/runner-mcp-http.service ]]; then
+  systemctl disable --now runner-mcp-http.service
+  rm -f /etc/systemd/system/runner-mcp-http.service
+  systemctl daemon-reload
+fi
+
 say "runner doctor"
 runuser -u runner -- /usr/local/bin/runner doctor || true
 cat <<EOF
@@ -236,3 +277,6 @@ Next:
   2. Add the laptop's SSH key to $home/.ssh/authorized_keys, as README.md says.
   3. Bring in the base disk, or a new one: sudo -u runner /usr/local/bin/runner import --replace base - <path/to/base.ext4>
 EOF
+if [[ $mcp_http == 1 ]]; then
+  echo "  4. Make a token for an MCP client over HTTP, shown only once: sudo -u runner /usr/local/bin/runner mcp-http token"
+fi
