@@ -56,6 +56,7 @@ fi
 bad_reserve="RUNNER_HOST_RESERVE=$reserve isn't a memory size: use MiB, or a whole number with M or G, like 2G"
 [[ $reserve =~ ^[0-9]{1,6}([MmGg]([Ii][Bb])?)?$ ]] || die "$bad_reserve"
 ((10#${reserve%%[!0-9]*} > 0)) || die "$bad_reserve"
+
 [[ $mcp_http == [01] ]] || die "RUNNER_MCP_HTTP=$mcp_http isn't 0 or 1: 1 serves the MCP tools over HTTP, 0 doesn't"
 # The runner hands it to clients as it is, so only what needs no quoting.
 url='^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
