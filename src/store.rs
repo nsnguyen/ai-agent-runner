@@ -126,6 +126,15 @@ pub struct Vm {
     pub mem_mib: u32,
 }
 
+/// Every VM on the host, as `Store::survey` finds them.
+#[derive(Debug, Default)]
+pub struct Survey {
+    /// Those that can be read, by name.
+    pub vms: Vec<Vm>,
+    /// Those that can't, by name, with why.
+    pub broken: Vec<(String, Error)>,
+}
+
 /// What `Store::resize` changes, each left out kept as it is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sizes {
@@ -885,12 +894,22 @@ impl Store {
     }
 
     pub fn list(&self) -> Result<Vec<Vm>> {
+        let Survey { vms, broken } = self.survey()?;
+        // One broken VM shouldn't hide the rest.
+        for (name, e) in broken {
+            eprintln!("runner: skipping {name}: {e}");
+        }
+        Ok(vms)
+    }
+
+    /// `list`, and each VM that can't be read.
+    pub fn survey(&self) -> Result<Survey> {
         let vms = self.vms();
         let entries = match fs::read_dir(&vms) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Survey::default()),
             r => r.map_err(at(&vms))?,
         };
-        let mut out = Vec::new();
+        let (mut out, mut broken) = (Vec::new(), Vec::new());
         for entry in entries {
             let name = entry.map_err(at(&vms))?.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -898,12 +917,12 @@ impl Store {
                 Ok(vm) => out.push(vm),
                 // Not a VM's directory: a staging one, or something else.
                 Err(Error::NoVm(_) | Error::BadName(_)) => {}
-                // One broken VM shouldn't hide the rest.
-                Err(e) => eprintln!("runner: skipping {name}: {e}"),
+                Err(e) => broken.push((name.to_string(), e)),
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        broken.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Survey { vms: out, broken })
     }
 
     /// Clones the current disk into a new generation for one run to boot

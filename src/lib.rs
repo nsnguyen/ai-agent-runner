@@ -29,6 +29,7 @@ pub mod proto;
 pub mod rebase;
 pub mod resize;
 pub mod result;
+pub mod room;
 pub mod runs;
 pub mod services;
 pub mod sessions;

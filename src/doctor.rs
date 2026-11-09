@@ -5,7 +5,9 @@ use crate::fence;
 use crate::host;
 use crate::idle::Idle;
 use crate::power;
+use crate::room::{Room, gib};
 use crate::store::{BASE, Error, Store};
+use crate::systemd;
 use rmcp::schemars;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
@@ -68,6 +70,8 @@ pub trait Host {
     fn reflinks(&self, dir: &Path) -> io::Result<bool>;
     /// This user's home directory.
     fn home(&self) -> io::Result<PathBuf>;
+    /// The host's room (src/room.rs), or why it can't be read.
+    fn room(&self, store: &Store) -> Result<Room, String>;
 }
 
 /// The machine this runs on.
@@ -124,6 +128,10 @@ impl Host for System {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn room(&self, store: &Store) -> Result<Room, String> {
+        systemd::room(store).map_err(|e| e.to_string())
+    }
 }
 
 /// Whether files in `dir` can be cloned by reflink, tried with the same GNU
@@ -159,6 +167,7 @@ pub fn check(host: &impl Host, store: &Store) -> Report {
         named("unit", unit(host)),
         named("key", key(host)),
         named("host-idle", host_idle(host, store.root())),
+        named("room", room(host, store)),
     ];
     let ok = checks.iter().all(|c| c.status != Status::Fail);
     Report { ok, checks }
@@ -571,6 +580,30 @@ fn host_idle(host: &impl Host, root: &Path) -> Verdict {
     ok(format!(
         "{idle}: the host powers itself off once every VM has been stopped or asleep, with no one but runner logged in, for {idle}"
     ))
+}
+
+// The host's reserve, and the room the VMs up leave, which each boot and wake
+// has to fit in. A host with none still runs the VMs it has, so it only warns.
+fn room(host: &impl Host, store: &Store) -> Verdict {
+    let room = match host.room(store) {
+        Ok(room) => room,
+        Err(why) => return warn(why),
+    };
+    let s = if room.up == 1 { "" } else { "s" };
+    let sums = format!(
+        "{}, less a {} reserve for the host and {} for {} VM{s} awake \
+         (sudo RUNNER_HOST_RESERVE=2G {INSTALL} sets the reserve)",
+        gib(room.total),
+        gib(room.reserve),
+        gib(room.held),
+        room.up
+    );
+    match room.free() {
+        0 => warn(format!(
+            "no room: each start or wake is refused until a VM stops or sleeps. {sums}"
+        )),
+        free => ok(format!("{} free for VMs: {sums}", gib(free))),
+    }
 }
 
 // What `runner hosts add` takes from a host's id_ed25519.pub: its first line

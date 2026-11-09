@@ -231,11 +231,18 @@ fn a_stopped_vm_is_started_first() {
     let out = vm.run(&["exec", "dev", "--", "true"], b"");
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     let start = "systemctl start firecracker@dev.service";
-    assert_eq!(vm.sd.calls(), [show, start, show]);
+    // The rest are shows: of dev, and of each VM, for the host's room.
+    let verbs = || -> Vec<String> {
+        let calls = vm.sd.calls().into_iter();
+        calls.filter(|c| c != show).collect()
+    };
+    assert_eq!(vm.sd.calls()[0], show);
+    assert_eq!(verbs(), [start]);
+    let before = vm.sd.calls().len();
 
     let out = vm.run(&["exec", "dev", "--", "true"], b"");
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
-    assert_eq!(vm.sd.calls(), [show, start, show, show]);
+    assert_eq!(vm.sd.calls()[before..], [show]);
     assert_eq!(vm.vsock.connects(), ["CONNECT 10022", "CONNECT 10022"]);
 }
 
