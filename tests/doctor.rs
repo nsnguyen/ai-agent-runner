@@ -755,6 +755,37 @@ fn host_idle_shows_the_setting_and_whether_the_host_can_power_itself_off() {
     assert!(verdict(&report, "host-idle").1.contains("host/install.sh"));
 }
 
+// claude.ai can't start a stopped host, so with MCP over HTTP on, an idle
+// time is one it fails after. install.sh sets never then.
+#[test]
+fn host_idle_warns_when_mcp_over_http_is_on_and_the_host_can_stop() {
+    let (_dir, store) = with_base();
+    let fake = || Fake::healthy(store.root());
+    let on = fake().file(host::MCP_HTTP, Ok("1\n"));
+    let report = assert_verdict(on, &store, "host-idle", Status::Warn, "MCP over HTTP");
+    let said = verdict(&report, "host-idle").1;
+    let fixes = ["never", "RUNNER_MCP_HTTP=0", "host/install.sh"];
+    for says in ["1h", host::MCP_HTTP].iter().chain(&fixes) {
+        assert!(said.contains(says), "{said:?} lacks {says:?}");
+    }
+
+    // Never, or no idle time at all, is what it needs.
+    let never = fake()
+        .file(host::MCP_HTTP, Ok("1\n"))
+        .file(host::HOST_IDLE, Ok("never\n"));
+    assert_verdict(never, &store, "host-idle", Status::Ok, "never");
+    let unset = fake()
+        .file(host::MCP_HTTP, Ok("1\n"))
+        .file(host::HOST_IDLE, Err(ErrorKind::NotFound));
+    assert_verdict(unset, &store, "host-idle", Status::Ok, "never");
+
+    // Off, or never turned on, changes nothing.
+    let off = fake().file(host::MCP_HTTP, Ok("0\n"));
+    assert_verdict(off, &store, "host-idle", Status::Ok, "powers itself off");
+    let unset = fake().file(host::MCP_HTTP, Err(ErrorKind::NotFound));
+    assert_verdict(unset, &store, "host-idle", Status::Ok, "powers itself off");
+}
+
 #[test]
 fn the_pin_is_a_release_version() {
     let v = host::firecracker_version();
