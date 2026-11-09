@@ -19,9 +19,12 @@ path = "src/bin/runner-guest.rs"
 [dependencies]
 # MCP over HTTP: rmcp's Streamable HTTP server, served by axum.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# OAuth for claude.ai: PKCE's base64url and HTTP Basic, and forms.
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 ext4-view = { version = "1", features = ["std"] }
+form_urlencoded = "1"
 hickory-proto = "0.26"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "net", "poll", "process", "signal", "socket", "term", "user"] }

@@ -7,9 +7,11 @@ name = "ai-agent-runner"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "clap",
  "ext4-view",
+ "form_urlencoded",
  "hickory-proto",
  "libc",
  "nix",

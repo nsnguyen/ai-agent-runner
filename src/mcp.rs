@@ -19,6 +19,7 @@ use crate::doctor::{self, Report, System};
 use crate::exec::{self, Captured};
 use crate::hosts::{self, HostRow};
 use crate::moves::{self, Moved};
+use crate::oauth;
 use crate::peers::{Remote, structured};
 use crate::proto::Request;
 use crate::rebase::{self, Rebased};
@@ -1040,7 +1041,22 @@ pub async fn serve_http(
         );
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_on(listener, store, user, url, oauth::Clock::system()).await
+}
+
+/// `serve_http` on a listener already bound, with the clock OAuth's
+/// lifetimes run on: tests give it one they can move on.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    store: Store,
+    user: String,
+    url: Option<String>,
+    clock: oauth::Clock,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let at = listener.local_addr()?;
+    if !at.ip().is_loopback() {
+        return Err(format!("{at} isn't a loopback address").into());
+    }
     let base = url.map_or_else(
         || format!("http://{at}"),
         |u| u.trim_end_matches('/').to_string(),
