@@ -8,8 +8,9 @@
 # With several, a command naming a VM goes to the host that has it (README.md,
 # Several hosts), and move's target is passed on as listed, since that host's
 # ssh reaches it. A host aws.sh made that a command finds stopped is started
-# first, by the aws.sh beside this script (README.md, Day to day). POSIX sh
-# only, since macOS's /bin/sh runs it.
+# first, by the aws.sh beside this script (README.md, Day to day), and create
+# starts one when no running host has room. POSIX sh only, since macOS's
+# /bin/sh runs it.
 
 # No argument or host name is ever a glob.
 set -f
