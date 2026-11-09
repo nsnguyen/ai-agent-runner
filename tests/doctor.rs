@@ -805,7 +805,7 @@ fn room_shows_the_reserve_and_what_s_left_for_vms() {
         "8.0G",
         "1.0G reserve",
         "4.1G",
-        "1 VM up",
+        "1 VM awake",
         "RUNNER_HOST_RESERVE",
     ] {
         assert!(detail.contains(says), "{detail:?} lacks {says:?}");

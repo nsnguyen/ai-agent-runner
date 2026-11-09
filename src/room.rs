@@ -77,8 +77,8 @@ pub fn needs(mem_mib: u32) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "{vm} needs {}; {host} has {} free: stop or sleep a VM, or move {vm}",
-    gib(*need),
-    gib(*free)
+    tenths(*need, f64::ceil),
+    tenths(*free, f64::floor)
 )]
 pub struct NoRoom {
     pub vm: String,
@@ -90,9 +90,16 @@ pub struct NoRoom {
     pub host: String,
 }
 
-/// Bytes in GiB, to a tenth, like 4.1G.
+/// Bytes in GiB, to the nearest tenth, like 4.1G.
 pub fn gib(bytes: u64) -> String {
-    format!("{:.1}G", bytes as f64 / f64::from(1u32 << 30))
+    tenths(bytes, f64::round)
+}
+
+// Bytes in GiB, to a tenth rounded as `round` does, so a refusal can round
+// what's needed up and what's free down, and never read as if it fit.
+fn tenths(bytes: u64, round: fn(f64) -> f64) -> String {
+    let tenths = round(bytes as f64 * 10.0 / f64::from(1u32 << 30));
+    format!("{:.1}G", tenths / 10.0)
 }
 
 /// The lock a check holds until the VM it let through counts as up.

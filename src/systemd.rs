@@ -59,6 +59,8 @@ pub enum Error {
     NoRoom(#[from] NoRoom),
     #[error("reading this host's memory: {0}")]
     Mem(io::Error),
+    #[error("taking the room lock: {0}")]
+    RoomLock(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -219,30 +221,38 @@ pub fn room(store: &Store) -> Result<Room> {
     room_but(store, None)
 }
 
-// The room, not counting `but`'s own. A VM whose state systemd can't say
-// counts as up: the room can't count on its memory, and one VM's unit
-// shouldn't stop every other VM booting.
-fn room_but(store: &Store, but: Option<&str>) -> Result<Room> {
+/// The room on this host with VMs in these states, each with its memory in
+/// MiB: its MemTotal and reserve, less what those hold.
+pub fn room_with(vms: impl IntoIterator<Item = (State, u32)>) -> Result<Room> {
     let total = crate::host::mem_total().map_err(Error::Mem)?;
     let reserve = crate::host::reserve().map_err(Error::Mem)?;
-    let vms = (store.list()?.into_iter())
+    Ok(Room::of(total, reserve, vms))
+}
+
+// The room, not counting `but`'s own. A VM whose state systemd can't say
+// counts as up: the room can't count on its memory, and one VM's unit
+// shouldn't stop every other VM booting. So does one whose directory can't
+// be read, with the default memory, unless it's stopped. Quietly: the boot's
+// URL asks too, where eprintln! would panic.
+fn room_but(store: &Store, but: Option<&str>) -> Result<Room> {
+    let crate::store::Survey { vms, broken } = store.survey()?;
+    let state = |name: &str| state(store, name).unwrap_or(State::Running);
+    let vms = (vms.into_iter())
         .filter(|vm| Some(vm.name.as_str()) != but)
-        .map(|vm| {
-            let state = state(store, &vm.name).unwrap_or(State::Running);
-            (state, vm.mem_mib)
-        });
-    Ok(Room::of(total, reserve, vms.collect::<Vec<_>>()))
+        .map(|vm| (state(&vm.name), vm.mem_mib));
+    let broken = (broken.into_iter())
+        .filter(|(name, _)| Some(name.as_str()) != but)
+        .map(|(name, _)| (state(&name), crate::store::DEFAULT_MEM_MIB));
+    room_with(vms.chain(broken).collect::<Vec<_>>())
 }
 
 fn lock_room(store: &Store) -> Result<File> {
-    room::lock(store.root()).map_err(|source| Error::Run {
-        prog: "the room lock",
-        source,
-    })
+    room::lock(store.root()).map_err(Error::RoomLock)
 }
 
-// Refused unless `name` fits in the room the other VMs leave.
-fn fits(store: &Store, name: &str) -> Result<()> {
+/// Refused unless `name` fits in the room the other VMs leave: a look, with
+/// no lock, for a command that boots it later to refuse at once.
+pub fn fits(store: &Store, name: &str) -> Result<()> {
     let need = room::needs(store.get(name)?.mem_mib);
     let free = room_but(store, Some(name))?.free();
     if need <= free {

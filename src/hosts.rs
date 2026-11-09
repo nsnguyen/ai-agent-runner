@@ -44,17 +44,16 @@ impl HostRow {
 /// This host's row, asking systemd how each VM stands.
 pub fn row(store: &Store) -> Result<HostRow, Error> {
     let vms = store.list()?;
-    let mut up = 0;
+    let mut states = Vec::new();
     for vm in &vms {
-        if systemd::status(store, &vm.name)?.state != State::Stopped {
-            up += 1;
-        }
+        states.push((systemd::status(store, &vm.name)?.state, vm.mem_mib));
     }
+    let up = states.iter().filter(|(s, _)| *s != State::Stopped).count();
     Ok(HostRow {
         name: hostname(),
         vms: vms.len(),
         up,
-        mem_available: systemd::room(store)?.free(),
+        mem_available: systemd::room_with(states)?.free(),
     })
 }
 

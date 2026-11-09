@@ -123,7 +123,7 @@ pub fn reserve_in(path: &Path) -> io::Result<u64> {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{}: {e}. RUNNER_HOST_RESERVE=1G host/install.sh sets it again",
+                "{}: {e}. sudo RUNNER_HOST_RESERVE=1G host/install.sh sets it again",
                 path.display()
             ),
         )

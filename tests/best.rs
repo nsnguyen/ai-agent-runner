@@ -10,12 +10,14 @@
 mod common;
 
 use common::wait_for;
-use common::{FakeApi, FakeSystemd, FakeVsock, Guest, debugfs, image, me, script, text, tree};
+use common::{
+    FakeApi, FakeSystemd, FakeVsock, Guest, StandIn, debugfs, image, me, script, text, tree,
+};
 use runner::best;
 use runner::changes::{Change, Changes, Kind};
 use runner::creds::Cred;
 use runner::result::{AgentSays, Changed, Outcome, RunResult};
-use runner::store::{self, Checkpoint, Store};
+use runner::store::{self, Checkpoint, Slept, Store};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
@@ -408,6 +410,30 @@ fn a_batch_of_the_wrong_size_or_too_big_for_memory_is_refused() {
     assert_eq!(h.vms(), ["dev"]);
     assert_eq!(h.history(), before);
     assert_eq!(best::tries(&h.store, "dev").unwrap(), None);
+}
+
+// A sleeping dev wakes for the batch's checkpoint and keeps its memory
+// after, so the batch counts it: room for three tries, not three and dev.
+#[test]
+fn a_sleeping_dev_s_wake_counts_against_the_batch() {
+    let h = host(false);
+    h.sd.set_vm_state("dev", "active");
+    let boot = StandIn::serve(&h.store, "dev");
+    let snap = h.store.snapshot("dev").unwrap();
+    snap.make_room().unwrap();
+    let generation = h.store.get("dev").unwrap().generation + 1;
+    let slept = Slept {
+        generation,
+        at: chrono::Utc::now(),
+        parked: false,
+    };
+    snap.note(&slept).unwrap();
+    h.free(7 * GIB);
+    let err = h.refused(&["run", "dev", "--n", "3", "p"]);
+    assert!(err.contains("waking dev"), "{err}");
+    assert!(err.contains("--n 2 fits"), "{err}");
+    assert_eq!(h.vms(), ["dev"]);
+    assert!(boot.asked().is_empty(), "{:?}", boot.asked());
 }
 
 #[test]

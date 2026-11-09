@@ -202,6 +202,44 @@ fn a_start_that_doesn_t_fit_is_refused_and_nothing_boots() {
     assert_eq!(h.starts(), ["systemctl start firecracker@dev.service"]);
 }
 
+// A run that would boot its VM is refused at once, with no run made, as
+// a start is, rather than failing in the background once it has an id.
+#[test]
+fn a_run_that_would_boot_a_vm_with_no_room_is_refused_at_once() {
+    let h = host(&[("dev", 4096), ("web", 2048)], 6 * GIB);
+    h.sd.set_vm_state("web", "active");
+    let err = h.refused(&["run", "dev", "fix it"]);
+    assert!(err.contains("dev needs 4.1G"), "{err}");
+    // Each run is a numbered directory there; the run lock's file isn't one.
+    let runs = h.store.runs("dev").unwrap();
+    let names: Vec<String> = fs::read_dir(&runs).map_or(Vec::new(), |d| {
+        d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    });
+    let made = names
+        .iter()
+        .filter(|n| n.bytes().all(|b| b.is_ascii_digit()));
+    assert_eq!(made.count(), 0, "{names:?}");
+    assert!(h.starts().is_empty(), "{:?}", h.starts());
+}
+
+// The need rounds up and the room down, so a refusal never reads as if
+// it fit: 2112 MiB needed and 2100 MiB free are both 2.1G to a tenth.
+#[test]
+fn a_refusal_never_reads_as_if_it_fit() {
+    let no = NoRoom {
+        vm: "dev".into(),
+        need: room::needs(2048),
+        free: 2100 * MIB,
+        host: "kvm-host".into(),
+    };
+    assert!(
+        no.to_string()
+            .starts_with("dev needs 2.1G; kvm-host has 2.0G free"),
+        "{no}"
+    );
+}
+
 // A VM asleep holds nothing, so one fits beside it.
 #[test]
 fn a_sleeping_vm_leaves_its_room_to_the_others() {
@@ -279,7 +317,7 @@ fn two_starts_at_once_against_room_for_one_boot_one() {
         .map(|(_, s)| s)
         .unwrap();
     assert!(refused.contains("needs 2.1G"), "{refused}");
-    assert!(refused.contains("has 1.0G free"), "{refused}");
+    assert!(refused.contains("has 0.9G free"), "{refused}");
     assert_eq!(h.starts().len(), 1, "{:?}", h.starts());
 }
 

@@ -591,8 +591,8 @@ fn room(host: &impl Host, store: &Store) -> Verdict {
     };
     let s = if room.up == 1 { "" } else { "s" };
     let sums = format!(
-        "{}, less a {} reserve for the host and {} for {} VM{s} up \
-         (RUNNER_HOST_RESERVE=2G {INSTALL} sets the reserve)",
+        "{}, less a {} reserve for the host and {} for {} VM{s} awake \
+         (sudo RUNNER_HOST_RESERVE=2G {INSTALL} sets the reserve)",
         gib(room.total),
         gib(room.reserve),
         gib(room.held),

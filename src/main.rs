@@ -399,9 +399,10 @@ enum Cmd {
         /// run's id. Each fork is new and stopped, so its run boots it. A
         /// stopped VM's current disk is forked; a running or sleeping one is
         /// checkpointed first, and that's forked. The forks get the default
-        /// credentials. Refused if a name is taken, if this host's free
-        /// memory less 1 GiB can't hold N of the VM, while the VM has a run
-        /// going, and while an earlier batch's tries are still VMs. Tokens
+        /// credentials. Refused if a name is taken, if this host's room
+        /// (`runner hosts`) can't hold N of the VM, and it too if it's asleep,
+        /// while the VM has a run going, and while an earlier batch's tries
+        /// are still VMs. Tokens
         /// cost N times one run's.
         #[arg(long = "n", value_name = "N")]
         n: Option<u32>,

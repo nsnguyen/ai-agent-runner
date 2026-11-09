@@ -378,6 +378,10 @@ pub fn start(store: &Store, exe: &Path, s: &Start) -> Result<AgentRun> {
         }
         VmState::Stopping => return Err(Error::Stopping(s.vm.to_string())),
     };
+    // Its drive boots it, checking again; this refuses before there's a run.
+    if boots {
+        systemd::fits(store, s.vm)?;
+    }
     // Under the lock, so no other run takes the number.
     let n = newest(&runs)?.unwrap_or(0) + 1;
     let dir = runs.join(n.to_string());

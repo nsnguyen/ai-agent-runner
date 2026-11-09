@@ -88,14 +88,15 @@ pub enum Error {
         left: String,
     },
     #[error(
-        "{n} tries of {vm} take {need} MiB, {n} times its {each} and {FIRECRACKER_MIB} for its \
-         Firecracker, and this host has {free} MiB free: {fits}"
+        "{n} tries of {vm} take {n} times its {each} MiB and {FIRECRACKER_MIB} for its \
+         Firecracker{woken}, and this host has {free} MiB free: {fits}"
     )]
     NoRoom {
         vm: String,
         n: u32,
         each: u64,
-        need: u64,
+        /// What waking the VM for the checkpoint takes, if it's asleep.
+        woken: String,
         free: u64,
         fits: String,
     },
@@ -198,10 +199,11 @@ pub fn start(store: &Store, exe: &Path, s: &Start, n: u32) -> Result<Vec<AgentRu
             e => e.into(),
         })?;
     }
-    room(store, vm, n, each)?;
-    // A sleeping VM is woken for its checkpoint, and one booting or stopping
-    // is refused.
-    let checkpoint = match systemd::state(store, vm)? {
+    // A sleeping VM is woken for its checkpoint, so it counts too, and one
+    // booting or stopping is refused.
+    let state = systemd::state(store, vm)?;
+    room(store, vm, n, each, state == State::Sleeping)?;
+    let checkpoint = match state {
         State::Stopped => None,
         _ => {
             let comment = format!("before best of {n}");
@@ -787,15 +789,22 @@ fn on_hand(store: &Store, vm: &str) -> Result<Option<Error>> {
 }
 
 // Refused unless the host's room (src/room.rs) holds `n` VMs of `each` MiB,
-// each with its Firecracker. The host's reserve is what it keeps to spare.
-fn room(store: &Store, vm: &str, n: u32, each: u64) -> Result<()> {
+// each with its Firecracker, and `vm` too if it `wakes` for the checkpoint,
+// after which it keeps its memory. The host's reserve is what it keeps to
+// spare.
+fn room(store: &Store, vm: &str, n: u32, each: u64, wakes: bool) -> Result<()> {
     let free = systemd::room(store)?.free() >> 20;
     let one = each + FIRECRACKER_MIB;
-    let need = one * u64::from(n);
+    let woken = if wakes { one } else { 0 };
+    let need = one * u64::from(n) + woken;
     if need <= free {
         return Ok(());
     }
-    let fit = free / one;
+    let fit = free.saturating_sub(woken) / one;
+    let woken = match wakes {
+        true => format!(", and waking {vm} for the checkpoint takes {one} more"),
+        false => String::new(),
+    };
     let fits = match fit >= u64::from(MIN) {
         true => format!("--n {fit} fits"),
         false => "not even two fit".to_string(),
@@ -804,7 +813,7 @@ fn room(store: &Store, vm: &str, n: u32, each: u64) -> Result<()> {
         vm: vm.to_string(),
         n,
         each,
-        need,
+        woken,
         free,
         fits,
     })
