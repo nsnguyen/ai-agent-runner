@@ -27,7 +27,7 @@ ask="-n -o BatchMode=yes -o ConnectTimeout=$wait -o ServerAliveInterval=$wait -o
 # Options of the host's runner that take a value, so the scan below knows the
 # next argument is that value and not the VM. tests/hosts.rs checks that
 # every one clap has is here. --run is claude's; --host is the laptop's own.
-valued=" --root --keep --creds --from --cpus --mem --disk --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --peer --name --host "
+valued=" --root --keep --creds --from --cpus --mem --disk --kernel --idle --port -n --lines -m --comment --user -s --session -d --dir -e --env --resume --n --run --peer --name --http --url --host "
 
 hosts_usage="usage: runner hosts [add <host> | rm <host>]
   runner hosts                         each host: its VMs, how many are up, its free memory
@@ -697,12 +697,41 @@ reconcile() {
   return 1
 }
 
+# relist HOST [LISTED]...: HOST's runner gets LISTED as the hosts as listed,
+# the first first, which its MCP over HTTP reads at each call as `runner mcp`
+# takes --name and --peer; with none, it has no list. BatchMode, with no
+# stdin, and what the host says isn't passed on, since an older runner's
+# usage would bury the one line here. Returns 1 if it didn't answer or
+# failed, naming HOST and what's left, $left.
+relist() {
+  # Not a host, so there's nothing on it to change.
+  case $1 in -*) return 0 ;; esac
+  on=$1
+  shift
+  c='runner mcp-http peers'
+  for l; do
+    # Nor is a line ssh would take for an option one to reach.
+    case $l in -*) continue ;; esac
+    quote "$l"
+    c="$c $arg"
+  done
+  # shellcheck disable=SC2086,SC2029 # $ask is options, split; $c is for the host.
+  ssh $ask "$on" "$c" >/dev/null 2>&1
+  case $? in
+  0) return 0 ;;
+  255) echo "runner: $(name_of "$on") didn't answer, so $left" >&2 ;;
+  *) echo "runner: \`runner mcp-http peers\` failed on $(name_of "$on") (an older runner?), so $left" >&2 ;;
+  esac
+  return 1
+}
+
 # share: every listed host's key on every other host, so each drives the
 # others' runners through `runner peer`: each host that answers gets a line
 # for every other host whose key came, in place of any it had for that host
 # or that key, and keeps the lines of listed hosts whose key didn't come;
-# a line for a host that isn't listed goes. Then exits, 1 if a host didn't
-# answer, had no key or couldn't take the lines.
+# a line for a host that isn't listed goes. The first host gets the list for
+# its MCP over HTTP. Then exits, 1 if a host didn't answer, had no key or
+# couldn't take the lines, or the first couldn't take the list.
 share() {
   sane
   scratch
@@ -779,6 +808,10 @@ share() {
     done
     reconcile "$h" "$keep" "$fresh" "$add" || failed=1
   done
+  top=${hosts%%"$nl"*}
+  left="MCP over HTTP there won't reach the hosts as listed until \`runner hosts add $top\` again"
+  # shellcheck disable=SC2086 # a host a word, never globbed (set -f).
+  relist "$top" $hosts || failed=1
   [ -z "$failed" ] || exit 1
   if [ "$n" -gt 1 ]; then
     echo "shared keys: each of$(for h in $hosts; do printf ' %s' "$(name_of "$h")"; done) drives the others' runners"
@@ -875,6 +908,7 @@ if [ "${1-}" = hosts ]; then
       echo "removed $match"
       # The rest drop its line, keeping each other's; then it drops theirs.
       gone=$match
+      was=${hosts%%"$nl"*}
       hosts=$(saved_hosts)
       failed=
       keep=
@@ -886,6 +920,17 @@ if [ "${1-}" = hosts ]; then
       if [ -n "$hosts" ]; then
         left="the other hosts' keys still work there"
         reconcile "$gone" "" "" "" || failed=1
+        # The first, maybe a new one, gets the list for its MCP over HTTP.
+        top=${hosts%%"$nl"*}
+        left="MCP over HTTP there won't reach the hosts as listed until \`runner hosts add $top\` again"
+        # shellcheck disable=SC2086 # a host a word, never globbed (set -f).
+        relist "$top" $hosts || failed=1
+      fi
+      # One that was first has no list. It's off the list, so one it keeps
+      # is only said.
+      if [ "$gone" = "$was" ]; then
+        left="MCP over HTTP there still has the old list: \`RUNNER_HOST=$gone runner mcp-http peers\` clears it"
+        relist "$gone" || :
       fi
       [ -z "$failed" ] || exit 1
       exit 0
@@ -1140,6 +1185,11 @@ if [ "$cmd" = mcp ]; then
 fi
 
 case $cmd in
+mcp-http)
+  # Names no VM, whatever the scan took for one: token and revoke are for
+  # the MCP over HTTP of the first host, or the one --host names.
+  go "$host"
+  ;;
 list)
   [ -z "$via" ] || go "$via"
   survey "$remote"

@@ -521,8 +521,9 @@ fn key(host: &impl Host) -> Verdict {
 
 // The host's idle time (power.rs), and whether it can power itself off once
 // idle: its timer looking, polkit letting this user power it off, and the
-// busy lock open to the commands that keep it up. A host that stays up
-// still runs VMs, so none of it fails.
+// busy lock open to the commands that keep it up. With MCP over HTTP on, it
+// should never power off. A host that stays up still runs VMs, so none of
+// it fails.
 fn host_idle(host: &impl Host, root: &Path) -> Verdict {
     let path = host::HOST_IDLE;
     // None there is never, as install.sh leaves it unless told otherwise.
@@ -541,6 +542,13 @@ fn host_idle(host: &impl Host, root: &Path) -> Verdict {
     if idle == Idle::Never {
         return ok(format!(
             "never: the host stays up until it's stopped (RUNNER_HOST_IDLE=1h {INSTALL} sets an idle time)"
+        ));
+    }
+    // claude.ai can't start a stopped host. None there is off.
+    let mcp = host::MCP_HTTP;
+    if host.read(Path::new(mcp)).is_ok_and(|on| on.trim() == "1") {
+        return warn(format!(
+            "{idle}, but MCP over HTTP is on ({mcp}), and claude.ai can't start a stopped host, so it fails once the host stops: rerun {INSTALL}, which sets never, or RUNNER_MCP_HTTP=0 {INSTALL}"
         ));
     }
     let timer = host::IDLE_TIMER;

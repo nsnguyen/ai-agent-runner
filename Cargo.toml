@@ -17,6 +17,8 @@ name = "runner-guest"
 path = "src/bin/runner-guest.rs"
 
 [dependencies]
+# MCP over HTTP: rmcp's Streamable HTTP server, served by axum.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 ext4-view = { version = "1", features = ["std"] }
@@ -24,16 +26,21 @@ hickory-proto = "0.26"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "net", "poll", "process", "signal", "socket", "term", "user"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
-rmcp = { version = "3.8", features = ["client", "server", "macros", "transport-io"] }
+rmcp = { version = "3.8", features = ["client", "server", "macros", "transport-io", "transport-streamable-http-server"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MCP over HTTP keeps only its tokens' hashes.
+sha2 = "0.11"
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "io-std", "io-util", "process", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-std", "io-util", "net", "process", "sync", "time"] }
 vsock = "0.5"
 
 [dev-dependencies]
 # sched, for the tests that step into a network namespace.
 nix = { version = "0.31", features = ["sched"] }
 proptest = "1"
+# An MCP client over HTTP, and plain requests, for runner mcp --http.
+reqwest = { version = "0.13", default-features = false }
+rmcp = { version = "3.8", features = ["transport-streamable-http-client-reqwest"] }
 tempfile = "3"
