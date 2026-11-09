@@ -59,8 +59,13 @@ if [ ! -d "$dir" ]; then
   echo "ssh: Could not resolve hostname ${host##*@}: Name or service not known" >&2
   exit 255
 fi
-if [ -e "$dir/down" ] || [ -e "$dir/stopped" ]; then
+if [ -e "$dir/down" ] || [ -e "$dir/stopped" ] || [ -e "$dir/pending" ]; then
   echo "ssh: connect to host ${host##*@} port 22: Connection timed out" >&2
+  exit 255
+fi
+# Mute: up, as a check finds it, but no command gets through.
+if [ -e "$dir/mute" ] && [ "$cmd" != true ]; then
+  echo "Connection to ${host##*@} closed by remote host." >&2
   exit 255
 fi
 export HOST_DIR="$dir" HOME="$dir"
@@ -138,12 +143,16 @@ esac
 "#;
 
 // The laptop's aws.sh: each call in $FLEET/aws-log, RUNNER_AWS_NAME first.
-// `state` says stopped for a host with `stopped`, running for the rest;
-// `start` starts it.
+// `state` says stopped for a host with `stopped`, pending for one with
+// `pending`, running for the rest; `start` starts it.
 const AWS_SH: &str = r#"printf '%s %s\n' "${RUNNER_AWS_NAME-}" "$*" >>"$FLEET/aws-log"
 case $1 in
-state) if [ -e "$FLEET/$RUNNER_AWS_NAME/stopped" ]; then echo stopped; else echo running; fi ;;
-start) rm -f "$FLEET/$RUNNER_AWS_NAME/stopped"; echo "$RUNNER_AWS_NAME is up at 203.0.113.7." ;;
+state)
+  if [ -e "$FLEET/$RUNNER_AWS_NAME/stopped" ]; then echo stopped
+  elif [ -e "$FLEET/$RUNNER_AWS_NAME/pending" ]; then echo pending
+  else echo running; fi
+  ;;
+start) rm -f "$FLEET/$RUNNER_AWS_NAME/stopped" "$FLEET/$RUNNER_AWS_NAME/pending"; echo "$RUNNER_AWS_NAME is up at 203.0.113.7." ;;
 esac
 "#;
 
@@ -258,6 +267,12 @@ impl Fleet {
     fn aws_cli(&self) {
         let aws = self.dir.path().join("bin/aws");
         script(&aws, "echo 'aws: not in these tests' >&2\nexit 1\n");
+    }
+
+    /// Marks `name` with `file`: pending (starting on AWS) or mute.
+    fn mark(&self, name: &str, file: &str) {
+        fs::write(self.dir.path().join("fleet").join(name).join(file), "").unwrap();
+        self.aws_cli();
     }
 
     /// Stopped on AWS, until aws.sh starts it.
@@ -2317,6 +2332,23 @@ fn with_every_host_stopped_create_starts_the_first() {
             "{shell:?}"
         );
         assert_eq!(made(&fleet), on("kvm-host", &["create app"]), "{shell:?}");
+
+        // No host answered before, so base's memory is the started one's:
+        // 4G there, which 4 GiB isn't room for.
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 4 << 30);
+        fs::write(fleet.dir.path().join("fleet/kvm-host/mem"), "4G").unwrap();
+        for h in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            fleet.stop(h);
+        }
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("no running host has 4.1G free; starting kvm-host-2"),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(made(&fleet), on("kvm-host-2", &["create app"]), "{shell:?}");
     }
 }
 
@@ -2396,4 +2428,122 @@ fn import_starts_no_host() {
     ok(&fleet.run(SHELLS[0], &["import", "app", "-"]));
     assert_eq!(made(&fleet), on("kvm-host-2", &["import app -"]));
     assert_eq!(fleet.aws_calls(), ["kvm-host-3 state"]);
+}
+
+// A host already starting, say from a create cut short, is waited for before
+// a stopped one is started.
+#[test]
+fn a_host_already_starting_is_waited_for_before_another_starts() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 6 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.mark("kvm-host-2", "pending");
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        assert!(
+            err.contains(
+                "no running host has 2.1G free; waiting for kvm-host-2, which is starting"
+            ),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(made(&fleet), on("kvm-host-2", &["create app"]), "{shell:?}");
+        let starts: Vec<String> = fleet
+            .aws_calls()
+            .into_iter()
+            .filter(|c| c.ends_with(" start"))
+            .collect();
+        assert!(
+            !starts.contains(&"kvm-host-3 start".to_string()),
+            "{shell:?}"
+        );
+    }
+}
+
+// One started that won't take a command ends the create: starting the next
+// would leave two up.
+#[test]
+fn a_started_host_that_doesn_t_answer_ends_the_create() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-2");
+        fleet.mark("kvm-host-2", "mute");
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("runner: kvm-host-2 is started, but didn't say its room: run it again once it answers"),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-2 state", "kvm-host-3 state", "kvm-host-2 start"],
+            "{shell:?}"
+        );
+        assert!(made(&fleet).is_empty(), "{shell:?}");
+    }
+}
+
+// A --mem the host's runner won't take is its to refuse: nothing starts.
+#[test]
+fn a_mem_too_big_to_be_one_starts_nothing() {
+    for shell in SHELLS {
+        for mem in ["4194304G", "9000000T", "0", "4X"] {
+            let fleet = Fleet::new();
+            fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+            fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+            fleet.stop("kvm-host-3");
+            fleet.run(shell, &["create", "app", "--mem", mem]);
+            assert_eq!(fleet.aws_calls(), ["kvm-host-3 state"], "{shell:?} {mem}");
+        }
+    }
+}
+
+// With no host answering and none stopped, it's the network, say, not room.
+#[test]
+fn with_no_host_answering_create_says_so() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        for h in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            fleet.down(h);
+        }
+        let out = fleet.run(shell, &["create", "app"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("runner: no host answered, so app has nowhere to go"),
+            "{shell:?}: {err}"
+        );
+        assert!(!err.contains("aws.sh up"), "{shell:?}: {err}");
+    }
+}
+
+// claude looks for the VM, then places it: two surveys, each naming the
+// stopped hosts, and each is still tried once.
+#[test]
+fn claude_tries_each_stopped_host_once() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        for h in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            fleet.host(h, &["base"], 1 << 30);
+        }
+        fleet.stop("kvm-host-2");
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["claude", "fresh"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        for h in ["kvm-host-2", "kvm-host-3"] {
+            let starting = format!("starting {h}\n");
+            assert_eq!(err.matches(&starting).count(), 1, "{shell:?}: {err}");
+            let rows = fleet.calls(h).iter().filter(|c| *c == "hosts").count();
+            assert_eq!(rows, 1, "{shell:?} {h}");
+        }
+        assert!(made(&fleet).is_empty(), "{shell:?}");
+    }
 }

@@ -102,12 +102,13 @@ exit "$rc"'
 
 # A host `client/aws.sh up` made that a command finds stopped is started by
 # the aws.sh beside this script, where client/install.sh puts it (README.md,
-# Day to day). $up holds the hosts this run has reached, and $stopped those
-# it found stopped, a word each.
+# Day to day). $up holds the hosts this run has reached, $stopped those it
+# found stopped, and $starting those it found starting, a word each.
 aws_sh=$(dirname "$0")/aws.sh
 aws_failed=
 up=
 stopped=
+starting=
 
 # ssh hands the remote shell one string, so each argument is quoted for it:
 # bare when it's only safe characters, else in single quotes, with ' as '\''.
@@ -299,8 +300,8 @@ survey() {
 # answered CMD: after a survey of CMD, passes on each host's stderr, names
 # each host that didn't answer or failed, and sets $failed if one did. One
 # that didn't answer and AWS has stopped is named so, and noted in $stopped,
-# but not started: the command that goes to it starts it, as it waits for
-# one that's starting.
+# or in $starting if it's starting, once each, but not started: the command
+# that goes to it starts it, as it waits for one that's starting.
 answered() {
   failed=
   i=0
@@ -313,9 +314,12 @@ answered() {
     255)
       aws_state "$h" || state=
       case $state in
-      pending) echo "runner: $(name_of "$h") is starting" >&2 ;;
+      pending)
+        case " $starting " in *" $h "*) ;; *) starting="$starting $h" ;; esac
+        echo "runner: $(name_of "$h") is starting" >&2
+        ;;
       stopping | stopped)
-        stopped="$stopped $h"
+        case " $stopped " in *" $h "*) ;; *) stopped="$stopped $h" ;; esac
         echo "runner: $(name_of "$h") is $state" >&2
         ;;
       *) echo "runner: $(name_of "$h") didn't answer" >&2 ;;
@@ -450,6 +454,11 @@ mib() {
   [tT] | [tT][iI][bB]) mib=$((digits * 1048576)) ;;
   *) return 1 ;;
   esac
+  # It takes no more MiB than a u32 holds.
+  [ "$mib" -le 4294967295 ] || {
+    mib=
+    return 1
+  }
 }
 
 # mem_of LINE: sets $mib to the memory a line of `runner list` gives its VM,
@@ -527,9 +536,10 @@ room_of() {
 # pick NAME: sets $at to the host a new VM NAME goes to: the one --host
 # names, the first for base, the host of a VM other than base it forks, else
 # the one with the most free memory, if NAME has room there. If none has,
-# the stopped hosts are started one at a time, in the hosts file's order,
-# until one has (README.md, Several hosts); if none does, it's refused,
-# naming each host's room. Refuses a name any host has.
+# a host already starting is waited for, then the stopped hosts are started
+# one at a time, in the hosts file's order, until one has (README.md,
+# Several hosts); if none does, it's refused, naming each host's room.
+# Refuses a name any host has.
 pick() {
   survey "runner hosts && runner list"
   answered "runner hosts && runner list"
@@ -570,8 +580,12 @@ pick() {
   # A stopped host's room is known once it answers. ready takes it out of
   # $stopped, which the loop has read; ready and needs have loops of their
   # own, so these are named apart.
-  for cold in $stopped; do
-    echo "runner: no running host has $(gib "$need" up) free; starting $(name_of "$cold")" >&2
+  for cold in $starting $stopped; do
+    case " $starting " in
+    *" $cold "*) doing="waiting for $(name_of "$cold"), which is starting" ;;
+    *) doing="starting $(name_of "$cold")" ;;
+    esac
+    echo "runner: no running host has $(gib "$need" up) free; $doing" >&2
     ready "$cold" || exit 255
     k=0
     for h in $hosts; do
@@ -587,16 +601,31 @@ pick() {
     # Base's memory, if no host had answered before.
     needs
     room_of "$k"
-    if [ -n "$free" ] && [ "$free" -ge "$need" ]; then
+    # Starting the next would leave this one up with nothing on it.
+    if [ -z "$free" ]; then
+      echo "runner: $(name_of "$cold") is started, but didn't say its room: run it again once it answers" >&2
+      exit 1
+    fi
+    if [ "$free" -ge "$need" ]; then
       at=$cold
       return 0
     fi
   done
   width=0
+  any=
+  i=0
   for h in $hosts; do
+    i=$((i + 1))
     hn=$(name_of "$h")
     [ "${#hn}" -le "$width" ] || width=${#hn}
+    room_of "$i"
+    [ -z "$free" ] || any=1
   done
+  # The network, say, not room.
+  if [ -z "$any" ]; then
+    echo "runner: no host answered, so $1 has nowhere to go" >&2
+    exit 1
+  fi
   {
     echo "runner: no host has room for $1, which needs $(gib "$need" up):"
     i=0
