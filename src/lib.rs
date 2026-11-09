@@ -23,6 +23,7 @@ pub mod import;
 pub mod mcp;
 pub mod moves;
 pub mod net;
+pub mod oauth;
 pub mod peers;
 pub mod power;
 pub mod proto;

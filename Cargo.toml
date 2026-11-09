@@ -19,9 +19,12 @@ path = "src/bin/runner-guest.rs"
 [dependencies]
 # MCP over HTTP: rmcp's Streamable HTTP server, served by axum.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# OAuth for claude.ai: PKCE's base64url and HTTP Basic, and forms.
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 ext4-view = { version = "1", features = ["std"] }
+form_urlencoded = "1"
 hickory-proto = "0.26"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "net", "poll", "process", "signal", "socket", "term", "user"] }
@@ -42,5 +45,6 @@ nix = { version = "0.31", features = ["sched"] }
 proptest = "1"
 # An MCP client over HTTP, and plain requests, for runner mcp --http.
 reqwest = { version = "0.13", default-features = false }
-rmcp = { version = "3.8", features = ["transport-streamable-http-client-reqwest"] }
+# Its OAuth client, too, against src/oauth.rs.
+rmcp = { version = "3.8", features = ["transport-streamable-http-client-reqwest", "auth"] }
 tempfile = "3"

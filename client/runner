@@ -1186,8 +1186,9 @@ fi
 
 case $cmd in
 mcp-http)
-  # Names no VM, whatever the scan took for one: token and revoke are for
-  # the MCP over HTTP of the first host, or the one --host names.
+  # Names no VM, whatever the scan took for one: token, pair, list and
+  # revoke are for the MCP over HTTP of the first host, or the one --host
+  # names.
   go "$host"
   ;;
 list)
