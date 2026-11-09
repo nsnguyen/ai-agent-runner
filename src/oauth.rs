@@ -14,8 +14,9 @@
 // - GET /authorize checks the client and that the redirect URI is one it
 //   registered before anything else, since until then there's nowhere safe
 //   to send an error. It wants PKCE with S256 (plain would let whoever saw
-//   the request redeem the code), and a `resource` (RFC 8707) that is this
-//   server. Then it shows a page naming the client, with a box for the
+//   the request redeem the code). A `resource` (RFC 8707) has to be this
+//   server, here and at /token: it issues tokens for nothing else, so one
+//   left out means this one too. Then it shows a page naming the client, with a box for the
 //   pairing code. The form carries only a CSRF token, naming the checked
 //   request this server holds, and the same token is a SameSite=Strict
 //   cookie: a form posted from another site has neither, and nothing in the
@@ -25,14 +26,14 @@
 //   shell there has it. One at a time, single-use, ten minutes, five wrong
 //   tries for it and it's void, 40 bits: a guess has no real chance. The
 //   right one gets a redirect with an authorization code that's single-use,
-//   lives a minute and is bound to the client, the redirect URI, the PKCE
-//   challenge and the resource.
+//   lives a minute and is bound to the client, the redirect URI and the
+//   PKCE challenge; the resource it's for is this server, the only one.
 // - POST /token trades the code, with its PKCE verifier and the client's
 //   secret if it has one, for an access token that lives an hour and a
 //   refresh token that lives 30 days. A refresh token is rotated at each
 //   use, and the spent one is kept until it'd have expired: one used twice
 //   was stolen, or the client's broken, so every token of the client's is
-//   dropped. So is every token of a client whose code is tried twice.
+//   dropped. So is every token of a client that tries its code twice.
 //
 // Tokens go in src/tokens.rs's file as hashes, as `runner mcp-http token`'s
 // do, so #176's check takes them, and its plain `revoke` drops them. The
@@ -900,6 +901,11 @@ async fn approve(State(s): State<Arc<Server>>, headers: HeaderMap, body: Bytes) 
         return send_back(&s, &request, &[("error", "access_denied")]);
     }
     let code = find(&form, "code").unwrap_or("").to_string();
+    // Allow with the box empty is no try.
+    if typed(&code).is_empty() {
+        let said = "Type the code `runner mcp-http pair` prints on the host.";
+        return approval(&s, StatusCode::BAD_REQUEST, request, Some(said));
+    }
     let root = s.root.clone();
     let paired = match blocking(move || try_pair(&root, &code, now)).await {
         Ok(p) => p,
@@ -969,7 +975,13 @@ async fn token(State(s): State<Arc<Server>>, headers: HeaderMap, body: Bytes) ->
     let form = pairs(&body);
     let get = |name| find(&form, name);
     let now = s.clock.now();
-    let refused = |what: &str| oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", what);
+    // RFC 6749 5.2: a 401 names how a client authenticates.
+    let refused = |what: &str| {
+        let mut res = oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", what);
+        let how = HeaderValue::from_static("Basic realm=\"runner\"");
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, how);
+        res
+    };
     let Some((id, secret)) = presented(&headers, &form) else {
         return refused("no client_id");
     };
@@ -1012,7 +1024,10 @@ async fn token(State(s): State<Arc<Server>>, headers: HeaderMap, body: Bytes) ->
                     .get(&h)
                     .filter(|(_, until)| now < *until)
                     .map(|(c, _)| c.clone());
-                if let Some(owner) = reused {
+                // Only the code's own client trying again revokes: anyone
+                // else who saw it in a callback URL could otherwise cut
+                // that client off.
+                if let Some(owner) = reused.filter(|owner| *owner == client.id) {
                     let dropped = blocking(move || {
                         Ok(tokens::edit(&root, |lines| drop_client(lines, &owner))?)
                     })

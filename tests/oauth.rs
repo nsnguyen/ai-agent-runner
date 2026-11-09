@@ -639,6 +639,11 @@ fn a_secret_client_needs_its_secret() {
     };
     let res = host.exchange(&wrong, &code, &flow.verifier, &[]);
     assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+    assert!(
+        res.headers.contains_key("www-authenticate"),
+        "{:?}",
+        res.headers
+    );
     res.refused("invalid_client");
     let bare = Registered {
         id: client.id.clone(),
@@ -880,7 +885,12 @@ fn a_token_for_another_resource_is_refused() {
     host.token_request(&client, p).refused("invalid_target");
 
     // This server, as its base or its /mcp, is fine, and so is none.
-    for resource in [host.base.clone(), host.mcp(), format!("{}/", host.mcp())] {
+    for resource in [
+        host.base.clone(),
+        host.mcp(),
+        format!("{}/", host.mcp()),
+        String::new(),
+    ] {
         let mut flow = Flow::new(&host);
         flow.resource = resource.clone();
         let code = host.authorize(&client, &flow);
@@ -1167,4 +1177,89 @@ fn rmcp_s_oauth_client_signs_in() {
     let second = token(&state);
     assert_ne!(first, second);
     assert!(host.mcp_works(&second));
+}
+
+// A spent code someone else presents is refused, and revokes nothing of the
+// client's that spent it: only its owner trying twice does.
+#[test]
+fn another_client_s_spent_code_revokes_nothing() {
+    let host = Host::new();
+    let owner = host.register(Some("none"));
+    let thief = host.register(Some("none"));
+    let flow = Flow::new(&host);
+    let code = host.authorize(&owner, &flow);
+    let tokens = host.exchange(&owner, &code, &flow.verifier, &[]).tokens();
+    host.exchange(&thief, &code, &flow.verifier, &[])
+        .refused("invalid_grant");
+    assert!(host.mcp_works(&tokens.access));
+}
+
+// Allow with the box empty asks for the code again, and spends no try.
+#[test]
+fn an_empty_code_costs_no_try() {
+    let host = Host::new();
+    let client = host.register(Some("none"));
+    let code = host.pair();
+    let mut page = host.page(&client, &Flow::new(&host));
+    for _ in 0..6 {
+        page = host.approve(&page, "  ");
+        assert_eq!(page.status, StatusCode::BAD_REQUEST);
+        assert!(page.body.contains("Type the code"), "{}", page.body);
+    }
+    assert!(host.approve(&page, &code).code().is_some());
+}
+
+// A refused refresh changes nothing, so it doesn't rewrite the store: a
+// flood of them can't hold the lock the real ones wait on.
+#[test]
+fn a_refused_refresh_writes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let host = Host::new();
+    let client = host.register(Some("none"));
+    let tokens = host.sign_in(&client);
+    let path = host.root.join("mcp-http").join("tokens");
+    let before = fs::metadata(&path).unwrap().ino();
+    host.refresh(&client, &"0".repeat(64))
+        .refused("invalid_grant");
+    host.refresh(&client, &tokens.access)
+        .refused("invalid_grant");
+    assert_eq!(fs::metadata(&path).unwrap().ino(), before);
+}
+
+// Behind Funnel the Host is the public one, as for /mcp: any other is
+// refused at every OAuth endpoint, against DNS rebinding.
+#[test]
+fn a_stranger_host_gets_no_oauth_endpoint() {
+    let host = Host::new();
+    let local = host.base.trim_start_matches("http://").to_string();
+    for (name, refused) in [
+        ("evil.example", true),
+        (local.as_str(), false),
+        ("localhost", false),
+    ] {
+        for (method, path) in [
+            ("GET", "/.well-known/oauth-protected-resource"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("POST", "/register"),
+            ("GET", "/authorize"),
+            ("POST", "/authorize"),
+            ("POST", "/token"),
+        ] {
+            let res = host.rt.block_on(async {
+                let req = if method == "GET" {
+                    host.http.get(host.url(path))
+                } else {
+                    host.http.post(host.url(path)).body("{}")
+                };
+                req.header("Host", name).send().await.unwrap()
+            });
+            let forbidden = res.status() == StatusCode::FORBIDDEN;
+            assert_eq!(
+                forbidden,
+                refused,
+                "{name} {method} {path}: {}",
+                res.status()
+            );
+        }
+    }
 }

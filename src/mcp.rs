@@ -1054,9 +1054,7 @@ pub async fn serve_on(
     clock: oauth::Clock,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let at = listener.local_addr()?;
-    if !at.ip().is_loopback() {
-        return Err(format!("{at} isn't a loopback address").into());
-    }
+    check_addr(&at)?;
     let base = url.map_or_else(
         || format!("http://{at}"),
         |u| u.trim_end_matches('/').to_string(),
@@ -1064,7 +1062,7 @@ pub async fn serve_on(
     let mut allowed: Vec<String> = ["localhost", "127.0.0.1", "::1"].map(String::from).into();
     allowed.extend(authority(&base));
     let config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed)
+        .with_allowed_hosts(allowed.clone())
         .with_allowed_origins(ORIGINS);
     let mut sessions = LocalSessionManager::default();
     sessions.session_config.keep_alive = Some(SESSION_IDLE);
@@ -1092,10 +1090,62 @@ pub async fn serve_on(
     let app = axum::Router::new()
         .route_service("/mcp", mcp)
         .route_layer(axum::middleware::from_fn_with_state(gate, bearer))
-        .merge(oauth::routes(Arc::new(oauth)));
+        .merge(
+            oauth::routes(Arc::new(oauth)).layer(axum::middleware::from_fn_with_state(
+                Arc::new(allowed),
+                known_host,
+            )),
+        );
     eprintln!("runner mcp: serving http://{at}/mcp for {base}/mcp");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// Refuses a request to OAuth's endpoints whose Host isn't on the list, as
+// rmcp does /mcp's, against DNS rebinding: a host listed without a port
+// matches any.
+async fn known_host(
+    axum::extract::State(allowed): axum::extract::State<Arc<Vec<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let named = (request.headers().get(axum::http::header::HOST))
+        .and_then(|h| h.to_str().ok())
+        .and_then(split_authority);
+    let known = named.is_some_and(|(host, port)| {
+        (allowed.iter().filter_map(|a| split_authority(a)))
+            .any(|(h, p)| h == host && (p.is_none() || p == port))
+    });
+    if known {
+        next.run(request).await
+    } else {
+        let said = "this host doesn't answer to that name\n";
+        (axum::http::StatusCode::FORBIDDEN, said).into_response()
+    }
+}
+
+// An authority's host, lower case and without an IPv6 address's brackets,
+// and its port if it names one.
+fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
+    let authority = authority.trim();
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        (host, after.strip_prefix(':'))
+    } else if authority.matches(':').count() > 1 {
+        // A bare IPv6 address, as the list names ::1.
+        (authority, None)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let port = match port {
+        Some(p) => Some(p.parse().ok()?),
+        None => None,
+    };
+    (!host.is_empty()).then(|| (host.to_ascii_lowercase(), port))
 }
 
 // A URL's host, with its port if it has one, as a Host header names it.
@@ -1684,4 +1734,24 @@ fn peer_row(answer: &Value, peer: &str) -> Result<HostRow, String> {
     let mut row = (list.hosts.into_iter().next()).ok_or("it gave no row")?;
     row.name = peer.to_string();
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_authority;
+
+    #[test]
+    fn an_authority_splits_into_host_and_port() {
+        let at = |a| split_authority(a);
+        assert_eq!(
+            at("Kvm-Host.ts.net"),
+            Some(("kvm-host.ts.net".into(), None))
+        );
+        assert_eq!(at("127.0.0.1:8740"), Some(("127.0.0.1".into(), Some(8740))));
+        assert_eq!(at("[::1]:8740"), Some(("::1".into(), Some(8740))));
+        assert_eq!(at("::1"), Some(("::1".into(), None)));
+        assert_eq!(at("[::1]"), Some(("::1".into(), None)));
+        assert_eq!(at("host:http"), None);
+        assert_eq!(at(""), None);
+    }
 }

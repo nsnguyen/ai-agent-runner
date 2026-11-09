@@ -180,17 +180,22 @@ pub fn mint(root: &Path, how: &str) -> Result<String> {
     Ok(token)
 }
 
-/// Runs `f` on the file's lines, locked, and writes back what it leaves.
+/// Runs `f` on the file's lines, locked, and writes back what it leaves,
+/// if that's changed: a refused request writes nothing, so a flood of them
+/// doesn't hold the lock the real ones wait on.
 pub fn edit<T>(root: &Path, f: impl FnOnce(&mut Vec<String>) -> T) -> Result<T> {
     locked(root, || {
         let text = read(root, TOKENS)?;
-        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let before: Vec<String> = text.lines().map(String::from).collect();
+        let mut lines = before.clone();
         let out = f(&mut lines);
-        let mut text = lines.join("\n");
-        if !text.is_empty() {
-            text.push('\n');
+        if lines != before {
+            let mut text = lines.join("\n");
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            write(root, TOKENS, &text)?;
         }
-        write(root, TOKENS, &text)?;
         Ok(out)
     })
 }
@@ -231,6 +236,8 @@ pub struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
+    /// The line read, or none for one this doesn't understand, which is
+    /// then no token: a client's with no kind, or a kind this doesn't know.
     pub fn parse(line: &'a str) -> Option<Entry<'a>> {
         let mut words = line.split_whitespace();
         let hash = unhex(words.next()?)?;
@@ -241,15 +248,24 @@ impl<'a> Entry<'a> {
             until: None,
             spent: false,
         };
+        let mut kind = None;
         for word in words {
             match word.split_once('=') {
                 Some(("client", id)) => entry.client = Some(id),
-                Some(("kind", "refresh")) => entry.kind = Kind::Refresh,
+                Some(("kind", "access")) => kind = Some(Some(Kind::Access)),
+                Some(("kind", "refresh")) => kind = Some(Some(Kind::Refresh)),
+                Some(("kind", _)) => kind = Some(None),
                 // An unreadable time is one long past.
                 Some(("until", t)) => entry.until = Some(t.parse().unwrap_or(0)),
                 None if word == "spent" => entry.spent = true,
                 _ => {}
             }
+        }
+        match (kind, entry.client) {
+            (Some(Some(kind)), _) => entry.kind = kind,
+            (Some(None), _) | (None, Some(_)) => return None,
+            // The CLI's: a bearer token with no end.
+            (None, None) => {}
         }
         Some(entry)
     }
@@ -290,4 +306,22 @@ pub fn check(root: &Path, token: &str, now: i64) -> Result<Option<Holder>> {
             e.client
                 .map_or(Holder::Cli, |c| Holder::Client(c.to_string()))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A kind this doesn't know is no bearer token: it fails closed.
+    #[test]
+    fn an_unknown_kind_is_no_bearer() {
+        let hash = "ab".repeat(32);
+        let line =
+            format!("{hash} 2026-11-09T00:00:00Z oauth client=c kind=device until=9999999999");
+        assert!(Entry::parse(&line).is_none_or(|e| e.kind != Kind::Access));
+        let line = format!("{hash} 2026-11-09T00:00:00Z oauth client=c until=9999999999");
+        assert!(Entry::parse(&line).is_none_or(|e| e.kind != Kind::Access));
+        let line = format!("{hash} 2026-11-09T00:00:00Z cli");
+        assert_eq!(Entry::parse(&line).unwrap().kind, Kind::Access);
+    }
 }
