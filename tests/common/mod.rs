@@ -347,7 +347,8 @@ exit 0
 
 /// systemctl, journalctl and loginctl on PATH. systemctl logs its argv to `calls`,
 /// keeps a unit's ActiveState in `state`, replaced whole so a `show` racing a
-/// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it, and fails with the text in `fail` if that
+/// `start` never reads it empty, or one VM's in `state.<unit>` if a test set it,
+/// which that VM's `start` and `stop` then change alone, and fails with the text in `fail` if that
 /// file exists. A `stop` runs `on-stop` first if a test put one there, as the
 /// unit runs its ExecStop, and a `start` runs `on-start`, as the unit's boot
 /// would, each with systemctl's arguments, the unit second. journalctl logs its argv and prints one line; loginctl logs its argv
@@ -368,9 +369,11 @@ impl FakeSystemd {
 if [ -f "{d}/fail" ]; then cat "{d}/fail" >&2; exit 1; fi
 case "$1" in
   start) if [ -x "{d}/on-start" ]; then "{d}/on-start" "$@" || exit 1; fi
-    echo active > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
+    f="{d}/state"; if [ -f "{d}/state.$2" ]; then f="{d}/state.$2"; fi
+    echo active > "$f.$$" && mv "$f.$$" "$f" ;;
   stop) if [ -x "{d}/on-stop" ]; then "{d}/on-stop" "$@" || exit 1; fi
-    echo inactive > "{d}/state.$$" && mv "{d}/state.$$" "{d}/state" ;;
+    f="{d}/state"; if [ -f "{d}/state.$2" ]; then f="{d}/state.$2"; fi
+    echo inactive > "$f.$$" && mv "$f.$$" "$f" ;;
   show) cat "{d}/state.$4" 2>/dev/null || cat "{d}/state" 2>/dev/null || echo inactive ;;
 esac
 "#
@@ -566,7 +569,7 @@ fi
 # Run in place of this shell, so the pid it notes is the peer's own.
 peer() {
   exec env -i PATH="$dir/root/bin:${0%/*}:$SYS_PATH" RUNNER_ROOT="$dir/root" \
-    RUNNER_MEMINFO="$dir/meminfo" FLEET="$FLEET" RUNNER="$RUNNER" SYS_PATH="$SYS_PATH" \
+    RUNNER_MEMINFO="$dir/meminfo" RUNNER_RESERVE="$dir/reserve" FLEET="$FLEET" RUNNER="$RUNNER" SYS_PATH="$SYS_PATH" \
     SSH_ORIGINAL_COMMAND="$*" "$RUNNER" peer
 }
 vanish() {
@@ -600,8 +603,9 @@ peer "$@"
 "#;
 
 /// A host behind PEER_SSH, at `dir`: `root` its RUNNER_ROOT, with a fake
-/// systemd in root/bin, and `meminfo` its free memory. It has base, and a
-/// fork of it for each of `vms`.
+/// systemd in root/bin, and `meminfo` its memory, which leaves `free` room
+/// with nothing up and the default reserve. It has base, and a fork of it
+/// for each of `vms`.
 pub struct PeerHost {
     pub dir: PathBuf,
     pub sd: FakeSystemd,
@@ -638,9 +642,10 @@ impl PeerHost {
         self.store().get(vm).is_ok()
     }
 
+    /// Its room with nothing up: MemTotal less the 1 GiB reserve.
     pub fn set_free(&self, bytes: u64) {
-        let kib = bytes / 1024;
-        let meminfo = format!("MemTotal: 16000000 kB\nMemAvailable: {kib} kB\n");
+        let kib = (bytes + (1 << 30)) / 1024;
+        let meminfo = format!("MemTotal: {kib} kB\n");
         fs::write(self.dir.join("meminfo"), meminfo).unwrap();
     }
 

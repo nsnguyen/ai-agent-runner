@@ -138,6 +138,7 @@ impl Fleet {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
         cmd.env("RUNNER_ROOT", self.here.root())
             .env("RUNNER_MEMINFO", self.here.dir.join("meminfo"))
+            .env("RUNNER_RESERVE", self.here.dir.join("reserve"))
             .env("RUNNER_USER", me())
             .env("PATH", path)
             .env("SYS_PATH", sys)

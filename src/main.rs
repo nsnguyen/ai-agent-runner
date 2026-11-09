@@ -137,7 +137,8 @@ enum Cmd {
     /// and memory, and the space its disks use.
     List,
     /// Boot a VM under systemd, or wake it if it's sleeping. Returns once its
-    /// guest has started.
+    /// guest has started. Refused, with nothing started, if the host has no
+    /// room for its memory (`runner hosts`).
     Start { name: String },
     /// Shut a VM down: Ctrl-Alt-Del, and a kill after 30 seconds. A sleeping
     /// VM is woken first, so it shuts down cleanly.
@@ -150,7 +151,8 @@ enum Cmd {
     /// Open shells and execs end; tmux sessions live on. Refused while a run
     /// is going.
     Sleep { name: String },
-    /// Bring a sleeping VM back where it was, and set its clock.
+    /// Bring a sleeping VM back where it was, and set its clock. Refused,
+    /// and it sleeps on, if the host has no room for its memory.
     Wake { name: String },
     /// Show or set how long a VM goes unused before it sleeps. Use is a
     /// shell, exec, attached session, run, MCP call or open `runner proxy` on
@@ -397,9 +399,10 @@ enum Cmd {
         /// run's id. Each fork is new and stopped, so its run boots it. A
         /// stopped VM's current disk is forked; a running or sleeping one is
         /// checkpointed first, and that's forked. The forks get the default
-        /// credentials. Refused if a name is taken, if this host's free
-        /// memory less 1 GiB can't hold N of the VM, while the VM has a run
-        /// going, and while an earlier batch's tries are still VMs. Tokens
+        /// credentials. Refused if a name is taken, if this host's room
+        /// (`runner hosts`) can't hold N of the VM, and it too if it's asleep,
+        /// while the VM has a run going, and while an earlier batch's tries
+        /// are still VMs. Tokens
         /// cost N times one run's.
         #[arg(long = "n", value_name = "N")]
         n: Option<u32>,
@@ -465,7 +468,9 @@ enum Cmd {
     /// Check this host can run VMs: one line per check, failing if any fails.
     Doctor,
     /// This host's row in the laptop's `runner hosts`: how many VMs it has,
-    /// how many are up, and its free memory, MemAvailable from /proc/meminfo.
+    /// how many are up, and its free memory: its room, MemTotal less the
+    /// host's reserve and each up VM's memory and 64 MiB, which a start or
+    /// wake has to fit in.
     /// On the laptop, `runner hosts` lists every host, and `hosts add` and
     /// `hosts rm` change the list (README.md, Several hosts).
     Hosts,

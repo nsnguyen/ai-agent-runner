@@ -242,7 +242,7 @@ pub fn boot(store: &Store, name: &str, bin: &Path, ip: &Path, nft: &Path) -> Res
             .map_err(io_err(format!("serving calls on {}", calls_sock.display())))?;
         let asks = Asks::serve(&boot_sock, asker(events.clone(), name))
             .map_err(io_err(format!("taking asks on {}", boot_sock.display())))?;
-        let url = url::Served::start(store, name, net.address, waker(events.clone(), name))
+        let url = url::Served::start(store, name, net.address, waker(store, events.clone(), name))
             .map_err(io_err("serving the VM's URL"))?;
         Ok((offer, calls, asks, url))
     });
@@ -649,12 +649,18 @@ fn asker(events: mpsc::Sender<Event>, name: &str) -> impl Fn(Ask) -> Reply + Sen
     }
 }
 
-// What the URL asks to have the VM awake: a wake, through the loop.
-fn waker(events: mpsc::Sender<Event>, name: &str) -> url::Wake {
+// What the URL asks to have the VM awake: a wake, through the loop, once
+// the host has room for it, holding the room until it's awake. A refusal
+// closes the connection, and the URL notes why.
+fn waker(store: &Store, events: mpsc::Sender<Event>, name: &str) -> url::Wake {
     let ask = asker(events, name);
-    Arc::new(move || match ask(Ask::Wake) {
-        Reply::Done => Ok(()),
-        Reply::Refused(why) => Err(why),
+    let (store, name) = (store.clone(), name.to_string());
+    Arc::new(move || {
+        let _room = systemd::room_to_wake(&store, &name).map_err(|e| e.to_string())?;
+        match ask(Ask::Wake) {
+            Reply::Done => Ok(()),
+            Reply::Refused(why) => Err(why),
+        }
     })
 }
 

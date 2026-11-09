@@ -8,14 +8,17 @@
 # /etc/runner/net for reruns. RUNNER_HOST_IDLE sets how long the host goes
 # unused before it powers itself off, in `runner idle`'s syntax (90s, 60m,
 # 2h), or never, the default; it's kept in /etc/runner/host-idle for reruns
-# (src/power.rs). Safe to rerun, after an upgrade too: every step overwrites
-# or checks, never appends.
+# (src/power.rs). RUNNER_HOST_RESERVE sets how much memory the host keeps for
+# itself, like 2G (default 1G): VMs boot only into the rest, kept in
+# /etc/runner/reserve for reruns (src/room.rs). Safe to rerun, after an
+# upgrade too: every step overwrites or checks, never appends.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bin=${1:-$(dirname "$here")/target/release/runner}
 net=${RUNNER_NET:-$(cat /etc/runner/net 2>/dev/null || echo 172.16.0.0/16)}
 idle=${RUNNER_HOST_IDLE:-$(cat /etc/runner/host-idle 2>/dev/null || echo never)}
+reserve=${RUNNER_HOST_RESERVE:-$(cat /etc/runner/reserve 2>/dev/null || echo 1G)}
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -39,6 +42,11 @@ if [[ $idle != never ]]; then
   [[ $idle =~ ^[0-9]{1,6}[smh]?$ ]] || die "$bad_idle"
   ((10#${idle%[smh]} > 0)) || die "$bad_idle"
 fi
+# What the runner reads (store::parse_mem), short of T and of a count too
+# big for it.
+bad_reserve="RUNNER_HOST_RESERVE=$reserve isn't a memory size: use MiB, or a whole number with M or G, like 2G"
+[[ $reserve =~ ^[0-9]{1,6}([MmGg]([Ii][Bb])?)?$ ]] || die "$bad_reserve"
+((10#${reserve%%[!0-9]*} > 0)) || die "$bad_reserve"
 
 missing=()
 command -v nft >/dev/null || missing+=(nftables)
@@ -191,6 +199,9 @@ install -d -m 0755 /etc/runner
 install -m 0644 "$tmp/nat.nft" /etc/runner/nat.nft
 echo "$net" >"$tmp/net"
 install -m 0644 "$tmp/net" /etc/runner/net
+say "reserve for the host: $reserve"
+echo "$reserve" >"$tmp/reserve"
+install -m 0644 "$tmp/reserve" /etc/runner/reserve
 install -m 0644 "$here/runner-nat.service" /etc/systemd/system/runner-nat.service
 systemctl daemon-reload
 systemctl enable runner-nat.service

@@ -400,16 +400,15 @@ fn start_status_and_stop_drive_the_vms_unit() {
         run(&["stop", "dev"]),
         "dev  gen 0  6 bytes  cpus 2  mem 2G  stopped\n"
     );
-    let show = "systemctl show --property=ActiveState --value firecracker@dev.service";
+    // The shows between are each VM's, for the host's room.
+    let verbs: Vec<String> = (sd.calls().into_iter())
+        .filter(|c| !c.starts_with("systemctl show "))
+        .collect();
     assert_eq!(
-        sd.calls(),
+        verbs,
         [
-            show,
             "systemctl start firecracker@dev.service",
-            show,
-            show,
             "systemctl stop firecracker@dev.service",
-            show,
         ]
     );
 }
@@ -731,6 +730,7 @@ fn doctor_prints_a_line_per_check_and_fails_on_any_failure() {
         "unit",
         "key",
         "host-idle",
+        "room",
     ];
     assert_eq!(names, all, "{stdout}");
     for l in &lines {
@@ -959,17 +959,30 @@ fn net_help_names_all_four() {
 }
 
 // `runner hosts` on a host: the row the laptop's `runner hosts` shows for it.
-fn meminfo(dir: &Path, available_kib: u64) -> std::path::PathBuf {
+// Its free memory is its room (tests/room.rs): MemTotal less the reserve and
+// what the VMs up hold.
+fn meminfo(dir: &Path, total_kib: u64) -> std::path::PathBuf {
     let path = dir.join("meminfo");
     fs::write(
         &path,
         format!(
-            "MemTotal:        8000000 kB\nMemFree:          123456 kB\n\
-             MemAvailable:   {available_kib:>8} kB\nBuffers:           4096 kB\n"
+            "MemTotal:       {total_kib:>8} kB\nMemFree:          123456 kB\n\
+             MemAvailable:     654321 kB\nBuffers:           4096 kB\n"
         ),
     )
     .unwrap();
     path
+}
+
+fn hosts(dir: &Path, sd: &FakeSystemd, total_kib: u64) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir)
+        .env("PATH", sd.path())
+        .env("RUNNER_MEMINFO", meminfo(dir, total_kib))
+        .env("RUNNER_RESERVE", dir.join("reserve"))
+        .arg("hosts")
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -982,39 +995,32 @@ fn hosts_counts_the_vms_the_ones_up_and_the_free_memory() {
     sd.set_vm_state("dev", "active");
     sd.set_vm_state("web", "activating");
     sd.set_vm_state("old", "failed");
-    let out = Command::new(env!("CARGO_BIN_EXE_runner"))
-        .env("RUNNER_ROOT", dir.path())
-        .env("PATH", sd.path())
-        .env("RUNNER_MEMINFO", meminfo(dir.path(), 6_291_456))
-        .arg("hosts")
-        .output()
-        .unwrap();
+    // 10 GiB, less the 1 GiB reserve and dev's and web's 2 GiB and 64 MiB.
+    let out = hosts(dir.path(), &sd, 10 << 20);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    // base, dev, web and old; dev and web up; 6 GiB available.
-    assert_eq!(text(&out.stdout), "4 VMs  2 up  6442450944 bytes free\n");
+    // base, dev, web and old; dev and web up.
+    let free = (10240u64 - 1024 - 2 * (2048 + 64)) << 20;
+    assert_eq!(
+        text(&out.stdout),
+        format!("4 VMs  2 up  {free} bytes free\n")
+    );
 }
 
 #[test]
 fn hosts_on_a_host_with_one_vm_says_vm() {
     let dir = with_base();
     let sd = FakeSystemd::new(dir.path());
-    let out = Command::new(env!("CARGO_BIN_EXE_runner"))
-        .env("RUNNER_ROOT", dir.path())
-        .env("PATH", sd.path())
-        .env("RUNNER_MEMINFO", meminfo(dir.path(), 1))
-        .arg("hosts")
-        .output()
-        .unwrap();
+    let out = hosts(dir.path(), &sd, (1 << 20) + 1);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "1 VM  0 up  1024 bytes free\n");
 }
 
 #[test]
-fn hosts_fails_saying_why_without_memavailable() {
+fn hosts_fails_saying_why_without_memtotal() {
     let dir = with_base();
     let sd = FakeSystemd::new(dir.path());
     let bad = dir.path().join("meminfo");
-    fs::write(&bad, "MemTotal: 8000000 kB\n").unwrap();
+    fs::write(&bad, "MemAvailable: 8000000 kB\n").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_runner"))
         .env("RUNNER_ROOT", dir.path())
         .env("PATH", sd.path())
@@ -1025,6 +1031,6 @@ fn hosts_fails_saying_why_without_memavailable() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let err = text(&out.stderr);
-    assert!(err.contains("MemAvailable"), "{err}");
+    assert!(err.contains("MemTotal"), "{err}");
     assert!(err.contains(bad.to_str().unwrap()), "{err}");
 }

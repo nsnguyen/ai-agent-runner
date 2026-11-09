@@ -426,7 +426,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Boot a VM from its current disk, or wake it if it's sleeping. Returns once the guest has started. The VM can't be deleted or undone while it runs or sleeps."
+        description = "Boot a VM from its current disk, or wake it if it's sleeping. Returns once the guest has started. Refused, with nothing started, if the host has no room for the VM's memory (list_hosts). The VM can't be deleted or undone while it runs or sleeps."
     )]
     async fn start_vm(
         &self,
@@ -490,7 +490,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Wake a sleeping VM where it was, and set its clock, which stood still while it slept. A VM awake already stays so."
+        description = "Wake a sleeping VM where it was, and set its clock, which stood still while it slept. A VM awake already stays so. Refused, and it sleeps on, if the host has no room for its memory (list_hosts)."
     )]
     async fn wake_vm(
         &self,
@@ -514,14 +514,14 @@ impl Tools {
     }
 
     #[tool(
-        description = "Check this host can run VMs: KVM, the pinned Firecracker, reflink under the VM root, the guest kernel, the base VM, NAT, the systemd unit, and the SSH key other hosts trust this one by. `ok` is false if any check fails; warnings don't fail."
+        description = "Check this host can run VMs: KVM, the pinned Firecracker, reflink under the VM root, the guest kernel, the base VM, NAT, the systemd unit, the SSH key other hosts trust this one by, and the host's reserve and room. `ok` is false if any check fails; warnings don't fail."
     )]
     fn doctor(&self) -> Result<Json<Report>, String> {
         Ok(Json(doctor::check(&System, &self.store)))
     }
 
     #[tool(
-        description = "List the hosts this runner reaches, this one first, each with its name, how many VMs it has (base included), how many are up (booting, running, sleeping or stopping), and its free memory in bytes (MemAvailable). A host that doesn't answer is named in `unreachable`, with why."
+        description = "List the hosts this runner reaches, this one first, each with its name, how many VMs it has (base included), how many are up (booting, running, sleeping or stopping), and its free memory in bytes: its room, MemTotal less a reserve for the host and what each VM up holds, which a VM's boot or wake has to fit in. A host that doesn't answer is named in `unreachable`, with why."
     )]
     async fn list_hosts(&self) -> Result<Json<HostList>, String> {
         // systemd is asked about each VM here while the peers are asked.
@@ -805,7 +805,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Best of N: fork a VM into <name>-1 to <name>-<n>, n from 2 to 4, start the prompt in each at once as an ordinary run, and return the n runs; read each with run_output, as any run. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its result measures what that try changed against the VM's disk. The VM itself isn't touched: a stopped one's current disk is forked, and a running or sleeping one is checkpointed first (kind run), and that's forked. The forks get the default credentials, claude only, and the VM's sizes. Refused, with nothing made, if a fork's name is taken, if the host's free memory less 1 GiB can't hold n of the VM, while the VM has a run going, and while an earlier batch's forks are still VMs. Tokens cost n times one run's."
+        description = "Best of N: fork a VM into <name>-1 to <name>-<n>, n from 2 to 4, start the prompt in each at once as an ordinary run, and return the n runs; read each with run_output, as any run. Each fork is new and stopped, so its run boots it and commits only a clean exit, and its result measures what that try changed against the VM's disk. The VM itself isn't touched: a stopped one's current disk is forked, and a running or sleeping one is checkpointed first (kind run), and that's forked. The forks get the default credentials, claude only, and the VM's sizes. Refused, with nothing made, if a fork's name is taken, if the host's room (list_hosts) can't hold n of the VM and their Firecrackers, and the VM too if it's asleep, since it wakes for the checkpoint, while the VM has a run going, and while an earlier batch's forks are still VMs. Tokens cost n times one run's."
     )]
     async fn run_best_of(
         &self,
@@ -1199,8 +1199,13 @@ impl Tools {
     async fn most_free(&self, lists: &Lists) -> Result<Option<usize>, String> {
         let up: Vec<usize> = (0..lists.len()).filter(|&i| lists[i].is_ok()).collect();
         let answers = self.ask("list_hosts", &up).await;
-        let mut best: Option<(Option<usize>, u64)> =
-            crate::host::mem_available().ok().map(|free| (None, free));
+        let store = self.store.clone();
+        let here = tokio::task::spawn_blocking(move || systemd::room(&store).map(|r| r.free()));
+        let mut best: Option<(Option<usize>, u64)> = here
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|free| (None, free));
         for (i, answer) in answers.into_iter().enumerate() {
             let Ok(row) = answer.and_then(|v| peer_row(&v, &self.peers[i].name)) else {
                 continue;

@@ -429,7 +429,7 @@ esac
     assert!(free(), "held after start_vm");
 }
 
-// With no peers, this host only: its VMs, the ones up, and MemAvailable, as
+// With no peers, this host only: its VMs, the ones up, and its room, as
 // `runner hosts` counts them. tests/mcp_hosts.rs has the rest.
 #[test]
 fn list_hosts_gives_this_host_s_row() {
@@ -441,30 +441,84 @@ fn list_hosts_gives_this_host_s_row() {
     store.fork("base", "dev").unwrap();
     let sd = FakeSystemd::new(dir.path());
     sd.set_vm_state("dev", "active");
+    // 8 GiB, less the 1 GiB reserve and dev's 2 GiB and 64 MiB.
     let meminfo = dir.path().join("meminfo");
-    fs::write(&meminfo, "MemTotal: 8000000 kB\nMemAvailable: 4194304 kB\n").unwrap();
+    fs::write(&meminfo, "MemTotal: 8388608 kB\nMemAvailable: 1 kB\n").unwrap();
 
     let path = sd.path();
+    let reserve = dir.path().join("reserve");
     let mut s = start_with_env(
         dir.path(),
         &[
             ("PATH", &path),
             ("RUNNER_MEMINFO", meminfo.to_str().unwrap()),
+            ("RUNNER_RESERVE", reserve.to_str().unwrap()),
         ],
     );
     let got = s.call(2, "list_hosts", json!({}));
     assert_eq!(got["isError"], json!(false), "{got}");
     let name = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    let free = (8192u64 - 1024 - 2048 - 64) << 20;
     assert_eq!(
         got["structuredContent"],
-        json!({"hosts": [{"name": name.trim(), "vms": 2, "up": 1, "mem_available": 4u64 << 30}]})
+        json!({"hosts": [{"name": name.trim(), "vms": 2, "up": 1, "mem_available": free}]})
     );
 
-    fs::write(&meminfo, "MemTotal: 8000000 kB\n").unwrap();
+    fs::write(&meminfo, "MemAvailable: 8000000 kB\n").unwrap();
     let got = s.call(3, "list_hosts", json!({}));
     assert_eq!(got["isError"], json!(true), "{got}");
     let why = got["content"][0]["text"].as_str().unwrap();
-    assert!(why.contains("MemAvailable"), "{why}");
+    assert!(why.contains("MemTotal"), "{why}");
+}
+
+// A start on a full host is refused as the CLI's is, with nothing started:
+// 4 GiB, less the 1 GiB reserve and dev's 2 GiB and 64 MiB, leaves 0.9G,
+// short of web's 2 GiB and 64 MiB.
+#[test]
+fn start_vm_on_a_full_host_says_what_the_cli_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = dir.path().join("rootfs.ext4");
+    fs::write(&disk, b"rootfs").unwrap();
+    let store = Store::new(dir.path());
+    store.import("base", &disk).unwrap();
+    store.fork("base", "dev").unwrap();
+    store.fork("base", "web").unwrap();
+    let sd = FakeSystemd::new(dir.path());
+    sd.set_vm_state("dev", "active");
+    sd.set_vm_state("web", "inactive");
+    let meminfo = dir.path().join("meminfo");
+    fs::write(&meminfo, "MemTotal: 4194304 kB\n").unwrap();
+    let path = sd.path();
+    let reserve = dir.path().join("reserve");
+    let env = [
+        ("PATH", path.as_str()),
+        ("RUNNER_MEMINFO", meminfo.to_str().unwrap()),
+        ("RUNNER_RESERVE", reserve.to_str().unwrap()),
+    ];
+    let cli = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .env("RUNNER_ROOT", dir.path())
+        .envs(env)
+        .args(["start", "web"])
+        .output()
+        .unwrap();
+    assert!(!cli.status.success());
+    let said = String::from_utf8_lossy(&cli.stderr);
+    let said = said.trim().strip_prefix("runner: ").unwrap();
+    assert!(said.starts_with("web needs 2.1G; "), "{said}");
+    assert!(
+        said.ends_with(" has 0.9G free: stop or sleep a VM, or move web"),
+        "{said}"
+    );
+
+    let mut s = start_with_env(dir.path(), &env);
+    let got = s.call(2, "start_vm", json!({"name": "web"}));
+    assert_eq!(got["isError"], json!(true), "{got}");
+    assert_eq!(got["content"][0]["text"], json!(said), "{got}");
+    assert!(
+        !sd.calls().iter().any(|c| c.starts_with("systemctl start")),
+        "{:?}",
+        sd.calls()
+    );
 }
 
 // Through the VM's boot (src/sleep.rs), which a stand-in plays here.
@@ -624,6 +678,7 @@ fn doctor_reports_every_check() {
         "unit",
         "key",
         "host-idle",
+        "room",
     ];
     assert_eq!(names, all, "{report}");
     // No base VM in an empty root, so at least that one fails.
