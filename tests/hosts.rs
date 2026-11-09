@@ -2274,3 +2274,25 @@ fn hosts_rm_names_a_host_that_can_t_take_the_list() {
         );
     }
 }
+
+// `runner mcp-http token` and `revoke` name no VM: they're for the first
+// host's MCP over HTTP, or the one --host names, never for a host with a VM
+// named token.
+#[test]
+fn mcp_http_goes_to_the_first_host_unless_host_says() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host-2", &["base", "web", "token"], 6 << 30);
+        ok(&fleet.run(shell, &["list"]));
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["mcp-http", "token"]));
+        assert_eq!(fleet.calls("kvm-host"), ["mcp-http token"], "{shell:?}");
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["mcp-http", "token", "--host", "kvm-host-2"]));
+        assert!(fleet.calls("kvm-host").is_empty(), "{shell:?}");
+        assert_eq!(fleet.calls("kvm-host-2"), ["mcp-http token"], "{shell:?}");
+    }
+}
