@@ -746,6 +746,7 @@ if [ "${1-}" = hosts ]; then
       echo "removed $match"
       # The rest drop its line, keeping each other's; then it drops theirs.
       gone=$match
+      was=${hosts%%"$nl"*}
       hosts=$(saved_hosts)
       failed=
       keep=
@@ -757,6 +758,17 @@ if [ "${1-}" = hosts ]; then
       if [ -n "$hosts" ]; then
         left="the other hosts' keys still work there"
         reconcile "$gone" "" "" "" || failed=1
+        # The first, maybe a new one, gets the list for its MCP over HTTP.
+        top=${hosts%%"$nl"*}
+        left="MCP over HTTP there won't reach the hosts as listed until \`runner hosts add $top\` again"
+        # shellcheck disable=SC2086 # a host a word, never globbed (set -f).
+        relist "$top" $hosts || failed=1
+      fi
+      # One that was first has no list. It's off the list, so one it keeps
+      # is only said.
+      if [ "$gone" = "$was" ]; then
+        left="MCP over HTTP there still has the old list: \`RUNNER_HOST=$gone runner mcp-http peers\` clears it"
+        relist "$gone" || :
       fi
       [ -z "$failed" ] || exit 1
       exit 0

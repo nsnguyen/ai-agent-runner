@@ -1207,7 +1207,13 @@ fn hosts_rm_takes_a_host_out_by_its_name() {
             "runner@kvm-host\nrunner@kvm-host-3\n",
             "{shell:?}"
         );
-        for host in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+        // No runner command but the first's list for MCP over HTTP.
+        assert_eq!(
+            fleet.calls("kvm-host"),
+            [listing(&[HOSTS[0], HOSTS[2]])],
+            "{shell:?}"
+        );
+        for host in ["kvm-host-2", "kvm-host-3"] {
             assert!(fleet.calls(host).is_empty(), "{shell:?} {host}");
         }
         let out = fleet.run(shell, &["hosts", "rm", "runner@kvm-host"]);
@@ -1979,6 +1985,8 @@ fn hosts_rm_takes_lines_out_past_a_listed_line_that_isn_t_a_host() {
     let out = fleet.run(SHELLS[0], &["hosts", "rm", "kvm-host-2"]);
     ok(&out);
     assert_eq!(fleet.authorized_keys("kvm-host"), trusting(&[]));
+    // Nor is it in the first's list, for its runner's ssh to take.
+    assert_eq!(fleet.calls("kvm-host"), [listing(&[HOSTS[0]])]);
     assert!(
         fleet
             .ssh_calls()
@@ -2193,6 +2201,76 @@ fn hosts_add_names_a_first_host_that_can_t_take_the_list() {
         assert!(
             err.contains("kvm-host didn't answer, so MCP over HTTP there"),
             "{err}"
+        );
+    }
+}
+
+#[test]
+fn hosts_rm_rewrites_the_first_host_s_list() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        ok(&fleet.run(shell, &["hosts", "rm", "kvm-host-2"]));
+        assert_eq!(
+            fleet.calls("kvm-host"),
+            [listing(&[HOSTS[0], HOSTS[2]])],
+            "{shell:?}"
+        );
+        assert!(fleet.calls("kvm-host-2").is_empty(), "{shell:?}");
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+
+        // The first gone, the next is first, and the one that left has no list.
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["hosts", "rm", "runner@kvm-host"]));
+        assert_eq!(
+            fleet.calls("kvm-host-3"),
+            [listing(&[HOSTS[2]])],
+            "{shell:?}"
+        );
+        assert_eq!(fleet.calls("kvm-host"), [listing(&[])], "{shell:?}");
+
+        // The last gone, there's no first to write to.
+        fleet.forget_calls();
+        ok(&fleet.run(shell, &["hosts", "rm", "kvm-host-3"]));
+        assert_eq!(fleet.calls("kvm-host-3"), [listing(&[])], "{shell:?}");
+        assert_eq!(fleet.ssh_calls().len(), 1, "{shell:?}");
+    }
+}
+
+// A first host that can't take the list fails the rm, as for the keys; the
+// one that left keeping its own is only said.
+#[test]
+fn hosts_rm_names_a_host_that_can_t_take_the_list() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.old("kvm-host");
+        let out = fleet.run(shell, &["hosts", "rm", "kvm-host-2"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert_eq!(err.lines().count(), 1, "{shell:?}: {err}");
+        assert!(err.contains("on kvm-host (an older runner?)"), "{err}");
+        assert!(
+            err.contains("`runner hosts add runner@kvm-host` again"),
+            "{err}"
+        );
+
+        let out = fleet.run(shell, &["hosts", "rm", "kvm-host"]);
+        ok(&out);
+        assert_eq!(
+            fleet.calls("kvm-host-3"),
+            [listing(&[HOSTS[2]])],
+            "{shell:?}"
+        );
+        let err = text(&out.stderr);
+        assert_eq!(err.lines().count(), 1, "{shell:?}: {err}");
+        assert!(err.contains("on kvm-host (an older runner?)"), "{err}");
+        assert!(
+            err.contains("`RUNNER_HOST=runner@kvm-host runner mcp-http peers`"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(fleet.hosts_file()).unwrap(),
+            "runner@kvm-host-3\n",
+            "{shell:?}"
         );
     }
 }
