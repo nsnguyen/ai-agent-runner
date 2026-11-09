@@ -786,12 +786,6 @@ fn a_pairing_code_is_single_use_lives_ten_minutes_and_types_loosely() {
     assert!(res.code().is_none());
     assert!(res.body.contains("runner mcp-http pair"), "{}", res.body);
 
-    // Ten minutes on, it's void.
-    let code = host.pair();
-    host.later(10 * 60 + 1);
-    let page = host.page(&client, &flow);
-    assert!(host.approve(&page, &code).code().is_none());
-
     // A new pair replaces the old.
     let old = host.pair();
     let new = host.pair();
@@ -801,6 +795,12 @@ fn a_pairing_code_is_single_use_lives_ten_minutes_and_types_loosely() {
     }
     let page = host.page(&client, &flow);
     assert!(host.approve(&page, &new).code().is_some());
+
+    // Ten minutes on, it's void: last, as `pair` runs on the real clock.
+    let code = host.pair();
+    host.later(10 * 60 + 1);
+    let page = host.page(&client, &flow);
+    assert!(host.approve(&page, &code).code().is_none());
 }
 
 #[test]

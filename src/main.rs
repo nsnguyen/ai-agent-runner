@@ -10,6 +10,7 @@ use runner::export;
 use runner::idle::Idle;
 use runner::image;
 use runner::import;
+use runner::oauth;
 use runner::peers;
 use runner::power;
 use runner::proto::{Exit, Request};
@@ -505,7 +506,8 @@ enum Cmd {
         #[arg(long, env = "RUNNER_MCP_URL", value_name = "URL")]
         url: Option<String>,
     },
-    /// The bearer tokens MCP over HTTP (`runner mcp --http`) takes.
+    /// The bearer tokens MCP over HTTP (`runner mcp --http`) takes, and the
+    /// OAuth clients, like claude.ai, that sign in for one.
     #[command(name = "mcp-http", subcommand)]
     McpHttp(McpHttpCmd),
     /// Run a VM until it shuts down: the unit's main process.
@@ -572,8 +574,19 @@ enum McpHttpCmd {
     /// Print a new token, once: only its hash is kept. For curl, and for
     /// MCP clients that take a header: `Authorization: Bearer <token>`.
     Token,
-    /// Drop every token: each client needs a new one.
-    Revoke,
+    /// Print a pairing code, for the page claude.ai opens when it signs in
+    /// by OAuth: single use, for 10 minutes, void after five wrong tries.
+    /// A new one replaces the old.
+    Pair,
+    /// The OAuth clients, like claude.ai, that registered: each one's id,
+    /// live tokens, when it last called, and name.
+    List,
+    /// Drop every token and the waiting pairing code, or with a client's
+    /// id, that client's tokens alone: it can pair again.
+    Revoke {
+        /// The client's id, as `runner mcp-http list` shows it.
+        client: Option<String>,
+    },
     /// Write the hosts MCP over HTTP reaches to <root>/peers, as listed on
     /// the laptop: this one first, then its peers. With none, remove it.
     /// What the laptop's `runner hosts add` and `rm` run here.
@@ -1006,10 +1019,33 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
             user, peers, name, ..
         } => return Ok(serve(store, user, peers, name)),
         Cmd::McpHttp(McpHttpCmd::Token) => println!("{}", tokens::mint(root, "cli")?),
-        Cmd::McpHttp(McpHttpCmd::Revoke) => {
-            let n = tokens::revoke(root)?;
+        Cmd::McpHttp(McpHttpCmd::Pair) => {
+            println!("{}", oauth::pair(root, oauth::Clock::system().now())?);
+            eprintln!(
+                "type it on the page claude.ai opened: single use, for 10 minutes, void after 5 wrong tries"
+            );
+        }
+        Cmd::McpHttp(McpHttpCmd::List) => {
+            let rows = oauth::list(root, oauth::Clock::system().now())?;
+            if rows.is_empty() {
+                println!("no clients yet: claude.ai registers one when you add the connector");
+            }
+            rows.iter().for_each(|r| println!("{r}"));
+        }
+        Cmd::McpHttp(McpHttpCmd::Revoke { client: None }) => {
+            let (n, voided) = oauth::revoke_all(root)?;
             let s = if n == 1 { "" } else { "s" };
-            println!("revoked {n} token{s}");
+            let code = if voided {
+                ", and the waiting pairing code"
+            } else {
+                ""
+            };
+            println!("revoked {n} token{s}{code}");
+        }
+        Cmd::McpHttp(McpHttpCmd::Revoke { client: Some(id) }) => {
+            let (n, name) = oauth::revoke_client(root, &id)?;
+            let s = if n == 1 { "" } else { "s" };
+            println!("revoked {n} token{s} of {id} ({name})");
         }
         Cmd::McpHttp(McpHttpCmd::Peers { hosts }) => write_peers(root, &hosts)?,
         Cmd::Boot {

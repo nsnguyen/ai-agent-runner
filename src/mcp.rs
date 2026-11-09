@@ -1071,7 +1071,10 @@ pub async fn serve_on(
     let gate = Arc::new(Gate {
         root: store.root().to_path_buf(),
         challenge: format!("Bearer resource_metadata=\"{base}{RESOURCE_METADATA}\""),
+        clock: clock.clone(),
+        noted: Mutex::default(),
     });
+    let oauth = oauth::Server::new(store.root().to_path_buf(), base.clone(), clock);
     let tools = Tools {
         store,
         user,
@@ -1084,9 +1087,12 @@ pub async fn serve_on(
     // A session's server is a clone: the hosts dialed and where VMs were
     // seen are every session's.
     let mcp = StreamableHttpService::new(move || Ok(tools.clone()), Arc::new(sessions), config);
+    // The token check is /mcp's alone: OAuth's endpoints are how a client
+    // gets one.
     let app = axum::Router::new()
         .route_service("/mcp", mcp)
-        .route_layer(axum::middleware::from_fn_with_state(gate, bearer));
+        .route_layer(axum::middleware::from_fn_with_state(gate, bearer))
+        .merge(oauth::routes(Arc::new(oauth)));
     eprintln!("runner mcp: serving http://{at}/mcp for {base}/mcp");
     axum::serve(listener, app).await?;
     Ok(())
@@ -1099,11 +1105,18 @@ fn authority(url: &str) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_string())
 }
 
-/// What the token check needs: the store, and what a 401 says.
+/// What the token check needs: the store, what a 401 says, the clock an
+/// OAuth token's hour runs on, and when each OAuth client's last call was
+/// noted.
 struct Gate {
     root: std::path::PathBuf,
     challenge: String,
+    clock: oauth::Clock,
+    noted: Mutex<HashMap<String, i64>>,
 }
+
+/// How often an OAuth client's last call is written down, at most.
+const NOTE_EVERY: i64 = 60;
 
 // Lets a request with a good bearer token through to MCP; any other gets
 // 401 and its challenge, and no tool runs. The store is read at each
@@ -1121,19 +1134,25 @@ async fn bearer(
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         .map(|(_, token)| token.trim().to_string())
         .filter(|token| !token.is_empty());
-    let good = match presented {
-        None => Ok(false),
+    let now = gate.clock.now();
+    let holder = match presented {
+        None => Ok(None),
         Some(token) => {
             let root = gate.root.clone();
-            match tokio::task::spawn_blocking(move || tokens::check(&root, &token)).await {
+            match tokio::task::spawn_blocking(move || tokens::check(&root, &token, now)).await {
                 Ok(checked) => checked.map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }
         }
     };
-    match good {
-        Ok(true) => next.run(request).await,
-        Ok(false) => {
+    match holder {
+        Ok(Some(holder)) => {
+            if let tokens::Holder::Client(id) = holder {
+                note_call(&gate, id, now).await;
+            }
+            next.run(request).await
+        }
+        Ok(None) => {
             let said = "a bearer token is needed: `runner mcp-http token` on the host makes one\n";
             let mut refused = (StatusCode::UNAUTHORIZED, said).into_response();
             if let Ok(challenge) = HeaderValue::from_str(&gate.challenge) {
@@ -1148,6 +1167,25 @@ async fn bearer(
             let said = "the host couldn't read its tokens\n";
             (StatusCode::INTERNAL_SERVER_ERROR, said).into_response()
         }
+    }
+}
+
+// Notes when an OAuth client last called, for `runner mcp-http list`: at
+// most once a minute each, so a busy client doesn't rewrite the file at
+// every request. A failure is logged; the call goes on.
+async fn note_call(gate: &Gate, id: String, now: i64) {
+    {
+        let mut noted = gate.noted.lock().unwrap();
+        if noted.get(&id).is_some_and(|t| now - t < NOTE_EVERY) {
+            return;
+        }
+        noted.insert(id.clone(), now);
+    }
+    let root = gate.root.clone();
+    match tokio::task::spawn_blocking(move || oauth::called(&root, &id, now)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("runner mcp: noting a client's call: {e}"),
+        Err(e) => eprintln!("runner mcp: noting a client's call: {e}"),
     }
 }
 
