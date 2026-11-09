@@ -137,7 +137,7 @@ So one host reaches another only over the tailnet, with no terminal or forwardin
 
 The host takes SSH only over the tailnet. Never forward port 22 to it from a router or expose it on a public IP. If sshd does listen elsewhere, `from=` still refuses the runner user's key from outside the tailnet.
 
-MCP over HTTP is the one exception, and it's off unless set (MCP clients, Over HTTP): the server listens on loopback only, Funnel is what puts it on the internet, and every request needs a bearer token.
+MCP over HTTP is the one exception, and it's off unless set (MCP clients, Over HTTP): the server listens on loopback only, Funnel is what puts it on the internet, and every request needs a bearer token. `runner doctor` warns when Funnel puts anything else there.
 
 This needs the host's own sshd, not Tailscale SSH: with Tailscale SSH on, tailscaled answers port 22 on the tailnet address and never reads `authorized_keys`.
 
@@ -500,7 +500,7 @@ Nor do they get `AWS_PROFILE`, or the AWS CLI on PATH, which starting a stopped 
 
 #### Over HTTP
 
-claude.ai, and any client that can't run a command, reaches the same server over Streamable HTTP: the same tools, reaching the other listed hosts the same way. It's off unless set. On the first host, `sudo RUNNER_MCP_HTTP=1 RUNNER_MCP_URL=https://kvm-host.<tailnet>.ts.net host/install.sh` starts `runner-mcp-http.service`, which is `runner mcp --http 127.0.0.1:8740` as runner, and reruns remember both (`/etc/runner/mcp-http`, `/etc/runner/mcp-url`); `RUNNER_MCP_HTTP=0` stops it and takes it out. It listens on loopback only and refuses any other address: Funnel or `tailscale serve` puts it on a URL, which `RUNNER_MCP_URL` names. Without that URL only loopback's Host is let in, so a request through either gets 403, which install.sh warns of. It also sets the host's idle time to never, since claude.ai can't start a stopped host, so the host runs around the clock, and `runner doctor` warns when it's set otherwise. Turning it off leaves never as it is: `RUNNER_MCP_HTTP=0 RUNNER_HOST_IDLE=1h host/install.sh` sets an idle time again. Only this host is kept up: a peer with an idle time that has stopped doesn't answer until something starts it, like the laptop's `runner`, and a call for its VMs fails meanwhile, naming it.
+claude.ai, and any client that can't run a command, reaches the same server over Streamable HTTP: the same tools, reaching the other listed hosts the same way. It's off unless set. On the first host, `sudo RUNNER_MCP_HTTP=1 RUNNER_MCP_URL=https://kvm-host.<tailnet>.ts.net:8443 host/install.sh` starts `runner-mcp-http.service`, which is `runner mcp --http 127.0.0.1:8740` as runner, and reruns remember both (`/etc/runner/mcp-http`, `/etc/runner/mcp-url`); `RUNNER_MCP_HTTP=0` stops it and takes it out. It listens on loopback only and refuses any other address: Funnel (From claude.ai and the phone) or `tailscale serve` puts it on a URL, which `RUNNER_MCP_URL` names. Without that URL only loopback's Host is let in, so a request through either gets 403, which install.sh warns of. It also sets the host's idle time to never, since claude.ai can't start a stopped host, so the host runs around the clock, and `runner doctor` warns when it's set otherwise. Turning it off leaves never as it is: `RUNNER_MCP_HTTP=0 RUNNER_HOST_IDLE=1h host/install.sh` sets an idle time again. Only this host is kept up: a peer with an idle time that has stopped doesn't answer until something starts it, like the laptop's `runner`, and a call for its VMs fails meanwhile, naming it.
 
 Every request needs a bearer token. claude.ai gets its own by OAuth (From claude.ai and the phone); for curl, and clients that take a header:
 
@@ -521,15 +521,41 @@ curl -s http://127.0.0.1:8740/mcp -H "Authorization: Bearer $TOKEN" \
 
 #### From claude.ai and the phone
 
-claude.ai signs in by OAuth, so no token is pasted anywhere. With the server on a URL (Over HTTP), add a custom connector in claude.ai's Settings, Connectors, at `RUNNER_MCP_URL/mcp`, and connect it. claude.ai registers itself and opens an approval page on the host that names it; type there the code `pair` prints:
+claude.ai reaches the server through Funnel, which puts one of the host's ports on the internet, and signs in by OAuth, so no token is pasted anywhere. `host/install.sh` never turns Funnel on: going public is a step you take by hand. On the first host (Over HTTP):
+
+1. Let the host use Funnel: the tailnet's policy file (admin console, Access controls) needs the `funnel` node attribute for it, `"nodeAttrs": [{"target": ["autogroup:member"], "attr": ["funnel"]}]` as the admin console's own Funnel prompt writes it, and the tailnet needs HTTPS on (admin console, DNS).
+2. Funnel port 8443 to the server, and name that URL, port and all, as RUNNER_MCP_URL:
+
+   ```sh
+   sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8740
+   tailscale funnel status          # https://kvm-host.<tailnet>.ts.net:8443 (Funnel on)
+   sudo RUNNER_MCP_HTTP=1 RUNNER_MCP_URL=https://kvm-host.<tailnet>.ts.net:8443 host/install.sh
+   sudo -u runner runner doctor     # its mcp-http line ok
+   ```
+
+   Funnel serves only ports 443, 8443 and 10000; 443 is left for a VM's URL on the tailnet (docs/host.md). `runner doctor`'s `mcp-http` line, with MCP over HTTP on, checks that the service is up, that RUNNER_MCP_URL is https, and that Funnel takes the URL's port, under the URL's name, to 127.0.0.1:8740 and to nothing else, and that it puts no other port on the internet, a VM's URL included. Each warning says the command that fixes it. With MCP over HTTP off, doctor has no line about it.
+3. Add a custom connector in claude.ai's Settings, Connectors, at `RUNNER_MCP_URL/mcp`, like `https://kvm-host.<tailnet>.ts.net:8443/mcp`, and connect it. claude.ai registers itself and opens an approval page on the host that names it; type there the code `pair` prints:
+
+   ```sh
+   runner mcp-http pair              # a code for the approval page: single use, 10 minutes, void after 5 wrong tries
+   runner mcp-http list              # each client: its id, live tokens, when it last called, its name
+   runner mcp-http revoke <client>   # drops that client's tokens; it can pair again
+   ```
+
+4. From the phone: the Claude app, signed in to the same account, gets the connector once it's connected on claude.ai. Ask it to list the VMs.
+
+From the laptop `pair`, `list` and `revoke` go to the first host, as `token` does. Allowed, the page sends you back to claude.ai with a code good for a minute, which claude.ai trades for an access token that lasts an hour and a refresh token that lasts 30 days, and it refreshes on its own from then on. Registration takes only claude.ai's and claude.com's callbacks, so a code can't be sent anywhere else, and nobody gets a token without a code from `pair`. A refresh token is replaced at each use: one used twice, or an authorization code tried twice, revokes all of that client's tokens, and claude.ai has to connect again. docs/design.md (Credentials) says what claude.ai holds. The endpoints are under `RUNNER_MCP_URL`: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize` and `/token`.
+
+To take it back:
 
 ```sh
-runner mcp-http pair              # a code for the approval page: single use, 10 minutes, void after 5 wrong tries
-runner mcp-http list              # each client: its id, live tokens, when it last called, its name
-runner mcp-http revoke <client>   # drops that client's tokens; it can pair again
+sudo tailscale funnel --https=8443 off   # on the host: off the internet at once
+runner mcp-http revoke                   # every token, claude.ai's too, and a waiting pairing code
 ```
 
-From the laptop they go to the first host, as `token` does. Allowed, the page sends you back to claude.ai with a code good for a minute, which claude.ai trades for an access token that lasts an hour and a refresh token that lasts 30 days, and it refreshes on its own from then on. Registration takes only claude.ai's and claude.com's callbacks, so a code can't be sent anywhere else, and nobody gets a token without a code from `pair`. A refresh token is replaced at each use: one used twice, or an authorization code tried twice, revokes all of that client's tokens, and claude.ai has to connect again. docs/design.md (Credentials) says what claude.ai holds. The endpoints are under `RUNNER_MCP_URL`: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize` and `/token`.
+claude.ai then gets no answer, and once Funnel is on again, a 401 until it connects and pairs again. `RUNNER_MCP_HTTP=0 host/install.sh` stops the server too (Over HTTP).
+
+`client/check.sh`'s laptop checks reach RUNNER_MCP_URL as claude.ai does, through Funnel: curl looks its name up in public DNS, since on the tailnet MagicDNS takes it to the host whether Funnel is on or not, and `/mcp` with no token has to get 401 and the protected-resource metadata 200.
 
 #### The tools
 
