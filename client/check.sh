@@ -286,6 +286,44 @@ check_mcp() {
     pass "MCP exec with env GH_TOKEN: refused" || fail "MCP exec with env GH_TOKEN: ${got:-no reply}"
 }
 
+# public URL: the HTTP status URL answers with through public DNS, or 000.
+public() { curl -s -o /dev/null -w '%{http_code}' -m 20 --doh-url https://1.1.1.1/dns-query "$1"; }
+# unheard CODE: why, when nothing answered: Funnel is off, or public DNS
+# doesn't have the name yet.
+unheard() { [ "${1:-000}" != 000 ] || printf ': nothing answers through public DNS. Is Funnel on? Its name is there a few minutes after Funnel first turns on'; }
+
+# MCP over HTTP, when the host has it on (README.md, From claude.ai and the
+# phone): RUNNER_MCP_URL as claude.ai reaches it, through Funnel. curl looks
+# its name up in public DNS, over HTTPS, since on the tailnet MagicDNS gives
+# the host's tailnet address, which answers whether Funnel is on or not.
+# /mcp with no token gets 401, and the protected-resource metadata, where a
+# client finds how to sign in, 200. Neither touches the VM.
+check_mcp_http() {
+  # Line 1 is mcp-http, 1 when on; line 2 mcp-url, when there is one.
+  # shellcheck disable=SC2086
+  conf=$(ssh -n $opts "$host" "cat /etc/runner/mcp-http /etc/runner/mcp-url" 2>/dev/null)
+  on=$(printf '%s\n' "$conf" | sed -n 1p)
+  if [ "$on" != 1 ]; then
+    step "MCP over HTTP: not checked, since $host has it off"
+    return
+  fi
+  url=$(printf '%s\n' "$conf" | sed -n 2p)
+  url=${url%/}
+  step "MCP over HTTP, through Funnel at ${url:-no URL}"
+  case $url in
+  https://*) ;;
+  *)
+    fail "MCP over HTTP: $host has no https RUNNER_MCP_URL${url:+, only $url}, so claude.ai can't reach it: on the host, sudo RUNNER_MCP_URL=https://<its name>:8443 host/install.sh"
+    return
+    ;;
+  esac
+  got=$(public "$url/mcp")
+  [ "$got" = 401 ] && pass "MCP over HTTP: $url/mcp with no token gets 401" || fail "MCP over HTTP: $url/mcp with no token gets HTTP ${got:-000}, not 401$(unheard "$got")"
+  meta=$url/.well-known/oauth-protected-resource
+  got=$(public "$meta")
+  [ "$got" = 200 ] && pass "MCP over HTTP: $meta gets 200" || fail "MCP over HTTP: $meta gets HTTP ${got:-000}, not 200$(unheard "$got")"
+}
+
 # others: sets $peers to the other hosts ~/.config/runner/hosts lists, a
 # word each, and $listed if it lists the host checked.
 others() {
@@ -636,6 +674,7 @@ check_move() {
 laptop_checks() {
   check_exec
   check_mcp
+  check_mcp_http
   check_mcp_hosts
   check_move
   check_joined

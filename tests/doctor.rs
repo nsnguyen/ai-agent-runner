@@ -8,6 +8,7 @@ use runner::power;
 use runner::room::Room;
 use runner::store::Store;
 use runner::systemd::State;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -183,6 +184,28 @@ fn timer() -> String {
     format!("systemctl is-active {}", host::IDLE_TIMER)
 }
 
+fn mcp_unit() -> String {
+    format!("systemctl is-active {}", host::MCP_HTTP_SERVICE)
+}
+
+// Called by name, from PATH, as Tailscale's packages install it.
+const FUNNEL_STATUS: &str = "tailscale funnel status --json";
+
+// RUNNER_MCP_URL as README.md has it, on the port Funnel serves it at.
+const URL: &str = "https://kvm-host.tailnet.ts.net:8443";
+const AT: &str = "kvm-host.tailnet.ts.net:8443";
+
+// What `tailscale funnel status --json` prints after README.md's
+// `sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8740`: the
+// serve config, whose AllowFunnel names what's on the internet.
+fn funnel() -> Value {
+    json!({
+        "TCP": {"8443": {"HTTPS": true}},
+        "Web": {AT: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8740"}}}},
+        "AllowFunnel": {AT: true}
+    })
+}
+
 // Polkit's answer for this process, which runs the checks.
 fn pkcheck() -> String {
     let pid = std::process::id();
@@ -252,6 +275,21 @@ impl Fake {
     fn cmd(mut self, line: &str, got: Result<Ran, ErrorKind>) -> Self {
         self.runs.insert(line.to_string(), got);
         self
+    }
+
+    // MCP over HTTP on, as README.md's From claude.ai and the phone sets it
+    // up: its service up, RUNNER_MCP_URL on Funnel's port 8443, and Funnel
+    // taking that port to it.
+    fn with_mcp_http(self) -> Self {
+        self.file(host::MCP_HTTP, Ok("1\n"))
+            .file(host::MCP_URL, Ok(&format!("{URL}\n")))
+            .cmd(&mcp_unit(), ran(true, "active\n", ""))
+            .funnel(&funnel())
+    }
+
+    fn funnel(self, status: &Value) -> Self {
+        let printed = format!("{status:#}\n");
+        self.cmd(FUNNEL_STATUS, ran(true, &printed, ""))
     }
 
     fn lookup(&self, path: &Path) -> io::Result<String> {
@@ -761,7 +799,7 @@ fn host_idle_shows_the_setting_and_whether_the_host_can_power_itself_off() {
 fn host_idle_warns_when_mcp_over_http_is_on_and_the_host_can_stop() {
     let (_dir, store) = with_base();
     let fake = || Fake::healthy(store.root());
-    let on = fake().file(host::MCP_HTTP, Ok("1\n"));
+    let on = fake().with_mcp_http();
     let report = assert_verdict(on, &store, "host-idle", Status::Warn, "MCP over HTTP");
     let said = verdict(&report, "host-idle").1;
     let fixes = ["never", "RUNNER_MCP_HTTP=0", "host/install.sh"];
@@ -770,12 +808,10 @@ fn host_idle_warns_when_mcp_over_http_is_on_and_the_host_can_stop() {
     }
 
     // Never, or no idle time at all, is what it needs.
-    let never = fake()
-        .file(host::MCP_HTTP, Ok("1\n"))
-        .file(host::HOST_IDLE, Ok("never\n"));
+    let never = fake().with_mcp_http().file(host::HOST_IDLE, Ok("never\n"));
     assert_verdict(never, &store, "host-idle", Status::Ok, "never");
     let unset = fake()
-        .file(host::MCP_HTTP, Ok("1\n"))
+        .with_mcp_http()
         .file(host::HOST_IDLE, Err(ErrorKind::NotFound));
     assert_verdict(unset, &store, "host-idle", Status::Ok, "never");
 
@@ -848,4 +884,221 @@ fn room_shows_the_reserve_and_what_s_left_for_vms() {
     let mut unread = fake();
     unread.room = Err("no MemTotal in /proc/meminfo".into());
     assert_verdict(unread, &store, "room", Status::Warn, "no MemTotal");
+}
+
+// MCP over HTTP, once it's on (README.md, From claude.ai and the phone).
+// Every problem only warns: VMs run without it.
+fn mcp_http_on(root: &Path) -> Fake {
+    Fake::healthy(root)
+        .with_mcp_http()
+        .file(host::HOST_IDLE, Ok("never\n"))
+}
+
+#[test]
+fn mcp_http_is_ok_when_funnel_serves_it_and_nothing_else() {
+    let (_dir, store) = with_base();
+    let report = doctor::check(&mcp_http_on(store.root()), &store);
+    let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, [&NAMES[..], &["mcp-http"]].concat());
+    for c in &report.checks {
+        assert_eq!(c.status, Status::Ok, "{}: {}", c.name, c.detail);
+    }
+    let (_, said) = verdict(&report, "mcp-http");
+    for says in [
+        host::MCP_HTTP_SERVICE,
+        &format!("{URL}/mcp"),
+        "127.0.0.1:8740",
+    ] {
+        assert!(said.contains(says), "{said:?} lacks {says:?}");
+    }
+
+    // The proxy as tailscale may keep it, and a VM's URL that `tailscale
+    // serve` gives the tailnet alone (docs/host.md).
+    for proxy in ["http://127.0.0.1:8740/", "http://localhost:8740"] {
+        let mut status = funnel();
+        status["Web"][AT]["Handlers"]["/"]["Proxy"] = json!(proxy);
+        let fake = mcp_http_on(store.root()).funnel(&status);
+        assert_verdict(fake, &store, "mcp-http", Status::Ok, URL);
+    }
+    let mut status = funnel();
+    status["TCP"]["443"] = json!({"HTTPS": true});
+    status["Web"]["kvm-host.tailnet.ts.net:443"] =
+        json!({"Handlers": {"/": {"Proxy": "http://100.101.102.103:10001"}}});
+    let fake = mcp_http_on(store.root()).funnel(&status);
+    assert_verdict(fake, &store, "mcp-http", Status::Ok, URL);
+}
+
+#[test]
+fn mcp_http_warns_with_the_command_when_funnel_is_off() {
+    let (_dir, store) = with_base();
+    let on = "sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8740";
+    // Served on the tailnet alone, turned off, nothing served at all, and
+    // nothing ever served, which tailscale prints as null.
+    let mut tailnet = funnel();
+    tailnet.as_object_mut().unwrap().remove("AllowFunnel");
+    let mut off = funnel();
+    off["AllowFunnel"][AT] = json!(false);
+    for status in [tailnet, off, json!({}), Value::Null] {
+        let fake = mcp_http_on(store.root()).funnel(&status);
+        let report = assert_verdict(fake, &store, "mcp-http", Status::Warn, on);
+        let said = verdict(&report, "mcp-http").1;
+        assert!(said.contains("Funnel is off"), "{status}: {said}");
+    }
+}
+
+#[test]
+fn mcp_http_warns_naming_any_other_port_funnel_serves() {
+    let (_dir, store) = with_base();
+    let warns = |status: &Value, says: &[&str]| {
+        let fake = mcp_http_on(store.root()).funnel(status);
+        let report = assert_verdict(fake, &store, "mcp-http", Status::Warn, says[0]);
+        let said = verdict(&report, "mcp-http").1;
+        for says in says {
+            assert!(said.contains(says), "{said:?} lacks {says:?}");
+        }
+    };
+
+    // A VM's URL, funneled.
+    let mut vm = funnel();
+    vm["TCP"]["443"] = json!({"HTTPS": true});
+    vm["Web"]["kvm-host.tailnet.ts.net:443"] =
+        json!({"Handlers": {"/": {"Proxy": "http://100.101.102.103:10001"}}});
+    vm["AllowFunnel"]["kvm-host.tailnet.ts.net:443"] = json!(true);
+    let vm_off = "sudo tailscale funnel --https=443 off";
+    warns(&vm, &["port 443", "http://100.101.102.103:10001", vm_off]);
+
+    // A raw TCP port, and one Funnel ends TLS for.
+    let mut tcp = funnel();
+    tcp["TCP"]["10000"] = json!({"TCPForward": "127.0.0.1:22"});
+    tcp["AllowFunnel"]["kvm-host.tailnet.ts.net:10000"] = json!(true);
+    let tcp_off = "sudo tailscale funnel --tcp=10000 off";
+    warns(&tcp, &["port 10000", "127.0.0.1:22", tcp_off]);
+    tcp["TCP"]["10000"]["TerminateTLS"] = json!("kvm-host.tailnet.ts.net");
+    warns(&tcp, &["port 10000", "--tls-terminated-tcp=10000 off"]);
+
+    // Another path beside the MCP server's, on its port.
+    let mut path = funnel();
+    path["Web"][AT]["Handlers"]["/files"] = json!({"Path": "/home/ubuntu"});
+    warns(&path, &["port 8443", "/home/ubuntu", "/files"]);
+
+    // One a `tailscale funnel` left running without --bg serves, kept apart
+    // from the config --bg writes.
+    let mut foreground = funnel();
+    foreground["Foreground"] = json!({"a1b2c3": {
+        "TCP": {"443": {"HTTPS": true}},
+        "Web": {"kvm-host.tailnet.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}},
+        "AllowFunnel": {"kvm-host.tailnet.ts.net:443": true}
+    }});
+    warns(
+        &foreground,
+        &["port 443", "http://127.0.0.1:3000", "without --bg"],
+    );
+}
+
+#[test]
+fn mcp_http_warns_when_its_port_goes_elsewhere() {
+    let (_dir, store) = with_base();
+    let mut status = funnel();
+    status["Web"][AT]["Handlers"]["/"]["Proxy"] = json!("http://127.0.0.1:3000");
+    let fake = mcp_http_on(store.root()).funnel(&status);
+    let report = assert_verdict(fake, &store, "mcp-http", Status::Warn, "port 8443");
+    let said = verdict(&report, "mcp-http").1;
+    let fixes = [
+        "http://127.0.0.1:3000",
+        "sudo tailscale funnel --https=8443 off",
+        "sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8740",
+    ];
+    for says in fixes {
+        assert!(said.contains(says), "{said:?} lacks {says:?}");
+    }
+}
+
+#[test]
+fn mcp_http_warns_when_its_service_or_url_won_t_do() {
+    let (_dir, store) = with_base();
+    let on = || mcp_http_on(store.root());
+    let unit = host::MCP_HTTP_SERVICE;
+
+    let down = on().cmd(&mcp_unit(), ran(false, "failed\n", ""));
+    let report = assert_verdict(down, &store, "mcp-http", Status::Warn, unit);
+    let said = verdict(&report, "mcp-http").1;
+    for says in ["failed", "journalctl -u runner-mcp-http", "host/install.sh"] {
+        assert!(said.contains(says), "{said:?} lacks {says:?}");
+    }
+
+    // claude.ai gets 403 through Funnel without the URL.
+    let fix = "sudo RUNNER_MCP_URL=https://";
+    let none = on().file(host::MCP_URL, Err(ErrorKind::NotFound));
+    let report = assert_verdict(none, &store, "mcp-http", Status::Warn, "RUNNER_MCP_URL");
+    assert!(verdict(&report, "mcp-http").1.contains(fix));
+    let plain = on().file(host::MCP_URL, Ok("http://kvm-host.tailnet.ts.net:8443\n"));
+    let report = assert_verdict(plain, &store, "mcp-http", Status::Warn, "isn't https");
+    assert!(verdict(&report, "mcp-http").1.contains(fix));
+
+    // Funnel serves 443, 8443 and 10000 only, so there's no Funnel to turn
+    // on at another port: the fix is the URL, at the port Funnel gives it.
+    let port = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:8740\n"));
+    let report = assert_verdict(port, &store, "mcp-http", Status::Warn, "443, 8443 or 10000");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(!said.contains("--https=8740"), "{said}");
+    assert!(said.contains(&format!("{fix}{AT}")), "{said}");
+    let none = on()
+        .file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:8740\n"))
+        .funnel(&Value::Null);
+    let report = assert_verdict(none, &store, "mcp-http", Status::Warn, "--https=8443");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(!said.contains("--https=8740"), "{said}");
+    let huge = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:99999\n"));
+    assert_verdict(huge, &store, "mcp-http", Status::Warn, "99999");
+
+    // A URL from before Funnel, with no port, so 443, while Funnel serves the
+    // server on 8443, as README.md has it: the URL is what's wrong, and 443
+    // stays free for a VM's URL.
+    let old = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net\n"));
+    let report = assert_verdict(old, &store, "mcp-http", Status::Warn, "8443");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(said.contains(&format!("{fix}{AT}")), "{said}");
+    for wrong in ["--https=443", "--https=8443 off", "also puts"] {
+        assert!(!said.contains(wrong), "{said:?} has {wrong:?}");
+    }
+
+    // Funnel serves the port under the host's own name, which the URL has to
+    // be, or every request gets 403.
+    let other = on().file(host::MCP_URL, Ok("https://kvm-host.other.ts.net:8443\n"));
+    let report = assert_verdict(other, &store, "mcp-http", Status::Warn, AT);
+    let said = verdict(&report, "mcp-http").1;
+    assert!(said.contains(&format!("{fix}{AT}")), "{said}");
+}
+
+#[test]
+fn mcp_http_warns_when_tailscale_can_t_say() {
+    let (_dir, store) = with_base();
+    let on = || mcp_http_on(store.root());
+    let missing = on().cmd(FUNNEL_STATUS, Err(ErrorKind::NotFound));
+    assert_verdict(
+        missing,
+        &store,
+        "mcp-http",
+        Status::Warn,
+        "tailscale isn't installed",
+    );
+    let stopped = "failed to connect to local tailscaled; it doesn't appear to be running";
+    let down = on().cmd(FUNNEL_STATUS, ran(false, "", &format!("{stopped}\n")));
+    assert_verdict(down, &store, "mcp-http", Status::Warn, stopped);
+    let garbled = on().cmd(FUNNEL_STATUS, ran(true, "No serve config\n", ""));
+    assert_verdict(garbled, &store, "mcp-http", Status::Warn, FUNNEL_STATUS);
+}
+
+#[test]
+fn with_mcp_http_off_doctor_has_no_line_about_it() {
+    let (_dir, store) = with_base();
+    let names = |fake: Fake| -> Vec<String> {
+        let report = doctor::check(&fake, &store);
+        report.checks.into_iter().map(|c| c.name).collect()
+    };
+    let off = mcp_http_on(store.root()).file(host::MCP_HTTP, Ok("0\n"));
+    assert_eq!(names(off), NAMES);
+    let unset = mcp_http_on(store.root()).file(host::MCP_HTTP, Err(ErrorKind::NotFound));
+    assert_eq!(names(unset), NAMES);
+    assert_eq!(names(Fake::healthy(store.root())), NAMES);
 }

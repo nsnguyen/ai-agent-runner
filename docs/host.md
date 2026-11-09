@@ -89,12 +89,12 @@ The CLI's RUNNER_ROOT has to be the unit's: `start` checks the VM in its own roo
 
 ```
 sudo tailscale serve --bg --https=443 http://100.101.102.103:10001    # dev's URL, as `runner url dev` prints it
-sudo tailscale serve --bg --https=8443 http://100.101.102.103:10002   # another VM, another HTTPS port
+sudo tailscale serve --bg --https=4443 http://100.101.102.103:10002   # another VM, another HTTPS port
 tailscale serve status                                               # https://kvm-host.<tailnet>.ts.net/ is dev
 sudo tailscale serve --https=443 off
 ```
 
-Give each an HTTPS port that isn't one of the URL ports (10000 and up). tailscaled connects to the URL from the host's own tailnet address, so the URL takes it, and it wakes a sleeping VM as any connection does.
+Give each an HTTPS port that isn't one of the URL ports (10000 and up), nor 8443, which Funnel gives MCP over HTTP (README.md, From claude.ai and the phone). `tailscale serve` keeps them on the tailnet; `runner doctor` warns if Funnel puts one on the internet. tailscaled connects to the URL from the host's own tailnet address, so the URL takes it, and it wakes a sleeping VM as any connection does.
 
 ## Boot tests
 

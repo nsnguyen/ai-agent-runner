@@ -10,6 +10,7 @@ use crate::store::{BASE, Error, Store};
 use crate::systemd;
 use rmcp::schemars;
 use serde::Serialize;
+use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -156,7 +157,7 @@ pub fn reflinks(dir: &Path) -> io::Result<bool> {
 
 /// Runs every check, in the order a new host would fix them.
 pub fn check(host: &impl Host, store: &Store) -> Report {
-    let checks = vec![
+    let mut checks = vec![
         named("kvm", kvm(host)),
         named("firecracker", firecracker(host)),
         named("e2fsprogs", e2fsprogs(host)),
@@ -169,6 +170,10 @@ pub fn check(host: &impl Host, store: &Store) -> Report {
         named("host-idle", host_idle(host, store.root())),
         named("room", room(host, store)),
     ];
+    // Off, there's nothing to look at, so no line.
+    if mcp_http_on(host) {
+        checks.push(named("mcp-http", mcp_http(host)));
+    }
     let ok = checks.iter().all(|c| c.status != Status::Fail);
     Report { ok, checks }
 }
@@ -544,9 +549,9 @@ fn host_idle(host: &impl Host, root: &Path) -> Verdict {
             "never: the host stays up until it's stopped (RUNNER_HOST_IDLE=1h {INSTALL} sets an idle time)"
         ));
     }
-    // claude.ai can't start a stopped host. None there is off.
+    // claude.ai can't start a stopped host.
     let mcp = host::MCP_HTTP;
-    if host.read(Path::new(mcp)).is_ok_and(|on| on.trim() == "1") {
+    if mcp_http_on(host) {
         return warn(format!(
             "{idle}, but MCP over HTTP is on ({mcp}), and claude.ai can't start a stopped host, so it fails once the host stops: rerun {INSTALL}, which sets never, or RUNNER_MCP_HTTP=0 {INSTALL}"
         ));
@@ -612,6 +617,269 @@ fn room(host: &impl Host, store: &Store) -> Verdict {
         )),
         free => ok(format!("{} free for VMs: {sums}", gib(free))),
     }
+}
+
+// Whether the host serves MCP over HTTP, as install.sh keeps it. None there
+// is off.
+fn mcp_http_on(host: &impl Host) -> bool {
+    let on = host.read(Path::new(host::MCP_HTTP));
+    on.is_ok_and(|on| on.trim() == "1")
+}
+
+/// The ports Funnel serves: it takes no others.
+const FUNNEL_PORTS: [u16; 3] = [443, 8443, 10_000];
+
+// MCP over HTTP, once it's on (README.md, From claude.ai and the phone): its
+// service up, RUNNER_MCP_URL https, and Funnel taking that URL's port to the
+// server and putting nothing else on the internet, a VM's URL included.
+// install.sh never turns Funnel on, so each problem says the command that
+// fixes it. VMs run without any of it, so it only warns.
+fn mcp_http(host: &impl Host) -> Verdict {
+    let unit = host::MCP_HTTP_SERVICE;
+    let addr = host::MCP_HTTP_ADDR;
+    let mut warnings = Vec::new();
+    match host.run("systemctl", &["is-active", unit]) {
+        Ok(r) if r.ok => {}
+        Ok(r) => warnings.push(format!(
+            "{unit} is {}, so nothing answers at {addr}: `journalctl -u {unit}` says why, and rerunning {INSTALL} starts it",
+            r.stdout.trim()
+        )),
+        Err(e) => warnings.push(format!("systemctl: {e}")),
+    }
+
+    let url = host.read(Path::new(host::MCP_URL)).unwrap_or_default();
+    let url = url.trim().trim_end_matches('/');
+    let set = format!("sudo RUNNER_MCP_URL=https://<its name>:8443 {INSTALL}");
+    let public = if url.is_empty() {
+        let kept = host::MCP_URL;
+        warnings.push(format!(
+            "there's no RUNNER_MCP_URL ({kept}), so a request through Funnel gets 403: {set}"
+        ));
+        None
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let (name, port) = authority.rsplit_once(':').unwrap_or((authority, "443"));
+        let port = port.parse::<u16>().ok();
+        if port.is_none() {
+            warnings.push(format!(
+                "RUNNER_MCP_URL={url} has no port a server can have: {set}"
+            ));
+        }
+        port.map(|p| (name.to_lowercase(), p))
+    } else {
+        warnings.push(format!(
+            "RUNNER_MCP_URL={url} isn't https, which is all Funnel serves: {set}"
+        ));
+        None
+    };
+    if let Some((_, port)) = &public
+        && !FUNNEL_PORTS.contains(port)
+    {
+        warnings.push(format!(
+            "RUNNER_MCP_URL's port {port} isn't one Funnel serves, 443, 8443 or 10000: {set}"
+        ));
+    }
+
+    let status = ["funnel", "status", "--json"];
+    let funneled = match host.run("tailscale", &status) {
+        Ok(r) if r.ok => funneled(&r.stdout).map_err(|e| {
+            format!("`tailscale {}` printed what doctor can't read: {e}", status.join(" "))
+        }),
+        Ok(r) => Err(format!("tailscale funnel status failed: {}", r.stderr.trim())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Err(
+            "tailscale isn't installed, so Funnel can't put it on the internet: install Tailscale and join the tailnet (docs/host.md)"
+                .to_string(),
+        ),
+        Err(e) => Err(format!("tailscale: {e}")),
+    };
+    match funneled {
+        Ok(funneled) => warnings.extend(funnel_warnings(&funneled, url, public.as_ref())),
+        Err(why) => warnings.push(why),
+    }
+
+    if warnings.is_empty() {
+        return ok(format!(
+            "{unit} is up, and Funnel puts it alone on the internet: {url}/mcp, to {addr}"
+        ));
+    }
+    warn(format!("on, but {}", warnings.join("; and ")))
+}
+
+/// A port Funnel puts on the internet, as `tailscale funnel status --json`
+/// has it.
+struct Funneled {
+    /// The host's name it's served under.
+    name: String,
+    port: u16,
+    /// What each path goes to, by its mount point, or a TCP forward's
+    /// address under "".
+    to: Vec<(String, String)>,
+    /// `tailscale funnel`'s flag for it: https, tcp or tls-terminated-tcp.
+    flag: &'static str,
+    /// A `tailscale funnel` without --bg serves it, for as long as it runs.
+    foreground: bool,
+}
+
+// The ports Funnel serves, from tailscale's serve config: AllowFunnel names
+// each as name:port, which TCP and Web say what it goes to. A `tailscale
+// funnel` run without --bg keeps its own config, under Foreground.
+fn funneled(status: &str) -> serde_json::Result<Vec<Funneled>> {
+    let serve: Value = serde_json::from_str(status)?;
+    let foreground = serve["Foreground"]
+        .as_object()
+        .into_iter()
+        .flat_map(|f| f.values());
+    let configs = std::iter::once((&serve, false)).chain(foreground.map(|c| (c, true)));
+    let mut out = Vec::new();
+    for (config, foreground) in configs {
+        for (at, on) in config["AllowFunnel"].as_object().into_iter().flatten() {
+            let Some((name, port)) = at.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port.parse::<u16>() else {
+                continue;
+            };
+            if on != &Value::Bool(true) {
+                continue;
+            }
+            let tcp = &config["TCP"][port.to_string().as_str()];
+            let (to, flag) = match tcp["TCPForward"].as_str() {
+                Some(forward) => {
+                    let tls = tcp["TerminateTLS"].as_str().is_some_and(|t| !t.is_empty());
+                    let flag = if tls { "tls-terminated-tcp" } else { "tcp" };
+                    (vec![(String::new(), forward.to_string())], flag)
+                }
+                None => {
+                    let handlers = config["Web"][at.as_str()]["Handlers"].as_object();
+                    let to = handlers.into_iter().flatten();
+                    (to.map(|(at, h)| (at.clone(), target(h))).collect(), "https")
+                }
+            };
+            let name = name.to_lowercase();
+            out.push(Funneled {
+                name,
+                port,
+                to,
+                flag,
+                foreground,
+            });
+        }
+    }
+    Ok(out)
+}
+
+// What one of `tailscale serve`'s handlers serves.
+fn target(handler: &Value) -> String {
+    if let Some(proxy) = handler["Proxy"].as_str() {
+        proxy.to_string()
+    } else if let Some(path) = handler["Path"].as_str() {
+        format!("the files at {path}")
+    } else if let Some(to) = handler["Redirect"].as_str() {
+        format!("a redirect to {to}")
+    } else {
+        "a text".to_string()
+    }
+}
+
+// Whether a funneled port goes to the MCP server and nothing else: at /,
+// the way the README's command sets it, which tailscale may keep with a
+// trailing slash, or as localhost.
+fn serves_mcp(f: &Funneled) -> bool {
+    let [(at, to)] = f.to.as_slice() else {
+        return false;
+    };
+    let port = host::MCP_HTTP_ADDR.rsplit_once(':').map_or("", |(_, p)| p);
+    let to = to.trim_end_matches('/');
+    let ours = [
+        format!("http://{}", host::MCP_HTTP_ADDR),
+        format!("http://localhost:{port}"),
+    ];
+    f.flag == "https" && at == "/" && ours.iter().any(|o| o == to)
+}
+
+// Where a funneled port goes, each path's target, for a warning.
+fn goes_to(f: &Funneled) -> String {
+    let to = f.to.iter().map(|(at, to)| match at.as_str() {
+        "" | "/" => to.clone(),
+        at => format!("{to} at {at}"),
+    });
+    let to: Vec<String> = to.collect();
+    if to.is_empty() {
+        "nothing".to_string()
+    } else {
+        to.join(", ")
+    }
+}
+
+// The command that takes a funneled port off the internet.
+fn funnel_off(f: &Funneled) -> String {
+    if f.foreground {
+        "a `tailscale funnel` running without --bg serves it: end that".to_string()
+    } else {
+        format!("sudo tailscale funnel --{}={} off", f.flag, f.port)
+    }
+}
+
+fn funnel_on(port: u16) -> String {
+    let addr = host::MCP_HTTP_ADDR;
+    format!("sudo tailscale funnel --bg --https={port} http://{addr}")
+}
+
+// What's wrong with what Funnel serves. The MCP server's port is the one
+// that goes to it alone, RUNNER_MCP_URL's if there's one there, else the
+// port of RUNNER_MCP_URL's that Funnel serves: it has to go to the server
+// alone, under the URL's name and port, and no other port is funneled. A
+// URL that names a port Funnel doesn't serve, or none, is fixed by the URL,
+// not by turning Funnel on there.
+fn funnel_warnings(
+    funneled: &[Funneled],
+    url: &str,
+    public: Option<&(String, u16)>,
+) -> Vec<String> {
+    let addr = host::MCP_HTTP_ADDR;
+    let want = public.map(|(_, port)| *port);
+    let want = want.filter(|port| FUNNEL_PORTS.contains(port));
+    let at = |f: &Funneled| Some(f.port) == want;
+    let ours = (funneled.iter().position(|f| serves_mcp(f) && at(f)))
+        .or_else(|| funneled.iter().position(serves_mcp))
+        .or_else(|| funneled.iter().position(at));
+    let mut warnings = Vec::new();
+    match ours.map(|i| &funneled[i]) {
+        None => {
+            let port = want.unwrap_or(8443);
+            warnings.push(format!(
+                "Funnel is off for port {port}, so claude.ai can't reach it: {}",
+                funnel_on(port)
+            ));
+        }
+        Some(f) if !serves_mcp(f) => warnings.push(format!(
+            "Funnel's port {} goes to {}, not to {addr} alone: {}, then {}",
+            f.port,
+            goes_to(f),
+            funnel_off(f),
+            funnel_on(f.port)
+        )),
+        Some(f) => {
+            let served = (f.name.as_str(), f.port);
+            if public.is_some_and(|(name, port)| (name.as_str(), *port) != served) {
+                let (name, port) = served;
+                warnings.push(format!(
+                    "Funnel serves it at {name}:{port}, not at RUNNER_MCP_URL={url}, so claude.ai can't reach it there: sudo RUNNER_MCP_URL=https://{name}:{port} {INSTALL}"
+                ));
+            }
+        }
+    }
+    for (i, f) in funneled.iter().enumerate() {
+        if Some(i) != ours {
+            warnings.push(format!(
+                "Funnel also puts port {} on the internet, to {}: {}",
+                f.port,
+                goes_to(f),
+                funnel_off(f)
+            ));
+        }
+    }
+    warnings
 }
 
 // What `runner hosts add` takes from a host's id_ed25519.pub: its first line
