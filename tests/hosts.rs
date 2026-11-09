@@ -1316,8 +1316,9 @@ fn the_client_knows_every_option_that_takes_a_value() {
         missing.is_empty(),
         "client/runner's valued line lacks {missing:?}"
     );
-    // Seeded for tasks that merge in any order: #147's, #160's and #169's.
-    for opt in ["--n", "--run", "--host", "--disk"] {
+    // Seeded for tasks that merge in any order: #147's, #160's and #169's,
+    // and #176's `runner mcp --http` and `--url`.
+    for opt in ["--n", "--run", "--host", "--disk", "--http", "--url"] {
         assert!(known.contains(&opt), "{opt}");
     }
 }
