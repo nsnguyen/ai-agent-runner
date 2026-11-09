@@ -77,8 +77,8 @@ pub fn needs(mem_mib: u32) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "{vm} needs {}; {host} has {} free: stop or sleep a VM, or move {vm}",
-    tenths(*need, f64::ceil),
-    tenths(*free, f64::floor)
+    gib_up(*need),
+    gib_down(*free)
 )]
 pub struct NoRoom {
     pub vm: String,
@@ -93,6 +93,16 @@ pub struct NoRoom {
 /// Bytes in GiB, to the nearest tenth, like 4.1G.
 pub fn gib(bytes: u64) -> String {
     tenths(bytes, f64::round)
+}
+
+/// Bytes in GiB, to a tenth rounded up: what a VM needs, in a refusal.
+pub fn gib_up(bytes: u64) -> String {
+    tenths(bytes, f64::ceil)
+}
+
+/// Bytes in GiB, to a tenth rounded down: a host's room, in a refusal.
+pub fn gib_down(bytes: u64) -> String {
+    tenths(bytes, f64::floor)
 }
 
 // Bytes in GiB, to a tenth rounded as `round` does, so a refusal can round

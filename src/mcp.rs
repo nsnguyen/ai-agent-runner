@@ -23,10 +23,13 @@ use crate::peers::{Remote, structured};
 use crate::proto::Request;
 use crate::rebase::{self, Rebased};
 use crate::resize;
+use crate::room;
 use crate::runs::{self, AgentRun, Events};
 use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
-use crate::store::{BASE, Checkpoint, Config, Sizes, Store, Vm, parse_disk, parse_mem};
+use crate::store::{
+    BASE, Checkpoint, Config, DEFAULT_MEM_MIB, Sizes, Store, Vm, parse_disk, parse_mem,
+};
 use crate::systemd::{self, VmStatus};
 use crate::tokens;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -102,7 +105,9 @@ pub struct CreateArgs {
     /// minutes.
     idle: Option<String>,
     /// The host to make it on, as list_hosts names it. Left out, it goes
-    /// where the VM it forks is, else to the host with the most free memory.
+    /// where the VM it forks is, else to the host with the most free memory,
+    /// refused when no host has room for it: `runner create` on the laptop
+    /// starts a stopped host.
     host: Option<String>,
 }
 
@@ -424,7 +429,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist); `disk` grows its disk as it's made. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory. A name is one VM's across every host, base aside."
+        description = "Create a VM whose disk is a copy-on-write fork of another VM's current disk (base unless `from` names one). It keeps that VM's sizes and idle time unless told others, and its list of names (vm_allowlist); `disk` grows its disk as it's made. It sleeps once unused for its idle time, and any tool that needs its guest wakes it. It goes on `host` if given, else on the host of the VM it forks (base is on every host), else on the host with the most free memory, and is refused, with nothing made, when it doesn't fit there, as then no host has room: `runner create` on the laptop starts a stopped host. A name is one VM's across every host, base aside."
     )]
     async fn create_vm(
         &self,
@@ -1386,9 +1391,9 @@ impl Tools {
 
     /// Where create_vm makes its VM, as the laptop's `runner create` places
     /// one: on `host`; base here; a fork where the VM it forks is; else on
-    /// the host with the most free memory. A name another host has, or had
-    /// when last listed or made there if it doesn't answer now, is refused,
-    /// base aside.
+    /// the host with the most free memory, refused if it doesn't fit there.
+    /// A name another host has, or had when last listed or made there if it
+    /// doesn't answer now, is refused, base aside.
     async fn place(
         &self,
         request: &CallToolRequestParams,
@@ -1440,7 +1445,20 @@ impl Tools {
                 return Err(format!("{from} is on {on}, which didn't answer: {why}"));
             }
             (None, Some(at)) => at,
-            (None, None) => self.most_free(&lists).await?,
+            // A fork of a VM no host has fails wherever it goes.
+            (None, None) if from.is_some() => self.most_free(&lists, None).await?,
+            (None, None) => {
+                // Its memory, else base's here; a size that doesn't parse is
+                // the tool's to refuse, so it isn't checked.
+                let mem_mib = match args.get("mem") {
+                    None | Some(Value::Null) => {
+                        Some((self.store.get(BASE)).map_or(DEFAULT_MEM_MIB, |base| base.mem_mib))
+                    }
+                    Some(mem) => mem.as_str().and_then(|m| parse_mem(m).ok()),
+                };
+                let fit = mem_mib.map(|mib| (name, room::needs(mib)));
+                self.most_free(&lists, fit).await?
+            }
         };
         let Some(i) = at else { return Ok(None) };
         // The peer makes it on itself, whatever this host calls it.
@@ -1452,28 +1470,62 @@ impl Tools {
     }
 
     // The host with the most free memory, this one first among equals, of
-    // this one and the peers whose lists came.
-    async fn most_free(&self, lists: &Lists) -> Result<Option<usize>, String> {
+    // this one and the peers whose lists came. With `fit`, a VM and the
+    // bytes it needs, refused unless it fits there, as then it fits nowhere:
+    // naming each host's room, and each peer that didn't answer, which this
+    // host, holding no AWS keys, can't tell from one that's stopped.
+    async fn most_free(
+        &self,
+        lists: &Lists,
+        fit: Option<(&str, u64)>,
+    ) -> Result<Option<usize>, String> {
         let up: Vec<usize> = (0..lists.len()).filter(|&i| lists[i].is_ok()).collect();
         let answers = self.ask("list_hosts", &up).await;
         let store = self.store.clone();
         let here = tokio::task::spawn_blocking(move || systemd::room(&store).map(|r| r.free()));
-        let mut best: Option<(Option<usize>, u64)> = here
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .map(|free| (None, free));
-        for (i, answer) in answers.into_iter().enumerate() {
-            let Ok(row) = answer.and_then(|v| peer_row(&v, &self.peers[i].name)) else {
-                continue;
-            };
-            if best.is_none_or(|(_, most)| row.mem_available > most) {
-                best = Some((Some(i), row.mem_available));
+        let here = match here.await {
+            Ok(room) => room.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let peers = answers.into_iter().enumerate().map(|(i, answer)| {
+            let listed = lists[i].as_ref().map_err(String::clone);
+            let row = listed
+                .and(answer)
+                .and_then(|v| peer_row(&v, &self.peers[i].name));
+            (Some(i), row.map(|row| row.mem_available))
+        });
+        let mut best: Option<(Option<usize>, u64)> = None;
+        let (mut rooms, mut down) = (Vec::new(), Vec::new());
+        for (at, free) in std::iter::once((None, here)).chain(peers) {
+            let host = at.map_or(self.name.as_str(), |i| self.peers[i].name.as_str());
+            match free {
+                Ok(free) => {
+                    rooms.push(format!("{host} has {} free", room::gib_down(free)));
+                    if best.is_none_or(|(_, most)| free > most) {
+                        best = Some((at, free));
+                    }
+                }
+                Err(why) => down.push(format!("{host} didn't answer: {why}")),
             }
         }
-        best.map(|(at, _)| at).ok_or_else(|| {
-            "no host said how much memory it has free, so the VM has nowhere to go".into()
-        })
+        let Some((at, most)) = best else {
+            return Err(
+                "no host said how much memory it has free, so the VM has nowhere to go".into(),
+            );
+        };
+        match fit {
+            Some((vm, need)) if need > most => {
+                let mut said = vec![rooms.join(", ")];
+                said.extend(down);
+                Err(format!(
+                    "no host has room for {vm}, which needs {}: {}. Stop or sleep a VM, or run \
+                     `runner create {vm}` on the laptop, which starts a stopped host.",
+                    room::gib_up(need),
+                    said.join("; ")
+                ))
+            }
+            _ => Ok(at),
+        }
     }
 
     /// The VMs of each peer `which` picks, or why it didn't answer, in
