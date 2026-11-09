@@ -1,12 +1,16 @@
-// The CLI's commands as MCP tools, served on stdio. Local Claude Code reaches
-// it as `ssh -T kvm-host runner mcp`, so anything printed to stdout must be
-// protocol: log to stderr only.
+// The CLI's commands as MCP tools, one server behind two transports. On
+// stdio, local Claude Code reaches it as `ssh -T kvm-host runner mcp`, so
+// anything printed to stdout must be protocol: log to stderr only. Over
+// Streamable HTTP, `runner mcp --http`, claude.ai reaches it through Funnel
+// or `tailscale serve`, on loopback here, each request with a bearer token
+// (src/tokens.rs).
 //
 // With several hosts the laptop passes the rest as `--peer`s, and this one
 // reaches them (docs/design.md, MCP across hosts): list_vms and list_hosts
 // ask every host, create_vm places a VM as the laptop's `runner create`
 // does, and a call naming a VM or a run goes, as it came, to the VM's host,
-// through one `ssh <peer> runner mcp` each (peers::Remote).
+// through one `ssh <peer> runner mcp` each (peers::Remote). Over HTTP there's
+// no laptop to pass them: the hosts are <root>/peers's, read at each call.
 use crate::best::{self, Kept};
 use crate::checkpoint;
 use crate::claude;
@@ -24,6 +28,7 @@ use crate::services::{self, InVm, Service};
 use crate::sessions::{self, Pane, Session};
 use crate::store::{BASE, Checkpoint, Config, Sizes, Store, Vm, parse_disk, parse_mem};
 use crate::systemd::{self, VmStatus};
+use crate::tokens;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
@@ -31,10 +36,13 @@ use rmcp::model::{
     ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,10 +57,29 @@ pub struct Tools {
     /// It as the laptop lists it, like runner@kvm-host, if it said.
     listed: Option<String>,
     /// The other hosts, in the laptop's order. A peer's own MCP has none.
-    peers: Arc<Vec<Remote>>,
-    /// Which peer each VM was on when last listed, or made there since, so
-    /// a VM on a peer that has stopped answering is named as there.
-    seen: Arc<Mutex<HashMap<String, usize>>>,
+    peers: Arc<Vec<Arc<Remote>>>,
+    /// Where the hosts come from.
+    hosts: Hosts,
+    /// Which peer, as listed, each VM was on when last listed, or made
+    /// there since, so a VM on a peer that has stopped answering is named
+    /// as there.
+    seen: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Where a server's hosts come from.
+#[derive(Clone)]
+enum Hosts {
+    /// The laptop's `--name` and `--peer`s, for the session.
+    Given,
+    /// <root>/peers, read at each call: this host as the laptop lists it,
+    /// then its peers, a line each, as client/runner's `hosts add` and `rm`
+    /// write it. Each peer's session is kept while it's listed.
+    File(Arc<Mutex<HashMap<String, Arc<Remote>>>>),
+}
+
+/// The file the HTTP server reads its hosts from.
+pub fn peers_file(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("peers")
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -327,25 +354,26 @@ impl ServerHandler for Tools {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let _busy = crate::power::Busy::take(self.store.root());
-        if !self.peers.is_empty() {
-            let there = match self.route(&request).await {
+        let this = self.now();
+        if !this.peers.is_empty() {
+            let there = match this.route(&request).await {
                 Ok(None) => None,
                 Ok(Some((i, request))) => {
-                    let changes = self.changes(&request);
-                    let moves_to = self.moves_to(&request);
+                    let changes = this.changes(&request);
+                    let moves_to = this.moves_to(&request);
                     let tries = tries_of(&request);
-                    let answer = self.peers[i].call(request).await;
+                    let answer = this.peers[i].call(request).await;
                     if let Ok(result) = &answer
                         && result.is_error != Some(true)
                     {
-                        tries.iter().for_each(|vm| self.note(vm, i, true));
+                        tries.iter().for_each(|vm| this.note(vm, i, true));
                     }
                     if let (Ok(result), Some((vm, made))) = (&answer, changes)
                         && result.is_error != Some(true)
                     {
-                        self.note(&vm, i, made);
+                        this.note(&vm, i, made);
                         if let Some((vm, j)) = moves_to {
-                            self.note(&vm, j, true);
+                            this.note(&vm, j, true);
                         }
                     }
                     Some(answer.map_err(|g| g.to_string()))
@@ -358,7 +386,7 @@ impl ServerHandler for Tools {
                 return Ok(CallToolResponse::Complete(result));
             }
         }
-        let call = ToolCallContext::new(self, request, context);
+        let call = ToolCallContext::new(&this, request, context);
         Self::tool_router().call(call).await
     }
 }
@@ -917,21 +945,216 @@ pub async fn serve(
     peers: Vec<String>,
     listed: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let peers = peers.iter().map(|p| Remote::new(p, &user)).collect();
-    let name = listed.as_deref().map_or_else(hosts::hostname, |l| {
-        l.rsplit_once('@').map_or(l, |(_, h)| h).to_string()
-    });
+    let peers = peers
+        .iter()
+        .map(|p| Arc::new(Remote::new(p, &user)))
+        .collect();
     let tools = Tools {
         store,
         user,
-        name,
+        name: name_of(listed.as_deref()),
         listed,
         peers: Arc::new(peers),
+        hosts: Hosts::Given,
         seen: Arc::default(),
     };
     let running = tools.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
+}
+
+/// Where a 401's challenge points a client to learn how to get a token,
+/// past the public base URL. #177 serves it.
+pub const RESOURCE_METADATA: &str = "/.well-known/oauth-protected-resource";
+
+/// The browser origins /mcp takes: claude.ai's. The MCP spec asks HTTP
+/// servers to check Origin, against DNS rebinding. A request with none,
+/// like curl's, isn't a browser's.
+pub const ORIGINS: [&str; 2] = ["https://claude.ai:443", "https://claude.com:443"];
+
+/// How long an HTTP session may go with nothing said before it's dropped:
+/// longer than the longest call, an exec's, since a call going says
+/// nothing until it's done.
+const SESSION_IDLE: Duration = Duration::from_secs(exec::MAX_TIMEOUT.as_secs() + 60 * 60);
+
+/// Whether the HTTP server may listen at `addr`: loopback only. Funnel or
+/// `tailscale serve` is how it's reached.
+pub fn check_addr(addr: &SocketAddr) -> Result<(), String> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(format!(
+        "{addr} isn't a loopback address: MCP over HTTP listens on loopback only, like 127.0.0.1:8740, and Funnel or `tailscale serve` reaches it"
+    ))
+}
+
+/// Serves MCP over Streamable HTTP at `addr`, on loopback, at /mcp, until
+/// it's killed. Every request needs a token from `runner mcp-http token`:
+/// one without gets 401, with a challenge naming `url`, the public base URL
+/// Funnel or `tailscale serve` gives this server, like
+/// https://kvm-host.tailnet.ts.net, else http://`addr`. That URL's host is
+/// let in besides loopback's. exec runs commands as `user`, here and on
+/// <root>/peers's hosts.
+pub async fn serve_http(
+    store: Store,
+    user: String,
+    addr: SocketAddr,
+    url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_addr(&addr)?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let at = listener.local_addr()?;
+    let base = url.map_or_else(
+        || format!("http://{at}"),
+        |u| u.trim_end_matches('/').to_string(),
+    );
+    let mut allowed: Vec<String> = ["localhost", "127.0.0.1", "::1"].map(String::from).into();
+    allowed.extend(authority(&base));
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed)
+        .with_allowed_origins(ORIGINS);
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(SESSION_IDLE);
+    let gate = Arc::new(Gate {
+        root: store.root().to_path_buf(),
+        challenge: format!("Bearer resource_metadata=\"{base}{RESOURCE_METADATA}\""),
+    });
+    let tools = Tools {
+        store,
+        user,
+        name: name_of(None),
+        listed: None,
+        peers: Arc::default(),
+        hosts: Hosts::File(Arc::default()),
+        seen: Arc::default(),
+    };
+    // A session's server is a clone: the hosts dialed and where VMs were
+    // seen are every session's.
+    let mcp = StreamableHttpService::new(move || Ok(tools.clone()), Arc::new(sessions), config);
+    let app = axum::Router::new()
+        .route_service("/mcp", mcp)
+        .route_layer(axum::middleware::from_fn_with_state(gate, bearer));
+    eprintln!("runner mcp: serving http://{at}/mcp for {base}/mcp");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// A URL's host, with its port if it has one, as a Host header names it.
+fn authority(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// What the token check needs: the store, and what a 401 says.
+struct Gate {
+    root: std::path::PathBuf,
+    challenge: String,
+}
+
+// Lets a request with a good bearer token through to MCP; any other gets
+// 401 and its challenge, and no tool runs. The store is read at each
+// request, so a revoke takes hold at once. The token is never logged.
+async fn bearer(
+    axum::extract::State(gate): axum::extract::State<Arc<Gate>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::IntoResponse;
+    let presented = (request.headers().get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let good = match presented {
+        None => Ok(false),
+        Some(token) => {
+            let root = gate.root.clone();
+            match tokio::task::spawn_blocking(move || tokens::check(&root, &token)).await {
+                Ok(checked) => checked.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+    };
+    match good {
+        Ok(true) => next.run(request).await,
+        Ok(false) => {
+            let said = "a bearer token is needed: `runner mcp-http token` on the host makes one\n";
+            let mut refused = (StatusCode::UNAUTHORIZED, said).into_response();
+            if let Ok(challenge) = HeaderValue::from_str(&gate.challenge) {
+                refused
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge);
+            }
+            refused
+        }
+        Err(why) => {
+            eprintln!("runner mcp: checking a token: {why}");
+            let said = "the host couldn't read its tokens\n";
+            (StatusCode::INTERNAL_SERVER_ERROR, said).into_response()
+        }
+    }
+}
+
+// What MCP calls this host: as the laptop lists it less its user@, else the
+// kernel's name for it.
+fn name_of(listed: Option<&str>) -> String {
+    listed.map_or_else(hosts::hostname, |l| {
+        l.rsplit_once('@').map_or(l, |(_, h)| h).to_string()
+    })
+}
+
+impl Tools {
+    /// The server as this call sees it: with <root>/peers's hosts as they
+    /// are now, for one that reads them there.
+    fn now(&self) -> Tools {
+        let Hosts::File(dialed) = &self.hosts else {
+            return self.clone();
+        };
+        let path = peers_file(self.store.root());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                eprintln!("runner: reading {}: {e}", path.display());
+                String::new()
+            }
+        };
+        let mut lines = (text.lines().map(str::trim))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| match crate::peers::check_host(l) {
+                Ok(()) => true,
+                Err(why) => {
+                    eprintln!("runner: {}: {why}", path.display());
+                    false
+                }
+            });
+        let listed = lines.next().map(String::from);
+        let mut targets: Vec<&str> = Vec::new();
+        for l in lines {
+            if Some(l) != listed.as_deref() && !targets.contains(&l) {
+                targets.push(l);
+            }
+        }
+        let mut dialed = dialed.lock().unwrap_or_else(|e| e.into_inner());
+        dialed.retain(|t, _| targets.contains(&t.as_str()));
+        let peers = (targets.iter())
+            .map(|t| {
+                let remote = dialed.entry(t.to_string());
+                remote
+                    .or_insert_with(|| Arc::new(Remote::new(t, &self.user)))
+                    .clone()
+            })
+            .collect();
+        Tools {
+            name: name_of(listed.as_deref()),
+            listed,
+            peers: Arc::new(peers),
+            ..self.clone()
+        }
+    }
 }
 
 // Where a call goes, past this host's own.
@@ -985,7 +1208,7 @@ impl Tools {
         for name in &names {
             let has = |l: &Result<Vec<Vm>, String>, i: usize| match l {
                 Ok(l) => l.iter().any(|v| v.name == *name),
-                Err(_) => seen.get(name) == Some(&i),
+                Err(_) => seen.get(name) == Some(&self.peers[i].target),
             };
             let on = if at.is_some() && here.iter().any(|v| v.name == *name) {
                 Some(self.name.as_str())
@@ -1085,7 +1308,8 @@ impl Tools {
 
     fn last_seen(&self, vm: &str) -> Option<usize> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get(vm).copied()
+        let at = seen.get(vm)?;
+        self.peers.iter().position(|p| p.target == *at)
     }
 
     /// The VM a call makes, (vm, true), or deletes, (vm, false), base aside:
@@ -1120,9 +1344,10 @@ impl Tools {
     /// cache: so a name stays taken, or is freed, while that peer is down.
     fn note(&self, vm: &str, i: usize, made: bool) {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let at = &self.peers[i].target;
         if made {
-            seen.insert(vm.to_string(), i);
-        } else if seen.get(vm) == Some(&i) {
+            seen.insert(vm.to_string(), at.clone());
+        } else if seen.get(vm) == Some(at) {
             seen.remove(vm);
         }
     }
@@ -1161,7 +1386,7 @@ impl Tools {
             }
             let listed = |(i, l): (usize, &Result<Vec<Vm>, String>)| match l {
                 Ok(l) => l.iter().any(|v| v.name == vm).then_some(i),
-                Err(_) => (seen.get(vm) == Some(&i)).then_some(i),
+                Err(_) => (seen.get(vm) == Some(&self.peers[i].target)).then_some(i),
             };
             lists.iter().enumerate().find_map(listed).map(Some)
         };
@@ -1234,9 +1459,10 @@ impl Tools {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         for (i, list) in lists.iter().enumerate() {
             if let Ok(vms) = list {
-                seen.retain(|_, at| *at != i);
+                let peer = &self.peers[i].target;
+                seen.retain(|_, at| at != peer);
                 for vm in vms.iter().filter(|v| v.name != BASE) {
-                    seen.insert(vm.name.clone(), i);
+                    seen.insert(vm.name.clone(), peer.clone());
                 }
             }
         }

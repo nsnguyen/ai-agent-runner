@@ -54,8 +54,9 @@ const STALLED: Duration = Duration::from_millis(100);
 const KILL_WAIT: Duration = Duration::from_secs(10);
 // How often `stream` asks whether to stop.
 const POLL: Duration = Duration::from_millis(100);
-// Without a stop, an Instant past this would overflow.
-const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest exec waits on a command. Without a stop, an Instant past
+/// this would overflow.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

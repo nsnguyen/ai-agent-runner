@@ -22,6 +22,7 @@ use runner::store::{
     self, BASE, Config, KEEP, Sizes, Source, Store, Vm, parse_disk, parse_mem, size_text,
 };
 use runner::systemd::{self, State, VmStatus};
+use runner::tokens;
 use runner::url;
 use std::error::Error;
 use std::fs::File;
@@ -469,7 +470,8 @@ enum Cmd {
     /// On the laptop, `runner hosts` lists every host, and `hosts add` and
     /// `hosts rm` change the list (README.md, Several hosts).
     Hosts,
-    /// Serve these commands as MCP tools on stdin and stdout.
+    /// Serve these commands as MCP tools on stdin and stdout, or with
+    /// --http, over HTTP.
     Mcp {
         /// The user MCP's exec runs commands as.
         #[arg(long, env = "RUNNER_USER", default_value = exec::USER)]
@@ -477,14 +479,30 @@ enum Cmd {
         /// Another host to reach, as ssh takes it, like runner@kvm-host-2:
         /// the laptop passes every host but this one. Each is dialed with
         /// this host's key on first use, as `ssh <peer> runner mcp`.
-        #[arg(long = "peer", value_name = "HOST", value_parser = peer_host)]
+        #[arg(long = "peer", value_name = "HOST", value_parser = peer_host, conflicts_with = "http")]
         peers: Vec<String>,
         /// This host as the laptop lists it, like runner@kvm-host, which
         /// MCP calls it by, less its user@: the laptop passes it with the
         /// peers. Left out, it's the kernel's name for this machine.
-        #[arg(long, value_name = "HOST")]
+        #[arg(long, value_name = "HOST", conflicts_with = "http")]
         name: Option<String>,
+        /// Serve over Streamable HTTP at this loopback address, like
+        /// 127.0.0.1:8740, at /mcp, in place of stdio: what
+        /// runner-mcp-http.service runs. Each request needs a token from
+        /// `runner mcp-http token`. The hosts it reaches are <root>/peers's,
+        /// which `runner hosts add` writes, read at each call.
+        #[arg(long, value_name = "ADDR", value_parser = loopback)]
+        http: Option<std::net::SocketAddr>,
+        /// With --http, the public base URL Funnel or `tailscale serve`
+        /// gives it, like https://kvm-host.tailnet.ts.net, which a 401
+        /// points clients at. Left out, /etc/runner/mcp-url's, as
+        /// host/install.sh keeps it, else http://ADDR.
+        #[arg(long, env = "RUNNER_MCP_URL", value_name = "URL")]
+        url: Option<String>,
     },
+    /// The bearer tokens MCP over HTTP (`runner mcp --http`) takes.
+    #[command(name = "mcp-http", subcommand)]
+    McpHttp(McpHttpCmd),
     /// Run a VM until it shuts down: the unit's main process.
     #[command(hide = true)]
     Boot {
@@ -541,6 +559,23 @@ enum Cmd {
         /// The program a run starts in the VM.
         #[arg(long, env = "RUNNER_CLAUDE", default_value = "claude")]
         claude: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpHttpCmd {
+    /// Print a new token, once: only its hash is kept. For curl, and for
+    /// MCP clients that take a header: `Authorization: Bearer <token>`.
+    Token,
+    /// Drop every token: each client needs a new one.
+    Revoke,
+    /// Write the hosts MCP over HTTP reaches to <root>/peers, as listed on
+    /// the laptop: this one first, then its peers. With none, remove it.
+    /// What the laptop's `runner hosts add` and `rm` run here.
+    #[command(hide = true)]
+    Peers {
+        #[arg(value_parser = peer_host)]
+        hosts: Vec<String>,
     },
 }
 
@@ -956,7 +991,22 @@ fn run(root: &Path, store: Store, cmd: Cmd) -> Result<ExitCode, Box<dyn Error>> 
                 .for_each(|c| println!("{}", c.row()));
         }
         Cmd::Restore { name, id } => show(&checkpoint::restore(&store, &name, id)?),
-        Cmd::Mcp { user, peers, name } => return Ok(serve(store, user, peers, name)),
+        Cmd::Mcp {
+            user,
+            http: Some(addr),
+            url,
+            ..
+        } => return Ok(serve_http(store, user, addr, url)),
+        Cmd::Mcp {
+            user, peers, name, ..
+        } => return Ok(serve(store, user, peers, name)),
+        Cmd::McpHttp(McpHttpCmd::Token) => println!("{}", tokens::mint(root, "cli")?),
+        Cmd::McpHttp(McpHttpCmd::Revoke) => {
+            let n = tokens::revoke(root)?;
+            let s = if n == 1 { "" } else { "s" };
+            println!("revoked {n} token{s}");
+        }
+        Cmd::McpHttp(McpHttpCmd::Peers { hosts }) => write_peers(root, &hosts)?,
         Cmd::Boot {
             name,
             firecracker,
@@ -1440,6 +1490,61 @@ fn move_vm(store: Store, name: &str, host: &str) -> Result<(), Box<dyn Error>> {
         let _ = writeln!(out, "{url}");
     }
     Ok(())
+}
+
+// A loopback address for MCP over HTTP.
+fn loopback(addr: &str) -> Result<std::net::SocketAddr, String> {
+    let at: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("{e}: give it as an address and port, like 127.0.0.1:8740"))?;
+    runner::mcp::check_addr(&at)?;
+    Ok(at)
+}
+
+/// Where host/install.sh keeps RUNNER_MCP_URL.
+const MCP_URL: &str = "/etc/runner/mcp-url";
+
+fn serve_http(
+    store: Store,
+    user: String,
+    addr: std::net::SocketAddr,
+    url: Option<String>,
+) -> ExitCode {
+    let url = url.or_else(|| {
+        let kept = std::fs::read_to_string(MCP_URL).ok()?;
+        let kept = kept.trim();
+        (!kept.is_empty()).then(|| kept.to_string())
+    });
+    let served = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+        .and_then(|rt| rt.block_on(runner::mcp::serve_http(store, user, addr, url)));
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runner mcp: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// <root>/peers, in one move, readable by all: it names hosts, nothing more.
+fn write_peers(root: &Path, hosts: &[String]) -> Result<(), Box<dyn Error>> {
+    let path = runner::mcp::peers_file(root);
+    if hosts.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("removing {}: {e}", path.display()).into())
+            }
+            _ => Ok(()),
+        };
+    }
+    let new = root.join("peers.new");
+    let text: String = hosts.iter().map(|h| format!("{h}\n")).collect();
+    std::fs::write(&new, text)
+        .and_then(|()| std::fs::rename(&new, &path))
+        .map_err(|e| format!("writing {}: {e}", path.display()).into())
 }
 
 fn serve(store: Store, user: String, peers: Vec<String>, name: Option<String>) -> ExitCode {
