@@ -697,6 +697,21 @@ fn escape(text: &str) -> String {
     out
 }
 
+// A message for a page: escaped, with each `command` in it set as code.
+fn message(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, part) in escape(text).split('`').enumerate() {
+        if i % 2 == 1 {
+            out.push_str("<code>");
+            out.push_str(part);
+            out.push_str("</code>");
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
+}
+
 // The page's headers: nothing but its own form, sent on to claude.ai, and
 // never in another site's frame.
 fn html(status: StatusCode, body: String) -> Response {
@@ -730,7 +745,7 @@ fn document(title: &str, inner: &str) -> String {
 
 // A page with nothing to do but say why.
 fn page_error(status: StatusCode, said: &str) -> Response {
-    let inner = format!("<h1>Can't connect</h1>\n<p>{}</p>", escape(said));
+    let inner = format!("<h1>Can't connect</h1>\n<p>{}</p>", message(said));
     html(status, document("Can't connect", &inner))
 }
 
@@ -750,7 +765,7 @@ fn approval(s: &Server, status: StatusCode, request: Request, said: Option<&str>
     let name = escape(&request.name);
     let back = escape(host_of(&request.redirect));
     let said = said.map_or_else(String::new, |s| {
-        format!("<p class=\"said\">{}</p>\n", escape(s))
+        format!("<p class=\"said\">{}</p>\n", message(s))
     });
     let inner = format!(
         "<h1>Connect {name}?</h1>\n\

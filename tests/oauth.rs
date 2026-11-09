@@ -1194,6 +1194,38 @@ fn another_client_s_spent_code_revokes_nothing() {
     assert!(host.mcp_works(&tokens.access));
 }
 
+// The page's messages set the command in code, as its label does, and never
+// show the backticks it's written with.
+#[test]
+fn the_page_s_messages_show_the_command_as_code() {
+    let host = Host::new();
+    let client = host.register(Some("none"));
+    let said = |page: &Reply| {
+        let at = page.body.find(r#"<p class="said">"#).expect("a message");
+        let rest = &page.body[at..];
+        rest[..rest.find("</p>").unwrap()].to_string()
+    };
+    let page = host.page(&client, &Flow::new(&host));
+    let none = host.approve(&page, "AAAAAAAA");
+    let empty = host.approve(&none, " ");
+    let code = host.pair();
+    let wrong = if code == "AAAAAAAA" {
+        "BBBBBBBB"
+    } else {
+        "AAAAAAAA"
+    };
+    let mut void = host.approve(&empty, wrong);
+    for _ in 0..4 {
+        void = host.approve(&void, wrong);
+    }
+    assert!(void.body.contains("void"), "{}", void.body);
+    for page in [&none, &empty, &void] {
+        let said = said(page);
+        assert!(said.contains("<code>runner mcp-http pair</code>"), "{said}");
+        assert!(!said.contains('`'), "{said}");
+    }
+}
+
 // Allow with the box empty asks for the code again, and spends no try.
 #[test]
 fn an_empty_code_costs_no_try() {
