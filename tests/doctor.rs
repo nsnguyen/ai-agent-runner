@@ -1035,9 +1035,32 @@ fn mcp_http_warns_when_its_service_or_url_won_t_do() {
     let report = assert_verdict(plain, &store, "mcp-http", Status::Warn, "isn't https");
     assert!(verdict(&report, "mcp-http").1.contains(fix));
 
-    // Funnel serves 443, 8443 and 10000 only.
+    // Funnel serves 443, 8443 and 10000 only, so there's no Funnel to turn
+    // on at another port: the fix is the URL, at the port Funnel gives it.
     let port = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:8740\n"));
-    assert_verdict(port, &store, "mcp-http", Status::Warn, "443, 8443 or 10000");
+    let report = assert_verdict(port, &store, "mcp-http", Status::Warn, "443, 8443 or 10000");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(!said.contains("--https=8740"), "{said}");
+    assert!(said.contains(&format!("{fix}{AT}")), "{said}");
+    let none = on()
+        .file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:8740\n"))
+        .funnel(&Value::Null);
+    let report = assert_verdict(none, &store, "mcp-http", Status::Warn, "--https=8443");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(!said.contains("--https=8740"), "{said}");
+    let huge = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net:99999\n"));
+    assert_verdict(huge, &store, "mcp-http", Status::Warn, "99999");
+
+    // A URL from before Funnel, with no port, so 443, while Funnel serves the
+    // server on 8443, as README.md has it: the URL is what's wrong, and 443
+    // stays free for a VM's URL.
+    let old = on().file(host::MCP_URL, Ok("https://kvm-host.tailnet.ts.net\n"));
+    let report = assert_verdict(old, &store, "mcp-http", Status::Warn, "8443");
+    let said = verdict(&report, "mcp-http").1;
+    assert!(said.contains(&format!("{fix}{AT}")), "{said}");
+    for wrong in ["--https=443", "--https=8443 off", "also puts"] {
+        assert!(!said.contains(wrong), "{said:?} has {wrong:?}");
+    }
 
     // Funnel serves the port under the host's own name, which the URL has to
     // be, or every request gets 403.

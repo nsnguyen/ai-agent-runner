@@ -1777,3 +1777,18 @@ fn mcp_over_http_without_an_https_url_fails_saying_how_to_set_one() {
         assert!(fails[0].contains("RUNNER_MCP_URL=https://"), "{fails:?}");
     }
 }
+
+// Nothing answering through public DNS is Funnel off, or its name not there
+// yet: the FAIL says so.
+#[test]
+fn mcp_over_http_with_funnel_off_says_to_look_at_funnel() {
+    let laptop = Laptop::new();
+    laptop.wrong("funnel-off");
+    let out = laptop.run(SHELLS[0], &["laptop"]);
+    assert_eq!(out.status.code(), Some(1), "{}", says(&out));
+    let fails = fails(&out);
+    assert_eq!(fails.len(), 2, "{fails:?}");
+    for fail in &fails {
+        assert!(fail.contains("public DNS. Is Funnel on?"), "{fail}");
+    }
+}

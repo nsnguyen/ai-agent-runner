@@ -1000,7 +1000,7 @@ pub fn check_addr(addr: &SocketAddr) -> Result<(), String> {
 pub fn check_url(url: &str) -> Result<(), String> {
     let refused = || {
         format!(
-            "RUNNER_MCP_URL={url} isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net"
+            "RUNNER_MCP_URL={url} isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net:8443"
         )
     };
     let rest = (url.strip_prefix("https://"))

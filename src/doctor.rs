@@ -659,7 +659,13 @@ fn mcp_http(host: &impl Host) -> Verdict {
     } else if let Some(rest) = url.strip_prefix("https://") {
         let authority = rest.split('/').next().unwrap_or_default();
         let (name, port) = authority.rsplit_once(':').unwrap_or((authority, "443"));
-        port.parse::<u16>().ok().map(|p| (name.to_lowercase(), p))
+        let port = port.parse::<u16>().ok();
+        if port.is_none() {
+            warnings.push(format!(
+                "RUNNER_MCP_URL={url} has no port a server can have: {set}"
+            ));
+        }
+        port.map(|p| (name.to_lowercase(), p))
     } else {
         warnings.push(format!(
             "RUNNER_MCP_URL={url} isn't https, which is all Funnel serves: {set}"
@@ -687,7 +693,7 @@ fn mcp_http(host: &impl Host) -> Verdict {
         Err(e) => Err(format!("tailscale: {e}")),
     };
     match funneled {
-        Ok(funneled) => warnings.extend(funnel_warnings(&funneled, public.as_ref())),
+        Ok(funneled) => warnings.extend(funnel_warnings(&funneled, url, public.as_ref())),
         Err(why) => warnings.push(why),
     }
 
@@ -819,19 +825,28 @@ fn funnel_on(port: u16) -> String {
     format!("sudo tailscale funnel --bg --https={port} http://{addr}")
 }
 
-// What's wrong with what Funnel serves: the MCP server's port, RUNNER_MCP_URL's
-// if it's known, else whichever goes to it, has to go to it alone, under the
-// URL's name, and no other port is funneled.
-fn funnel_warnings(funneled: &[Funneled], public: Option<&(String, u16)>) -> Vec<String> {
+// What's wrong with what Funnel serves. The MCP server's port is the one
+// that goes to it alone, RUNNER_MCP_URL's if there's one there, else the
+// port of RUNNER_MCP_URL's that Funnel serves: it has to go to the server
+// alone, under the URL's name and port, and no other port is funneled. A
+// URL that names a port Funnel doesn't serve, or none, is fixed by the URL,
+// not by turning Funnel on there.
+fn funnel_warnings(
+    funneled: &[Funneled],
+    url: &str,
+    public: Option<&(String, u16)>,
+) -> Vec<String> {
     let addr = host::MCP_HTTP_ADDR;
+    let want = public.map(|(_, port)| *port);
+    let want = want.filter(|port| FUNNEL_PORTS.contains(port));
+    let at = |f: &Funneled| Some(f.port) == want;
+    let ours = (funneled.iter().position(|f| serves_mcp(f) && at(f)))
+        .or_else(|| funneled.iter().position(serves_mcp))
+        .or_else(|| funneled.iter().position(at));
     let mut warnings = Vec::new();
-    let ours = funneled.iter().position(|f| match public {
-        Some((_, port)) => f.port == *port,
-        None => serves_mcp(f),
-    });
     match ours.map(|i| &funneled[i]) {
         None => {
-            let port = public.map_or(8443, |(_, port)| *port);
+            let port = want.unwrap_or(8443);
             warnings.push(format!(
                 "Funnel is off for port {port}, so claude.ai can't reach it: {}",
                 funnel_on(port)
@@ -845,12 +860,11 @@ fn funnel_warnings(funneled: &[Funneled], public: Option<&(String, u16)>) -> Vec
             funnel_on(f.port)
         )),
         Some(f) => {
-            if let Some((name, _)) = public
-                && *name != f.name
-            {
+            let served = (f.name.as_str(), f.port);
+            if public.is_some_and(|(name, port)| (name.as_str(), *port) != served) {
+                let (name, port) = served;
                 warnings.push(format!(
-                    "Funnel serves port {} as {}:{}, not RUNNER_MCP_URL's {name}, so each request gets 403: sudo RUNNER_MCP_URL=https://{}:{} {INSTALL}",
-                    f.port, f.name, f.port, f.name, f.port
+                    "Funnel serves it at {name}:{port}, not at RUNNER_MCP_URL={url}, so claude.ai can't reach it there: sudo RUNNER_MCP_URL=https://{name}:{port} {INSTALL}"
                 ));
             }
         }

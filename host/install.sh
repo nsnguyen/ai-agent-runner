@@ -15,7 +15,7 @@
 # and sets the idle time to never, since claude.ai can't start a stopped
 # host; it's off unless set, and kept in /etc/runner/mcp-http for reruns.
 # RUNNER_MCP_URL is the public base URL Funnel or `tailscale serve` gives it,
-# like https://kvm-host.tailnet.ts.net, kept in /etc/runner/mcp-url; set
+# like https://kvm-host.tailnet.ts.net:8443, kept in /etc/runner/mcp-url; set
 # empty, it drops the one kept. Safe to rerun, after an upgrade too: every
 # step overwrites or checks, never appends.
 set -euo pipefail
@@ -60,7 +60,7 @@ bad_reserve="RUNNER_HOST_RESERVE=$reserve isn't a memory size: use MiB, or a who
 [[ $mcp_http == [01] ]] || die "RUNNER_MCP_HTTP=$mcp_http isn't 0 or 1: 1 serves the MCP tools over HTTP, 0 doesn't"
 # The runner hands it to clients as it is, so only what needs no quoting.
 url='^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
-[[ -z $mcp_url || $mcp_url =~ $url ]] || die "RUNNER_MCP_URL=$mcp_url isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net"
+[[ -z $mcp_url || $mcp_url =~ $url ]] || die "RUNNER_MCP_URL=$mcp_url isn't a plain http(s)://host[:port][/path] URL, like https://kvm-host.tailnet.ts.net:8443"
 # claude.ai can't start a stopped host, so one that serves it stays up. Set
 # here, before the polkit rule and the timer, which both go by it.
 if [[ $mcp_http == 1 && $idle != never ]]; then
