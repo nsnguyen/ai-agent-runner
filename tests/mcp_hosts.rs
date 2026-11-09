@@ -407,6 +407,51 @@ fn create_vm_places_by_free_memory_and_takes_a_host() {
     }
 }
 
+// With no host given, create_vm places a VM only where it fits: on the host
+// with the most free memory, else nowhere, naming each host's room and each
+// peer that didn't answer, with nothing made.
+#[test]
+fn create_vm_is_refused_when_no_host_has_room() {
+    let fleet = Fleet::new();
+    fleet.here.set_free(1 << 30);
+    fleet.two.set_free(1 << 30);
+    fleet.down("kvm-host-3", true);
+    let mut s = fleet.serve();
+    let here = here();
+    let on = |vm: &str| -> Vec<&str> {
+        ["here", "kvm-host-2", "kvm-host-3"]
+            .into_iter()
+            .filter(|h| fleet.host(h).has(vm))
+            .collect()
+    };
+
+    // Base's 2G and its Firecracker's 64M fit in neither 1G.
+    let why = s.fails(2, "create_vm", json!({"name": "x"}));
+    let want = format!(
+        "no host has room for x, which needs 2.1G: {here} has 1.0G free, \
+         kvm-host-2 has 1.0G free; kvm-host-3 didn't answer: ssh: connect"
+    );
+    assert!(why.starts_with(&want), "{why}");
+    let end = ". Stop or sleep a VM, or run `runner create x` on the laptop, \
+               which starts a stopped host.";
+    assert!(why.ends_with(end), "{why}");
+    assert!(on("x").is_empty());
+    // A size that doesn't parse is the tool's to refuse.
+    let why = s.fails(3, "create_vm", json!({"name": "x", "mem": "lots"}));
+    assert!(!why.contains("no host has room"), "{why}");
+    assert!(on("x").is_empty());
+
+    // What fits goes on the most free, this host first among equals.
+    s.ok(4, "create_vm", json!({"name": "y", "mem": "512M"}));
+    assert_eq!(on("y"), ["here"]);
+    assert_eq!(fleet.here.store().machine("y").unwrap().mem_mib, 512);
+
+    // Back up, kvm-host-3 has room.
+    fleet.down("kvm-host-3", false);
+    s.ok(5, "create_vm", json!({"name": "x"}));
+    assert_eq!(on("x"), ["kvm-host-3"]);
+}
+
 #[test]
 fn a_peer_whose_ssh_fails_is_named_while_the_rest_answer() {
     let fleet = Fleet::new();

@@ -234,14 +234,14 @@ demo carries on while it's exported: the disk is a copy made with demo paused fo
 RUNNER_AWS_NAME=kvm-host-2 client/aws.sh up   # make a second server, set up like the first
 runner hosts add runner@kvm-host-2   # then add it: the servers learn each other's keys
 runner hosts                         # each server: its VMs, how many are up, its free memory
-runner create demo3                  # goes to the server with the most free memory
+runner create demo3                  # goes to the server with the most free memory, or turns one on if none has room
 runner list                          # every server's VMs, each line led by its server
 runner shell demo3                   # finds demo3's server for you
 runner create demo4 --host kvm-host  # or pick the server yourself
 runner move demo3 kvm-host-2         # move it to another server, checkpoints and all
 ```
 
-A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed: `runner list` turns none on, but a command naming a VM on it, or `--host kvm-host-2`, turns that one on. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
+A VM name is used once across all your servers, so `demo3` always means the same VM, and every command naming it goes to its server. `base` is on each server. A server that's off is named, and the rest still listed: `runner list` turns none on, but a command naming a VM on it, or `--host kvm-host-2`, turns that one on. So does `runner create` when no server that's on has room for the new VM: it says `no running host has 4.1G free; starting kvm-host-2`, waits a few minutes, and makes the VM there. Servers turn themselves off after an hour unused, so none costs more than its disks (about $7 a month) while you're away. With every server full and none off, `create` says each one's room: stop or sleep a VM, or make another server with the two lines above. `client/aws.sh stop` and `start` turn every server off and on together (section 1). Other `client/aws.sh` commands take `RUNNER_AWS_NAME=kvm-host-2` for the second server; without it, they mean `kvm-host`. `RUNNER_AWS_NAME=kvm-host-2 client/aws.sh stop` turns off just that one.
 
 Each server runs the build it was last given: `aws.sh up` gives kvm-host-2 this checkout's, and a plain `client/check.sh` updates only kvm-host. Keep both on the same build (README.md, After merging a change), so a move or Claude reaching across servers finds the same `runner` on both.
 
@@ -312,6 +312,7 @@ client/aws.sh stop     # turn the servers off now, or leave them to turn themsel
 | `demo is up, or a run or another runner command holds it` from `rebase` | `runner stop demo` first, or wait for its run to end |
 | `base's current generation, … came from "run", not an import` from `rebase` | base booted since its import: import it again (README.md, Build the base image) |
 | A VM won't start | `runner logs demo` shows why |
+| `no host has room for demo` | Every server is on and full: `runner stop` or `runner sleep` a VM you're not using, or make another server (section 9). From Claude, `runner create demo` on the laptop turns on a server that's off |
 | `kvm-host-2 didn't answer: … Permission denied (publickey)`, from a move or Claude | The servers don't trust each other yet, say because one had an older build when you added the other: `runner hosts add runner@kvm-host-2` again. It names any server without a key: update that one first (README.md, After merging a change) |
 | `administratively prohibited` from `runner proxy` | Add `port-forwarding` to the laptop's key line on the server (README.md, Add the laptop's key) |
 

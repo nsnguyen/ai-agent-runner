@@ -8,8 +8,9 @@
 # With several, a command naming a VM goes to the host that has it (README.md,
 # Several hosts), and move's target is passed on as listed, since that host's
 # ssh reaches it. A host aws.sh made that a command finds stopped is started
-# first, by the aws.sh beside this script (README.md, Day to day). POSIX sh
-# only, since macOS's /bin/sh runs it.
+# first, by the aws.sh beside this script (README.md, Day to day), and create
+# starts one when no running host has room. POSIX sh only, since macOS's
+# /bin/sh runs it.
 
 # No argument or host name is ever a glob.
 set -f
@@ -101,12 +102,13 @@ exit "$rc"'
 
 # A host `client/aws.sh up` made that a command finds stopped is started by
 # the aws.sh beside this script, where client/install.sh puts it (README.md,
-# Day to day). $up holds the hosts this run has reached, and $stopped those
-# it found stopped, a word each.
+# Day to day). $up holds the hosts this run has reached, $stopped those it
+# found stopped, and $starting those it found starting, a word each.
 aws_sh=$(dirname "$0")/aws.sh
 aws_failed=
 up=
 stopped=
+starting=
 
 # ssh hands the remote shell one string, so each argument is quoted for it:
 # bare when it's only safe characters, else in single quotes, with ' as '\''.
@@ -298,8 +300,8 @@ survey() {
 # answered CMD: after a survey of CMD, passes on each host's stderr, names
 # each host that didn't answer or failed, and sets $failed if one did. One
 # that didn't answer and AWS has stopped is named so, and noted in $stopped,
-# but not started: the command that goes to it starts it, as it waits for
-# one that's starting.
+# or in $starting if it's starting, once each, but not started: the command
+# that goes to it starts it, as it waits for one that's starting.
 answered() {
   failed=
   i=0
@@ -312,9 +314,12 @@ answered() {
     255)
       aws_state "$h" || state=
       case $state in
-      pending) echo "runner: $(name_of "$h") is starting" >&2 ;;
+      pending)
+        case " $starting " in *" $h "*) ;; *) starting="$starting $h" ;; esac
+        echo "runner: $(name_of "$h") is starting" >&2
+        ;;
       stopping | stopped)
-        stopped="$stopped $h"
+        case " $stopped " in *" $h "*) ;; *) stopped="$stopped $h" ;; esac
         echo "runner: $(name_of "$h") is $state" >&2
         ;;
       *) echo "runner: $(name_of "$h") didn't answer" >&2 ;;
@@ -431,21 +436,115 @@ held() {
   at=${via:-$at}
 }
 
+# mib SIZE: sets $mib to SIZE in MiB, as the host's runner reads a memory
+# size: MiB, or a whole number with M, G or T (src/store.rs). Fails on one it
+# wouldn't take, or one too big to count here.
+mib() {
+  mib=
+  digits=${1%%[!0-9]*}
+  suffix=${1#"$digits"}
+  # No leading zeros, which sh's arithmetic reads as octal.
+  while :; do
+    case $digits in 0?*) digits=${digits#0} ;; *) break ;; esac
+  done
+  case $digits in '' | 0 | ??????????*) return 1 ;; esac
+  case $suffix in
+  '' | [mM] | [mM][iI][bB]) mib=$digits ;;
+  [gG] | [gG][iI][bB]) mib=$((digits * 1024)) ;;
+  [tT] | [tT][iI][bB]) mib=$((digits * 1048576)) ;;
+  *) return 1 ;;
+  esac
+  # It takes no more MiB than a u32 holds.
+  [ "$mib" -le 4294967295 ] || {
+    mib=
+    return 1
+  }
+}
+
+# mem_of LINE: sets $mib to the memory a line of `runner list` gives its VM,
+# its word after mem.
+mem_of() {
+  # shellcheck disable=SC2086 # split into words, never globbed (set -f).
+  set -- $1
+  # Past its name, which could be mem.
+  shift
+  while [ $# -gt 1 ]; do
+    if [ "$1" = mem ]; then
+      mib "$2"
+      return
+    fi
+    shift
+  done
+  return 1
+}
+
+# gib BYTES [up]: BYTES in GiB to a tenth, like 4.1G, rounded down, or up
+# with up, as a host's refusal has them, so a need never reads as if it fit.
+gib() {
+  if [ -n "${2-}" ]; then
+    t=$((($1 * 10 + 1073741823) / 1073741824))
+  else
+    t=$(($1 * 10 / 1073741824))
+  fi
+  printf '%s.%sG' $((t / 10)) $((t % 10))
+}
+
+# needs: after a survey of rows and lists, sets $need to the bytes a new VM
+# from base needs to boot (src/room.rs): its memory, --mem's, else base's on
+# the first host that listed it, else the host's 2G, and 64 MiB for its
+# Firecracker. Fails on a --mem the host's runner would refuse itself.
+needs() {
+  need=
+  if [ -n "$mem" ]; then
+    mib "$mem" || return 1
+  else
+    mib=
+    i=0
+    for h in $hosts; do
+      i=$((i + 1))
+      read -r rc <"$tmp/$i.rc"
+      [ "$rc" = 0 ] || continue
+      while IFS= read -r line; do
+        case $line in "base "*) mem_of "$line" && break 2 ;; esac
+      done <"$tmp/$i.out"
+    done
+    [ -n "$mib" ] || mib=2048
+  fi
+  need=$(((mib + 64) * 1048576))
+}
+
+# taken NAME: refuses NAME if a host has a VM of that name, counting the VMs
+# a host that doesn't answer had when last listed. base is on every host.
+taken() {
+  [ "$1" != base ] || return 0
+  cached "$1"
+  [ -n "$at" ] || return 0
+  echo "runner: $(name_of "$at") has a VM named $1 already: VM names are one per name across hosts" >&2
+  exit 1
+}
+
+# room_of I: sets $free to host I's room, in bytes, from its row in the
+# survey; empty if it didn't answer or say.
+room_of() {
+  free=
+  read -r rc <"$tmp/$1.rc"
+  [ "$rc" = 0 ] || return 0
+  read -r _ _ _ _ free _ <"$tmp/$1.out"
+  case $free in '' | *[!0-9]*) free= ;; esac
+}
+
 # pick NAME: sets $at to the host a new VM NAME goes to: the one --host
 # names, the first for base, the host of a VM other than base it forks, else
-# the one with the most free memory. Refuses a name any host has, counting
-# the VMs a host that doesn't answer had when last listed.
+# the one with the most free memory, if NAME has room there. If none has,
+# a host already starting is waited for, then the stopped hosts are started
+# one at a time, in the hosts file's order, until one has (README.md,
+# Several hosts); if none does, it's refused, naming each host's room.
+# Refuses a name any host has.
 pick() {
   survey "runner hosts && runner list"
   answered "runner hosts && runner list"
   recache 1
-  if [ "$1" != base ]; then
-    cached "$1"
-    if [ -n "$at" ]; then
-      echo "runner: $(name_of "$at") has a VM named $1 already: VM names are one per name across hosts" >&2
-      exit 1
-    fi
-  fi
+  taken "$1"
   if [ -n "$via" ]; then
     at=$via
     return
@@ -463,19 +562,82 @@ pick() {
   i=0
   for h in $hosts; do
     i=$((i + 1))
-    read -r rc <"$tmp/$i.rc"
-    [ "$rc" = 0 ] || continue
-    read -r _ _ _ _ free _ <"$tmp/$i.out"
-    case $free in '' | *[!0-9]*) continue ;; esac
+    room_of "$i"
+    [ -n "$free" ] || continue
     if [ -z "$at" ] || [ "$free" -gt "$most" ]; then
       at=$h
       most=$free
     fi
   done
-  if [ -z "$at" ]; then
+  # An import is as big as its export, which only the host reads, and a
+  # fork of a VM no host has is the host's to refuse: neither starts a host.
+  if [ "$cmd" = import ] || { [ -n "$from" ] && [ "$from" != base ]; } || ! needs; then
+    [ -n "$at" ] && return 0
     echo "runner: no host answered, so $1 has nowhere to go" >&2
     exit 1
   fi
+  if [ -n "$at" ] && [ "$most" -ge "$need" ]; then return 0; fi
+  # A stopped host's room is known once it answers. ready takes it out of
+  # $stopped, which the loop has read; ready and needs have loops of their
+  # own, so these are named apart.
+  for cold in $starting $stopped; do
+    case " $starting " in
+    *" $cold "*) doing="waiting for $(name_of "$cold"), which is starting" ;;
+    *) doing="starting $(name_of "$cold")" ;;
+    esac
+    echo "runner: no running host has $(gib "$need" up) free; $doing" >&2
+    ready "$cold" || exit 255
+    k=0
+    for h in $hosts; do
+      k=$((k + 1))
+      [ "$h" != "$cold" ] || break
+    done
+    # shellcheck disable=SC2086 # $ask is options, split.
+    ssh $ask "$cold" "runner hosts && runner list" >"$tmp/$k.out" 2>"$tmp/$k.err"
+    echo $? >"$tmp/$k.rc"
+    cat "$tmp/$k.err" >&2
+    recache 1
+    taken "$1"
+    # Base's memory, if no host had answered before.
+    needs
+    room_of "$k"
+    # Starting the next would leave this one up with nothing on it.
+    if [ -z "$free" ]; then
+      echo "runner: $(name_of "$cold") is started, but didn't say its room: run it again once it answers" >&2
+      exit 1
+    fi
+    if [ "$free" -ge "$need" ]; then
+      at=$cold
+      return 0
+    fi
+  done
+  width=0
+  any=
+  i=0
+  for h in $hosts; do
+    i=$((i + 1))
+    hn=$(name_of "$h")
+    [ "${#hn}" -le "$width" ] || width=${#hn}
+    room_of "$i"
+    [ -z "$free" ] || any=1
+  done
+  # The network, say, not room.
+  if [ -z "$any" ]; then
+    echo "runner: no host answered, so $1 has nowhere to go" >&2
+    exit 1
+  fi
+  {
+    echo "runner: no host has room for $1, which needs $(gib "$need" up):"
+    i=0
+    for h in $hosts; do
+      i=$((i + 1))
+      room_of "$i"
+      if [ -n "$free" ]; then room="$(gib "$free") free"; else room="didn't answer"; fi
+      printf "  %-${width}s  %s\n" "$(name_of "$h")" "$room"
+    done
+    echo "Stop or sleep a VM on one, or add a host: \`RUNNER_AWS_NAME=<name> client/aws.sh up\`, then \`runner hosts add runner@<name>\`."
+  } >&2
+  exit 1
 }
 
 # go HOST [keep]: the command on HOST, with a terminal only when typed at
@@ -740,7 +902,7 @@ fi
 # command's own. --host comes out: the host's runner hasn't got it. move's
 # target is $to, and $spot its place among the arguments kept, so only it
 # becomes its listed form, not an option's value that reads the same.
-cmd='' sub='' vm='' run='' from='' via='' replace='' takes='' ended='' extra='' to='' spot='' tries=''
+cmd='' sub='' vm='' run='' from='' mem='' via='' replace='' takes='' ended='' extra='' to='' spot='' tries=''
 n=$#
 while [ "$n" -gt 0 ]; do
   a=$1
@@ -776,6 +938,7 @@ while [ "$n" -gt 0 ]; do
       continue
       ;;
     --from) from=$a ;;
+    --mem) mem=$a ;;
     --run) run=$a ;;
     --n) tries=$a ;;
     esac
@@ -798,6 +961,7 @@ while [ "$n" -gt 0 ]; do
     break
     ;;
   --from=*) from=${a#*=} ;;
+  --mem=*) mem=${a#*=} ;;
   --run=*) run=${a#*=} ;;
   --n=*) tries=${a#*=} ;;
   --replace) replace=1 ;;
