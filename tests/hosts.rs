@@ -74,7 +74,8 @@ rm -f "$read_in"
 exit "$rc"
 "#;
 
-// A host's runner, as far as the laptop sees it. It names the VMs it has.
+// A host's runner, as far as the laptop sees it. It names the VMs it has,
+// each line of `list` as the real one's.
 const RUNNER: &str = r#"printf '%s\n' "$*" >>"$HOST_DIR/calls"
 touch "$HOST_DIR/vms"
 has() { grep -qx -- "$1" "$HOST_DIR/vms"; }
@@ -89,7 +90,9 @@ done
 case $1 in
 list)
   [ -s "$HOST_DIR/vms" ] || { echo "no VMs yet"; exit 0; }
-  while read -r v; do echo "$v  gen 0  6 bytes  4096 bytes used"; done <"$HOST_DIR/vms"
+  # Each VM's memory is `mem`'s, else 2G.
+  mem=$(cat "$HOST_DIR/mem" 2>/dev/null || echo 2G)
+  while read -r v; do echo "$v  gen 0  6 bytes  cpus 2  mem $mem  4096 bytes used"; done <"$HOST_DIR/vms"
   ;;
 hosts)
   n=$(wc -l <"$HOST_DIR/vms" | tr -d ' ')
@@ -353,10 +356,10 @@ fn list_merges_every_host_s_vms_with_a_host_column() {
         ok(&out);
         assert_eq!(
             text(&out.stdout),
-            "kvm-host  base  gen 0  6 bytes  4096 bytes used\n\
-             kvm-host  dev  gen 0  6 bytes  4096 bytes used\n\
-             kvm-host-2  base  gen 0  6 bytes  4096 bytes used\n\
-             kvm-host-2  web  gen 0  6 bytes  4096 bytes used\n",
+            "kvm-host  base  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n\
+             kvm-host  dev  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n\
+             kvm-host-2  base  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n\
+             kvm-host-2  web  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n",
             "{shell:?}"
         );
         assert_eq!(text(&out.stderr), "", "{shell:?}");
@@ -404,8 +407,8 @@ fn a_host_that_times_out_is_named_and_the_rest_listed() {
         assert_eq!(out.status.code(), Some(1), "{shell:?}");
         assert_eq!(
             text(&out.stdout),
-            "kvm-host  base  gen 0  6 bytes  4096 bytes used\n\
-             kvm-host  dev  gen 0  6 bytes  4096 bytes used\n",
+            "kvm-host  base  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n\
+             kvm-host  dev  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n",
             "{shell:?}"
         );
         let err = text(&out.stderr);
@@ -1118,7 +1121,7 @@ fn runner_host_still_means_that_host_alone() {
         // One host's list as the host prints it: no host column.
         assert_eq!(
             text(&out.stdout),
-            "base  gen 0  6 bytes  4096 bytes used\nweb  gen 0  6 bytes  4096 bytes used\n"
+            "base  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\nweb  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n"
         );
     }
 }
@@ -2008,8 +2011,8 @@ fn list_starts_no_host_and_names_the_stopped_ones() {
         assert_eq!(out.status.code(), Some(1), "{shell:?}");
         assert_eq!(
             text(&out.stdout),
-            "kvm-host  base  gen 0  6 bytes  4096 bytes used\n\
-             kvm-host  dev  gen 0  6 bytes  4096 bytes used\n",
+            "kvm-host  base  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n\
+             kvm-host  dev  gen 0  6 bytes  cpus 2  mem 2G  4096 bytes used\n",
             "{shell:?}"
         );
         let err = text(&out.stderr);
@@ -2112,4 +2115,285 @@ fn move_to_a_running_target_asks_aws_nothing() {
     ok(&fleet.run(SHELLS[0], &["list"]));
     ok(&fleet.run(SHELLS[0], &["move", "web", "kvm-host-3"]));
     assert!(fleet.aws_calls().is_empty());
+}
+
+// create places a VM on a running host with room for it: its memory, --mem's
+// or else base's, and 64 MiB for its Firecracker. When none has room, the
+// first stopped host in the hosts file is started and asked its room once it
+// answers, then the next if that one's too small (#174).
+
+// What every host's runner got that it was asked to make, a host each.
+fn made(fleet: &Fleet) -> Vec<(String, Vec<String>)> {
+    ["kvm-host", "kvm-host-2", "kvm-host-3"]
+        .into_iter()
+        .map(|h| (h.to_string(), fleet.commands(h)))
+        .filter(|(_, c)| !c.is_empty())
+        .collect()
+}
+
+fn on(host: &str, commands: &[&str]) -> Vec<(String, Vec<String>)> {
+    let commands = commands.iter().map(|c| c.to_string()).collect();
+    vec![(host.to_string(), commands)]
+}
+
+#[test]
+fn create_starts_a_stopped_host_once_when_no_running_host_has_room() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        // 4 GiB isn't room for a 4 GiB VM: it needs 64 MiB more.
+        fleet.host("kvm-host-2", &["base", "web"], 4 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app", "--mem", "4G"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("runner: no running host has 4.1G free; starting kvm-host-3\n"),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-3 state", "kvm-host-3 start"],
+            "{shell:?}"
+        );
+        assert_eq!(
+            made(&fleet),
+            on("kvm-host-3", &["create app --mem 4G"]),
+            "{shell:?}"
+        );
+        assert_eq!(text(&out.stdout), "app  gen 0  6 bytes\n", "{shell:?}");
+        assert!(
+            fleet.cache().contains("app runner@kvm-host-3\n"),
+            "{shell:?}"
+        );
+    }
+}
+
+#[test]
+fn create_without_mem_needs_base_s_memory() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        // base is 4G on the hosts that answer, so 6 GiB is room and 4 isn't.
+        for h in ["kvm-host", "kvm-host-2"] {
+            fs::write(fleet.dir.path().join("fleet").join(h).join("mem"), "4G").unwrap();
+        }
+        fleet.host("kvm-host-2", &["base", "web"], 4 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("no running host has 4.1G free; starting kvm-host-3"),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(made(&fleet), on("kvm-host-3", &["create app"]), "{shell:?}");
+        // With a smaller --mem it fits where it is.
+        let fleet = Fleet::new();
+        for h in ["kvm-host", "kvm-host-2"] {
+            fs::write(fleet.dir.path().join("fleet").join(h).join("mem"), "4G").unwrap();
+        }
+        fleet.host("kvm-host-2", &["base", "web"], 4 << 30);
+        fleet.stop("kvm-host-3");
+        ok(&fleet.run(shell, &["create", "app", "--mem=2048"]));
+        assert_eq!(
+            made(&fleet),
+            on("kvm-host-2", &["create app --mem=2048"]),
+            "{shell:?}"
+        );
+        assert_eq!(fleet.aws_calls(), ["kvm-host-3 state"], "{shell:?}");
+    }
+}
+
+#[test]
+fn a_stopped_first_host_isn_t_started_when_another_has_room() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.stop("kvm-host");
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        assert_eq!(fleet.aws_calls(), ["kvm-host state"], "{shell:?}");
+        assert_eq!(made(&fleet), on("kvm-host-2", &["create app"]), "{shell:?}");
+        assert!(fleet.calls("kvm-host").is_empty(), "{shell:?}");
+    }
+}
+
+#[test]
+fn with_every_host_full_and_none_stopped_create_is_refused_and_nothing_starts() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.aws_cli();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 3 << 29);
+        // Down, but AWS has it running, so it isn't a stopped host.
+        fleet.down("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        for want in [
+            "runner: no host has room for app, which needs 2.1G:\n",
+            "  kvm-host    1.0G free\n",
+            "  kvm-host-2  1.5G free\n",
+            "  kvm-host-3  didn't answer\n",
+            "RUNNER_AWS_NAME=<name> client/aws.sh up",
+            "runner hosts add runner@<name>",
+        ] {
+            assert!(err.contains(want), "{shell:?}: {want:?} in {err}");
+        }
+        assert_eq!(fleet.aws_calls(), ["kvm-host-3 state"], "{shell:?}");
+        assert!(made(&fleet).is_empty(), "{shell:?}");
+        assert!(!fleet.cache().contains("app "), "{shell:?}");
+    }
+}
+
+#[test]
+fn a_started_host_without_room_moves_on_to_the_next_stopped_one() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-2");
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        let err = text(&out.stderr);
+        let two = err.find("no running host has 2.1G free; starting kvm-host-2");
+        let three = err.find("no running host has 2.1G free; starting kvm-host-3");
+        assert!(two.is_some() && two < three, "{shell:?}: {err}");
+        assert_eq!(
+            fleet.aws_calls(),
+            [
+                "kvm-host-2 state",
+                "kvm-host-3 state",
+                "kvm-host-2 start",
+                "kvm-host-3 start"
+            ],
+            "{shell:?}"
+        );
+        assert_eq!(made(&fleet), on("kvm-host-3", &["create app"]), "{shell:?}");
+
+        // Started, and neither has room: refused, each host's room named.
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-3", &["base"], 1 << 30);
+        fleet.stop("kvm-host-3");
+        fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+        let out = fleet.run(shell, &["create", "app"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("  kvm-host-3  1.0G free\n"),
+            "{shell:?}: {err}"
+        );
+        assert_eq!(
+            fleet.aws_calls(),
+            ["kvm-host-3 state", "kvm-host-3 start"],
+            "{shell:?}"
+        );
+        assert!(made(&fleet).is_empty(), "{shell:?}");
+    }
+}
+
+// With no host kept warm, every host is often stopped: the first is started.
+#[test]
+fn with_every_host_stopped_create_starts_the_first() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 4 << 30);
+        for h in ["kvm-host", "kvm-host-2", "kvm-host-3"] {
+            fleet.stop(h);
+        }
+        let out = fleet.run(shell, &["create", "app"]);
+        ok(&out);
+        assert_eq!(
+            fleet.aws_calls(),
+            [
+                "kvm-host state",
+                "kvm-host-2 state",
+                "kvm-host-3 state",
+                "kvm-host start"
+            ],
+            "{shell:?}"
+        );
+        assert_eq!(made(&fleet), on("kvm-host", &["create app"]), "{shell:?}");
+    }
+}
+
+// A started host is asked its VMs too, so a name it has is still refused.
+#[test]
+fn a_started_host_that_has_the_name_refuses_it() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+        fleet.host("kvm-host-3", &["base", "app"], 6 << 30);
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["create", "app"]);
+        assert_eq!(out.status.code(), Some(1), "{shell:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("kvm-host-3 has a VM named app"), "{err}");
+        assert!(made(&fleet).is_empty(), "{shell:?}");
+    }
+}
+
+#[test]
+fn a_fork_of_a_vm_other_than_base_never_starts_a_host() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-3");
+        ok(&fleet.run(shell, &["create", "dev2", "--from", "dev"]));
+        assert_eq!(
+            made(&fleet),
+            on("kvm-host", &["create dev2 --from dev"]),
+            "{shell:?}"
+        );
+        // Nor does one of a VM no host has: that's the host's to refuse.
+        fleet.forget_calls();
+        fleet.run(shell, &["create", "dev3", "--from", "nope"]);
+        assert!(
+            fleet.aws_calls().iter().all(|c| !c.ends_with(" start")),
+            "{shell:?}: {:?}",
+            fleet.aws_calls()
+        );
+        assert!(fleet.calls("kvm-host-3").is_empty(), "{shell:?}");
+    }
+}
+
+#[test]
+fn claude_on_a_new_vm_starts_a_stopped_host_as_create_does() {
+    for shell in SHELLS {
+        let fleet = Fleet::new();
+        fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+        fleet.host("kvm-host-2", &["base", "web"], 1 << 30);
+        fleet.host("kvm-host-3", &["base"], 6 << 30);
+        fleet.stop("kvm-host-3");
+        let out = fleet.run(shell, &["claude", "fresh"]);
+        ok(&out);
+        assert!(
+            text(&out.stderr).contains("no running host has 2.1G free; starting kvm-host-3"),
+            "{shell:?}"
+        );
+        assert_eq!(
+            made(&fleet),
+            on("kvm-host-3", &["claude fresh"]),
+            "{shell:?}"
+        );
+    }
+}
+
+// import's VM is as big as its export says, which stdin carries, so it's
+// placed by free memory as before and starts nothing.
+#[test]
+fn import_starts_no_host() {
+    let fleet = Fleet::new();
+    fleet.host("kvm-host", &["base", "dev"], 1 << 30);
+    fleet.host("kvm-host-2", &["base", "web"], 3 << 29);
+    fleet.stop("kvm-host-3");
+    ok(&fleet.run(SHELLS[0], &["import", "app", "-"]));
+    assert_eq!(made(&fleet), on("kvm-host-2", &["import app -"]));
+    assert_eq!(fleet.aws_calls(), ["kvm-host-3 state"]);
 }
