@@ -2,6 +2,33 @@
 
 `runner` runs my AI agents on Firecracker microVMs, one microVM per agent, like fly.io Sprites: local Claude Code starts and drives one over MCP, or I land in its terminal over SSH. Design: [docs/design.md](docs/design.md). New to it? [EXAMPLES.md](EXAMPLES.md) shows each command with an example.
 
+## What it does
+
+Each row is one thing you can do, with the command that does it and the section that says more. [EXAMPLES.md](EXAMPLES.md) walks through most of them.
+
+| What | Command | More |
+|---|---|---|
+| Make a VM, a copy of base or of another VM, and list, stop or delete them | `runner create dev`, `runner create dev2 --from dev`, `runner list`, `runner stop dev`, `runner delete dev2` | [EXAMPLES.md, 2](EXAMPLES.md#2-make-list-and-remove-vms) |
+| Claude Code in a VM of its own, logged in, that keeps working after you detach | `runner claude dev` | [Claude Code in a VM](#2-claude-code-in-a-vm) |
+| A shell, one command, or a named tmux session in a VM | `runner shell dev`, `runner exec dev -- ls`, `runner shell dev -s work` | [Shell and exec](#shell-and-exec), [Sessions](#sessions) |
+| An agent working alone on a prompt, to watch or check later; a run that boots its VM lists what it changed on the disk | `runner run dev "fix the test"`, `runner output dev.1 --follow`, `runner result dev.1` | [Headless runs](#headless-runs) |
+| One prompt in several forks at once; keep the best try | `runner run dev --n 3 "…"`, `runner tries dev`, `runner keep dev-2` | [Best of N](#best-of-n) |
+| Step into a headless run as interactive Claude Code, while it runs or after | `runner claude --run dev.1` | [Claude Code in the cloud](#claude-code-in-the-cloud) |
+| Save the disk and go back to it | `runner checkpoint dev -m "tests pass"`, `runner restore dev 4`, `runner undo dev` | [Checkpoints](#checkpoints) |
+| Sleep with memory on disk, and wake where it was; idle VMs sleep on their own | `runner sleep dev`, `runner wake dev`, `runner idle dev 30` | [Sleep and wake](#sleep-and-wake) |
+| Keep a dev server running whenever the VM is up | `runner service add dev web -- npm run dev` | [Services](#services) |
+| A VM's port on the laptop's localhost, or at a URL on the tailnet | `runner proxy dev 3000`, `runner url dev` | [Ports](#ports), [A URL per VM](#a-url-per-vm) |
+| Docker and Compose in VMs made from the current base, without sudo; a stack carries on through sleep, and after a reboot with a restart policy | `docker compose up -d`, in the VM | [Build the base image](#build-the-base-image) |
+| More disk, memory or vCPUs for a VM | `runner resize dev --disk 40G --mem 4G --cpus 4` | [Sizes](#sizes) |
+| Limit which sites a VM can reach | `runner net dev allow github.com`, `runner net dev open` | [Names a VM can reach](#names-a-vm-can-reach) |
+| Move a VM onto a newer base, keeping its home and services | `runner rebase dev` | [Rebase onto a new base](#rebase-onto-a-new-base) |
+| Back a VM up, bring it back, or move it to another host | `runner export dev > dev.tar`, `runner import dev2 - <dev.tar`, `runner move dev kvm-host-2` | [Back up and move](#back-up-and-move) |
+| Several hosts, each VM on one, all from the same commands | `runner hosts add runner@kvm-host-2`, `runner create dev2 --host kvm-host-2` | [Several hosts](#several-hosts) |
+| Make the AWS host once; it stops itself after an hour idle, and the next command naming a VM starts it | `client/aws.sh up`, `runner shell dev` | [On AWS](#on-aws), [Start the host](#1-start-the-host) |
+| Give a VM credentials beyond Claude Code's, like GitHub's | `runner creds dev claude github` | [EXAMPLES.md, 8](EXAMPLES.md#8-back-up-a-vm-and-bring-it-back) |
+| See what's wrong: the host's setup, a VM's console and boot notes | `runner doctor`, `runner logs dev` | [When something's off](#when-somethings-off) |
+| Drive most of it from Claude Code on the laptop, over MCP | `claude mcp add --scope user runner -- ~/.local/bin/runner mcp` | [From Claude Code on the laptop](#4-from-claude-code-on-the-laptop), [MCP clients](#mcp-clients) |
+
 ## Day to day, on the AWS host
 
 For a host already set up as Set up a host and On AWS below say: `kvm-host` on the tailnet, the laptop's key in, `runner` installed on the laptop. Everything here runs on the laptop, from this checkout, with Tailscale connected.
